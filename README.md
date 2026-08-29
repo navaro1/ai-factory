@@ -140,8 +140,8 @@ zellij theme is generated from it:
 cargo run --manifest-path ui/console/Cargo.toml -- tokens zellij
 ```
 
-CI fails when the committed theme drifts from the tokens. Build and test
-the console with `cargo test` inside `ui/console`.
+CI does not exist in this repo on purpose. Run `./check.sh` before you
+push; it runs fmt, clippy, tests, and the tokens drift check.
 
 To release a new version:
 
