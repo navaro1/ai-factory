@@ -12,7 +12,7 @@ Tab 1 — `Planner - <repo>`
 
 | Pane | Command | Model |
 |---|---|---|
-| Planner | `clauded` (Claude Code) | `claude-fable-5` |
+| Planner | `clauded` (Claude Code) | `claude-fable-5[1m]` |
 
 Tab 2 — `AI factory - <repo>`
 
@@ -21,7 +21,7 @@ Tab 2 — `AI factory - <repo>`
 | Refiner | `opencoded` (opencode, auto) | `openai/gpt-5.6-sol` |
 | Reviewer | `opencoded` (opencode, auto) | `openai/gpt-5.6-sol` |
 | Implementer | `opencoded` (opencode, auto) | `zai-coding-plan/glm-5.3-flash` |
-| Releaser | `clauded` (Claude Code) | `claude-opus-5` |
+| Releaser | `clauded` (Claude Code) | `claude-opus-5[1m]` |
 
 The factory panes run loop prompts. The Refiner refines tickets labelled
 `to-refine`. The Reviewer works through draft PRs. The Implementer picks up
