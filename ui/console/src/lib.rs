@@ -1,6 +1,9 @@
 pub mod actions;
 pub mod app;
 pub mod graph;
+pub mod probe;
+pub mod runner;
+pub mod scheduler;
 pub mod status;
 pub mod theme;
 pub mod view;

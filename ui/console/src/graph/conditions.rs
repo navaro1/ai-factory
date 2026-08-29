@@ -1,10 +1,6 @@
 use anyhow::{bail, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ItemKind {
-    Issue,
-    PullRequest,
-}
+pub use crate::probe::ItemKind;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Item<'a> {

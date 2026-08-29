@@ -20,6 +20,12 @@ pub fn press_enter(session: &str, pane: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn paste_text(session: &str, pane: &str, text: &str) -> Result<()> {
+    let payload = format!("\x1b[200~{text}\x1b[201~");
+    run_zellij(session, &["action", "write-chars", "-p", pane, &payload])?;
+    Ok(())
+}
+
 pub fn dump_scrollback(session: &str, pane: &str) -> Result<String> {
     let out = run_zellij(session, &["action", "dump-screen", "-f", "-p", pane])?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())

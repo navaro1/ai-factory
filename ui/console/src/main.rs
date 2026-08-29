@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use aif::{app, graph, status, theme};
+use aif::{app, graph, runner, status, theme};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +41,21 @@ enum Command {
     Graph {
         #[command(subcommand)]
         command: GraphCommand,
+    },
+    /// Evaluate the graph and dispatch ready tasks
+    Run {
+        /// Run one tick and exit
+        #[arg(long)]
+        once: bool,
+        /// Print the dispatch plan without touching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the event log
+    Events {
+        /// Show only the last N events
+        #[arg(long, default_value_t = 20)]
+        last: usize,
     },
 }
 
@@ -111,6 +126,18 @@ fn run() -> Result<()> {
                 render_zellij_theme(&tokens, &out, check)
             }
         },
+        Some(Command::Run { once, dry_run }) => {
+            let root = status::repo_root()?;
+            if once || dry_run {
+                runner::run_once(&root, dry_run)
+            } else {
+                runner::run_loop(&root)
+            }
+        }
+        Some(Command::Events { last }) => {
+            let root = status::repo_root()?;
+            runner::print_events(&root, last)
+        }
         Some(Command::Graph { command }) => match command {
             GraphCommand::Validate { path } => {
                 let graph = graph::Graph::load(&path)?;

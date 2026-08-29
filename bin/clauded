@@ -42,7 +42,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -n "$draft" && -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" ]]; then
+if [[ -n "$draft" && -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" && ! -f .aif/graph.kdl ]]; then
     (
         payload="$(printf '\033[200~%s\033[201~' "$draft")"
         zj() { zellij -s "$ZELLIJ_SESSION_NAME" "$@"; }
