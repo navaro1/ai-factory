@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use aif::{app, status, theme};
+use aif::{app, graph, status, theme};
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +37,27 @@ enum Command {
         #[command(subcommand)]
         command: TokensCommand,
     },
+    /// Inspect the repo graph file
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphCommand {
+    /// Parse and validate .aif/graph.kdl
+    Validate {
+        /// Path to the graph file
+        #[arg(long, default_value = graph::DEFAULT_GRAPH_PATH)]
+        path: PathBuf,
+    },
+    /// Print the graph as Graphviz dot
+    Dot {
+        /// Path to the graph file
+        #[arg(long, default_value = graph::DEFAULT_GRAPH_PATH)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -55,9 +76,17 @@ enum TokensCommand {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("aif: {err:?}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let command = cli.command;
+    match command {
         None | Some(Command::Tui) => app::run(),
         Some(Command::Status { json }) => {
             let report = status::report()?;
@@ -80,6 +109,39 @@ fn main() -> Result<()> {
         Some(Command::Tokens { command }) => match command {
             TokensCommand::Zellij { tokens, out, check } => {
                 render_zellij_theme(&tokens, &out, check)
+            }
+        },
+        Some(Command::Graph { command }) => match command {
+            GraphCommand::Validate { path } => {
+                let graph = graph::Graph::load(&path)?;
+                println!(
+                    "ok: {} nodes, {} edges, tick {}s, limit {}",
+                    graph.nodes.len(),
+                    graph.edges.len(),
+                    graph.tick_secs,
+                    graph.limit
+                );
+                for node in &graph.nodes {
+                    let when = node
+                        .when
+                        .as_ref()
+                        .map(|c| c.render())
+                        .unwrap_or_else(|| "manual".into());
+                    println!(
+                        "  {} · {} · {} · {} · when: {}",
+                        node.name,
+                        node.agent.as_str(),
+                        node.model,
+                        node.exec.as_str(),
+                        when
+                    );
+                }
+                Ok(())
+            }
+            GraphCommand::Dot { path } => {
+                let graph = graph::Graph::load(&path)?;
+                print!("{}", graph.to_dot());
+                Ok(())
             }
         },
     }
