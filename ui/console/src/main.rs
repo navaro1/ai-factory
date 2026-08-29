@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use aif::theme;
+use aif::{status, theme};
 
 #[derive(Parser)]
 #[command(
@@ -19,7 +19,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show the factory session and pane map
-    Status,
+    Status {
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Open the cockpit TUI
     Tui,
     /// Render theme files from tokens.json
@@ -48,8 +52,14 @@ enum TokensCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Status => {
-            bail!("status arrives in v0.2.0 chunk 2")
+        Command::Status { json } => {
+            let report = status::report()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report.render_text());
+            }
+            Ok(())
         }
         Command::Tui => {
             bail!("the cockpit arrives in v0.2.0 chunk 3")

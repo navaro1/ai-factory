@@ -197,8 +197,16 @@ text = (
 open(out, "w").write(text)
 PY
 
-if zellij list-sessions --no-formatting 2>/dev/null | grep -qx "$session"; then
-    printf 'Session %s already runs. Attaching.\n' "$session"
-    exec zellij attach "$session"
+line="$(zellij list-sessions --no-formatting 2>/dev/null | awk -v s="$session" '$1 == s {print; exit}')"
+if [[ -n "$line" ]]; then
+    if [[ "$line" == *EXITED* ]]; then
+        printf 'Session %s is dead. Deleting it and starting fresh.\n' "$session"
+        zellij delete-session "$session"
+    else
+        printf 'Session %s already runs. Attaching.\n' "$session"
+        exec zellij attach "$session"
+    fi
 fi
+
+rm -rf "${XDG_RUNTIME_DIR:-/tmp}/aif-registry/${session}"
 exec zellij --new-session-with-layout "$rendered" --session "$session"

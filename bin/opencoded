@@ -3,10 +3,22 @@
 # --draft "text" types text into the input box after start. It does not send it.
 set -euo pipefail
 
+register_role() {
+    if [[ -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" ]]; then
+        local reg="${XDG_RUNTIME_DIR:-/tmp}/aif-registry/${ZELLIJ_SESSION_NAME}"
+        mkdir -p "$reg"
+        printf '%s' "$1" >"${reg}/${ZELLIJ_PANE_ID}"
+    fi
+}
+
 draft=""
 args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+    --role)
+        register_role "${2-}"
+        shift 2
+        ;;
     --draft)
         draft="${2-}"
         shift 2
