@@ -42,13 +42,19 @@ if [[ -n "$draft" && -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" ]
     (
         payload="$(printf '\033[200~%s\033[201~' "$draft")"
         zj() { zellij -s "$ZELLIJ_SESSION_NAME" "$@"; }
-        for _ in $(seq 1 30); do
-            out="$(zj action dump-screen -p "$ZELLIJ_PANE_ID" 2>/dev/null || true)"
-            [[ "$out" == *"ctrl+p commands"* ]] && break
-            sleep 1
+        screen() { zj action dump-screen -p "$ZELLIJ_PANE_ID" 2>/dev/null || true; }
+        for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+            for _ in $(seq 1 20); do
+                out="$(screen)"
+                [[ "$out" == *"ctrl+p commands"* ]] && break
+                sleep 1
+            done
+            zj action write-chars -p "$ZELLIJ_PANE_ID" "$payload"
+            sleep 2
+            out="$(screen)"
+            [[ "$out" == *"[Pasted ~"* ]] && exit 0
+            sleep 2
         done
-        sleep 1
-        zj action write-chars -p "$ZELLIJ_PANE_ID" "$payload"
     ) >/dev/null 2>&1 &
 fi
 
