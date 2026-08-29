@@ -132,6 +132,17 @@ work on it, edit the files here, run `./install.sh`, and test inside a
 scratch git repository. Send a pull request with a short description of
 the change.
 
+**Console (`aif`).** The Rust console and graph engine live in
+`ui/console`. The color source of truth is `ui/tokens/tokens.json`; the
+zellij theme is generated from it:
+
+```sh
+cargo run --manifest-path ui/console/Cargo.toml -- tokens zellij
+```
+
+CI fails when the committed theme drifts from the tokens. Build and test
+the console with `cargo test` inside `ui/console`.
+
 To release a new version:
 
 ```sh
