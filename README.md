@@ -79,8 +79,8 @@ Make sure your agent tool supports them, or adapt the text.
 
 **Colors.** Open `zellij/themes/retro-future.kdl` and edit the palette.
 
-**OpenAI effort (optional).** To run `gpt-5.6-sol` at maximum reasoning
-effort with a ChatGPT subscription, add this to your opencode config
+**Reasoning effort (optional).** To run the OpenAI and Z.AI models at
+maximum effort, add this to your opencode config
 (`~/.config/opencode/opencode.jsonc`):
 
 ```jsonc
@@ -90,10 +90,19 @@ effort with a ChatGPT subscription, add this to your opencode config
       "options": {
         "reasoningEffort": "max"
       }
+    },
+    "zai-coding-plan": {
+      "options": {
+        "reasoningEffort": "max"
+      }
     }
   }
 }
 ```
+
+**Concurrency.** Every loop prompt caps the work at 3 subagents at the
+same time. Edit the `Dispatch at most 3 subagents` line in a prompt file
+to change this.
 
 ## Use
 

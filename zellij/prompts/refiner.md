@@ -1,4 +1,5 @@
 /loop every 30m Get all tickets labelled `to-refine`.
+Dispatch at most 3 subagents at the same time.
 For each of the ticket dispatch a subagent with following command:
 
 See ticket on github (use gh): {github_issue_no}
