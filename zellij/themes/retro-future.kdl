@@ -1,0 +1,15 @@
+themes {
+    retro-future {
+        bg "#0d0b1e"
+        fg "#dfe4ff"
+        black "#1b1633"
+        white "#f6f7ff"
+        red "#ff2975"
+        green "#00ffa3"
+        yellow "#ffd319"
+        blue "#3fc4ff"
+        magenta "#b967ff"
+        cyan "#00e5ff"
+        orange "#ff8c42"
+    }
+}

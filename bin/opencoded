@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# opencoded - opencode TUI with auto-approve enabled.
+# --draft "text" types text into the input box after start. It does not send it.
+set -euo pipefail
+
+draft=""
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --draft)
+        draft="${2-}"
+        shift 2
+        ;;
+    --draft=*)
+        draft="${1#*=}"
+        shift
+        ;;
+    --draft-file)
+        draft="$(cat "${2-}")"
+        shift 2
+        ;;
+    *)
+        args+=("$1")
+        shift
+        ;;
+    esac
+done
+
+if [[ -n "$draft" && -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" ]]; then
+    (
+        payload="$(printf '\033[200~%s\033[201~' "$draft")"
+        zj() { zellij -s "$ZELLIJ_SESSION_NAME" "$@"; }
+        for _ in $(seq 1 30); do
+            out="$(zj action dump-screen -p "$ZELLIJ_PANE_ID" 2>/dev/null || true)"
+            [[ "$out" == *"ctrl+p commands"* ]] && break
+            sleep 1
+        done
+        sleep 1
+        zj action write-chars -p "$ZELLIJ_PANE_ID" "$payload"
+    ) >/dev/null 2>&1 &
+fi
+
+exec opencode --auto "${args[@]}"
