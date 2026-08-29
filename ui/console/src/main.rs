@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use aif::{status, theme};
+use aif::{app, status, theme};
 
 #[derive(Parser)]
 #[command(
@@ -13,7 +13,7 @@ use aif::{status, theme};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -24,8 +24,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Open the cockpit TUI
+    /// Open the cockpit TUI (default)
     Tui,
+    /// Start the factory session through the ai-factory script
+    Start {
+        /// Panes or tabs to skip, comma separated
+        #[arg(long)]
+        skip: Option<String>,
+    },
     /// Render theme files from tokens.json
     Tokens {
         #[command(subcommand)]
@@ -52,7 +58,8 @@ enum TokensCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Status { json } => {
+        None | Some(Command::Tui) => app::run(),
+        Some(Command::Status { json }) => {
             let report = status::report()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -61,10 +68,16 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Tui => {
-            bail!("the cockpit arrives in v0.2.0 chunk 3")
+        Some(Command::Start { skip }) => {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new("ai-factory");
+            if let Some(skip) = skip {
+                cmd.arg("--skip").arg(skip);
+            }
+            let err = cmd.exec();
+            bail!("failed to run ai-factory (run install.sh first): {err}");
         }
-        Command::Tokens { command } => match command {
+        Some(Command::Tokens { command }) => match command {
             TokensCommand::Zellij { tokens, out, check } => {
                 render_zellij_theme(&tokens, &out, check)
             }

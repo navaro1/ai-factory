@@ -5,8 +5,8 @@ use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 
 use crate::actions;
@@ -40,7 +40,7 @@ pub fn run() -> Result<()> {
         std::thread::sleep(Duration::from_secs(2));
     });
 
-    event::enable_raw_mode()?;
+    terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
     let backend = CrosstermBackend::new(stdout);
@@ -56,7 +56,7 @@ pub fn run() -> Result<()> {
 
     let result = event_loop(&mut terminal, &mut app, &rx);
 
-    event::disable_raw_mode()?;
+    terminal::disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
     terminal.show_cursor()?;
     result

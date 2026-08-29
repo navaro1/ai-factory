@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::status::{Classification, PaneStatus, StatusReport};
+use crate::status::{Classification, PaneStatus};
 use crate::theme::{Rgb, Tokens};
 
 pub struct Overlay {
@@ -24,66 +24,54 @@ struct Palette {
     warn: Color,
     error: Color,
     dim: Color,
+    cyan: Color,
 }
 
 fn palette() -> &'static Palette {
     static PALETTE: OnceLock<Palette> = OnceLock::new();
-    PALETTE.get_or_init(|| {
-        let fallback = Palette {
-            bg: Color::Reset,
-            fg: Color::Reset,
-            surface: Color::Rgb(27, 22, 51),
-            accent: Color::Rgb(0, 255, 163),
-            warn: Color::Rgb(255, 211, 25),
-            error: Color::Rgb(255, 41, 117),
-            dim: Color::Rgb(138, 134, 184),
-        };
-        match Tokens::embedded() {
-            Ok(tokens) => Palette {
-                bg: color(&tokens, "bg", fallback.bg),
-                fg: color(&tokens, "fg", fallback.fg),
-                surface: Rgb::parse(&tokens.ui.surface)
-                    .map(|c| c.color())
-                    .unwrap_or(fallback.surface),
-                accent: Rgb::parse(&tokens.ui.accent)
-                    .map(|c| c.color())
-                    .unwrap_or(fallback.accent),
-                warn: Rgb::parse(&tokens.ui.warn)
-                    .map(|c| c.color())
-                    .unwrap_or(fallback.warn),
-                error: Rgb::parse(&tokens.ui.error)
-                    .map(|c| c.color())
-                    .unwrap_or(fallback.error),
-                dim: Rgb::parse(&tokens.ui.dim)
-                    .map(|c| c.color())
-                    .unwrap_or(fallback.dim),
-            },
-            Err(_) => fallback,
-        }
-    })
+    PALETTE.get_or_init(build_palette)
 }
 
-fn color(tokens: &Tokens, key: &str, fallback: Color) -> Color {
-    tokens.rgb(key).map(|c| c.color()).unwrap_or(fallback)
+fn build_palette() -> Palette {
+    let neutral = Palette {
+        bg: Color::Reset,
+        fg: Color::Reset,
+        surface: Color::Rgb(27, 22, 51),
+        accent: Color::Rgb(0, 255, 163),
+        warn: Color::Rgb(255, 211, 25),
+        error: Color::Rgb(255, 41, 117),
+        dim: Color::Rgb(138, 134, 184),
+        cyan: Color::Rgb(0, 229, 255),
+    };
+    let Ok(tokens) = Tokens::embedded() else {
+        return neutral;
+    };
+    let ui = |hex: &str, fallback: Color| -> Color {
+        Rgb::parse(hex).map(|c| c.color()).unwrap_or(fallback)
+    };
+    Palette {
+        bg: tokens.rgb("bg").map(|c| c.color()).unwrap_or(neutral.bg),
+        fg: tokens.rgb("fg").map(|c| c.color()).unwrap_or(neutral.fg),
+        surface: ui(&tokens.ui.surface, neutral.surface),
+        accent: ui(&tokens.ui.accent, neutral.accent),
+        warn: ui(&tokens.ui.warn, neutral.warn),
+        error: ui(&tokens.ui.error, neutral.error),
+        dim: ui(&tokens.ui.dim, neutral.dim),
+        cyan: tokens
+            .rgb("cyan")
+            .map(|c| c.color())
+            .unwrap_or(neutral.cyan),
+    }
 }
 
 fn state_color(state: &str, p: &Palette) -> Color {
     match state {
         "draft waiting" => p.accent,
-        "working" => color(tokens_none(), "cyan", p.fg),
+        "working" => p.cyan,
         "needs trust" | "exited" => p.error,
         "empty" => p.dim,
         _ => p.fg,
     }
-}
-
-fn tokens_none() -> &'static Tokens {
-    static T: OnceLock<Tokens> = OnceLock::new();
-    T.get_or_init(|| Tokens::embedded().unwrap_or(fallback_tokens()))
-}
-
-fn fallback_tokens() -> Tokens {
-    serde_json::from_str("{}").unwrap_or_else(|_| panic!("static empty tokens must parse"))
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -92,8 +80,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(Block::default().style(bg_style), f.area());
 
     let Some(report) = &app.report else {
-        let text = Paragraph::new("waiting for factory session...")
-            .style(Style::default().fg(p.dim));
+        let text =
+            Paragraph::new("waiting for factory session...").style(Style::default().fg(p.dim));
         f.render_widget(text, center(f.area(), 40, 3));
         return;
     };
@@ -109,9 +97,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(f.area());
 
     let header = Line::from(vec![
-        Span::styled(format!(" {} ", report.session), Style::default().fg(p.bg).bg(p.accent)),
+        Span::styled(
+            format!(" {} ", report.session),
+            Style::default().fg(p.bg).bg(p.accent),
+        ),
         Span::raw(format!(
-            "  {} panes   refreshed via zellij every 2s",
+            "  {} panes   refreshed every 2s",
             report.panes.len()
         )),
     ]);
@@ -121,19 +112,18 @@ pub fn draw(f: &mut Frame, app: &App) {
         let text = Paragraph::new("no agent panes found").style(Style::default().fg(p.warn));
         f.render_widget(text, chunks[2]);
     } else {
-        let planner_area = chunks[1];
         if let Some(pane) = report.panes.first() {
-            draw_card(f, planner_area, pane, app.selected == 0, 1, p);
+            draw_card(f, chunks[1], pane, app.selected == 0, 1, p);
         }
         let grid = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[2]);
-        for (col, areas) in grid.iter().enumerate() {
+        for (col, column) in grid.iter().enumerate() {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(*areas);
+                .split(*column);
             for (row, area) in rows.iter().enumerate() {
                 let idx = 1 + col * 2 + row;
                 if let Some(pane) = report.panes.get(idx) {
@@ -149,22 +139,24 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled("Enter", Style::default().fg(p.accent)),
         Span::raw(" submit draft  "),
         Span::styled("r", Style::default().fg(p.accent)),
-        Span::raw(" press enter in pane  "),
+        Span::raw(" press enter  "),
         Span::styled("s", Style::default().fg(p.accent)),
         Span::raw(" next  "),
         Span::styled("l", Style::default().fg(p.accent)),
         Span::raw(" scrollback  "),
         Span::styled("q", Style::default().fg(p.accent)),
         Span::raw(" quit  "),
-        Span::styled(&app.message, Style::default().fg(p.dim)),
+        Span::styled(app.message.clone(), Style::default().fg(p.dim)),
     ]);
     f.render_widget(Paragraph::new(footer), chunks[3]);
 
     if let Some(overlay) = &app.overlay {
-        let area = center(f.area(), f.area().width.saturating_sub(4), f.area().height.saturating_sub(4));
+        let width = f.area().width.saturating_sub(4);
+        let height = f.area().height.saturating_sub(4);
+        let area = center(f.area(), width, height);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(p.cyan_border()))
+            .border_style(Style::default().fg(p.cyan))
             .title(format!(" {} ", overlay.title));
         let text = Paragraph::new(overlay.text.clone())
             .block(block)
@@ -174,15 +166,16 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-impl Palette {
-    fn cyan_border(&self) -> Color {
-        self.accent
-    }
-}
-
-fn draw_card(f: &mut Frame, area: Rect, pane: &PaneStatus, selected: bool, number: usize, p: &Palette) {
+fn draw_card(
+    f: &mut Frame,
+    area: Rect,
+    pane: &PaneStatus,
+    selected: bool,
+    number: usize,
+    p: &Palette,
+) {
     let class: &Classification = &pane.class;
-    let border = if selected {
+    let border_style = if selected {
         Style::default().fg(p.accent)
     } else {
         Style::default().fg(p.dim)
@@ -194,11 +187,16 @@ fn draw_card(f: &mut Frame, area: Rect, pane: &PaneStatus, selected: bool, numbe
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border)
+        .border_style(border_style)
         .title(Line::from(vec![
             Span::styled(format!(" {number} "), title_style),
             Span::styled(class.role.clone(), title_style),
         ]));
+    let model = if class.model.is_empty() {
+        class.agent.clone()
+    } else {
+        class.model.clone()
+    };
     let lines = vec![
         Line::from(vec![
             Span::styled(" pane   ", Style::default().fg(p.dim)),
@@ -206,11 +204,7 @@ fn draw_card(f: &mut Frame, area: Rect, pane: &PaneStatus, selected: bool, numbe
         ]),
         Line::from(vec![
             Span::styled(" model  ", Style::default().fg(p.dim)),
-            Span::raw(if class.model.is_empty() {
-                class.agent.clone()
-            } else {
-                class.model.clone()
-            }),
+            Span::raw(model),
         ]),
         Line::from(vec![
             Span::styled(" state  ", Style::default().fg(p.dim)),
@@ -237,6 +231,7 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::StatusReport;
 
     fn sample_report() -> StatusReport {
         let class = |role: &str, agent: &str, model: &str, state: &str| Classification {
@@ -249,11 +244,31 @@ mod tests {
             session: "demo-factory".into(),
             running: true,
             panes: vec![
-                PaneStatus { pane: "terminal_0".into(), class: class("Planner", "claude", "claude-fable-5", "idle") },
-                PaneStatus { pane: "terminal_1".into(), class: class("Refiner", "opencode", "openai/gpt-5.6-sol", "draft waiting") },
-                PaneStatus { pane: "terminal_2".into(), class: class("Implementer", "opencode", "zai-coding-plan/glm-5.3-flash", "draft waiting") },
-                PaneStatus { pane: "terminal_3".into(), class: class("Reviewer", "opencode", "openai/gpt-5.6-sol", "working") },
-                PaneStatus { pane: "terminal_4".into(), class: class("Releaser", "claude", "claude-opus-5", "needs trust") },
+                PaneStatus {
+                    pane: "terminal_0".into(),
+                    class: class("Planner", "claude", "claude-fable-5", "idle"),
+                },
+                PaneStatus {
+                    pane: "terminal_1".into(),
+                    class: class("Refiner", "opencode", "openai/gpt-5.6-sol", "draft waiting"),
+                },
+                PaneStatus {
+                    pane: "terminal_2".into(),
+                    class: class(
+                        "Implementer",
+                        "opencode",
+                        "zai-coding-plan/glm-5.3-flash",
+                        "draft waiting",
+                    ),
+                },
+                PaneStatus {
+                    pane: "terminal_3".into(),
+                    class: class("Reviewer", "opencode", "openai/gpt-5.6-sol", "working"),
+                },
+                PaneStatus {
+                    pane: "terminal_4".into(),
+                    class: class("Releaser", "claude", "claude-opus-5", "needs trust"),
+                },
             ],
         }
     }
@@ -278,7 +293,12 @@ mod tests {
             .map(|c| c.symbol().to_owned())
             .collect();
         for expected in [
-            "Planner", "Refiner", "Implementer", "Reviewer", "Releaser", "draft waiting",
+            "Planner",
+            "Refiner",
+            "Implementer",
+            "Reviewer",
+            "Releaser",
+            "draft waiting",
         ] {
             assert!(content.contains(expected), "missing {expected}");
         }
