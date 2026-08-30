@@ -64,7 +64,14 @@ impl TaskState {
     }
 
     pub fn consumes_node(&self) -> bool {
-        !self.is_terminal()
+        !matches!(
+            self,
+            TaskState::Queued
+                | TaskState::Succeeded
+                | TaskState::Failed
+                | TaskState::Cancelled
+                | TaskState::Superseded
+        )
     }
 
     pub fn consumes_global(&self) -> bool {
@@ -90,8 +97,16 @@ impl TaskState {
             Queued => matches!(to, Reserved | Presenting | Superseded | Failed),
             Presenting => matches!(to, AwaitingUser | Superseded | Failed),
             AwaitingUser => matches!(to, Reserved | Superseded | Failed),
-            Reserved => matches!(to, Accepted | Queued | Uncertain | Cancelled),
-            Accepted => matches!(to, Running | CancelRequested | Failed | Uncertain | Cancelled),
+            Reserved => matches!(to, Accepted | Queued | Failed | Uncertain | Cancelled),
+            Accepted => matches!(
+                to,
+                TaskState::Running
+                    | TaskState::CancelRequested
+                    | TaskState::Failed
+                    | TaskState::Uncertain
+                    | TaskState::Cancelled
+                    | TaskState::Succeeded
+            ),
             Running => matches!(
                 to,
                 Succeeded | Failed | CancelRequested | Uncertain | Cancelled
@@ -157,6 +172,8 @@ mod tests {
         assert!(TaskState::CancelRequested.consumes_global());
         assert!(TaskState::AwaitingUser.consumes_node());
         assert!(!TaskState::AwaitingUser.consumes_global());
+        assert!(!TaskState::Queued.consumes_node());
+        assert!(!TaskState::Queued.consumes_global());
         assert!(!TaskState::Succeeded.consumes_node());
         assert!(!TaskState::Failed.consumes_global());
     }

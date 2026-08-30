@@ -1,6 +1,8 @@
 pub mod actions;
 pub mod app;
 pub mod codex;
+pub mod control;
+pub mod daemon;
 pub mod factory;
 pub mod graph;
 pub mod harness;

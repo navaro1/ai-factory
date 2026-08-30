@@ -81,11 +81,25 @@ impl FactoryPaths {
     }
 
     pub fn from_id(root: &Path, factory_id: &str) -> Self {
+        FactoryPaths::from_id_with_base(
+            root,
+            factory_id,
+            &xdg_state().join("aif"),
+            &xdg_runtime().join("aif"),
+        )
+    }
+
+    pub fn from_id_with_base(
+        root: &Path,
+        factory_id: &str,
+        state_base: &Path,
+        runtime_base: &Path,
+    ) -> Self {
         FactoryPaths {
             factory_id: factory_id.to_owned(),
             root: root.to_path_buf(),
-            state: xdg_state().join("aif").join("factories").join(factory_id),
-            runtime: xdg_runtime().join("aif").join(&factory_id[..8]),
+            state: state_base.join("factories").join(factory_id),
+            runtime: runtime_base.join(&factory_id[..8]),
         }
     }
 
