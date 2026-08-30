@@ -1,18 +1,11 @@
 //! The TUI and control binary. Later chunks fill in the TUI and doctor.
 
 use std::process::exit;
-use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
 use aif::config;
 use aif::sock::{Action, Client};
-
-/// How long `aif stop` waits for the daemon to leave the socket.
-const STOP_WAIT: Duration = Duration::from_secs(10);
-
-/// How often `aif stop` rechecks the socket file.
-const STOP_POLL: Duration = Duration::from_millis(100);
 
 /// Command line for `aif`.
 #[derive(Parser)]
@@ -50,7 +43,7 @@ fn main() {
     }
 }
 
-/// Send the stop action to the daemon and wait for it to leave the socket.
+/// Send the stop action to the daemon.
 ///
 /// The exit code is 0 on success and 1 on any failure.
 fn stop() -> i32 {
@@ -70,14 +63,5 @@ fn stop() -> i32 {
         return 1;
     }
     println!("aif stop: stop sent to {}", path.display());
-    let deadline = Instant::now() + STOP_WAIT;
-    while path.exists() {
-        if Instant::now() >= deadline {
-            eprintln!("aif stop: the daemon did not stop within 10 s");
-            return 1;
-        }
-        std::thread::sleep(STOP_POLL);
-    }
-    println!("aif stop: the daemon stopped");
     0
 }

@@ -15,16 +15,17 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufWriter, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::net::Shutdown;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ReleasePolicy};
@@ -101,7 +102,7 @@ pub struct StateInput<'a> {
 
 impl StateInput<'_> {
     /// Build the state view.
-    pub fn build(&self) -> StateView {
+    pub fn build(&self) -> Result<StateView> {
         let Self {
             config,
             limits,
@@ -150,18 +151,23 @@ impl StateInput<'_> {
         let tasks = table
             .order
             .iter()
-            .filter_map(|id| table.by_id.get(id))
-            .map(|task| TaskView {
-                id: task.id.clone(),
-                repo: task.repo.clone(),
-                stage: task.stage,
-                kind: task.kind,
-                number: task.number,
-                state: task.state.clone(),
-                attempt: task.attempt,
-                log_path: task.log_path.clone(),
+            .map(|id| {
+                let task = table
+                    .by_id
+                    .get(id)
+                    .ok_or_else(|| anyhow!("task table order names missing task \"{id}\""))?;
+                Ok(TaskView {
+                    id: task.id.clone(),
+                    repo: task.repo.clone(),
+                    stage: task.stage,
+                    kind: task.kind,
+                    number: task.number,
+                    state: task.state.clone(),
+                    attempt: task.attempt,
+                    log_path: task.log_path.clone(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let trains = config
             .repos
             .keys()
@@ -196,7 +202,7 @@ impl StateInput<'_> {
                 .collect(),
             repos: paused.repos.iter().cloned().collect(),
         };
-        StateView {
+        Ok(StateView {
             repos,
             stages,
             lanes,
@@ -204,7 +210,7 @@ impl StateInput<'_> {
             decisions: decisions.open().to_vec(),
             trains,
             paused,
-        }
+        })
     }
 }
 
@@ -424,7 +430,28 @@ struct Subscriber {
     /// The identity used to remove the entry again.
     id: u64,
     /// The bounded channel the writer thread drains into the socket.
-    tx: SyncSender<Push>,
+    tx: SyncSender<Arc<Push>>,
+    /// A socket handle that can stop both client threads.
+    stream: UnixStream,
+    /// The last snapshot queued for this subscriber.
+    last: Option<Arc<Push>>,
+}
+
+/// The newest state and whether subscribers need it.
+#[derive(Default)]
+struct PublishedState {
+    current: Option<Arc<Push>>,
+    dirty: bool,
+}
+
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        if let Err(error) = self.stream.shutdown(Shutdown::Both) {
+            if error.kind() != std::io::ErrorKind::NotConnected {
+                eprintln!("aifd: cannot close a control client: {error}");
+            }
+        }
+    }
 }
 
 /// The control socket server.
@@ -435,11 +462,12 @@ struct Subscriber {
 /// streams close.
 pub struct Server {
     path: PathBuf,
-    pending: Arc<Mutex<Option<StateView>>>,
-    current: Arc<Mutex<Option<StateView>>>,
+    socket_dev: u64,
+    socket_ino: u64,
+    published: Arc<Mutex<PublishedState>>,
     registry: Arc<Mutex<Vec<Subscriber>>>,
     stopping: Arc<AtomicBool>,
-    wake: Sender<()>,
+    wake: SyncSender<()>,
 }
 
 impl std::fmt::Debug for Server {
@@ -456,16 +484,29 @@ impl Server {
     /// mode 0600. The second return value delivers every client action; the
     /// daemon event loop drains it.
     pub fn bind(path: &Path) -> Result<(Server, Receiver<Action>)> {
-        if path.exists() {
-            match UnixStream::connect(path) {
-                // The probe connection lands in the live daemon's backlog.
-                // It carries no actions, so the live daemon ignores it.
-                Ok(_) => bail!("another daemon is already listening on {}", path.display()),
-                Err(_) => {
-                    fs::remove_file(path).with_context(|| {
-                        format!("cannot remove the stale socket file {}", path.display())
-                    })?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket() {
+                    bail!(
+                        "cannot bind {}: the existing path is not a socket",
+                        path.display()
+                    );
                 }
+                match UnixStream::connect(path) {
+                    // The probe connection lands in the live daemon's backlog.
+                    // It carries no actions, so the live daemon ignores it.
+                    Ok(_) => bail!("another daemon is already listening on {}", path.display()),
+                    Err(_) => {
+                        fs::remove_file(path).with_context(|| {
+                            format!("cannot remove the stale socket file {}", path.display())
+                        })?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect the socket path {}", path.display()));
             }
         }
         if let Some(parent) = path.parent() {
@@ -476,34 +517,35 @@ impl Server {
             UnixListener::bind(path).with_context(|| format!("cannot bind {}", path.display()))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("cannot set mode 0600 on {}", path.display()))?;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("cannot inspect the bound socket {}", path.display()))?;
 
-        let pending = Arc::new(Mutex::new(None::<StateView>));
-        let current = Arc::new(Mutex::new(None::<StateView>));
+        let published = Arc::new(Mutex::new(PublishedState::default()));
         let registry: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
-        let (wake, wake_rx) = channel::<()>();
+        let (wake, wake_rx) = sync_channel::<()>(1);
         let (actions, actions_rx) = channel::<Action>();
 
         {
-            let pending = Arc::clone(&pending);
+            let published = Arc::clone(&published);
             let registry = Arc::clone(&registry);
-            thread::spawn(move || run_pusher(pending, registry, wake_rx));
+            thread::spawn(move || run_pusher(published, registry, wake_rx));
         }
         {
             let stopping = Arc::clone(&stopping);
             let registry = Arc::clone(&registry);
-            let current = Arc::clone(&current);
+            let published = Arc::clone(&published);
             let actions = actions.clone();
             thread::spawn(move || {
                 for stream in listener.incoming() {
-                    if stopping.load(Ordering::Relaxed) {
+                    if stopping.load(Ordering::SeqCst) {
                         return;
                     }
                     match stream {
                         Ok(stream) => attach_client(
                             stream,
                             Arc::clone(&registry),
-                            Arc::clone(&current),
+                            Arc::clone(&published),
                             actions.clone(),
                         ),
                         Err(error) => {
@@ -518,8 +560,9 @@ impl Server {
         Ok((
             Server {
                 path: path.to_path_buf(),
-                pending,
-                current,
+                socket_dev: metadata.dev(),
+                socket_ino: metadata.ino(),
+                published,
                 registry,
                 stopping,
                 wake,
@@ -535,47 +578,96 @@ impl Server {
 
     /// Hand the current state to the pusher thread.
     ///
-    /// The call never blocks and keeps only the newest view. The pusher
-    /// thread sends at most one push per [`PUSH_COALESCE_MS`] milliseconds
-    /// to every subscriber.
+    /// The call does not wait for a client and keeps only the newest view.
+    /// The pusher thread sends at most one push per [`PUSH_COALESCE_MS`]
+    /// milliseconds to every subscriber.
     pub fn publish(&self, state: StateView) {
-        // The current slot feeds the initial push of a client that connects
-        // after this publish; the pending slot feeds the coalesced pushes.
-        *lock(&self.current) = Some(state.clone());
-        *lock(&self.pending) = Some(state);
-        // A send error means the pusher thread is gone; the daemon keeps
-        // running without pushes.
-        let _ = self.wake.send(());
+        let mut published = lock(&self.published);
+        published.current = Some(Arc::new(Push::State(state)));
+        published.dirty = true;
+        drop(published);
+        match self.wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                eprintln!("aifd: the control socket pusher stopped")
+            }
+        }
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Relaxed);
+        self.stopping.store(true, Ordering::SeqCst);
         // A connection to our own socket wakes the blocked accept, which
         // then sees the stop flag and exits.
-        let _ = UnixStream::connect(&self.path);
+        if let Err(error) = UnixStream::connect(&self.path) {
+            eprintln!(
+                "aifd: cannot wake the control socket at {}: {error}",
+                self.path.display()
+            );
+        }
         // Dropping the subscriber senders ends the writer threads, and each
         // writer drop closes its client stream.
         lock(&self.registry).clear();
-        let _ = fs::remove_file(&self.path);
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.dev() == self.socket_dev
+                    && metadata.ino() == self.socket_ino =>
+            {
+                if let Err(error) = fs::remove_file(&self.path) {
+                    eprintln!(
+                        "aifd: cannot remove the control socket {}: {error}",
+                        self.path.display()
+                    );
+                }
+            }
+            // A replacement at this path belongs to another owner.
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "aifd: cannot inspect the control socket {}: {error}",
+                self.path.display()
+            ),
+        }
     }
 }
 
 /// Lock a mutex and take the guard even when the mutex is poisoned.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("aifd: a control socket lock was poisoned");
+            mutex.clear_poison();
+            PoisonError::into_inner(error)
+        }
+    }
 }
 
 /// Send `push` to every subscriber and drop the ones that cannot keep up.
-fn broadcast(registry: &Mutex<Vec<Subscriber>>, push: Push) {
-    let mut registry = lock(registry);
-    registry.retain(|subscriber| subscriber.tx.try_send(push.clone()).is_ok());
+fn broadcast(registry: &mut Vec<Subscriber>, push: &Arc<Push>) {
+    registry.retain_mut(|subscriber| {
+        if subscriber
+            .last
+            .as_ref()
+            .is_some_and(|last| Arc::ptr_eq(last, push))
+        {
+            return true;
+        }
+        match subscriber.tx.try_send(Arc::clone(push)) {
+            Ok(()) => {
+                subscriber.last = Some(Arc::clone(push));
+                true
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    });
 }
 
 /// Coalesce publishes and push at most one state per window.
 fn run_pusher(
-    pending: Arc<Mutex<Option<StateView>>>,
+    published: Arc<Mutex<PublishedState>>,
     registry: Arc<Mutex<Vec<Subscriber>>>,
     wake_rx: Receiver<()>,
 ) {
@@ -585,15 +677,23 @@ fn run_pusher(
         if let Some(last) = last_push {
             let quiet = window.saturating_sub(last.elapsed());
             if !quiet.is_zero() {
-                // Wait out the rest of the window. A publish during the
-                // wait only refreshes the pending slot, so the next push
-                // carries the newest state. Queued wakes stay queued.
+                // Wait for the rest of the window. A publish during this
+                // wait refreshes the current snapshot. The next push uses it.
                 thread::sleep(quiet);
             }
         }
-        let state = lock(&pending).take();
-        if let Some(state) = state {
-            broadcast(&registry, Push::State(state));
+        let mut registry = lock(&registry);
+        let push = {
+            let mut published = lock(&published);
+            if published.dirty {
+                published.dirty = false;
+                published.current.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(push) = push {
+            broadcast(&mut registry, &push);
             last_push = Some(Instant::now());
         }
     }
@@ -612,34 +712,62 @@ fn unregister(registry: &Mutex<Vec<Subscriber>>, id: u64) {
 fn attach_client(
     stream: UnixStream,
     registry: Arc<Mutex<Vec<Subscriber>>>,
-    current: Arc<Mutex<Option<StateView>>>,
+    published: Arc<Mutex<PublishedState>>,
     actions: Sender<Action>,
 ) {
-    let Ok(write_half) = stream.try_clone() else {
-        eprintln!("aifd: cannot serve a control client: stream is gone");
-        return;
+    let write_half = match stream.try_clone() {
+        Ok(write_half) => write_half,
+        Err(error) => {
+            eprintln!("aifd: cannot clone a control client for writes: {error}");
+            return;
+        }
+    };
+    let shutdown_half = match stream.try_clone() {
+        Ok(shutdown_half) => shutdown_half,
+        Err(error) => {
+            eprintln!("aifd: cannot clone a control client for shutdown: {error}");
+            return;
+        }
     };
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = sync_channel::<Push>(SUBSCRIBER_CAPACITY);
-    // Register first, then snapshot, so a concurrent push is never missed.
-    // The initial snapshot carries the newest state at this moment and
-    // supersedes anything pushed in between.
-    lock(&registry).push(Subscriber { id, tx: tx.clone() });
-    let initial = lock(&current).clone();
-    if let Some(state) = initial {
-        // The channel is fresh, so the initial push always has room.
-        let _ = tx.try_send(Push::State(state));
+    let (tx, rx) = sync_channel::<Arc<Push>>(SUBSCRIBER_CAPACITY);
+    // The registry lock keeps a broadcast from passing the initial push.
+    // The state lock is second here and in the pusher, so the order is safe.
+    {
+        let mut registry = lock(&registry);
+        let initial = lock(&published).current.clone();
+        if let Some(push) = &initial {
+            if let Err(error) = tx.try_send(Arc::clone(push)) {
+                eprintln!("aifd: cannot send the initial state: {error}");
+                return;
+            }
+        }
+        registry.push(Subscriber {
+            id,
+            tx: tx.clone(),
+            stream: shutdown_half,
+            last: initial,
+        });
     }
     {
         let registry = Arc::clone(&registry);
         thread::spawn(move || {
             let mut writer = BufWriter::new(write_half);
             for push in rx {
-                let Ok(line) = serde_json::to_string(&push) else {
-                    break;
+                let line = match serde_json::to_string(push.as_ref()) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        eprintln!("aifd: cannot encode a state push: {error}");
+                        break;
+                    }
                 };
-                if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
+                if let Err(error) = writeln!(writer, "{line}") {
+                    eprintln!("aifd: cannot write a state push: {error}");
+                    break;
+                }
+                if let Err(error) = writer.flush() {
+                    eprintln!("aifd: cannot flush a state push: {error}");
                     break;
                 }
             }
@@ -655,12 +783,17 @@ fn attach_client(
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("aifd: cannot read a control action: {error}");
+                        break;
+                    }
                 }
                 match serde_json::from_str::<Action>(line.trim()) {
                     Ok(action) => {
-                        if actions.send(action).is_err() {
+                        if let Err(error) = actions.send(action) {
+                            eprintln!("aifd: cannot deliver a control action: {error}");
                             break;
                         }
                     }
@@ -762,8 +895,6 @@ impl Iterator for Pushes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
 
     /// A temporary directory that removes itself on drop.
     struct TempDir(PathBuf);
@@ -790,7 +921,11 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("cannot remove test directory {}: {error}", self.0.display());
+                }
+            }
         }
     }
 
@@ -932,6 +1067,26 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_skips_the_initial_push_that_a_subscriber_already_received() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (tx, rx) = sync_channel(SUBSCRIBER_CAPACITY);
+        let initial = Arc::new(Push::State(sample_view(1)));
+        let mut registry = vec![Subscriber {
+            id: 1,
+            tx,
+            stream,
+            last: Some(Arc::clone(&initial)),
+        }];
+
+        broadcast(&mut registry, &initial);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
     fn bind_creates_the_socket_with_mode_0600() {
         let dir = TempDir::new("mode");
         let path = dir.path().join("daemon.sock");
@@ -956,15 +1111,9 @@ mod tests {
     fn bind_replaces_a_stale_socket_file() {
         let dir = TempDir::new("stale");
         let path = dir.path().join("daemon.sock");
-        // Bind a listener and close its file descriptor without unlinking
-        // the path. What stays on disk is exactly what a dead daemon leaves.
+        // Dropping a listener closes it without removing its socket path.
         let listener = UnixListener::bind(&path).unwrap();
-        let fd = listener.as_raw_fd();
-        // SAFETY: the descriptor comes straight from the listener and is
-        // closed exactly once, through the owning File.
-        let closed = unsafe { fs::File::from_raw_fd(fd) };
-        drop(closed);
-        std::mem::forget(listener);
+        drop(listener);
         assert!(
             UnixStream::connect(&path).is_err(),
             "the leftover socket must be dead"
@@ -980,15 +1129,18 @@ mod tests {
     }
 
     #[test]
-    fn bind_replaces_a_plain_file_at_the_socket_path() {
+    fn bind_refuses_to_replace_a_plain_file_at_the_socket_path() {
         let dir = TempDir::new("plain");
         let path = dir.path().join("daemon.sock");
         fs::write(&path, "not a socket").unwrap();
 
-        let (_server, _rx) = Server::bind(&path).unwrap();
+        let error = Server::bind(&path).unwrap_err();
 
-        let mode = fs::metadata(&path).unwrap().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert!(
+            error.to_string().contains("not a socket"),
+            "message: {error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not a socket");
     }
 
     #[test]
@@ -1018,7 +1170,8 @@ mod tests {
         let dir = TempDir::new("round");
         let path = dir.path().join("daemon.sock");
         let (server, rx) = Server::bind(&path).unwrap();
-        let first = sample_view(1);
+        let mut first = sample_view(1);
+        first.repos[0].alias = "borsuk".to_string();
         server.publish(first.clone());
 
         let mut client = Client::connect(&path).unwrap();
@@ -1053,8 +1206,20 @@ mod tests {
             Action::Stop
         );
 
-        // The next publish reaches both clients.
-        let second = sample_view(2);
+        // Apply the action as the daemon will. The next push carries its
+        // visible queued-task effect to both clients.
+        let mut second = first;
+        second.stages[0].queued = 1;
+        second.tasks.push(TaskView {
+            id: "borsuk/refine-i142".to_string(),
+            repo: "borsuk".to_string(),
+            stage: Stage::Refine,
+            kind: ItemKind::Issue,
+            number: 142,
+            state: TaskState::Queued,
+            attempt: 1,
+            log_path: PathBuf::from("/state/logs/borsuk__refine-i142.jsonl"),
+        });
         server.publish(second.clone());
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(second.clone()));
         assert_eq!(
@@ -1100,9 +1265,10 @@ mod tests {
         client.set_read_timeout(Duration::from_millis(300)).unwrap();
         let mut pushes = client.pushes().unwrap();
 
-        const CHANGES: usize = 40;
+        const CHANGES: usize = 20;
         for label in 0..CHANGES {
             server.publish(sample_view(label));
+            thread::sleep(Duration::from_millis(5));
         }
 
         // Collect pushes until the stream falls quiet for one window.
@@ -1114,8 +1280,8 @@ mod tests {
             }
         }
         assert!(
-            seen.len() < CHANGES,
-            "40 changes must coalesce, got {} pushes",
+            seen.len() <= 4,
+            "20 rapid changes must produce at most four pushes, got {}",
             seen.len()
         );
         assert_eq!(
@@ -1196,10 +1362,19 @@ mod tests {
         let stalled_pushes = stalled.pushes().unwrap();
         let mut stalled_seen = 0;
         for push in stalled_pushes {
-            if push.is_err() {
-                break;
+            match push {
+                Ok(_) => stalled_seen += 1,
+                Err(error) => {
+                    let timed_out = error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        )
+                    });
+                    assert!(!timed_out, "the dropped client stayed open: {error:#}");
+                    break;
+                }
             }
-            stalled_seen += 1;
         }
         assert!(
             stalled_seen < healthy.len(),
@@ -1215,7 +1390,7 @@ mod tests {
         let (server, _rx) = Server::bind(&path).unwrap();
         server.publish(sample_view(1));
         let client = Client::connect(&path).unwrap();
-        client.set_read_timeout(Duration::from_secs(5)).unwrap();
+        client.set_read_timeout(Duration::from_millis(500)).unwrap();
         let mut pushes = client.pushes().unwrap();
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(sample_view(1)));
 
@@ -1223,9 +1398,22 @@ mod tests {
 
         assert!(!path.exists(), "the socket file must be removed on drop");
         assert!(
-            matches!(pushes.next(), None | Some(Err(_))),
-            "the client stream must end when the server is dropped"
+            pushes.next().is_none(),
+            "the server must close the client stream cleanly"
         );
+    }
+
+    #[test]
+    fn a_server_drop_preserves_a_replacement_at_the_socket_path() {
+        let dir = TempDir::new("drop-replacement");
+        let path = dir.path().join("daemon.sock");
+        let (server, _rx) = Server::bind(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "replacement").unwrap();
+
+        drop(server);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }
 
     /// Parse text for a config with four stages and two repositories.
@@ -1241,6 +1429,36 @@ mod tests {
             "[repo.qubitsok]\npath = \"/tmp/q\"\nrelease = { policy = \"interval\", minutes = 30 }\n",
         );
         text
+    }
+
+    #[test]
+    fn the_view_build_rejects_a_missing_ordered_task() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let mut table = TaskTable::new();
+        table.order.push("missing-task".to_string());
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+
+        let error = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            trains: &trains,
+            policies: &policies,
+            now_ms: 0,
+        }
+        .build()
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("missing-task"),
+            "message: {error}"
+        );
     }
 
     #[test]
@@ -1310,7 +1528,8 @@ mod tests {
             policies: &policies,
             now_ms: 120_000,
         }
-        .build();
+        .build()
+        .unwrap();
 
         // Repositories come from the config in alias order.
         assert_eq!(
