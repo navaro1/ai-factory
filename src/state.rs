@@ -67,7 +67,7 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    /// Read the state file, or the empty state when it is missing or corrupt.
+    /// Read the state file, or return empty state when it is missing or invalid.
     ///
     /// A missing or corrupt file is not an error. The call logs it once on
     /// standard error, and the daemon continues with the config defaults.
@@ -91,16 +91,26 @@ impl DaemonState {
             }
         };
         match serde_json::from_str::<StateFile>(&text) {
-            Ok(file) => DaemonState {
-                stage_limits: file.stage_limits,
-                lanes: file
-                    .lanes
-                    .into_iter()
-                    .map(|entry| (entry.stage, entry.repo, entry.slots))
-                    .collect(),
-                policies: file.policies,
-                last_fire_ms: file.last_fire_ms,
-            },
+            Ok(file) => {
+                if let Some(reason) = invalid_state(&file) {
+                    eprintln!(
+                        "{}: corrupt state file ({reason}); the daemon starts with the config \
+                         defaults",
+                        path.display()
+                    );
+                    return DaemonState::default();
+                }
+                DaemonState {
+                    stage_limits: file.stage_limits,
+                    lanes: file
+                        .lanes
+                        .into_iter()
+                        .map(|entry| (entry.stage, entry.repo, entry.slots))
+                        .collect(),
+                    policies: file.policies,
+                    last_fire_ms: file.last_fire_ms,
+                }
+            }
             Err(e) => {
                 eprintln!(
                     "{}: corrupt state file ({e}); the daemon starts with the config \
@@ -149,6 +159,27 @@ impl DaemonState {
             .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))?;
         Ok(())
     }
+}
+
+/// Return the reason that a parsed state file is invalid.
+fn invalid_state(file: &StateFile) -> Option<String> {
+    if let Some((stage, _)) = file.stage_limits.iter().find(|(_, limit)| **limit == 0) {
+        return Some(format!("the {stage} stage limit is 0"));
+    }
+    for (repo, policy) in &file.policies {
+        match policy {
+            ReleasePolicy::Interval { minutes: 0 } => {
+                return Some(format!("the interval policy for {repo} has 0 minutes"));
+            }
+            ReleasePolicy::Threshold { count: 0 } => {
+                return Some(format!("the threshold policy for {repo} has count 0"));
+            }
+            ReleasePolicy::Manual
+            | ReleasePolicy::Interval { .. }
+            | ReleasePolicy::Threshold { .. } => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -201,6 +232,22 @@ mod tests {
         let loaded = DaemonState::load(&path);
         assert_eq!(loaded, DaemonState::default());
         assert_eq!(loaded.stage_limits.get(&Stage::Refine), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_state_file_with_an_invalid_limit_loads_the_defaults() {
+        let dir = temp_dir("invalid-limit");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"stage_limits":{"refine":0},"lanes":[],"policies":{},"last_fire_ms":{}}"#,
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert_eq!(loaded, DaemonState::default());
         let _ = fs::remove_dir_all(dir);
     }
 

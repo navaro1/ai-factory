@@ -33,7 +33,7 @@ use anyhow::{anyhow, bail, Result};
 use crate::config::{self, Config, ReleasePolicy, RepoConfig};
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
-use crate::gates::{GateTracker, ReadyWork};
+use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
@@ -197,6 +197,8 @@ impl Daemon {
     /// The constructor restores `last_fire_ms` from `state.json` and applies
     /// the stored overrides before the first drive, so an interval policy
     /// never releases again just because the daemon restarted.
+    // Each argument is one daemon-owned dependency. A bundle would hide the
+    // ownership boundary without reducing it.
     #[allow(clippy::too_many_arguments)]
     pub fn with_runners(
         config: Config,
@@ -216,7 +218,15 @@ impl Daemon {
             limits.stage.insert(*stage, *limit);
         }
         for (stage, repo, slots) in &stored.lanes {
-            limits.lanes.insert((*stage, repo.clone()), *slots);
+            let config_slots = config
+                .repos
+                .get(repo)
+                .and_then(|repo_cfg| repo_cfg.lanes.get(stage))
+                .copied()
+                .unwrap_or(0);
+            if *slots != 0 || config_slots != 0 {
+                limits.lanes.insert((*stage, repo.clone()), *slots);
+            }
         }
         let policies = stored.policies;
 
@@ -269,8 +279,9 @@ impl Daemon {
         };
         // Seed the write cache with the current state, so a daemon that
         // changes nothing writes nothing.
-        if let Ok(text) = daemon.collect_state().to_json() {
-            daemon.saved = Some(text);
+        match daemon.collect_state().to_json() {
+            Ok(text) => daemon.saved = Some(text),
+            Err(error) => eprintln!("cannot serialize the initial daemon state: {error:#}"),
         }
         daemon
     }
@@ -289,7 +300,7 @@ impl Daemon {
         let dummy_rx: Receiver<RunEvent> = mpsc::channel().1;
         let run_rx = std::mem::replace(&mut self.run_rx, dummy_rx);
         let action_rx = self.action_rx.take().unwrap_or_else(|| mpsc::channel().1);
-        let handles = vec![
+        let _forwarders = [
             forwarder("aif-poll", poll_rx, in_tx.clone(), Inbound::Poll)?,
             forwarder("aif-run", run_rx, in_tx.clone(), Inbound::Run)?,
             forwarder("aif-act", action_rx, in_tx, Inbound::Act)?,
@@ -303,7 +314,10 @@ impl Daemon {
             let message = match self.next_deadline() {
                 Some(timeout) => match in_rx.recv_timeout(timeout) {
                     Ok(message) => Some(message),
-                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.now_ms = (self.clock)();
+                        None
+                    }
                     Err(RecvTimeoutError::Disconnected) => break,
                 },
                 None => match in_rx.recv() {
@@ -315,9 +329,6 @@ impl Daemon {
                 Some(message) => self.handle(message),
                 None => self.drive(),
             }
-        }
-        for handle in handles {
-            let _ = handle.join();
         }
         Ok(())
     }
@@ -441,6 +452,9 @@ impl Daemon {
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
         }
+        if !unchanged {
+            self.reconcile_unready(repo, &fresh);
+        }
         let ready = self.gates.observe(repo, &fresh);
         let mut changed = !ready.is_empty();
         self.pending_ready.extend(ready);
@@ -466,12 +480,15 @@ impl Daemon {
             }
         }
         for number in old.prs.keys() {
-            let gone = fresh.prs.get(number).is_none_or(|pr| !pr.open || pr.draft);
-            if gone {
-                self.gates.forget(repo, ItemKind::Pr, *number);
+            let current = fresh.prs.get(number);
+            let gone = current.is_none_or(|pr| !pr.open);
+            if gone || current.is_some_and(|pr| pr.draft) {
                 if let Some(train) = self.trains.get_mut(repo) {
                     train.dequeue(*number);
                 }
+            }
+            if gone {
+                self.gates.forget(repo, ItemKind::Pr, *number);
                 self.cancel_item_tasks(repo, ItemKind::Pr, *number);
             }
         }
@@ -484,6 +501,31 @@ impl Daemon {
             .active()
             .iter()
             .filter(|task| task.repo == repo && task.kind == kind && task.number == number)
+            .map(|task| task.id.clone())
+            .collect();
+        for id in ids {
+            self.cancel_task(&id);
+        }
+    }
+
+    /// Cancel active implement and review tasks whose gates closed.
+    fn reconcile_unready(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let ids: Vec<String> = self
+            .table
+            .active()
+            .into_iter()
+            .filter(|task| task.repo == repo)
+            .filter(|task| match task.stage {
+                Stage::Implement => fresh
+                    .issues
+                    .get(&task.number)
+                    .is_none_or(|issue| !implement_ready(fresh, issue)),
+                Stage::Review => fresh
+                    .prs
+                    .get(&task.number)
+                    .is_none_or(|pr| !review_ready(pr)),
+                Stage::Refine | Stage::Release => false,
+            })
             .map(|task| task.id.clone())
             .collect();
         for id in ids {
@@ -549,6 +591,23 @@ impl Daemon {
                 }
                 continue;
             }
+            if work.stage == Stage::Review {
+                let superseded = self
+                    .table
+                    .active()
+                    .into_iter()
+                    .find(|task| {
+                        task.repo == work.repo
+                            && task.stage == Stage::Review
+                            && task.kind == work.kind
+                            && task.number == work.number
+                            && task.head_sha != work.head_sha
+                    })
+                    .map(|task| task.id.clone());
+                if let Some(id) = superseded {
+                    self.cancel_task(&id);
+                }
+            }
             let log = self.log_path(&work.repo, work.stage, work.kind, work.number);
             match self.table.upsert_queued(
                 &work.repo,
@@ -613,27 +672,35 @@ impl Daemon {
 
     /// Open or close one release-gate row per repository.
     ///
-    /// A manual policy with a stacked or retrying set waits for a human. The
-    /// push call refreshes the row, so the snapshot the row carries always
-    /// matches the set that would ship.
+    /// A manual policy with a stacked or retrying set waits for a human.
+    /// A changed set replaces the old row with a new snapshot.
     fn refresh_release_gates(&mut self) {
         let aliases: Vec<String> = self.trains.keys().cloned().collect();
         for alias in aliases {
+            let release_is_stuck = self.decisions.open().iter().any(|row| {
+                row.repo == alias
+                    && row.stage == Some(Stage::Release)
+                    && matches!(row.kind, DecisionKind::Stuck { .. })
+            });
             let waiting = {
                 let train = &self.trains[&alias];
                 let policy = self.active_policy(&alias);
                 train.in_flight.is_none()
                     && matches!(policy, ReleasePolicy::Manual)
                     && !train.fired_set().is_empty()
+                    && !release_is_stuck
             };
             let id = format!("gate:{alias}");
             if waiting {
                 let prs = self.trains[&alias].fired_set();
-                if self
-                    .decisions
-                    .push(Decision::release_gate(&alias, prs, self.now_ms))
-                    .is_some()
-                {
+                let same = self.decisions.open().iter().any(|row| {
+                    row.id == id
+                        && matches!(&row.kind, DecisionKind::ReleaseGate { prs: open } if open == &prs)
+                });
+                if !same {
+                    self.decisions.take(&id);
+                    self.decisions
+                        .push(Decision::release_gate(&alias, prs, self.now_ms));
                     self.changed = true;
                 }
             } else if self.decisions.take(&id).is_some() {
@@ -697,7 +764,9 @@ impl Daemon {
         for id in reaped {
             if let Some(mut session) = self.sessions.remove(&id) {
                 eprintln!("task {id}: the parked session passed the idle limit; stopping it");
-                let _ = session.stop();
+                if let Err(error) = session.stop() {
+                    eprintln!("task {id}: cannot stop the parked session: {error:#}");
+                }
                 self.changed = true;
             }
         }
@@ -732,7 +801,10 @@ impl Daemon {
             let Some(task) = self.table.by_id.get(id) else {
                 continue;
             };
-            if task.state != TaskState::Queued || saturated.contains(&task.stage) {
+            if task.state != TaskState::Queued
+                || saturated.contains(&task.stage)
+                || self.sessions.contains_key(&task.id)
+            {
                 continue;
             }
             if matches!(
@@ -770,7 +842,7 @@ impl Daemon {
         }
         let Some(repo_cfg) = self.config.repos.get(&task.repo).cloned() else {
             let reason = format!("repository {} left the config", task.repo);
-            self.fail_task(id, &reason);
+            self.fail_run(&task, &reason);
             return Err(anyhow!(reason));
         };
         let cwd = match task.stage {
@@ -785,7 +857,7 @@ impl Daemon {
             Ok(cwd) => cwd,
             Err(e) => {
                 let reason = format!("cannot prepare the worktree: {e:#}");
-                self.fail_task(id, &reason);
+                self.fail_run(&task, &reason);
                 return Err(e);
             }
         };
@@ -793,13 +865,13 @@ impl Daemon {
             Ok(prompt) => prompt,
             Err(e) => {
                 let reason = format!("cannot render the prompt: {e:#}");
-                self.fail_task(id, &reason);
+                self.fail_run(&task, &reason);
                 return Err(e);
             }
         };
         if let Err(e) = self.launch_task(&task, prompt, None) {
             let reason = format!("the runner could not start: {e:#}");
-            self.fail_task(id, &reason);
+            self.fail_run(&task, &reason);
             return Err(e);
         }
         Ok(true)
@@ -837,7 +909,12 @@ impl Daemon {
             .transition(&task.id, TaskState::Running, self.now_ms)
         {
             if let Some(mut session) = self.sessions.remove(&task.id) {
-                let _ = session.stop();
+                if let Err(stop_error) = session.stop() {
+                    eprintln!(
+                        "task {}: cannot stop the rejected session: {stop_error:#}",
+                        task.id
+                    );
+                }
             }
             return Err(e);
         }
@@ -888,9 +965,13 @@ impl Daemon {
         let Some(train) = self.trains.get_mut(repo) else {
             return;
         };
+        let task_id = train.in_flight.clone();
         let gh = GhClient::new(&*self.exec);
         match train.finish(ok, &owner_repo, &gh) {
             Ok(batch) => {
+                if let Some(task_id) = task_id {
+                    self.release_batches.remove(&task_id);
+                }
                 if !batch.is_empty() {
                     self.changed = true;
                 }
@@ -914,13 +995,27 @@ impl Daemon {
                 session_id: Some(session_id),
                 ..
             } => {
-                if let Some(task) = self.table.by_id.get_mut(&task_id) {
-                    task.session_id = Some(session_id.clone());
-                }
-                if let Some(cwd) = self.task_cwd(&task_id) {
-                    if let Err(e) = self.worktrees.write_session(&cwd, &session_id) {
-                        eprintln!("task {task_id}: cannot write the session marker: {e:#}");
+                let Some(task) = self.table.by_id.get_mut(&task_id) else {
+                    eprintln!("task {task_id} started, but it is not in the table");
+                    return;
+                };
+                task.session_id = Some(session_id.clone());
+                let marker = self
+                    .task_cwd(&task_id)
+                    .ok_or_else(|| anyhow!("the task has no worktree"))
+                    .and_then(|cwd| self.worktrees.write_session(&cwd, &session_id));
+                if let Err(error) = marker {
+                    let reason = format!("cannot write the session marker: {error:#}");
+                    eprintln!("task {task_id}: {reason}");
+                    if let Some(mut session) = self.sessions.remove(&task_id) {
+                        if let Err(stop_error) = session.stop() {
+                            eprintln!("task {task_id}: cannot stop the session: {stop_error:#}");
+                        }
                     }
+                    if let Some(task) = self.table.by_id.get(&task_id).cloned() {
+                        self.fail_run(&task, &reason);
+                    }
+                    return;
                 }
                 self.changed = true;
             }
@@ -951,45 +1046,54 @@ impl Daemon {
                 // The runner tees this into the task log; the interfaces read
                 // the log file, so the daemon stores nothing here.
             }
-            RunEvent::TurnEnd { .. } => self.on_turn_end(&task_id),
+            RunEvent::TurnEnd { ok, summary, .. } => self.on_turn_end(&task_id, ok, &summary),
             RunEvent::Exit { ok, detail, .. } => self.on_exit_event(&task_id, ok, &detail),
         }
     }
 
     /// Apply one turn end.
     ///
-    /// Completion differs per runner. An interactive task (refine) parks on
-    /// `AwaitingUser` and waits for the human. A one-shot task (implement,
-    /// review, release, and a one-shot claude run) treats a turn end as a
-    /// step boundary and completes on `Exit`.
-    fn on_turn_end(&mut self, id: &str) {
-        let parks =
-            self.table.by_id.get(id).is_some_and(|task| {
-                task.state == TaskState::Running && task.stage == Stage::Refine
-            });
-        if !parks {
+    /// Completion differs per runner. A claude refine task waits for a user.
+    /// Another claude task completes or fails from the turn result.
+    /// An opencode turn is only a step boundary.
+    fn on_turn_end(&mut self, id: &str, ok: bool, summary: &str) {
+        let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
-        }
-        if let Err(e) = self
-            .table
-            .transition(id, TaskState::AwaitingUser, self.now_ms)
+        };
+        if task.state != TaskState::Running
+            || self.config.stage(task.stage).runner.as_str() != "claude"
         {
-            eprintln!("task {id}: {e:#}");
             return;
         }
-        self.changed = true;
+        if task.stage == Stage::Refine {
+            if let Err(error) = self
+                .table
+                .transition(id, TaskState::AwaitingUser, self.now_ms)
+            {
+                eprintln!("task {id}: {error:#}");
+                return;
+            }
+            self.changed = true;
+        } else if ok {
+            self.complete_task(&task);
+        } else {
+            let reason = if summary.is_empty() {
+                "the claude turn failed"
+            } else {
+                summary
+            };
+            self.fail_run(&task, reason);
+        }
     }
 
     /// Apply one run exit.
     ///
-    /// A terminal task ignores the exit, which covers an abort race. A
-    /// parked task keeps its state: the reaper or a human stopped the
-    /// process, and a chat message resumes the task later. A success moves
-    /// the task to `Done` and applies the stage's completion work. A failure
-    /// requeues the task while attempts remain, and opens a stuck row on the
-    /// last failure.
+    /// A terminal task ignores the exit. A parked task stays resumable.
+    /// An opencode exit supplies the task result.
+    /// A claude exit without a prior result fails the active task.
     fn on_exit_event(&mut self, id: &str, ok: bool, detail: &str) {
         self.sessions.remove(id);
+        self.last_event_ms.remove(id);
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
@@ -999,51 +1103,68 @@ impl Daemon {
         if task.state == TaskState::AwaitingUser {
             return;
         }
-        if ok {
-            if let Err(e) = self.table.transition(id, TaskState::Done, self.now_ms) {
-                eprintln!("task {id}: {e:#}");
+        if self.config.stage(task.stage).runner.as_str() == "claude" {
+            if task.state == TaskState::Queued {
                 return;
             }
-            self.changed = true;
-            self.decisions.drop_for_task(id);
-            match task.stage {
-                Stage::Review => self.write_review_marker(&task),
-                Stage::Release => {
-                    self.release_batches.remove(id);
-                    self.finish_train(&task.repo, true);
-                }
-                Stage::Refine | Stage::Implement => {}
-            }
+            let reason = if ok {
+                format!("claude exited before it reported a turn result: {detail}")
+            } else {
+                detail.to_string()
+            };
+            self.fail_run(&task, &reason);
+        } else if ok {
+            self.complete_task(&task);
         } else {
-            if task.stage == Stage::Release {
-                self.release_batches.remove(id);
-                self.finish_train(&task.repo, false);
-            }
-            self.fail_task(id, detail);
+            self.fail_run(&task, detail);
         }
+    }
+
+    /// Complete one task and apply its stage-specific success action.
+    fn complete_task(&mut self, task: &Task) {
+        if task.stage == Stage::Review {
+            if let Err(error) = self.write_review_marker(task) {
+                let reason = format!("cannot write the reviewed-sha marker: {error:#}");
+                eprintln!("task {}: {reason}", task.id);
+                self.fail_run(task, &reason);
+                return;
+            }
+        }
+        if let Err(error) = self
+            .table
+            .transition(&task.id, TaskState::Done, self.now_ms)
+        {
+            eprintln!("task {}: {error:#}", task.id);
+            return;
+        }
+        self.changed = true;
+        self.decisions.drop_for_task(&task.id);
+        match task.stage {
+            Stage::Release => self.finish_train(&task.repo, true),
+            Stage::Refine | Stage::Implement | Stage::Review => {}
+        }
+    }
+
+    /// Fail one run and return a final release batch to its train.
+    fn fail_run(&mut self, task: &Task, reason: &str) {
+        if task.stage == Stage::Release && task.attempt >= tasks::MAX_ATTEMPTS {
+            self.finish_train(&task.repo, false);
+        }
+        self.fail_task(&task.id, reason);
     }
 
     /// Write the `.aif/reviewed-sha` marker of a finished review.
     ///
     /// The marker records the head sha the gate admitted, and it is written
     /// only here, after the review task reported success.
-    fn write_review_marker(&mut self, task: &Task) {
+    fn write_review_marker(&self, task: &Task) -> Result<()> {
         let Some(sha) = task.head_sha.clone() else {
-            eprintln!(
-                "review task {}: no head sha; no reviewed-sha marker",
-                task.id
-            );
-            return;
+            bail!("review task {} has no head sha", task.id);
         };
         let Some(cwd) = self.task_cwd(&task.id) else {
-            return;
+            bail!("review task {} has no worktree", task.id);
         };
-        if let Err(e) = self.worktrees.write_reviewed_sha(&cwd, &sha) {
-            eprintln!(
-                "task {}: cannot write the reviewed-sha marker: {e:#}",
-                task.id
-            );
-        }
+        self.worktrees.write_reviewed_sha(&cwd, &sha)
     }
 
     // ------------------------------------------------------------------
@@ -1054,6 +1175,10 @@ impl Daemon {
     fn on_action(&mut self, action: Action) {
         match action {
             Action::Refine { repo, kind, number } => {
+                if !self.config.repos.contains_key(&repo) {
+                    eprintln!("the refine request for {repo}: no such repository");
+                    return;
+                }
                 let log = self.log_path(&repo, Stage::Refine, kind, number);
                 match self
                     .table
@@ -1094,6 +1219,16 @@ impl Daemon {
                 self.fire_train(&repo, &prs);
             }
             Action::Policy { repo, policy } => {
+                if !self.config.repos.contains_key(&repo) {
+                    eprintln!("the policy change for {repo}: no such repository");
+                    return;
+                }
+                if matches!(policy, ReleasePolicy::Threshold { count: 0 })
+                    || matches!(policy, ReleasePolicy::Interval { minutes: 0 })
+                {
+                    eprintln!("the policy change for {repo}: the value must be at least 1");
+                    return;
+                }
                 let is_default = self.config.repos.get(&repo).map(|r| &r.release) == Some(&policy);
                 if is_default {
                     self.policies.remove(&repo);
@@ -1103,18 +1238,32 @@ impl Daemon {
                 self.changed = true;
             }
             Action::Limit { stage, limit } => {
-                if limit == self.config.stage(stage).limit {
-                    self.limits.stage.remove(&stage);
-                } else {
-                    self.limits.stage.insert(stage, limit);
+                if limit == 0 {
+                    eprintln!("the limit change for {stage}: the limit must be at least 1");
+                    return;
                 }
+                self.limits.stage.insert(stage, limit);
                 self.changed = true;
             }
             Action::Lane { stage, repo, slots } => {
-                // A zero reservation persists as an explicit override, so a
-                // disabled lane stays disabled across a restart.
-                self.limits.lanes.insert((stage, repo), slots);
-                self.changed = true;
+                if !self.config.repos.contains_key(&repo) {
+                    eprintln!("the lane change for {repo}: no such repository");
+                    return;
+                }
+                let config_slots = self.config.repos[&repo]
+                    .lanes
+                    .get(&stage)
+                    .copied()
+                    .unwrap_or(0);
+                let key = (stage, repo);
+                let changed = if slots == 0 && config_slots == 0 {
+                    self.limits.lanes.remove(&key).is_some()
+                } else {
+                    self.limits.lanes.insert(key, slots) != Some(slots)
+                };
+                if changed {
+                    self.changed = true;
+                }
             }
             Action::Pause { scope, paused } => {
                 match scope {
@@ -1127,6 +1276,10 @@ impl Daemon {
                         }
                     }
                     PauseScope::Repo { repo } => {
+                        if !self.config.repos.contains_key(&repo) {
+                            eprintln!("the pause change for {repo}: no such repository");
+                            return;
+                        }
                         if paused {
                             self.paused.repos.insert(repo);
                         } else {
@@ -1145,10 +1298,12 @@ impl Daemon {
     /// Send a chat message to a live session, or resume a parked task.
     fn chat(&mut self, id: &str, text: &str) {
         if let Some(session) = self.sessions.get_mut(id) {
-            if let Err(e) = session.send_user(text) {
-                eprintln!("the chat message for {id}: {e:#}");
+            match session.send_user(text) {
+                Ok(()) => {
+                    self.last_event_ms.insert(id.to_string(), self.now_ms);
+                }
+                Err(error) => eprintln!("the chat message for {id}: {error:#}"),
             }
-            self.last_event_ms.insert(id.to_string(), self.now_ms);
             return;
         }
         let Some(task) = self.table.by_id.get(id).cloned() else {
@@ -1192,39 +1347,61 @@ impl Daemon {
                     task, request_id, ..
                 },
                 Response::Allow,
-            ) => self.answer_session(
-                task,
-                request_id,
-                Answer::Allow {
-                    updated_input: None,
-                },
-            ),
+            ) => {
+                if let Err(error) = self.answer_session(
+                    task,
+                    request_id,
+                    Answer::Allow {
+                        updated_input: None,
+                    },
+                ) {
+                    eprintln!("the answer for {task}: {error:#}");
+                    self.decisions.push(decision.clone());
+                    return;
+                }
+            }
             (
                 DecisionKind::Permission {
                     task, request_id, ..
                 },
                 Response::Deny { message },
-            ) => self.answer_session(
-                task,
-                request_id,
-                Answer::Deny {
-                    message: message.clone(),
-                },
-            ),
+            ) => {
+                if let Err(error) = self.answer_session(
+                    task,
+                    request_id,
+                    Answer::Deny {
+                        message: message.clone(),
+                    },
+                ) {
+                    eprintln!("the answer for {task}: {error:#}");
+                    self.decisions.push(decision.clone());
+                    return;
+                }
+            }
             (
                 DecisionKind::Question {
                     task, request_id, ..
                 },
                 Response::Answers { updated_input },
-            ) => self.answer_session(
-                task,
-                request_id,
-                Answer::Allow {
-                    updated_input: Some(updated_input.clone()),
-                },
-            ),
+            ) => {
+                if let Err(error) = self.answer_session(
+                    task,
+                    request_id,
+                    Answer::Allow {
+                        updated_input: Some(updated_input.clone()),
+                    },
+                ) {
+                    eprintln!("the answer for {task}: {error:#}");
+                    self.decisions.push(decision.clone());
+                    return;
+                }
+            }
             (DecisionKind::Question { task, .. }, Response::Text { text }) => {
-                self.send_to_session(task, text)
+                if let Err(error) = self.send_to_session(task, text) {
+                    eprintln!("the chat message for {task}: {error:#}");
+                    self.decisions.push(decision.clone());
+                    return;
+                }
             }
             (DecisionKind::Stuck { task, .. }, Response::Retry) => self.retry_task(task),
             (DecisionKind::Stuck { task, .. }, Response::Cancel) => self.cancel_task(task),
@@ -1234,7 +1411,15 @@ impl Daemon {
             (DecisionKind::NeedsHuman { .. }, Response::Cancel) => {
                 self.resolve_needs_human(decision, None)
             }
-            (DecisionKind::ReleaseGate { .. }, Response::Go { prs }) => {
+            (DecisionKind::ReleaseGate { prs: expected }, Response::Go { prs }) => {
+                if expected != prs {
+                    eprintln!(
+                        "the answer for {}: the release batch changed from {expected:?} to {prs:?}",
+                        decision.id
+                    );
+                    self.decisions.push(decision.clone());
+                    return;
+                }
                 self.fire_train(&decision.repo, prs);
             }
             _ => eprintln!(
@@ -1246,27 +1431,21 @@ impl Daemon {
     }
 
     /// Forward an answer to the live session of one task.
-    fn answer_session(&mut self, task: &str, request_id: &str, answer: Answer) {
-        match self.sessions.get_mut(task) {
-            Some(session) => {
-                if let Err(e) = session.answer(request_id, answer) {
-                    eprintln!("the answer for {task}: {e:#}");
-                }
-            }
-            None => eprintln!("the answer for {task}: no live session holds it"),
-        }
+    fn answer_session(&mut self, task: &str, request_id: &str, answer: Answer) -> Result<()> {
+        let session = self
+            .sessions
+            .get_mut(task)
+            .ok_or_else(|| anyhow!("no live session holds it"))?;
+        session.answer(request_id, answer)
     }
 
     /// Forward a chat line to the live session of one task.
-    fn send_to_session(&mut self, task: &str, text: &str) {
-        match self.sessions.get_mut(task) {
-            Some(session) => {
-                if let Err(e) = session.send_user(text) {
-                    eprintln!("the chat message for {task}: {e:#}");
-                }
-            }
-            None => eprintln!("the chat message for {task}: no live session holds it"),
-        }
+    fn send_to_session(&mut self, task: &str, text: &str) -> Result<()> {
+        let session = self
+            .sessions
+            .get_mut(task)
+            .ok_or_else(|| anyhow!("no live session holds it"))?;
+        session.send_user(text)
     }
 
     /// Apply a `NeedsHuman` answer: comment on GitHub, then drop the label.
@@ -1339,6 +1518,27 @@ impl Daemon {
             eprintln!("the retry of {id}: the task is still active");
             return;
         }
+        if task.stage == Stage::Release {
+            let Some(prs) = self.trains.get(&task.repo).map(Train::fired_set) else {
+                eprintln!("the retry of {id}: no release train for {}", task.repo);
+                return;
+            };
+            if prs.is_empty() {
+                eprintln!("the retry of {id}: the release batch is empty");
+                return;
+            }
+            self.fire_train(&task.repo, &prs);
+            let queued = self
+                .table
+                .by_id
+                .get(id)
+                .is_some_and(|task| task.state == TaskState::Queued)
+                && self.trains[&task.repo].in_flight.as_deref() == Some(id);
+            if queued {
+                self.decisions.drop_for_task(id);
+            }
+            return;
+        }
         let log = task.log_path.clone();
         match self.table.upsert_queued(
             &task.repo,
@@ -1348,7 +1548,10 @@ impl Daemon {
             log,
             self.now_ms,
         ) {
-            Ok(_) => self.changed = true,
+            Ok(_) => {
+                self.decisions.drop_for_task(id);
+                self.changed = true;
+            }
             Err(e) => eprintln!("the retry of {id}: {e:#}"),
         }
     }
@@ -1356,7 +1559,9 @@ impl Daemon {
     /// Abort one task: stop its process, cancel it, and drop its decisions.
     fn cancel_task(&mut self, id: &str) {
         if let Some(mut session) = self.sessions.remove(id) {
-            let _ = session.stop();
+            if let Err(error) = session.stop() {
+                eprintln!("the abort of {id}: cannot stop the session: {error:#}");
+            }
         }
         let active = self
             .table
@@ -1376,6 +1581,10 @@ impl Daemon {
 
     /// Queue an interactive ticket-creation task for one repository.
     fn ticket_create(&mut self, repo: &str) {
+        if !self.config.repos.contains_key(repo) {
+            eprintln!("the ticket session for {repo}: no such repository");
+            return;
+        }
         let log = self.log_path(repo, Stage::Refine, ItemKind::Issue, TICKET_NUMBER);
         match self.table.upsert_queued(
             repo,
@@ -1395,13 +1604,17 @@ impl Daemon {
         match repo {
             Some(alias) => match self.wake.get(alias) {
                 Some(sender) => {
-                    let _ = sender.send(());
+                    if sender.send(()).is_err() {
+                        eprintln!("reconcile: the poller for {alias} stopped");
+                    }
                 }
                 None => eprintln!("reconcile: no poller for {alias}"),
             },
             None => {
                 for sender in self.wake.values() {
-                    let _ = sender.send(());
+                    if sender.send(()).is_err() {
+                        eprintln!("reconcile: a repository poller stopped");
+                    }
                 }
             }
         }
@@ -1435,6 +1648,7 @@ impl Daemon {
                 .upsert_queued(repo, Stage::Release, ItemKind::Pr, first, log, self.now_ms)
         {
             eprintln!("the release task {id}: {e:#}");
+            self.finish_train(repo, false);
             return;
         }
         self.changed = true;
@@ -1442,12 +1656,16 @@ impl Daemon {
 
     /// The number of live sessions of one stage.
     ///
-    /// This counts running tasks and parked tasks whose process still lives.
+    /// This counts each session until its process reports `Exit`.
     fn live_sessions(&self, stage: Stage) -> usize {
-        self.table
-            .active()
-            .iter()
-            .filter(|task| task.stage == stage && self.sessions.contains_key(&task.id))
+        self.sessions
+            .keys()
+            .filter(|id| {
+                self.table
+                    .by_id
+                    .get(*id)
+                    .is_some_and(|task| task.stage == stage)
+            })
             .count()
     }
 
@@ -1580,8 +1798,9 @@ impl Daemon {
                 .repos
                 .get(repo)
                 .and_then(|repo_cfg| repo_cfg.lanes.get(stage))
-                .copied();
-            if config_slots != Some(*slots) {
+                .copied()
+                .unwrap_or(0);
+            if config_slots != *slots {
                 lanes.push((*stage, repo.clone(), *slots));
             }
         }
@@ -1608,15 +1827,20 @@ impl Daemon {
         }
         self.changed = false;
         let state = self.collect_state();
-        let Ok(text) = state.to_json() else {
-            eprintln!("cannot serialize the daemon state");
-            return;
+        let text = match state.to_json() {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("cannot serialize the daemon state: {error:#}");
+                self.changed = true;
+                return;
+            }
         };
         if self.saved.as_deref() == Some(text.as_str()) {
             return;
         }
         if let Err(e) = state.save(&self.state_path) {
             eprintln!("cannot write {}: {e:#}", self.state_path.display());
+            self.changed = true;
             return;
         }
         self.saved = Some(text);
@@ -1642,17 +1866,32 @@ fn fill_template(template: &str, values: &[(&str, String)]) -> Result<String> {
             bail!("the prompt template uses the unknown placeholder {{{token}}}");
         }
     }
-    let mut out = template.to_string();
-    for (name, value) in values {
-        out = out.replace(&format!("{{{name}}}"), value);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let token = &after[..end];
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == token) {
+            out.push_str(value);
+        } else {
+            out.push_str(&rest[start..start + end + 2]);
+        }
+        rest = &after[end + 1..];
     }
+    out.push_str(rest);
     Ok(out)
 }
 
 /// List the `{placeholder}` tokens of a template, in first-seen order.
 ///
 /// A token is placeholder-shaped when it holds only ASCII letters, digits,
-/// and underscores. Other brace content is literal text and stays untouched.
+/// underscores, and hyphens. Other brace content stays untouched.
 fn scan_placeholders(template: &str) -> Vec<&str> {
     let mut found: Vec<&str> = Vec::new();
     let mut rest = template;
@@ -1664,7 +1903,9 @@ fn scan_placeholders(template: &str) -> Vec<&str> {
         let token = &after[..end];
         if !token.is_empty()
             && !token.contains('{')
-            && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             && !found.contains(&token)
         {
             found.push(token);
@@ -1991,6 +2232,8 @@ mod tests {
         stopped: Arc<AtomicBool>,
         answers: Arc<Mutex<Vec<String>>>,
         sends: Arc<Mutex<Vec<String>>>,
+        fail_answer: Arc<AtomicBool>,
+        fail_send: Arc<AtomicBool>,
     }
 
     impl SessionHandle {
@@ -1999,6 +2242,8 @@ mod tests {
                 stopped: Arc::new(AtomicBool::new(false)),
                 answers: Arc::new(Mutex::new(Vec::new())),
                 sends: Arc::new(Mutex::new(Vec::new())),
+                fail_answer: Arc::new(AtomicBool::new(false)),
+                fail_send: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -2010,11 +2255,17 @@ mod tests {
 
     impl Session for FakeSession {
         fn send_user(&mut self, text: &str) -> anyhow::Result<()> {
+            if self.handle.fail_send.load(Ordering::SeqCst) {
+                bail!("the fake session refuses the message");
+            }
             self.handle.sends.lock().unwrap().push(text.to_string());
             Ok(())
         }
 
         fn answer(&mut self, request_id: &str, answer: Answer) -> anyhow::Result<()> {
+            if self.handle.fail_answer.load(Ordering::SeqCst) {
+                bail!("the fake session refuses the answer");
+            }
             let tag = match answer {
                 Answer::Allow { .. } => "allow",
                 Answer::Deny { .. } => "deny",
@@ -2281,10 +2532,14 @@ mod tests {
     }
 
     fn turn_ended(task: &str) -> RunEvent {
+        turn_finished(task, true, "")
+    }
+
+    fn turn_finished(task: &str, ok: bool, summary: &str) -> RunEvent {
         RunEvent::TurnEnd {
             task: task.to_string(),
-            ok: true,
-            summary: String::new(),
+            ok,
+            summary: summary.to_string(),
             cost_usd: None,
         }
     }
@@ -2328,6 +2583,20 @@ mod tests {
             .table
             .by_id
             .contains_key("borsuk/refine-i142"));
+    }
+
+    #[test]
+    fn a_session_marker_error_stops_and_retries_the_task() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        let first = rig.session(0);
+        fs::create_dir_all(rig.repo.join(".aif").join("session")).unwrap();
+
+        rig.event(started("borsuk/refine-i142", "sid-1"));
+
+        assert!(first.stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.task("borsuk/refine-i142").attempt, 2);
+        assert_eq!(rig.job_count(), 2);
     }
 
     #[test]
@@ -2387,15 +2656,31 @@ mod tests {
             Some("sha5")
         );
 
-        rig.event(exited("borsuk/review-p5", true, "lgtm"));
+        rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
         assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
         let marker = issue_wt(&dir, 5).join(".aif").join("reviewed-sha");
         assert_eq!(fs::read_to_string(marker).unwrap().trim_end(), "sha5");
 
         rig.poll(vec![], vec![pr(5, true, &[]), pr(6, true, &[])]);
-        rig.event(exited("borsuk/review-p6", false, "lint"));
+        rig.event(turn_finished("borsuk/review-p6", false, "lint"));
         assert_eq!(rig.task("borsuk/review-p6").attempt, 2);
         assert!(!issue_wt(&dir, 6).join(".aif").join("reviewed-sha").exists());
+    }
+
+    #[test]
+    fn a_review_marker_error_requeues_the_review() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        fs::create_dir_all(worktree.join(".aif").join("reviewed-sha")).unwrap();
+
+        rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
+
+        let task = rig.task("borsuk/review-p5");
+        assert_eq!(task.state, TaskState::Queued);
+        assert_eq!(task.attempt, 2);
     }
 
     #[test]
@@ -2637,6 +2922,40 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_loop_waits_for_a_message_and_stop_returns() {
+        let mut rig = Rig::make(vec![]);
+        let (action_tx, action_rx) = mpsc::channel();
+        rig.daemon.action_rx = Some(action_rx);
+        let (clock_tx, clock_rx) = mpsc::channel();
+        rig.daemon.clock = Arc::new(move || {
+            let _ = clock_tx.send(());
+            T0
+        });
+        let daemon = rig.daemon;
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = done_tx.send(daemon.run());
+        });
+
+        clock_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the loop reads the clock before it blocks");
+        assert_eq!(
+            clock_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "an idle loop does not wake without a message or deadline"
+        );
+
+        action_tx.send(Action::Stop).unwrap();
+        drop(action_tx);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the stop action must let the event loop return");
+        assert!(result.is_ok(), "the event loop returned {result:?}");
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn the_gate_row_tracks_the_stacked_set() {
         let steps = vec![
             gh_step(
@@ -2683,6 +3002,7 @@ mod tests {
             on: true,
         });
         // The next poll confirms the label, and the row refreshes to the new set.
+        rig.set_now(T0 + 1);
         rig.poll(
             vec![],
             vec![
@@ -2695,8 +3015,9 @@ mod tests {
         prs.sort();
         assert_eq!(prs, vec![2, 3]);
         assert_eq!(
-            second.opened_ms, first.opened_ms,
-            "the push refreshes, it never re-opens"
+            second.opened_ms,
+            T0 + 1,
+            "a changed batch replaces the stale approval row"
         );
 
         rig.act(Action::Stack {
@@ -2720,6 +3041,27 @@ mod tests {
             "an empty train closes the row"
         );
         assert_eq!(rig.exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_release_answer_must_match_the_gate_snapshot() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(
+            vec![],
+            vec![
+                pr(2, false, &["release-stacked"]),
+                pr(3, false, &["release-stacked"]),
+            ],
+        );
+
+        rig.act(Action::Answer {
+            decision_id: "gate:borsuk".to_string(),
+            response: Response::Go { prs: vec![2] },
+        });
+
+        assert!(rig.decision("gate:borsuk").is_some());
+        assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
+        assert_eq!(rig.job_count(), 0);
     }
 
     #[test]
@@ -2816,6 +3158,52 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_session_answer_keeps_the_decision_open() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().yolo = false;
+        });
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(RunEvent::Ask {
+            task: "borsuk/refine-i142".to_string(),
+            request_id: "req-1".to_string(),
+            tool: "Bash".to_string(),
+            input: json!({"command": "ls"}),
+            suggestions: serde_json::Value::Null,
+            needs_human: false,
+        });
+        let session = rig.session(0);
+        session.fail_answer.store(true, Ordering::SeqCst);
+
+        rig.act(Action::Answer {
+            decision_id: "perm:borsuk/refine-i142:req-1".to_string(),
+            response: Response::Allow,
+        });
+
+        assert!(rig.decision("perm:borsuk/refine-i142:req-1").is_some());
+        assert!(session.answers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_chat_does_not_extend_the_idle_deadline() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+        let session = rig.session(0);
+        session.fail_send.store(true, Ordering::SeqCst);
+        rig.set_now(T0 + 100);
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "hello".to_string(),
+        });
+
+        assert_eq!(
+            rig.daemon.last_event_ms["borsuk/refine-i142"], T0,
+            "a rejected message is not session activity"
+        );
+    }
+
+    #[test]
     fn prompt_rendering_fills_every_placeholder_and_reports_an_unknown_one() {
         let dir = temp_root();
         let steps = fresh_issue_steps(
@@ -2884,6 +3272,79 @@ mod tests {
     }
 
     #[test]
+    fn unknown_repository_actions_change_no_domain_state() {
+        let mut rig = Rig::make(vec![]);
+        rig.act(Action::Refine {
+            repo: "missing".to_string(),
+            kind: ItemKind::Issue,
+            number: 1,
+        });
+        rig.act(Action::TicketCreate {
+            repo: "missing".to_string(),
+        });
+        rig.act(Action::Policy {
+            repo: "missing".to_string(),
+            policy: ReleasePolicy::Threshold { count: 2 },
+        });
+        rig.act(Action::Lane {
+            stage: Stage::Implement,
+            repo: "missing".to_string(),
+            slots: 1,
+        });
+        rig.act(Action::Pause {
+            scope: PauseScope::Repo {
+                repo: "missing".to_string(),
+            },
+            paused: true,
+        });
+
+        assert!(rig.daemon.table.by_id.is_empty());
+        assert!(!rig.daemon.policies.contains_key("missing"));
+        assert!(!rig
+            .daemon
+            .limits
+            .lanes
+            .contains_key(&(Stage::Implement, "missing".to_string())));
+        assert!(!rig.daemon.paused.repos.contains("missing"));
+    }
+
+    #[test]
+    fn invalid_runtime_limits_and_policies_are_refused() {
+        let mut rig = Rig::make(vec![]);
+        rig.act(Action::Limit {
+            stage: Stage::Refine,
+            limit: 0,
+        });
+        rig.act(Action::Policy {
+            repo: "borsuk".to_string(),
+            policy: ReleasePolicy::Threshold { count: 0 },
+        });
+
+        assert_eq!(rig.daemon.limits.limit(Stage::Refine), 2);
+        assert_eq!(rig.daemon.active_policy("borsuk"), &ReleasePolicy::Manual);
+    }
+
+    #[test]
+    fn zero_removes_an_absent_lane_without_persisting_an_override() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), vec![], |_| {});
+
+        rig.act(Action::Lane {
+            stage: Stage::Implement,
+            repo: "borsuk".to_string(),
+            slots: 0,
+        });
+
+        assert!(!rig
+            .daemon
+            .limits
+            .lanes
+            .contains_key(&(Stage::Implement, "borsuk".to_string())));
+        let stored = DaemonState::load(&dir.join("state").join("state.json"));
+        assert!(stored.lanes.is_empty());
+    }
+
+    #[test]
     fn a_stuck_task_retries_from_attempt_one_and_an_abort_cancels() {
         let dir = temp_root();
         let wt = issue_wt(&dir, 144);
@@ -2907,6 +3368,7 @@ mod tests {
         assert_eq!(task.attempt, 1, "a retry starts a fresh attempt count");
         assert_eq!(task.state, TaskState::Running);
         assert_eq!(rig.job_count(), 4);
+        assert!(rig.decision("stuck:borsuk/implement-i144:3").is_none());
 
         rig.act(Action::Abort {
             task: "borsuk/implement-i144".to_string(),
@@ -2917,6 +3379,57 @@ mod tests {
             TaskState::Failed("cancelled".to_string())
         );
         assert!(rig.decision("stuck:borsuk/implement-i144:3").is_none());
+    }
+
+    #[test]
+    fn a_manual_release_retry_keeps_the_exact_batch() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = train_wt(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let steps: Vec<Step> = fresh_train_steps(&repo, &worktree, &gitdir)
+            .into_iter()
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        assert!(rig.job(0).prompt.contains("#2"));
+
+        rig.event(exited("borsuk/release-p2", false, "first"));
+        assert_eq!(rig.task("borsuk/release-p2").attempt, 2);
+        assert!(rig.job(1).prompt.contains("#2"));
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release-p2")
+        );
+        assert!(rig.decision("gate:borsuk").is_none());
+
+        rig.event(exited("borsuk/release-p2", false, "second"));
+        assert_eq!(rig.task("borsuk/release-p2").attempt, 3);
+        assert!(rig.job(2).prompt.contains("#2"));
+
+        rig.event(exited("borsuk/release-p2", false, "third"));
+        assert_eq!(rig.job_count(), 3);
+        assert!(rig.decision("stuck:borsuk/release-p2:3").is_some());
+        assert!(rig.decision("gate:borsuk").is_none());
+
+        rig.act(Action::Answer {
+            decision_id: "stuck:borsuk/release-p2:3".to_string(),
+            response: Response::Retry,
+        });
+        assert_eq!(rig.job_count(), 4);
+        assert!(rig.job(3).prompt.contains("#2"));
+        assert_eq!(rig.task("borsuk/release-p2").attempt, 1);
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release-p2")
+        );
     }
 
     #[test]
@@ -2957,10 +3470,18 @@ mod tests {
     #[test]
     fn overrides_persist_across_a_restart() {
         let dir = temp_root();
-        let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+        let lane_config = |config: &mut Config| {
+            config
+                .repos
+                .get_mut("borsuk")
+                .unwrap()
+                .lanes
+                .insert(Stage::Implement, 1);
+        };
+        let mut first = Rig::make_in(dir.clone(), vec![], lane_config);
         first.act(Action::Limit {
             stage: Stage::Refine,
-            limit: 0,
+            limit: 4,
         });
         first.act(Action::Lane {
             stage: Stage::Implement,
@@ -2974,7 +3495,7 @@ mod tests {
 
         let path = dir.join("state").join("state.json");
         let stored = DaemonState::load(&path);
-        assert_eq!(stored.stage_limits.get(&Stage::Refine), Some(&0));
+        assert_eq!(stored.stage_limits.get(&Stage::Refine), Some(&4));
         assert!(stored
             .lanes
             .iter()
@@ -2990,6 +3511,11 @@ mod tests {
             stage: Stage::Refine,
             limit: 2,
         });
+        assert_eq!(
+            first.daemon.limits.limit(Stage::Refine),
+            2,
+            "the config value remains the effective limit"
+        );
         let stored = DaemonState::load(&path);
         assert!(
             stored.stage_limits.is_empty(),
@@ -2997,7 +3523,7 @@ mod tests {
         );
         drop(first);
 
-        let second = Rig::make_in(dir, vec![], |_| {});
+        let second = Rig::make_in(dir, vec![], lane_config);
         // from_config seeds every config limit; the empty stored.stage_limits above
         // is the proof that the override itself did not survive as an override.
         assert_eq!(second.daemon.limits.stage.get(&Stage::Refine), Some(&2));
@@ -3013,6 +3539,29 @@ mod tests {
         assert_eq!(
             second.daemon.policies.get("borsuk"),
             Some(&ReleasePolicy::Interval { minutes: 45 })
+        );
+    }
+
+    #[test]
+    fn a_failed_state_write_retries_after_the_path_recovers() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), vec![], |_| {});
+        let path = dir.join("state").join("state.json");
+        fs::create_dir_all(&path).unwrap();
+
+        rig.act(Action::Limit {
+            stage: Stage::Refine,
+            limit: 4,
+        });
+        assert!(path.is_dir(), "the first state write fails at rename");
+
+        fs::remove_dir(&path).unwrap();
+        rig.drive();
+
+        assert!(path.is_file(), "a later drive retries the state write");
+        assert_eq!(
+            DaemonState::load(&path).stage_limits.get(&Stage::Refine),
+            Some(&4)
         );
     }
 
@@ -3040,6 +3589,145 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unrelated_poll_change_does_not_cancel_a_draft_review() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        let session = rig.session(0);
+
+        rig.poll(vec![issue(9, &[])], vec![pr(5, true, &[])]);
+
+        assert!(!session.stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
+        assert_eq!(rig.job_count(), 1);
+    }
+
+    #[test]
+    fn a_closed_implement_gate_cancels_its_running_task() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        let session = rig.session(0);
+
+        rig.poll(vec![issue(142, &[])], vec![]);
+
+        assert!(session.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed("cancelled".to_string())
+        );
+    }
+
+    #[test]
+    fn making_a_pull_request_ready_cancels_its_draft_review() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        let session = rig.session(0);
+
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+
+        assert!(session.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            rig.task("borsuk/review-p5").state,
+            TaskState::Failed("cancelled".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_head_replaces_only_the_superseded_review() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        let first = rig.session(0);
+        let mut updated = pr(5, true, &[]);
+        updated.head_sha = "new-sha".to_string();
+
+        rig.poll(vec![], vec![updated]);
+
+        assert!(first.stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(
+            rig.task("borsuk/review-p5").head_sha.as_deref(),
+            Some("new-sha")
+        );
+    }
+
+    #[test]
+    fn a_claude_turn_completes_a_one_shot_task_before_process_exit() {
+        let dir = temp_root();
+        let steps: Vec<Step> = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        )
+        .into_iter()
+        .chain(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 143),
+            143,
+            &rig_gitdir(&dir),
+        ))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(
+            vec![issue(142, &["refined"]), issue(143, &["refined"])],
+            vec![],
+        );
+        assert_eq!(rig.job_count(), 1);
+
+        rig.event(turn_finished("borsuk/implement-i142", true, "done"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the live process keeps its stage slot until Exit"
+        );
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.job_count(), 2);
+    }
+
+    #[test]
+    fn an_opencode_step_does_not_complete_its_task() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.stages.get_mut(&Stage::Implement).unwrap().runner = "opencode".to_string();
+        });
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        rig.event(turn_finished("borsuk/implement-i142", true, "one step"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+    }
+
     // ------------------------------------------------------------------
     // Template helpers
     // ------------------------------------------------------------------
@@ -3056,6 +3744,19 @@ mod tests {
         assert!(error.to_string().contains("other"));
         let filled = fill_template("hi {name}", &[("name", "x".to_string())]).unwrap();
         assert_eq!(filled, "hi x");
+
+        let error = fill_template("hi {not-known}", &[("name", "x".to_string())]).unwrap_err();
+        assert!(error.to_string().contains("not-known"));
+
+        let filled = fill_template(
+            "title={title}; body={body}",
+            &[
+                ("title", "keep {body} literal".to_string()),
+                ("body", "body text".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(filled, "title=keep {body} literal; body=body text");
     }
 
     // Path helpers that mirror the rig layout.
