@@ -306,7 +306,7 @@ impl<R: GhRunner> GithubPoller<R> {
 pub fn owner_repo_of(root: &std::path::Path) -> Result<(String, u64)> {
     let out = Command::new("gh")
         .current_dir(root)
-        .args(["repo", "view", "--json", "nameWithOwner,databaseId"])
+        .args(["repo", "view", "--json", "nameWithOwner"])
         .output()?;
     if !out.status.success() {
         anyhow::bail!(
@@ -319,8 +319,19 @@ pub fn owner_repo_of(root: &std::path::Path) -> Result<(String, u64)> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing nameWithOwner"))?
         .to_owned();
-    let id = value["databaseId"].as_u64().unwrap_or(0);
-    Ok((name, id))
+    let api = Command::new("gh")
+        .current_dir(root)
+        .args(["api", &format!("repos/{name}"), "--jq", ".id"])
+        .output()?;
+    let repo_id = if api.status.success() {
+        String::from_utf8_lossy(&api.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok((name, repo_id))
 }
 
 pub fn poll_seconds_from_env() -> u64 {
