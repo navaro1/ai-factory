@@ -27,7 +27,7 @@ use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -48,15 +48,23 @@ pub struct Inbox {
     /// The id of the selected decision, if any.
     selected_id: Option<String>,
     /// The picked options of each question row, keyed by decision id.
-    /// The inner vector runs parallel to the parsed questions, and each
-    /// set holds the indexes of the picked options.
-    picks: BTreeMap<String, Vec<BTreeSet<usize>>>,
+    /// Each value stores the exact question snapshot and its option indexes.
+    picks: BTreeMap<String, QuestionPicks>,
     /// The checked pull requests of each gate row, keyed by decision id.
     checks: BTreeMap<String, BTreeSet<u64>>,
     /// The text input in progress, if any.
     input: Option<TextInput>,
     /// A short hint that explains a blocked intent.
     hint: Option<&'static str>,
+}
+
+/// The option picks for one exact question snapshot.
+#[derive(Debug)]
+struct QuestionPicks {
+    /// The questions that the option indexes refer to.
+    questions: serde_json::Value,
+    /// The option indexes for each parsed question.
+    selected: Vec<BTreeSet<usize>>,
 }
 
 /// What the human is typing, and the response it will produce.
@@ -136,15 +144,33 @@ impl Inbox {
 
     /// Apply one pushed state.
     ///
-    /// The call drops the local state of rows that closed and re-anchors
-    /// the selection to the first row when its row is gone. The age of a
-    /// row needs no bookkeeping here: it derives from `opened_ms`, which
-    /// the daemon preserves across re-pushes.
+    /// The call drops local state for closed or changed rows. It removes
+    /// pull requests that left a gate snapshot. It re-anchors a lost
+    /// selection to the first row. A row age derives from `opened_ms`.
     pub fn observe(&mut self, state: &StateView) {
-        self.picks
-            .retain(|id, _| state.decisions.iter().any(|d| d.id == *id));
-        self.checks
-            .retain(|id, _| state.decisions.iter().any(|d| d.id == *id));
+        self.picks.retain(|id, picks| {
+            state
+                .decisions
+                .iter()
+                .find(|decision| decision.id == *id)
+                .is_some_and(|decision| {
+                    matches!(
+                        &decision.kind,
+                        DecisionKind::Question { questions, .. }
+                            if questions == &picks.questions
+                    )
+                })
+        });
+        self.checks.retain(|id, checked| {
+            let Some(decision) = state.decisions.iter().find(|decision| decision.id == *id) else {
+                return false;
+            };
+            let DecisionKind::ReleaseGate { prs } = &decision.kind else {
+                return false;
+            };
+            checked.retain(|pr| prs.contains(pr));
+            true
+        });
         if self.input.as_ref().is_some_and(|input| {
             state
                 .decisions
@@ -193,8 +219,14 @@ impl Inbox {
         sink: &mut impl ActionSink,
     ) -> InboxOutcome {
         self.hint = None;
+        if key.kind != KeyEventKind::Press {
+            return InboxOutcome::None;
+        }
         if self.input.is_some() {
             return self.typing_key(state, key, sink);
+        }
+        if !key.modifiers.is_empty() {
+            return InboxOutcome::None;
         }
         if state.decisions.is_empty() {
             return InboxOutcome::None;
@@ -251,12 +283,6 @@ impl Inbox {
             return InboxOutcome::None;
         };
         let decision = decision.clone();
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return InboxOutcome::None;
-        }
         match (&decision.kind, key.code) {
             (DecisionKind::Permission { .. }, KeyCode::Char('y')) => {
                 self.answer(&decision.id, Response::Allow, sink);
@@ -343,10 +369,11 @@ impl Inbox {
             return InboxOutcome::None;
         }
         let decision = decision.clone();
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
+        let allowed_modifiers = match key.code {
+            KeyCode::Char(_) => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
+            _ => key.modifiers.is_empty(),
+        };
+        if !allowed_modifiers {
             return InboxOutcome::None;
         }
         match key.code {
@@ -421,12 +448,20 @@ impl Inbox {
         let Some((question_index, option_index)) = flattened_option(&parsed, digit) else {
             return;
         };
-        let picks = self.picks.entry(decision.id.clone()).or_default();
-        if picks.len() != parsed.len() {
-            let empty = vec![BTreeSet::new(); parsed.len()];
-            *picks = empty;
+        let picks = self
+            .picks
+            .entry(decision.id.clone())
+            .or_insert_with(|| QuestionPicks {
+                questions: questions.clone(),
+                selected: vec![BTreeSet::new(); parsed.len()],
+            });
+        if &picks.questions != questions || picks.selected.len() != parsed.len() {
+            *picks = QuestionPicks {
+                questions: questions.clone(),
+                selected: vec![BTreeSet::new(); parsed.len()],
+            };
         }
-        let chosen = &mut picks[question_index];
+        let chosen = &mut picks.selected[question_index];
         if parsed[question_index].multi_select {
             if chosen.contains(&option_index) {
                 chosen.remove(&option_index);
@@ -453,24 +488,29 @@ impl Inbox {
             return;
         }
         let empty = Vec::new();
-        let picks = self.picks.get(&decision.id).unwrap_or(&empty);
+        let picks = self
+            .picks
+            .get(&decision.id)
+            .filter(|picks| &picks.questions == questions)
+            .map(|picks| &picks.selected)
+            .unwrap_or(&empty);
         let mut answers = serde_json::Map::new();
         for (index, question) in parsed.iter().enumerate() {
-            let chosen = picks.get(index);
+            let Some(chosen) = picks.get(index).filter(|chosen| !chosen.is_empty()) else {
+                self.hint = Some("answer every question, or press i for a free answer");
+                return;
+            };
             if question.multi_select {
                 let labels: Vec<String> = question
                     .options
                     .iter()
                     .enumerate()
-                    .filter(|(option_index, _)| {
-                        chosen.is_some_and(|set| set.contains(option_index))
-                    })
+                    .filter(|(option_index, _)| chosen.contains(option_index))
                     .map(|(_, (label, _))| label.clone())
                     .collect();
                 answers.insert(question.key.clone(), serde_json::json!(labels));
             } else {
-                let Some(pick) = chosen.and_then(|set| set.iter().next()) else {
-                    self.hint = Some("answer every question, or press i for a free answer");
+                let Some(pick) = chosen.iter().next() else {
                     return;
                 };
                 let Some((label, _)) = question.options.get(*pick) else {
@@ -780,6 +820,7 @@ fn stage_text(decision: &Decision) -> String {
 pub fn draw(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms: u64) {
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let mut lines: Vec<Line> = Vec::new();
+    let mut selected_span = None;
     if state.decisions.is_empty() {
         lines.push(Line::from(
             "No open decisions. The factory asks here when an agent needs you.",
@@ -787,13 +828,27 @@ pub fn draw(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms:
     }
     for decision in &state.decisions {
         let selected = inbox.selected_id.as_deref() == Some(decision.id.as_str());
+        let row_index = lines.len();
         lines.push(row_line(decision, now_ms, selected));
         if selected {
             lines.extend(detail_lines(decision, inbox));
+            selected_span = Some((row_index, lines.len().saturating_sub(1)));
         }
     }
     let title = format!("decisions - {} open", state.decisions.len());
-    let list = Paragraph::new(Text::from(lines)).block(Block::bordered().title(title));
+    let inner_height = usize::from(rows[0].height.saturating_sub(2));
+    let scroll = selected_span
+        .filter(|_| inner_height > 0)
+        .map(|(start, end)| {
+            end.saturating_add(1)
+                .saturating_sub(inner_height)
+                .min(start)
+        })
+        .unwrap_or(0)
+        .min(usize::from(u16::MAX)) as u16;
+    let list = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title(title))
+        .scroll((scroll, 0));
     f.render_widget(list, rows[0]);
     f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
 }
@@ -886,7 +941,7 @@ fn option_picked(inbox: &Inbox, id: &str, question_index: usize, option_index: u
     inbox
         .picks
         .get(id)
-        .and_then(|all| all.get(question_index))
+        .and_then(|picks| picks.selected.get(question_index))
         .is_some_and(|set| set.contains(&option_index))
 }
 
@@ -1068,7 +1123,12 @@ mod tests {
 
     /// Render the inbox and return the whole screen as text.
     fn render(state: &StateView, inbox: &Inbox, now_ms: u64) -> String {
-        let backend = TestBackend::new(100, 20);
+        render_with_height(state, inbox, now_ms, 20)
+    }
+
+    /// Render the inbox at one test height.
+    fn render_with_height(state: &StateView, inbox: &Inbox, now_ms: u64, height: u16) -> String {
+        let backend = TestBackend::new(100, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| draw(f, f.area(), state, inbox, now_ms))
@@ -1262,6 +1322,30 @@ mod tests {
     }
 
     #[test]
+    fn permission_answers_require_a_plain_key_press() {
+        let state = full_state();
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        let repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Repeat,
+        );
+        let super_key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SUPER);
+
+        inbox.handle_key(&state, release, &mut tx);
+        inbox.handle_key(&state, repeat, &mut tx);
+        inbox.handle_key(&state, super_key, &mut tx);
+
+        assert!(rx.try_recv().is_err(), "a modified event sent an answer");
+    }
+
+    #[test]
     fn permission_n_takes_a_reason_and_sends_deny() {
         let state = full_state();
         let (mut tx, rx) = fake_sink();
@@ -1316,6 +1400,33 @@ mod tests {
             rx.try_recv().is_err(),
             "an unanswered question sends nothing"
         );
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("answer every question"), "hint: {screen}");
+    }
+
+    #[test]
+    fn question_enter_without_a_multi_select_pick_is_blocked_with_a_hint() {
+        let decision = Decision::question(
+            &worker(),
+            "req-multi",
+            serde_json::json!([{
+                "question": "Which caches?",
+                "header": "Caches",
+                "options": [
+                    {"label": "redis", "description": ""},
+                    {"label": "memcached", "description": ""},
+                ],
+                "multiSelect": true,
+            }]),
+            OPENED,
+        );
+        let state = state_with(vec![decision]);
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        assert!(rx.try_recv().is_err(), "an empty choice sent an answer");
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("answer every question"), "hint: {screen}");
     }
@@ -1668,6 +1779,54 @@ mod tests {
     }
 
     #[test]
+    fn a_push_that_changes_question_options_clears_stale_picks() {
+        let state = full_state();
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 1);
+        inbox.handle_key(&state, press('2'), &mut tx);
+
+        let changed = Decision::question(
+            &worker(),
+            "req-2",
+            serde_json::json!([{
+                "question": "Which database?",
+                "header": "Storage",
+                "options": [
+                    {"label": "duckdb", "description": "embedded"},
+                    {"label": "mysql", "description": "server"},
+                ],
+                "multiSelect": false,
+            }]),
+            OPENED,
+        );
+        let changed_state = state_with(vec![changed]);
+        inbox.observe(&changed_state);
+
+        inbox.handle_key(&changed_state, press_code(KeyCode::Enter), &mut tx);
+
+        assert!(rx.try_recv().is_err(), "a stale option sent an answer");
+        let screen = render(&changed_state, &inbox, OPENED);
+        assert!(screen.contains("answer every question"), "hint: {screen}");
+    }
+
+    #[test]
+    fn a_gate_repush_drops_checks_for_absent_pull_requests() {
+        let first = state_with(vec![Decision::release_gate("borsuk", vec![7, 9], OPENED)]);
+        let (mut tx, _rx) = fake_sink();
+        let mut inbox = selected(&first, 0);
+        inbox.handle_key(&first, press('2'), &mut tx);
+
+        let middle = state_with(vec![Decision::release_gate("borsuk", vec![9], OPENED)]);
+        inbox.observe(&middle);
+        let last = state_with(vec![Decision::release_gate("borsuk", vec![7, 9], OPENED)]);
+        inbox.observe(&last);
+
+        let screen = render(&last, &inbox, OPENED);
+        assert!(screen.contains("1. [ ] #7"), "stale check: {screen}");
+        assert!(screen.contains("2. [ ] #9"), "stale check: {screen}");
+    }
+
+    #[test]
     fn the_selection_follows_its_row_across_a_repush_and_prunes_gone_rows() {
         let state = full_state();
         let mut inbox = selected(&state, 4);
@@ -1727,6 +1886,29 @@ mod tests {
             inbox.selected_id.as_deref(),
             Some("perm:borsuk/implement-i142:req-1")
         );
+    }
+
+    #[test]
+    fn the_selected_row_remains_visible_below_the_viewport() {
+        let worker = worker();
+        let decisions = (0..12)
+            .map(|index| {
+                Decision::permission(
+                    &worker,
+                    &format!("req-{index}"),
+                    "Write",
+                    serde_json::json!({"file_path": format!("file-{index}.rs")}),
+                    OPENED,
+                )
+            })
+            .collect();
+        let state = state_with(decisions);
+        let inbox = selected(&state, 11);
+
+        let screen = render_with_height(&state, &inbox, OPENED, 8);
+
+        assert!(screen.contains(">   0s"), "selection: {screen}");
+        assert!(screen.contains("file-11.rs"), "selected row: {screen}");
     }
 
     #[test]
