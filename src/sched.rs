@@ -3,10 +3,9 @@
 //! The scheduler holds the stage limits and the strict lane reservations. It
 //! answers two questions. May one `(stage, repository)` start a task now?
 //! Which queued task should start next? The scheduler is pure logic. It runs
-//! no process, does no IO, and owns no state beyond the limits themselves.
+//! no process and performs no input or output.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 
 use crate::config::Config;
 use crate::model::Stage;
@@ -75,22 +74,6 @@ pub enum Verdict {
     No(Reason),
 }
 
-impl Verdict {
-    /// True when the request may start.
-    pub fn is_yes(self) -> bool {
-        matches!(self, Verdict::Yes)
-    }
-}
-
-impl fmt::Display for Verdict {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Verdict::Yes => f.write_str("yes"),
-            Verdict::No(reason) => write!(f, "no: {reason}"),
-        }
-    }
-}
-
 /// Why the scheduler refuses one start request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
@@ -101,16 +84,6 @@ pub enum Reason {
     LaneBlocked,
     /// The operator paused this stage, this repository, or the whole factory.
     Paused,
-}
-
-impl fmt::Display for Reason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Reason::StageFull => f.write_str("stage full"),
-            Reason::LaneBlocked => f.write_str("lane blocked"),
-            Reason::Paused => f.write_str("paused"),
-        }
-    }
 }
 
 /// What the operator paused.
@@ -143,7 +116,7 @@ impl Paused {
 /// `limit(stage) - running(stage)` minus, over every other repository with a
 /// reservation on this stage, `max(0, reserve(other) - running(stage, other))`.
 ///
-/// A free capacity of 0 or less reports `Verdict::No(Reason::LaneBlocked)`.
+/// No free capacity reports `Verdict::No(Reason::LaneBlocked)`.
 /// The repository's own reservation never works against itself. Queued,
 /// awaiting, and terminal tasks hold no slot; the reservation of a repository
 /// stays blocked for others even while that repository has nothing to run.
@@ -172,7 +145,7 @@ pub fn can_start(
             .get(&(lane_repo.clone(), stage))
             .copied()
             .unwrap_or(0);
-        reserved += count.saturating_sub(busy);
+        reserved = reserved.saturating_add(count.saturating_sub(busy));
     }
     if limit - running <= reserved {
         return Verdict::No(Reason::LaneBlocked);
@@ -195,7 +168,10 @@ pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Opt
         if task.state != TaskState::Queued {
             continue;
         }
-        if can_start(limits, paused, table, task.stage, &task.repo).is_yes() {
+        if matches!(
+            can_start(limits, paused, table, task.stage, &task.repo),
+            Verdict::Yes
+        ) {
             return Some(task.id.clone());
         }
     }
@@ -216,7 +192,7 @@ pub fn warnings(limits: &Limits) -> Vec<String> {
             .iter()
             .filter(|((lane_stage, _), _)| *lane_stage == stage)
             .map(|(_, count)| *count)
-            .sum();
+            .fold(0, usize::saturating_add);
         let limit = limits.limit(stage);
         if limit > 0 && sum >= limit {
             out.push(format!(
@@ -390,6 +366,22 @@ mod tests {
         assert!(warnings(&plain_limits()).is_empty());
     }
 
+    /// Runtime lane changes cannot make the warning sum overflow.
+    #[test]
+    fn excessive_runtime_lane_values_still_produce_a_warning() {
+        let limits = limits(
+            &[(Stage::Implement, 3)],
+            &[
+                (Stage::Implement, "a", usize::MAX),
+                (Stage::Implement, "b", 1),
+            ],
+        );
+
+        let out = warnings(&limits);
+        assert_eq!(out.len(), 1, "one warning: {out:?}");
+        assert!(out[0].contains("stage.implement"), "message: {}", out[0]);
+    }
+
     /// Pausing a stage, a repository, or everything blocks dispatch and the
     /// refusal names the pause.
     #[test]
@@ -547,6 +539,29 @@ mod tests {
         );
     }
 
+    /// Runtime lane changes cannot make the reservation sum overflow.
+    #[test]
+    fn excessive_runtime_lane_values_still_block_unreserved_work() {
+        let limits = limits(
+            &[(Stage::Implement, 3)],
+            &[
+                (Stage::Implement, "a", usize::MAX),
+                (Stage::Implement, "b", 1),
+            ],
+        );
+
+        assert_eq!(
+            can_start(
+                &limits,
+                &Paused::default(),
+                &TaskTable::new(),
+                Stage::Implement,
+                "c"
+            ),
+            Verdict::No(Reason::LaneBlocked)
+        );
+    }
+
     /// The limits come out of a parsed config.
     #[test]
     fn limits_build_from_a_config() {
@@ -644,17 +659,5 @@ mod tests {
             ),
             Verdict::Yes
         );
-    }
-
-    /// The reason texts stay short, for logs and the doctor output.
-    #[test]
-    fn reasons_display_as_short_text() {
-        assert_eq!(Verdict::Yes.to_string(), "yes");
-        assert_eq!(Verdict::No(Reason::StageFull).to_string(), "no: stage full");
-        assert_eq!(
-            Verdict::No(Reason::LaneBlocked).to_string(),
-            "no: lane blocked"
-        );
-        assert_eq!(Verdict::No(Reason::Paused).to_string(), "no: paused");
     }
 }
