@@ -404,7 +404,14 @@ snapshot type that keeps repositories strictly separate.
 chunk 2; do not edit `src/model.rs`.
 
 **Detail.**
-- `spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Vec<JoinHandle<()>>`.
+- `spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Pollers` where
+  `Pollers { handles: Vec<JoinHandle<()>>, wake: BTreeMap<String, Sender<()>> }`.
+  Create each repository's wake channel INSIDE spawn_pollers before spawning,
+  hand the receiver to the thread, and return the sender in the map. Do not
+  deliver the senders to the daemon as a message: that would add a startup
+  handshake the daemon must wait on before it can force a reconcile, and it
+  would put a `Sender` inside `DaemonMsg`, which costs `PartialEq` on the
+  daemon's whole message enum and so costs chunk 15 its message assertions.
   Each thread loops: fetch, send `DaemonMsg::Polled { repo, snapshot }`, then
   wait 60 s on a per-repo wake channel so `Reconcile` can force an early pass.
   A fetch error sends `DaemonMsg::PollFailed { repo, error }` and the thread
