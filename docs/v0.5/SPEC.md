@@ -328,9 +328,11 @@ release = { policy = "threshold", count = 3 }
 - Validation, all returning a clear `anyhow` message that names the offending
   key: repository path must exist and contain `.git`; alias must match
   `[a-z0-9._-]+`; every `limit` at least 1; the sum of a stage's lane
-  reservations must not exceed that stage's limit; a lane must name a known
-  repository and a known stage; `Threshold` count at least 1; `Interval`
-  minutes at least 1.
+  reservations must not exceed that stage's limit; a lane key must name a known
+  stage, the repository coming from the enclosing `[repo.<alias>]` block, so a
+  lane is the pair (stage, repo) and the error reads
+  `repo.<alias>.lanes.<key>`; `Threshold` count at least 1; `Interval` minutes
+  at least 1.
 - `Config::load(path: Option<&Path>)` resolves the default path per the naming
   rules. A missing file is an error that tells the user where to create it and
   names the example file.
@@ -514,7 +516,11 @@ that carry state instead of a database.
   - `.aif/reviewed-sha` holds the head sha of the last completed review.
   Provide typed read and write helpers for both. Write with a temporary file
   and a rename so a crash cannot leave a half-written marker.
-- `exists_issue(repo, number) -> bool` is the dispatch dedupe check.
+- `exists_issue(repo, number) -> bool` reports whether the worktree is already
+  there. It decides create versus reuse. It is NOT a dispatch blocker: after a
+  restart the gates legitimately re-open work whose worktree already exists,
+  and that work must resume in place. The only duplicate-dispatch guard is the
+  in-memory task table from chunk 6.
 - `remove_issue(repo, number, proof: Cleanable)` runs `git worktree remove` and
   then deletes the branch. `Cleanable` has one variant, `MergedOrClosed`, so no
   code path can delete the worktree of a live issue by accident. There is no
