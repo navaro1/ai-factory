@@ -511,24 +511,13 @@ fn start_v4_ui(
             }
         }
     }
+    if detach {
+        return start_v4_ui_detached(root, &session, graph);
+    }
     let layout = aif::layout::render_v4(graph, root)?;
     let layout_file =
         std::env::temp_dir().join(format!("aif-{session}-{}.kdl", std::process::id()));
     std::fs::write(&layout_file, layout)?;
-    if detach {
-        let status = std::process::Command::new("zellij")
-            .arg("--layout")
-            .arg(&layout_file)
-            .args(["attach", "--create-background", "--create", &session])
-            .status()
-            .context("failed to start detached zellij session")?;
-        let _ = std::fs::remove_file(&layout_file);
-        if !status.success() {
-            bail!("zellij failed to start detached session {session}");
-        }
-        println!("aif: session {session} started in the background");
-        return Ok(());
-    }
     let err = std::process::Command::new("zellij")
         .arg("--new-session-with-layout")
         .arg(&layout_file)
@@ -536,6 +525,105 @@ fn start_v4_ui(
         .arg(&session)
         .exec();
     bail!("failed to start zellij: {err}");
+}
+
+fn start_v4_ui_detached(root: &Path, session: &str, graph: &graph::Graph) -> Result<()> {
+    let status = std::process::Command::new("zellij")
+        .args(["attach", "--create-background", "--create", session])
+        .current_dir(root)
+        .status()
+        .context("failed to start detached zellij session")?;
+    if !status.success() {
+        bail!("zellij failed to start detached session {session}");
+    }
+
+    let configured = (|| -> Result<()> {
+        zellij_action(session, &["rename-tab", "--tab-id", "0", "Cockpit"])?;
+        zellij_action(
+            session,
+            &[
+                "new-pane",
+                "--in-place",
+                "--close-replaced-pane",
+                "--pane-id",
+                "terminal_0",
+                "--name",
+                "Cockpit",
+                "--cwd",
+                root.to_string_lossy().as_ref(),
+                "--",
+                "aif",
+                "tui",
+            ],
+        )?;
+        let _ = zellij_action(session, &["close-pane", "--pane-id", "plugin_3"]);
+
+        for node in graph
+            .nodes
+            .iter()
+            .filter(|node| node.exec == graph::Exec::Supervised)
+        {
+            let mut chars = node.name.chars();
+            let role = chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default();
+            let tab = zellij_action(
+                session,
+                &[
+                    "new-tab",
+                    "--name",
+                    &role,
+                    "--cwd",
+                    root.to_string_lossy().as_ref(),
+                ],
+            )?;
+            zellij_action(
+                session,
+                &[
+                    "new-pane",
+                    "--tab-id",
+                    &tab,
+                    "--name",
+                    &role,
+                    "--cwd",
+                    root.to_string_lossy().as_ref(),
+                    "--",
+                    "clauded",
+                    "--role",
+                    &role,
+                    "--model",
+                    &node.model,
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = configured {
+        let _ = std::process::Command::new("zellij")
+            .args(["kill-session", session])
+            .status();
+        return Err(err);
+    }
+    println!("aif: session {session} started in the background");
+    Ok(())
+}
+
+fn zellij_action(session: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("zellij")
+        .arg("--session")
+        .arg(session)
+        .arg("action")
+        .args(args)
+        .output()
+        .context("failed to run zellij action")?;
+    if !output.status.success() {
+        bail!(
+            "zellij action failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn render_zellij_theme(tokens_path: &Path, out: &Path, check: bool) -> Result<()> {
