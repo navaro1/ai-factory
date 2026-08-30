@@ -957,6 +957,32 @@ loop {
   requeues, otherwise fails the task and opens a Stuck decision.
 - Review success writes `.aif/reviewed-sha` only after the task reports
   success, never before.
+- Completion differs per runner and you must not treat them alike. For a
+  one-shot runner (opencode) a `TurnEnd` is only a step boundary, several
+  arrive per run, and the task completes on `Exit`. For an interactive runner
+  (claude) a `TurnEnd` ends a turn: an interactive task moves to `AwaitingUser`
+  and waits for the human, while a one-shot claude task completes.
+- YOLO POLICY. Set `job.yolo` from the stage's config, which defaults to true.
+  With yolo on, the claude runner auto-answers `allow` to ordinary tool asks
+  and they never reach you; only asks carrying `requires_user_interaction`
+  arrive, and those open a `Question` decision. With yolo off for a stage,
+  every ask arrives and opens a `Permission` decision. This is deliberately NOT
+  `--dangerously-skip-permissions`: that flag would close the control channel
+  and take AskUserQuestion with it, so the agents could no longer ask the human
+  anything. Never pass it.
+- Answering routes to four sinks and nowhere else: a `Permission` or `Question`
+  answer goes to the runner's `answer`; a chat message goes to the runner's
+  `send_user`; a `Stuck` answer retries or cancels the task; a `ReleaseGate`
+  answer fires the train. `NeedsHuman` is the one that touches GitHub rather
+  than a process: `Text` posts a comment and removes the label, `Cancel`
+  removes the label.
+- `Reconcile` sends on that repository's wake sender from chunk 4's `Pollers`,
+  which forces an early poll. Dropping a wake sender stops its poller, which is
+  the shutdown path.
+- `Refine` and `TicketCreate` from the UI create work directly rather than
+  waiting for a gate: `Refine` queues a refine task for the named issue, and
+  `TicketCreate` starts an interactive claude session whose prompt tells it to
+  create a ticket with `gh`.
 - Contracts the decisions module imposes on you, reported by its author:
   - A `ReleaseGate` row snapshots its pull request list when it opens. If the
     stacked set changes while that row is open, you must take the row and push
