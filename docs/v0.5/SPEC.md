@@ -367,8 +367,12 @@ not edit `src/model.rs`.
   and the same for `pulls`. It sends `-H "If-None-Match: <etag>"` when it holds
   an ETag for that page. It parses the response head and body from the `-i`
   output: split on the first blank line, read `ETag`, `Link`, and the status
-  line. On `304` it reports the page unchanged. It follows pagination until a
-  page returns fewer than 100 items or the `Link` header has no `rel="next"`.
+  line. On `304` it reports the page unchanged and REUSES the cached entries for it.
+  A 304 must NOT end the walk: page 1 can be unchanged while page 2 carries a
+  label edit, and label edits drive every gate. So cache, beside each page's
+  ETag, whether that page was full and whether its `Link` head named a next
+  page; on a 304 consult those two cached flags to decide whether to continue.
+  The walk ends only when a page is known to be short or to have no next page.
 - The issues endpoint returns pull requests too. Drop any issue object that has
   a `pull_request` key.
 - Command execution goes through the `Exec` trait from chunk 2's `src/exec.rs`.
