@@ -12,9 +12,15 @@ pub fn list_sessions() -> Result<Vec<String>> {
     let text = String::from_utf8_lossy(&out.stdout);
     Ok(text
         .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::to_owned)
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty())
         .collect())
+}
+
+pub fn session_line<'a>(sessions: &'a [String], session: &str) -> Option<&'a String> {
+    sessions
+        .iter()
+        .find(|line| line.split_whitespace().next() == Some(session))
 }
 
 pub fn dump_screen(session: &str, pane: &str) -> Option<String> {

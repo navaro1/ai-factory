@@ -186,3 +186,11 @@ git push --tags
   Start the session again, or type the prompt by hand.
 - The draft mechanism depends on zellij actions
   (`write-chars`, `dump-screen` with `--pane-id`).
+- systemd-oomd can kill a whole terminal scope under memory pressure,
+  taking every factory started from that terminal with it. `aif start`
+  therefore runs the session inside its own user scope,
+  `aif-<repo>-factory`. Five agent TUIs are heavy; avoid running several
+  factories plus a browser in one user session, or raise the oomd
+  thresholds. To shield a factory further:
+  `systemctl --user edit --runtime aif-<repo>-factory.scope` and set
+  `ManagedOOMPreference=avoid`.

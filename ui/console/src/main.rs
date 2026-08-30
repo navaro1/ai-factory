@@ -195,7 +195,6 @@ fn start_factory(skip: Option<&str>) -> Result<()> {
             }
         }
     }
-
     let skip_items: Vec<String> = skip
         .map(|raw| raw.split(',').map(str::to_owned).collect())
         .unwrap_or_default();
@@ -224,12 +223,33 @@ fn start_factory(skip: Option<&str>) -> Result<()> {
         std::env::temp_dir().join(format!("aif-{session}-{}.kdl", std::process::id()));
     std::fs::write(&layout_file, &rendered)?;
 
-    let err = std::process::Command::new("zellij")
-        .arg("--new-session-with-layout")
-        .arg(&layout_file)
-        .arg("--session")
-        .arg(&session)
-        .exec();
+    let layout_arg = layout_file.display().to_string();
+    let isolated = std::process::Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    let err = if isolated {
+        eprintln!("aif: starting {session} in its own user scope aif-{session}");
+        std::process::Command::new("systemd-run")
+            .args(["--user", "--scope"])
+            .arg(format!("--unit=aif-{session}"))
+            .args([
+                "zellij",
+                "--new-session-with-layout",
+                &layout_arg,
+                "--session",
+                &session,
+            ])
+            .exec()
+    } else {
+        std::process::Command::new("zellij")
+            .arg("--new-session-with-layout")
+            .arg(&layout_file)
+            .arg("--session")
+            .arg(&session)
+            .exec()
+    };
     bail!("failed to start zellij: {err}");
 }
 

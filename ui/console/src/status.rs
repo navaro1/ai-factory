@@ -76,15 +76,18 @@ pub fn report() -> Result<StatusReport> {
     let root = repo_root()?;
     let session = session_name(&root);
     let sessions = zellij::list_sessions()?;
-    let running = sessions.iter().any(|s| s == &session);
-    if !running {
-        bail!("session {session} is not running; start it with: ai-factory");
+    if let Some(line) = zellij::session_line(&sessions, &session) {
+        if line.contains("EXITED") {
+            bail!("session {session} is dead (EXITED); run `aif start` to restart it");
+        }
+    } else {
+        bail!("session {session} is not running; start it with: aif start");
     }
     let registry = registry_roles(&session);
     let panes = probe_panes(&session, &registry);
     Ok(StatusReport {
         session,
-        running,
+        running: true,
         panes,
     })
 }
