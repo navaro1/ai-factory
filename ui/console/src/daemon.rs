@@ -379,9 +379,13 @@ impl Daemon {
             self.stale_source = true;
             return;
         }
-        let changed = apply_batch(&mut self.snapshot, obs.items);
+        let changed = apply_batch(&mut self.snapshot, obs.items.clone());
         if !changed.is_empty() || obs.forced {
             self.stale_source = false;
+            let _ = self.append(Rec::SourceBatch {
+                items: obs.items,
+                forced: obs.forced,
+            });
         }
         let ready = self.gates.apply(&self.graph, &self.snapshot, &changed);
         for work in ready {
@@ -1746,5 +1750,120 @@ mod tests {
             .find(|t| t["node"] == "releaser")
             .unwrap();
         assert_eq!(releaser["state"], "failed", "no pane without a session");
+    }
+}
+
+#[cfg(test)]
+mod replay_gate_tests {
+    use super::*;
+    use crate::harness::{fake_adapter, HarnessSignal};
+
+    fn item(node_id: &str, number: u64, labels: &[&str]) -> ItemState {
+        ItemState {
+            repo_id: 1,
+            node_id: node_id.into(),
+            kind: ItemKind::Issue,
+            number,
+            title: format!("item {number}"),
+            open: true,
+            draft: false,
+            labels: labels.iter().map(|s| (*s).to_owned()).collect(),
+            blocked_by: vec![],
+            head: None,
+        }
+    }
+
+    fn base_graph() -> Graph {
+        use crate::graph::conditions::Condition;
+        use crate::graph::{Agent, Exec, NodeSpec};
+        Graph {
+            version: 4,
+            tick_secs: 600,
+            limit: 2,
+            nodes: vec![NodeSpec {
+                name: "refiner".into(),
+                agent: Agent::Codex,
+                model: "test/model".into(),
+                exec: Exec::Auto,
+                when: Some(Condition::parse("issue has label 'to-refine'").unwrap()),
+                prompt: Some("prompts/x.md".into()),
+                limit: None,
+                retrigger: crate::graph::Retrigger::Gate,
+            }],
+            edges: vec![],
+        }
+    }
+
+    fn build(
+        tmp: &std::path::Path,
+        graph: Graph,
+        records: Vec<crate::journal::Record>,
+    ) -> (Daemon, Receiver<AdapterEvent>) {
+        let paths = FactoryPaths::from_id_with_base(
+            tmp,
+            "0123456789abcdef",
+            &tmp.join("state"),
+            &tmp.join("run"),
+        );
+        paths.ensure().unwrap();
+        std::fs::create_dir_all(paths.root.join("prompts")).unwrap();
+        std::fs::write(paths.root.join("prompts/x.md"), "work on {gh_ticket_no}").unwrap();
+        paths.write_trust(true).unwrap();
+        let (tx, rx) = channel::<AdapterEvent>();
+        let (codex, _handle) = fake_adapter("codex", tx);
+        let journal = Journal::open(&paths.journal()).unwrap().0;
+        (
+            Daemon::new(
+                paths,
+                graph,
+                journal,
+                vec![("codex", codex)],
+                noop_supervised(),
+                temp_worktrees(),
+                records,
+            )
+            .unwrap(),
+            rx,
+        )
+    }
+
+    fn drain(daemon: &mut Daemon, rx: &Receiver<AdapterEvent>) {
+        while let Ok(event) = rx.try_recv() {
+            daemon.on_adapter("codex", event);
+        }
+    }
+
+    #[test]
+    fn restart_keeps_gate_generations_without_duplicates() {
+        let tmp = std::env::temp_dir().join(format!("aif-replay-{}", ids::new_id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (mut daemon, rx) = build(&tmp, base_graph(), Vec::new());
+        daemon.observe(Observation {
+            items: vec![item("I_1", 1, &["to-refine"])],
+            forced: true,
+            stale: false,
+        });
+        drain(&mut daemon, &rx);
+        let first = daemon.status_json();
+        assert_eq!(first["tasks"].as_array().unwrap().len(), 1);
+        let path = daemon.paths.journal();
+        drop(daemon);
+
+        let (_, records) = Journal::open(&path).unwrap();
+        let (mut second, rx2) = build(&tmp, base_graph(), records);
+        drain(&mut second, &rx2);
+        second.observe(Observation {
+            items: vec![item("I_1", 1, &["to-refine"])],
+            forced: false,
+            stale: false,
+        });
+        drain(&mut second, &rx2);
+        let after = second.status_json();
+        assert_eq!(
+            after["tasks"].as_array().unwrap().len(),
+            1,
+            "unchanged batch after restart creates no duplicate task"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
