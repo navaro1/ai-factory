@@ -118,8 +118,28 @@ opencode run --format json --auto --agent build -m <provider>/<model> \
 ```
 
 `--format json` writes NDJSON, one object per line. Observed line types:
-`step_start`, `text`, `step_finish`. Every line carries `sessionID` and a
-`part` object. A `text` line holds the assistant text at `part.text`.
+`step_start`, `text`, `step_finish`, and `tool_use`. Every line carries
+`sessionID` and a `part` object. A `text` line holds the assistant text at
+`part.text`.
+
+A `tool_use` line, probed on this machine, looks like this:
+
+```json
+{"type":"tool_use","timestamp":1788091541442,"sessionID":"ses_...",
+ "part":{"type":"tool","tool":"read","callID":"call_...",
+   "state":{"status":"completed","input":{"filePath":"..."},
+            "output":"...","metadata":{...},"time":{...},"title":"..."}}}
+```
+
+So the line type is `tool_use`, the part type is `tool`, the tool name is at
+`part.tool`, and the call's status, input and output live under `part.state`.
+Note the mismatch: the LINE says `tool_use` while the PART says `tool`. Match
+on the part, not only on the line type.
+
+One run emits SEVERAL `step_finish` lines, one per step, and exits once. So for
+opencode a step ending is not the task ending: task completion is the process
+`Exit`, never a `TurnEnd`. This differs from claude, where a `result` line ends
+a turn and an interactive task then waits for the human.
 
 Both provider routes are confirmed to work on this machine:
 `zai-coding-plan/glm-5.3-flash` and `openai/gpt-5.6-sol --variant xhigh`.
