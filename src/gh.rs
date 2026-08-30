@@ -9,7 +9,7 @@ use std::fmt;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
-use crate::exec::Exec;
+use crate::exec::{CmdOut, Exec};
 use crate::model::{Issue, Pr};
 
 /// The page size every list request asks for.
@@ -37,17 +37,16 @@ impl fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
-/// One fetched list: the items of every page that changed, plus the pages
-/// that answered 304.
+/// One fetched list with all current items and the pages that answered 304.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collection<T> {
-    /// The items of the pages that returned 200, keyed by number.
-    pub changed: BTreeMap<u64, T>,
+    /// All current items, keyed by number.
+    pub items: BTreeMap<u64, T>,
     /// The numbers of the pages that answered 304, in fetch order.
     pub unchanged: Vec<u64>,
 }
 
-/// Which GitHub list a page belongs to; half of the ETag cache key.
+/// Which GitHub list a page belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ListKind {
     /// The issues endpoint. It also returns pull requests; the reader drops
@@ -68,26 +67,29 @@ impl ListKind {
 }
 
 /// What the reader remembers about one page.
-#[derive(Debug, Clone)]
-struct CachedPage {
+#[derive(Debug)]
+struct CachedPage<T> {
     /// The ETag of the last 200 answer; the next request sends it as
     /// `If-None-Match`.
-    etag: String,
+    etag: Option<String>,
     /// The page held exactly [`PAGE_SIZE`] items at its last 200.
     full: bool,
     /// The `Link` head named a `rel="next"` page at its last 200.
     next: bool,
+    /// The mapped entries from the last successful response for this page.
+    items: BTreeMap<u64, T>,
 }
 
 /// A GitHub reader for one poller thread.
 ///
 /// The client runs `gh api` through the [`Exec`] indirection and remembers,
-/// per list and page, the ETag of the last 200 answer and the two pagination
-/// flags learned from it. The next request for that page sends
+/// per repository, list, and page, the ETag and the last mapped entries.
+/// The next request for that page sends
 /// `If-None-Match`. A page that answers 304 keeps its cache entry.
 pub struct GhClient<'a> {
     exec: &'a dyn Exec,
-    pages: BTreeMap<(ListKind, u64), CachedPage>,
+    issue_pages: BTreeMap<(String, u64), CachedPage<Issue>>,
+    pull_pages: BTreeMap<(String, u64), CachedPage<Pr>>,
 }
 
 impl<'a> GhClient<'a> {
@@ -95,7 +97,8 @@ impl<'a> GhClient<'a> {
     pub fn new(exec: &'a dyn Exec) -> Self {
         GhClient {
             exec,
-            pages: BTreeMap::new(),
+            issue_pages: BTreeMap::new(),
+            pull_pages: BTreeMap::new(),
         }
     }
 
@@ -105,44 +108,41 @@ impl<'a> GhClient<'a> {
     /// drops them. A 304 page is reported in `unchanged`, and the walk goes
     /// on while the cached flags of that page know a next page.
     pub fn fetch_issues(&mut self, owner_repo: &str) -> Result<Collection<Issue>> {
-        self.fetch_list(owner_repo, ListKind::Issues, issue_from_value)
+        Self::fetch_list(
+            self.exec,
+            &mut self.issue_pages,
+            owner_repo,
+            ListKind::Issues,
+            issue_from_value,
+        )
     }
 
     /// Fetch the open pull requests of `owner_repo` and follow pagination.
     pub fn fetch_pulls(&mut self, owner_repo: &str) -> Result<Collection<Pr>> {
-        self.fetch_list(owner_repo, ListKind::Pulls, |value| {
-            Ok(Some(pr_from_value(value)?))
-        })
+        Self::fetch_list(
+            self.exec,
+            &mut self.pull_pages,
+            owner_repo,
+            ListKind::Pulls,
+            |value| Ok(Some(pr_from_value(value)?)),
+        )
     }
 
-    /// The stored ETag of one issues page.
-    pub fn issue_etag(&self, page: u64) -> Option<&str> {
-        self.pages
-            .get(&(ListKind::Issues, page))
-            .map(|cached| cached.etag.as_str())
-    }
-
-    /// The stored ETag of one pull requests page.
-    pub fn pull_etag(&self, page: u64) -> Option<&str> {
-        self.pages
-            .get(&(ListKind::Pulls, page))
-            .map(|cached| cached.etag.as_str())
-    }
-
-    /// Fetch every page of one list and merge the changed pages.
+    /// Fetch every page of one list and merge its current items.
     ///
     /// The walk goes to the next page while the current page is known to
     /// carry one: a 200 with exactly [`PAGE_SIZE`] items and a `Link` head
-    /// that names `rel="next"`, or a 304 whose cached flags say both. A 304
-    /// without a cache entry stops the walk instead of looping.
-    fn fetch_list<T>(
-        &mut self,
+    /// that names `rel="next"`, or a 304 whose cached flags say both. The
+    /// method rejects a 304 without a cache entry.
+    fn fetch_list<T: Clone>(
+        exec: &dyn Exec,
+        pages: &mut BTreeMap<(String, u64), CachedPage<T>>,
         owner_repo: &str,
         kind: ListKind,
         map_item: impl Fn(&Value) -> Result<Option<T>>,
     ) -> Result<Collection<T>> {
         let mut fetched = Collection {
-            changed: BTreeMap::new(),
+            items: BTreeMap::new(),
             unchanged: Vec::new(),
         };
         let mut page: u64 = 1;
@@ -150,27 +150,30 @@ impl<'a> GhClient<'a> {
             let path = kind.path();
             let url =
                 format!("repos/{owner_repo}/{path}?state=open&per_page={PAGE_SIZE}&page={page}");
-            let cached = self.pages.get(&(kind, page)).cloned();
+            let key = (owner_repo.to_string(), page);
             let mut args: Vec<&str> = vec!["api", "-i"];
             let header;
-            if let Some(cached_page) = &cached {
-                header = format!("If-None-Match: {}", cached_page.etag);
+            if let Some(etag) = pages.get(&key).and_then(|cached| cached.etag.as_deref()) {
+                header = format!("If-None-Match: {etag}");
                 args.push("-H");
                 args.push(&header);
             }
             args.extend(["-X", "GET", url.as_str()]);
-            let out = self
-                .exec
+            let out = exec
                 .run("gh", &args, None)
                 .context("gh api failed to run")?;
-            let response = parse_response(&out.stdout)?;
-            ensure_ok(&response, &out.stderr)?;
+            let response = checked_response(&out)?;
             if response.status == 304 {
                 // A 304 says only that this page is byte-identical. Pages
                 // after it can still carry changes, so the walk continues
                 // while the cached flags know a next page.
                 fetched.unchanged.push(page);
-                if !cached.is_some_and(|entry| entry.full && entry.next) {
+                let cached = pages.get(&key).ok_or_else(|| {
+                    anyhow!("gh api returned 304 for page {page} with no cached page")
+                })?;
+                let has_next = cached.full && cached.next;
+                fetched.items.extend(cached.items.clone());
+                if !has_next {
                     break;
                 }
                 page += 1;
@@ -180,27 +183,23 @@ impl<'a> GhClient<'a> {
                 .context("gh api returned a body that is not a JSON array")?;
             let full = items.len() == PAGE_SIZE;
             let next = response.link_next;
-            match &response.etag {
-                Some(etag) => {
-                    self.pages.insert(
-                        (kind, page),
-                        CachedPage {
-                            etag: etag.clone(),
-                            full,
-                            next,
-                        },
-                    );
-                }
-                None => {
-                    self.pages.remove(&(kind, page));
-                }
-            }
+            let mut page_items = BTreeMap::new();
             for item in &items {
                 let number = u64_field(item, "number")?;
                 if let Some(mapped) = map_item(item)? {
-                    fetched.changed.insert(number, mapped);
+                    page_items.insert(number, mapped);
                 }
             }
+            fetched.items.extend(page_items.clone());
+            pages.insert(
+                key,
+                CachedPage {
+                    etag: response.etag,
+                    full,
+                    next,
+                    items: page_items,
+                },
+            );
             if !full || !next {
                 break;
             }
@@ -213,25 +212,31 @@ impl<'a> GhClient<'a> {
     pub fn add_label(&self, owner_repo: &str, number: u64, label: &str) -> Result<()> {
         let url = format!("repos/{owner_repo}/issues/{number}/labels");
         let field = format!("labels[]={label}");
-        let args = ["api", "-X", "POST", url.as_str(), "-f", field.as_str()];
+        let args = [
+            "api",
+            "-i",
+            "-X",
+            "POST",
+            url.as_str(),
+            "-f",
+            field.as_str(),
+        ];
         let out = self
             .exec
             .run("gh", &args, None)
             .context("gh api failed to run")?;
-        let response = parse_response(&out.stdout)?;
-        ensure_ok(&response, &out.stderr)
+        checked_response(&out).map(|_| ())
     }
 
     /// Remove one label from an issue or a pull request.
     pub fn remove_label(&self, owner_repo: &str, number: u64, label: &str) -> Result<()> {
         let url = format!("repos/{owner_repo}/issues/{number}/labels/{label}");
-        let args = ["api", "-X", "DELETE", url.as_str()];
+        let args = ["api", "-i", "-X", "DELETE", url.as_str()];
         let out = self
             .exec
             .run("gh", &args, None)
             .context("gh api failed to run")?;
-        let response = parse_response(&out.stdout)?;
-        ensure_ok(&response, &out.stderr)
+        checked_response(&out).map(|_| ())
     }
 
     /// Create an issue and return the issue GitHub answered with.
@@ -241,6 +246,7 @@ impl<'a> GhClient<'a> {
         let body_field = format!("body={body}");
         let args = [
             "api",
+            "-i",
             "-X",
             "POST",
             url.as_str(),
@@ -253,8 +259,7 @@ impl<'a> GhClient<'a> {
             .exec
             .run("gh", &args, None)
             .context("gh api failed to run")?;
-        let response = parse_response(&out.stdout)?;
-        ensure_ok(&response, &out.stderr)?;
+        let response = checked_response(&out)?;
         let value: Value = serde_json::from_str(&response.body)
             .context("gh api returned a broken create_issue body")?;
         issue_from_value(&value)?
@@ -270,6 +275,20 @@ struct Response {
     link_next: bool,
     retry_after: Option<u64>,
     body: String,
+}
+
+/// Parse one command output and reject command or HTTP failures.
+fn checked_response(out: &CmdOut) -> Result<Response> {
+    let response = parse_response(&out.stdout).with_context(|| {
+        let detail = out.stderr.lines().next().unwrap_or("no stderr");
+        format!("gh api exited with status {}: {detail}", out.status)
+    })?;
+    ensure_ok(&response, &out.stderr)?;
+    if out.status != 0 {
+        let detail = out.stderr.lines().next().unwrap_or("no stderr");
+        bail!("gh api exited with status {}: {detail}", out.status);
+    }
+    Ok(response)
 }
 
 /// Parse the response head and body out of the raw `gh api -i` output.
@@ -347,7 +366,7 @@ fn issue_from_value(value: &Value) -> Result<Option<Issue>> {
         number: u64_field(value, "number")?,
         node_id: str_field(value, "node_id")?.to_string(),
         title: str_field(value, "title")?.to_string(),
-        body: optional_str(value, "body").to_string(),
+        body: nullable_str(value, "body")?.to_string(),
         labels: label_names(value)?,
         open: state_is_open(value)?,
     }))
@@ -359,14 +378,14 @@ fn pr_from_value(value: &Value) -> Result<Pr> {
         number: u64_field(value, "number")?,
         node_id: str_field(value, "node_id")?.to_string(),
         title: str_field(value, "title")?.to_string(),
-        body: optional_str(value, "body").to_string(),
+        body: nullable_str(value, "body")?.to_string(),
         labels: label_names(value)?,
         open: state_is_open(value)?,
-        draft: value.get("draft").and_then(Value::as_bool).unwrap_or(false),
+        draft: bool_field(value, "draft")?,
         head_sha: value
             .pointer("/head/sha")
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow!("GitHub object has no string field \"head.sha\""))?
             .to_string(),
     })
 }
@@ -387,16 +406,31 @@ fn u64_field(value: &Value, key: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("GitHub object has no number field \"{key}\""))
 }
 
-/// The string value of `key`; empty when the key is absent or null.
-fn optional_str<'v>(value: &'v Value, key: &str) -> &'v str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
+/// The string value of `key`; an explicit null becomes an empty string.
+fn nullable_str<'v>(value: &'v Value, key: &str) -> Result<&'v str> {
+    match value.get(key) {
+        Some(Value::String(text)) => Ok(text),
+        Some(Value::Null) => Ok(""),
+        _ => Err(anyhow!(
+            "GitHub object has no string or null field \"{key}\""
+        )),
+    }
+}
+
+/// The boolean value of `key`, or an error when the key is missing.
+fn bool_field(value: &Value, key: &str) -> Result<bool> {
+    value
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("GitHub object has no boolean field \"{key}\""))
 }
 
 /// The label names of one GitHub object.
 fn label_names(value: &Value) -> Result<Vec<String>> {
-    let Some(labels) = value.get("labels").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
+    let labels = value
+        .get("labels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("GitHub object has no array field \"labels\""))?;
     labels
         .iter()
         .map(|label| Ok(str_field(label, "name")?.to_string()))
@@ -405,7 +439,11 @@ fn label_names(value: &Value) -> Result<Vec<String>> {
 
 /// Whether the GitHub object is in the open state.
 fn state_is_open(value: &Value) -> Result<bool> {
-    Ok(str_field(value, "state")? == "open")
+    match str_field(value, "state")? {
+        "open" => Ok(true),
+        "closed" => Ok(false),
+        state => bail!("GitHub object has unknown state \"{state}\""),
+    }
 }
 
 #[cfg(test)]
@@ -464,13 +502,12 @@ mod tests {
         let fetched = client.fetch_issues("acme/borsuk").unwrap();
 
         assert!(fetched.unchanged.is_empty());
-        assert_eq!(fetched.changed.len(), 2);
-        let one = &fetched.changed[&1];
+        assert_eq!(fetched.items.len(), 2);
+        let one = &fetched.items[&1];
         assert_eq!(one.title, "issue 1");
         assert_eq!(one.node_id, "node-1");
         assert_eq!(one.body, "body 1");
         assert!(one.open);
-        assert_eq!(client.issue_etag(1), Some("\"e1\""));
         let calls = exec.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, "gh");
@@ -520,9 +557,44 @@ mod tests {
         let second = client.fetch_issues("acme/borsuk").unwrap();
 
         assert_eq!(second.unchanged, vec![1]);
-        assert!(second.changed.is_empty());
-        assert_eq!(client.issue_etag(1), Some("\"v1\""));
+        assert_eq!(second.items.len(), 1);
         assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn an_etag_from_one_repository_is_not_sent_to_another_repository() {
+        let exec = ScriptExec::new()
+            .expect(
+                |call| call.program == "gh",
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"repo-a\""],
+                    &issues_json(1, 1),
+                )),
+            )
+            .expect(
+                |call| call.program == "gh",
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"repo-b\""],
+                    &issues_json(2, 2),
+                )),
+            );
+        let mut client = GhClient::new(&exec);
+
+        client.fetch_issues("acme/one").unwrap();
+        client.fetch_issues("acme/two").unwrap();
+
+        assert_eq!(
+            exec.calls()[1].argv(),
+            [
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/two/issues?state=open&per_page=100&page=1"
+            ]
+        );
     }
 
     #[test]
@@ -555,10 +627,10 @@ mod tests {
                 CmdOut::ok("HTTP/2 304\r\n\r\nTHIS IS NOT JSON {"),
             );
         let mut client = GhClient::new(&exec);
-        client.fetch_issues("acme/borsuk").unwrap();
+        let first = client.fetch_issues("acme/borsuk").unwrap();
         let second = client.fetch_issues("acme/borsuk").unwrap();
 
-        assert!(second.changed.is_empty());
+        assert_eq!(second.items, first.items);
         assert_eq!(second.unchanged, vec![1]);
     }
 
@@ -626,15 +698,14 @@ mod tests {
         let second = client.fetch_issues("acme/borsuk").unwrap();
 
         assert_eq!(second.unchanged, vec![1]);
-        assert_eq!(second.changed.len(), 1);
-        assert_eq!(second.changed[&101].labels, vec!["refined".to_string()]);
-        assert_eq!(client.issue_etag(1), Some("\"p1\""));
-        assert_eq!(client.issue_etag(2), Some("\"p2b\""));
+        assert_eq!(second.items.len(), 101);
+        assert_eq!(second.items[&101].labels, vec!["refined".to_string()]);
         assert_eq!(exec.calls().len(), 4);
     }
 
     #[test]
     fn a_304_page_known_to_be_short_ends_the_walk() {
+        let next_link = "link: <https://api.github.com/repositories/1/issues?page=2>; rel=\"next\"";
         let exec = ScriptExec::new()
             .expect(
                 gh(&[
@@ -646,7 +717,7 @@ mod tests {
                 ]),
                 CmdOut::ok(response(
                     "HTTP/2 200",
-                    &["etag: \"s1\""],
+                    &["etag: \"s1\"", next_link],
                     &issues_json(1, 1),
                 )),
             )
@@ -667,12 +738,12 @@ mod tests {
         let second = client.fetch_issues("acme/borsuk").unwrap();
 
         assert_eq!(second.unchanged, vec![1]);
-        assert!(second.changed.is_empty());
+        assert_eq!(second.items.len(), 1);
         assert_eq!(exec.calls().len(), 2);
     }
 
     #[test]
-    fn an_unknown_page_that_answers_304_ends_the_walk() {
+    fn a_304_without_a_cached_page_is_an_error() {
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
@@ -684,10 +755,9 @@ mod tests {
             CmdOut::ok("HTTP/2 304\r\n\r\n"),
         );
         let mut client = GhClient::new(&exec);
-        let fetched = client.fetch_issues("acme/borsuk").unwrap();
+        let error = client.fetch_issues("acme/borsuk").unwrap_err();
 
-        assert_eq!(fetched.unchanged, vec![1]);
-        assert!(fetched.changed.is_empty());
+        assert!(error.to_string().contains("no cached page"));
         assert_eq!(exec.calls().len(), 1);
     }
 
@@ -728,12 +798,10 @@ mod tests {
         let mut client = GhClient::new(&exec);
         let fetched = client.fetch_issues("acme/borsuk").unwrap();
 
-        assert_eq!(fetched.changed.len(), 103);
-        assert!(fetched.changed.contains_key(&1));
-        assert!(fetched.changed.contains_key(&103));
+        assert_eq!(fetched.items.len(), 103);
+        assert!(fetched.items.contains_key(&1));
+        assert!(fetched.items.contains_key(&103));
         assert!(fetched.unchanged.is_empty());
-        assert_eq!(client.issue_etag(1), Some("\"p1\""));
-        assert_eq!(client.issue_etag(2), Some("\"p2\""));
         let calls = exec.calls();
         assert_eq!(calls.len(), 2);
         assert!(calls[1]
@@ -742,26 +810,41 @@ mod tests {
     }
 
     #[test]
-    fn a_full_page_without_a_next_link_ends_pagination() {
-        let exec = ScriptExec::new().expect(
-            gh(&[
-                "api",
-                "-i",
-                "-X",
-                "GET",
-                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
-            ]),
-            CmdOut::ok(response(
-                "HTTP/2 200",
-                &["etag: \"p1\""],
-                &issues_json(1, 100),
-            )),
-        );
+    fn a_304_page_without_a_cached_next_link_ends_pagination() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"p1\""],
+                    &issues_json(1, 100),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"p1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &[], "")),
+            );
         let mut client = GhClient::new(&exec);
+        client.fetch_issues("acme/borsuk").unwrap();
         let fetched = client.fetch_issues("acme/borsuk").unwrap();
 
-        assert_eq!(fetched.changed.len(), 100);
-        assert_eq!(exec.calls().len(), 1);
+        assert_eq!(fetched.items.len(), 100);
+        assert_eq!(fetched.unchanged, vec![1]);
+        assert_eq!(exec.calls().len(), 2);
     }
 
     #[test]
@@ -784,8 +867,8 @@ mod tests {
         let mut client = GhClient::new(&exec);
         let fetched = client.fetch_issues("acme/borsuk").unwrap();
 
-        assert_eq!(fetched.changed.len(), 1);
-        assert!(fetched.changed.contains_key(&8));
+        assert_eq!(fetched.items.len(), 1);
+        assert!(fetched.items.contains_key(&8));
     }
 
     #[test]
@@ -798,7 +881,11 @@ mod tests {
                 "GET",
                 "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
             ]),
-            CmdOut::ok(response("HTTP/2 403", &["retry-after: 60"], "{}")),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 403", &["retry-after: 60"], "{}"),
+                stderr: "HTTP 403\n".into(),
+            },
         );
         let mut client = GhClient::new(&exec);
         let err = client.fetch_issues("acme/borsuk").unwrap_err();
@@ -818,7 +905,11 @@ mod tests {
                 "GET",
                 "repos/acme/borsuk/pulls?state=open&per_page=100&page=1",
             ]),
-            CmdOut::ok(response("HTTP/2 429", &["retry-after: 7"], "{}")),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 429", &["retry-after: 7"], "{}"),
+                stderr: "HTTP 429\n".into(),
+            },
         );
         let mut client = GhClient::new(&exec);
         let err = client.fetch_pulls("acme/borsuk").unwrap_err();
@@ -850,6 +941,29 @@ mod tests {
     }
 
     #[test]
+    fn a_command_failure_without_a_response_head_keeps_stderr() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "authentication failed\n".into(),
+            },
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_issues("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("authentication failed"));
+    }
+
+    #[test]
     fn fetch_pulls_maps_draft_and_head_sha() {
         let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"open","labels":[{"name":"release-stacked"},{"name":"x"}],"draft":true,"head":{"sha":"abc123"}}"#;
         let exec = ScriptExec::new().expect(
@@ -869,7 +983,7 @@ mod tests {
         let mut client = GhClient::new(&exec);
         let fetched = client.fetch_pulls("acme/borsuk").unwrap();
 
-        let pr = &fetched.changed[&5];
+        let pr = &fetched.items[&5];
         assert!(pr.draft);
         assert_eq!(pr.head_sha, "abc123");
         assert_eq!(
@@ -878,8 +992,87 @@ mod tests {
         );
         assert_eq!(pr.body, "");
         assert!(pr.open);
-        assert_eq!(client.pull_etag(1), Some("\"pr1\""));
-        assert_eq!(client.issue_etag(1), None);
+    }
+
+    #[test]
+    fn a_pull_without_a_draft_field_is_rejected() {
+        let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"open","labels":[],"head":{"sha":"abc123"}}"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/pulls?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &[], &format!("[{pr_json}]"))),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_pulls("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("draft"));
+    }
+
+    #[test]
+    fn a_pull_without_a_head_sha_is_rejected() {
+        let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"open","labels":[],"draft":false,"head":{}}"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/pulls?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &[], &format!("[{pr_json}]"))),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_pulls("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("head.sha"));
+    }
+
+    #[test]
+    fn an_issue_without_labels_is_rejected() {
+        let issue =
+            r#"[{"number":1,"node_id":"node-1","title":"issue 1","body":"body","state":"open"}]"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &[], issue)),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_issues("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("labels"));
+    }
+
+    #[test]
+    fn an_unknown_item_state_is_rejected() {
+        let issue = r#"[{"number":1,"node_id":"node-1","title":"issue 1","body":"body","state":"unknown","labels":[]}]"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &[], issue)),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_issues("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("unknown state"));
     }
 
     #[test]
@@ -887,6 +1080,7 @@ mod tests {
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
+                "-i",
                 "-X",
                 "POST",
                 "repos/acme/borsuk/issues/7/labels",
@@ -904,6 +1098,7 @@ mod tests {
             calls[0].argv(),
             [
                 "api",
+                "-i",
                 "-X",
                 "POST",
                 "repos/acme/borsuk/issues/7/labels",
@@ -918,6 +1113,7 @@ mod tests {
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
+                "-i",
                 "-X",
                 "DELETE",
                 "repos/acme/borsuk/issues/7/labels/to-refine",
@@ -936,6 +1132,7 @@ mod tests {
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
+                "-i",
                 "-X",
                 "POST",
                 "repos/acme/borsuk/issues",
