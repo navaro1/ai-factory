@@ -432,9 +432,13 @@ once per transition.
     and every dependency is closed.
   - review: pull request is open and `draft` is true.
   - release: pull request is open and `draft` is false.
-- Dependencies come from the issue body. Parse `blocked by #12`,
-  `blocked-by #12`, and `depends on #12`, case-insensitive, and collect the
-  numbers. A dependency is met when that issue is absent from the open set.
+- Dependencies come from the issue body. Parse `blocked by`, `blocked-by`,
+  and `depends on`, case-insensitive. Each phrase introduces a LIST, not a
+  single number: collect every `#N` that follows it, separated by commas,
+  the word `and`, or plain spaces, and stop at the first token that is not a
+  separator or a `#N`. A body may carry several such phrases; collect them
+  all. So `blocked by #1, #2 and #3` yields 1, 2 and 3, and
+  `blocked by #1 then ship #9` yields only 1. A dependency is met when that issue is absent from the open set.
   Put this in `parse_blocked_by(body: &str) -> Vec<u64>`.
 - `GateTracker` holds the last seen truth per `(repo, stage, kind, number)` and
   emits `ReadyWork` only on a false to true edge. For the review stage the key
