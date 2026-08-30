@@ -310,6 +310,13 @@ impl SessionView {
         self.task_id() == Some(task_id)
     }
 
+    /// The text in the input bar.
+    ///
+    /// The shell and the tests read it to check what a key press typed.
+    pub fn input_text(&self) -> &str {
+        &self.input
+    }
+
     /// Show `task` in the view.
     ///
     /// The first call, and every call with a new task id or log path,

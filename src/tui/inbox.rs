@@ -206,6 +206,21 @@ impl Inbox {
         self.selected_id = oldest_decision(state).map(|decision| decision.id.clone());
     }
 
+    /// The id of the selected row.
+    ///
+    /// The shell and the tests read it to check where the selection sits.
+    pub fn selected_id(&self) -> Option<&str> {
+        self.selected_id.as_deref()
+    }
+
+    /// True while the reason input holds the keyboard.
+    ///
+    /// The shell keeps every key away from the global handler while the
+    /// operator types a reason.
+    pub fn typing(&self) -> bool {
+        self.input.is_some()
+    }
+
     /// Handle one key while the inbox view is open.
     ///
     /// The call sends at most one action to `sink` and returns what the

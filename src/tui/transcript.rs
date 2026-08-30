@@ -12,40 +12,41 @@
 //! A line that parses to nothing known renders as a dim raw line. Verified
 //! claude subagent output is excluded. No input can panic the renderer.
 
-use ratatui::style::{Color, Modifier, Style};
+use super::theme::THEME;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 /// The style of ordinary assistant text.
 pub fn assistant_style() -> Style {
-    Style::default()
+    Style::default().fg(THEME.text)
 }
 
 /// The style of dimmed lines: tools, system notes, and raw fallbacks.
 pub fn dim_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+    Style::default().fg(THEME.dim).add_modifier(Modifier::DIM)
 }
 
 /// The style of text the human typed into the session.
 pub fn user_style() -> Style {
     Style::default()
-        .fg(Color::Cyan)
+        .fg(THEME.accent)
         .add_modifier(Modifier::BOLD)
 }
 
 /// The style of a successful result.
 pub fn ok_style() -> Style {
-    Style::default().fg(Color::Green)
+    Style::default().fg(THEME.ok)
 }
 
 /// The style of every marked failure.
 pub fn fail_style() -> Style {
-    Style::default().fg(Color::Red)
+    Style::default().fg(THEME.error)
 }
 
 /// The style of a pending ask for this task.
 pub fn ask_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(THEME.warn)
 }
 
 /// One parsed item of the transcript.
@@ -566,6 +567,7 @@ fn prefix_at_width(text: &str, width: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     /// The sum of the span widths of one rendered line.
     fn line_width(line: &Line<'_>) -> usize {
