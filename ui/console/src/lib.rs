@@ -8,6 +8,7 @@ pub mod ids;
 pub mod journal;
 pub mod layout;
 pub mod mem;
+pub mod ocserve;
 pub mod probe;
 pub mod runner;
 pub mod scheduler;
