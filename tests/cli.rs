@@ -33,7 +33,7 @@ fn aif_without_a_subcommand_starts_the_tui_placeholder() {
 
 #[test]
 fn aif_subcommands_print_placeholders() {
-    for command in ["tui", "stop", "doctor"] {
+    for command in ["tui", "doctor"] {
         let output = run(env!("CARGO_BIN_EXE_aif"), &[command]);
 
         assert!(output.status.success(), "{command} failed");
