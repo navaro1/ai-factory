@@ -53,7 +53,9 @@ pub enum DecisionKind {
     /// An item carries the `needs-human` label and waits for a human.
     ///
     /// The label can appear after the task ended, so this kind needs no
-    /// running task.
+    /// running task. The daemon routes the two answers: `Text` posts the
+    /// text as a comment on the item and removes the label. `Cancel`
+    /// removes the label without a comment.
     NeedsHuman {
         /// Whether the item is an issue or a pull request.
         kind: ItemKind,
@@ -87,7 +89,7 @@ impl DecisionKind {
             DecisionKind::Permission { .. } => "allow or deny",
             DecisionKind::Question { .. } => "answers or text",
             DecisionKind::Stuck { .. } => "retry or cancel",
-            DecisionKind::NeedsHuman { .. } => "text, retry, or cancel",
+            DecisionKind::NeedsHuman { .. } => "text or cancel",
             DecisionKind::ReleaseGate { .. } => "go",
         }
     }
@@ -193,6 +195,10 @@ pub enum Response {
         updated_input: serde_json::Value,
     },
     /// A free-text answer or instruction.
+    ///
+    /// On a `Question` the text folds into the answer for the agent. On a
+    /// `NeedsHuman` decision the daemon posts the text as a comment on the
+    /// item and removes the `needs-human` label.
     Text {
         /// The text the human typed.
         text: String,
@@ -232,10 +238,15 @@ impl Response {
 /// | `Permission` | `Allow`, `Deny` |
 /// | `Question` | `Answers`, `Text` |
 /// | `Stuck` | `Retry`, `Cancel` |
-/// | `NeedsHuman` | `Text`, `Retry`, `Cancel` |
+/// | `NeedsHuman` | `Text`, `Cancel` |
 /// | `ReleaseGate` | `Go` |
 ///
 /// Every other pairing is an error.
+///
+/// The daemon routes the two `NeedsHuman` answers: `Text` posts the text
+/// as a comment on the item and removes the `needs-human` label. `Cancel`
+/// removes the label without a comment. `Retry` is refused: the label can
+/// outlive the task that raised it, so there may be nothing to retry.
 pub fn validate(decision: &Decision, response: &Response) -> Result<()> {
     let legal = match response {
         Response::Allow => matches!(decision.kind, DecisionKind::Permission { .. }),
@@ -245,7 +256,8 @@ pub fn validate(decision: &Decision, response: &Response) -> Result<()> {
             decision.kind,
             DecisionKind::Question { .. } | DecisionKind::NeedsHuman { .. }
         ),
-        Response::Retry | Response::Cancel => matches!(
+        Response::Retry => matches!(decision.kind, DecisionKind::Stuck { .. }),
+        Response::Cancel => matches!(
             decision.kind,
             DecisionKind::Stuck { .. } | DecisionKind::NeedsHuman { .. }
         ),
@@ -627,7 +639,6 @@ mod tests {
             (STUCK, RETRY),
             (STUCK, CANCEL),
             (NEEDS_HUMAN, TEXT),
-            (NEEDS_HUMAN, RETRY),
             (NEEDS_HUMAN, CANCEL),
             (GATE, GO),
         ];
@@ -655,6 +666,38 @@ mod tests {
             }
         }
         assert_eq!(accepted, legal.len());
+    }
+
+    /// The needs-human row, for the routing tests below.
+    fn needs_human() -> Decision {
+        every_decision()[3].clone()
+    }
+
+    #[test]
+    fn needs_human_text_posts_a_comment_and_removes_the_label() {
+        let decision = needs_human();
+        validate(
+            &decision,
+            &Response::Text {
+                text: "run the seed jobs first".to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn needs_human_cancel_removes_the_label_without_a_comment() {
+        validate(&needs_human(), &Response::Cancel).unwrap();
+    }
+
+    #[test]
+    fn needs_human_refuses_retry_because_the_label_can_outlive_its_task() {
+        let error = validate(&needs_human(), &Response::Retry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs_human"), "message: {error}");
+        assert!(error.contains("retry"), "message: {error}");
+        assert!(error.contains("text or cancel"), "message: {error}");
     }
 
     #[test]
