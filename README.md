@@ -219,6 +219,11 @@ from prompt magic: run `aif graph init` once per repo to write a starter
 `.aif/graph.kdl`, then `aif run` dispatches on every tick. `aif start`
 prints a reminder when a repo has no graph file.
 
+`codexd` runs `--dangerously-bypass-approvals-and-sandbox` by default —
+the same auto-approve stance as `opencode --auto` — because worktrees and
+`gh` need writes and network outside the codex sandbox. Set
+`AIF_CODEX_YOLO=0` to fall back to `-a never` (auto-approve, sandboxed).
+
 ## Known limits
 
 - Claude shows a folder-trust dialog on first use in a new repository.
