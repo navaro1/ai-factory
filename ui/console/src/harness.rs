@@ -82,6 +82,9 @@ impl SharedClock {
     }
 
     pub fn idle_for(&self) -> Duration {
+        if !self.is_running() {
+            return Duration::ZERO;
+        }
         match &self.last_activity {
             Some(clock) => clock.lock().unwrap().elapsed(),
             None => Duration::ZERO,
@@ -289,5 +292,16 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(handle.jobs().len(), 1);
+    }
+
+    #[test]
+    fn stopped_clock_is_not_idle() {
+        let clock = SharedClock::new();
+        assert_eq!(clock.idle_for(), Duration::ZERO);
+        clock.set_running(true);
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(clock.idle_for() > Duration::ZERO);
+        clock.set_running(false);
+        assert_eq!(clock.idle_for(), Duration::ZERO);
     }
 }

@@ -208,10 +208,11 @@ impl Daemon {
                     self.tasks.insert(id.clone(), record);
                     self.order.push(id);
                 }
-                Rec::TaskTransition { id, to, .. } => {
+                Rec::TaskTransition { id, to, detail, .. } => {
                     if let Some(state) = TaskState::parse(&to) {
                         if let Some(task) = self.tasks.get_mut(&id) {
                             task.state = state;
+                            task.detail = detail;
                         }
                     }
                 }

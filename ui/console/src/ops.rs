@@ -272,11 +272,24 @@ pub fn stop_daemon(paths: &FactoryPaths, force: bool) -> Result<()> {
         println!("daemon is not running");
         return Ok(());
     }
-    let reply = control::request(
+    let reply = match control::request(
         &paths.socket(),
         "stop",
         serde_json::json!({ "force": force }),
-    )?;
+    ) {
+        Ok(reply) => reply,
+        Err(err) => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while factory::socket_alive(&paths.socket()) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !factory::socket_alive(&paths.socket()) {
+                println!("daemon stopped");
+                return Ok(());
+            }
+            return Err(err);
+        }
+    };
     if !reply.ok {
         bail!("{}", reply.error.map(|e| e.message).unwrap_or_default());
     }
