@@ -895,6 +895,19 @@ loop {
   `StateView` belongs to chunk 16. Here the daemon only owns the `dirty` flag
   and an empty subscriber list, so chunk 16 can attach the socket without
   reshaping the loop.
+- Two different limits, and they must not be confused. `counts_by_stage()` in
+  chunk 6 counts RUNNING tasks only, which is what `can_start` uses: a queued
+  task must not count against the limit it is waiting on, or a stage with limit
+  1 and one queued task would deadlock against itself.
+- The daemon owns the SECOND limit, on live processes. An interactive refine
+  chat in `AwaitingUser` still holds a claude process between turns, and those
+  processes are the real memory cost. So the daemon must also refuse to start a
+  new session for a stage when the number of LIVE sessions for that stage has
+  reached its limit, counting `AwaitingUser` tasks whose process is still
+  alive. The idle reaper is what frees this capacity: when it kills a parked
+  chat's process the task stays `AwaitingUser` and resumable, but its live-session
+  slot is released at once. Without this, parked chats accumulate live
+  processes without bound, which is exactly what the stage limit exists to stop.
 - Dispatch: ensure the worktree, render the prompt, start the runner, move the
   task to Running. Refine tasks run in the repository checkout, not a
   worktree, and never create one.
