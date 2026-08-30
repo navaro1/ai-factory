@@ -14,9 +14,9 @@ use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
 use crate::model::Stage;
-use crate::sock::{Action, PauseScope, StateView, TaskView};
+use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView};
 use crate::tasks::TaskState;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -163,15 +163,37 @@ enum Target {
     },
 }
 
+/// One safe adjustment to a limit or a lane reservation.
+#[derive(Clone, Copy)]
+enum AmountChange {
+    /// Add one unless the value is already the largest value.
+    Increase,
+    /// Remove one without crossing the given lower bound.
+    Decrease,
+}
+
+impl AmountChange {
+    /// Apply this adjustment to `value` with the given lower bound.
+    fn apply(self, value: usize, minimum: usize) -> usize {
+        match self {
+            AmountChange::Increase => value.saturating_add(1),
+            AmountChange::Decrease => value.saturating_sub(1).max(minimum),
+        }
+    }
+}
+
 /// Handle one key press in the pipeline view.
 ///
 /// The call resolves the selected row and sends at most one action through
 /// `sink`. A key with no resolvable target changes nothing and toasts
 /// nothing.
 pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSink) {
+    if !key.modifiers.is_empty() && key.modifiers != KeyModifiers::SHIFT {
+        return;
+    }
     match key.code {
-        KeyCode::Char('+') => change_amount(app, sink, 1),
-        KeyCode::Char('-') => change_amount(app, sink, -1),
+        KeyCode::Char('+') => change_amount(app, sink, AmountChange::Increase),
+        KeyCode::Char('-') => change_amount(app, sink, AmountChange::Decrease),
         KeyCode::Char('p') => pause_selected(app, sink),
         KeyCode::Char('P') => pause_all(app, sink),
         KeyCode::Char('r') => refine_ticket(app, sink),
@@ -199,7 +221,7 @@ fn selected_row(app: &App) -> Option<Row> {
 ///
 /// The stage limit clamps at one. The lane reservation clamps at zero,
 /// which removes the lane.
-fn change_amount(app: &mut App, sink: &mut impl ActionSink, delta: isize) {
+fn change_amount(app: &mut App, sink: &mut impl ActionSink, change: AmountChange) {
     let target = {
         let Some(state) = app.state.as_ref() else {
             return;
@@ -216,7 +238,7 @@ fn change_amount(app: &mut App, sink: &mut impl ActionSink, delta: isize) {
                 else {
                     return;
                 };
-                let limit = (view.limit as isize + delta).max(1) as usize;
+                let limit = change.apply(view.limit, 1);
                 Target::Limit { stage, limit }
             }
             Row::Repo { stage, repo } => {
@@ -226,29 +248,51 @@ fn change_amount(app: &mut App, sink: &mut impl ActionSink, delta: isize) {
                     .find(|lane| lane.stage == stage && lane.repo == repo)
                     .map(|lane| lane.slots)
                     .unwrap_or(0);
-                let slots = (slots as isize + delta).max(0) as usize;
+                let slots = change.apply(slots, 0);
                 Target::Lane { stage, repo, slots }
             }
             Row::Ticket { .. } | Row::Train { .. } => return,
         }
     };
     match target {
-        Target::Limit { stage, limit } => emit(
-            app,
-            sink,
-            Action::Limit { stage, limit },
-            format!("sent limit {} {limit}", stage.as_str()),
-        ),
-        Target::Lane { stage, repo, slots } => emit(
-            app,
-            sink,
-            Action::Lane {
-                stage,
-                repo: repo.clone(),
-                slots,
-            },
-            format!("sent lane {} {repo} {slots}", stage.as_str()),
-        ),
+        Target::Limit { stage, limit } => {
+            emit(
+                app,
+                sink,
+                Action::Limit { stage, limit },
+                format!("sent limit {} {limit}", stage.as_str()),
+            );
+            if let Some(stage_view) = app
+                .state
+                .as_mut()
+                .and_then(|state| state.stages.iter_mut().find(|view| view.stage == stage))
+            {
+                stage_view.limit = limit;
+            }
+        }
+        Target::Lane { stage, repo, slots } => {
+            emit(
+                app,
+                sink,
+                Action::Lane {
+                    stage,
+                    repo: repo.clone(),
+                    slots,
+                },
+                format!("sent lane {} {repo} {slots}", stage.as_str()),
+            );
+            if let Some(state) = app.state.as_mut() {
+                if let Some(lane) = state
+                    .lanes
+                    .iter_mut()
+                    .find(|lane| lane.stage == stage && lane.repo == repo)
+                {
+                    lane.slots = slots;
+                } else if slots > 0 {
+                    state.lanes.push(LaneView { stage, repo, slots });
+                }
+            }
+        }
     }
 }
 
@@ -295,12 +339,39 @@ fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
         (scope, paused, label)
     };
     let (scope, paused, label) = found;
+    let operation = if paused { "pause" } else { "resume" };
     emit(
         app,
         sink,
-        Action::Pause { scope, paused },
-        format!("sent pause {label}"),
+        Action::Pause {
+            scope: scope.clone(),
+            paused,
+        },
+        format!("sent {operation} {label}"),
     );
+    if let Some(state) = app.state.as_mut() {
+        match scope {
+            PauseScope::Global => state.paused.global = paused,
+            PauseScope::Stage { stage } => {
+                if paused {
+                    if !state.paused.stages.contains(&stage) {
+                        state.paused.stages.push(stage);
+                    }
+                } else {
+                    state.paused.stages.retain(|entry| *entry != stage);
+                }
+            }
+            PauseScope::Repo { repo } => {
+                if paused {
+                    if !state.paused.repos.contains(&repo) {
+                        state.paused.repos.push(repo);
+                    }
+                } else {
+                    state.paused.repos.retain(|entry| *entry != repo);
+                }
+            }
+        }
+    }
 }
 
 /// Pause or resume the whole factory with `P`.
@@ -309,6 +380,7 @@ fn pause_all(app: &mut App, sink: &mut impl ActionSink) {
         Some(state) => !state.paused.global,
         None => return,
     };
+    let operation = if paused { "pause" } else { "resume" };
     emit(
         app,
         sink,
@@ -316,8 +388,11 @@ fn pause_all(app: &mut App, sink: &mut impl ActionSink) {
             scope: PauseScope::Global,
             paused,
         },
-        "sent pause all".to_string(),
+        format!("sent {operation} all"),
     );
+    if let Some(state) = app.state.as_mut() {
+        state.paused.global = paused;
+    }
 }
 
 /// Send `Action::Refine` for the selected ticket and follow the new task.
@@ -393,7 +468,7 @@ fn ask_abort(app: &mut App) {
 
 /// Retry the selected task when it failed.
 fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
-    let task = {
+    let found = {
         let Some(state) = app.state.as_ref() else {
             return;
         };
@@ -406,14 +481,23 @@ fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
         let TaskState::Failed(_) = task.state else {
             return;
         };
-        task.id.clone()
+        (index, task.id.clone())
     };
+    let (index, task) = found;
     emit(
         app,
         sink,
         Action::Retry { task: task.clone() },
         format!("sent retry {task}"),
     );
+    if let Some(task) = app
+        .state
+        .as_mut()
+        .and_then(|state| state.tasks.get_mut(index))
+    {
+        task.state = TaskState::Queued;
+        task.attempt = 1;
+    }
 }
 
 /// Stack or unstack the first pull request of the selected train queue.
@@ -446,6 +530,19 @@ fn stack_head(app: &mut App, sink: &mut impl ActionSink) {
         },
         format!("sent {word} #{pr} {repo}"),
     );
+    if let Some(train) = app
+        .state
+        .as_mut()
+        .and_then(|state| state.trains.iter_mut().find(|train| train.repo == repo))
+    {
+        if on {
+            if !train.stacked.contains(&pr) {
+                train.stacked.push(pr);
+            }
+        } else {
+            train.stacked.retain(|entry| *entry != pr);
+        }
+    }
 }
 
 /// Ask the operator to confirm the release of the stacked batch.
@@ -494,6 +591,13 @@ fn cycle_policy(app: &mut App, sink: &mut impl ActionSink) {
         },
         format!("sent policy {repo} {}", policy_label(&policy)),
     );
+    if let Some(train) = app
+        .state
+        .as_mut()
+        .and_then(|state| state.trains.iter_mut().find(|train| train.repo == repo))
+    {
+        train.policy = policy;
+    }
 }
 
 /// The next policy in the manual, interval, threshold cycle.
@@ -904,7 +1008,7 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[cfg(test)]
 use crate::model::ItemKind;
 #[cfg(test)]
-use crate::sock::{LaneView, PausedView, RepoView, StageView, TrainView};
+use crate::sock::{PausedView, RepoView, StageView, TrainView};
 #[cfg(test)]
 use ratatui::backend::TestBackend;
 #[cfg(test)]
@@ -1219,6 +1323,69 @@ mod tests {
     }
 
     #[test]
+    fn repeated_amount_keys_use_the_previous_request_and_saturate() {
+        let mut app = app_with_selection(0);
+        let mut sink = FakeSink::default();
+        for character in ['+', '+', '-'] {
+            handle_key(&mut app, pressed(character), &mut sink);
+        }
+        assert_eq!(
+            sink.0,
+            vec![
+                Action::Limit {
+                    stage: Stage::Refine,
+                    limit: 4,
+                },
+                Action::Limit {
+                    stage: Stage::Refine,
+                    limit: 5,
+                },
+                Action::Limit {
+                    stage: Stage::Refine,
+                    limit: 4,
+                },
+            ]
+        );
+
+        app.state.as_mut().unwrap().stages[0].limit = usize::MAX;
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('+'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Limit {
+                stage: Stage::Refine,
+                limit: usize::MAX,
+            }]
+        );
+
+        let mut app = app_with_selection(1);
+        let mut sink = FakeSink::default();
+        for character in ['+', '+', '-'] {
+            handle_key(&mut app, pressed(character), &mut sink);
+        }
+        assert_eq!(
+            sink.0,
+            vec![
+                Action::Lane {
+                    stage: Stage::Refine,
+                    repo: "borsuk".to_string(),
+                    slots: 1,
+                },
+                Action::Lane {
+                    stage: Stage::Refine,
+                    repo: "borsuk".to_string(),
+                    slots: 2,
+                },
+                Action::Lane {
+                    stage: Stage::Refine,
+                    repo: "borsuk".to_string(),
+                    slots: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn plus_and_minus_change_the_lane_of_a_repository_row() {
         let mut app = app_with_selection(1);
         let mut sink = FakeSink::default();
@@ -1291,6 +1458,81 @@ mod tests {
     }
 
     #[test]
+    fn pause_keys_toggle_the_current_scope_and_name_the_operation() {
+        let mut app = app_with_selection(0);
+        app.state
+            .as_mut()
+            .unwrap()
+            .paused
+            .stages
+            .push(Stage::Refine);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('p'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Pause {
+                scope: PauseScope::Stage {
+                    stage: Stage::Refine,
+                },
+                paused: false,
+            }]
+        );
+        assert_eq!(app.visible_toast(), Some("sent resume refine"));
+
+        handle_key(&mut app, pressed('p'), &mut sink);
+        assert_eq!(
+            sink.0.last(),
+            Some(&Action::Pause {
+                scope: PauseScope::Stage {
+                    stage: Stage::Refine,
+                },
+                paused: true,
+            })
+        );
+        assert_eq!(app.visible_toast(), Some("sent pause refine"));
+
+        let mut app = app_with_selection(2);
+        app.state
+            .as_mut()
+            .unwrap()
+            .paused
+            .repos
+            .push("borsuk".to_string());
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('p'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Pause {
+                scope: PauseScope::Repo {
+                    repo: "borsuk".to_string(),
+                },
+                paused: false,
+            }]
+        );
+        assert_eq!(app.visible_toast(), Some("sent resume borsuk"));
+
+        let mut app = app_with_selection(0);
+        app.state.as_mut().unwrap().paused.global = true;
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('P'), &mut sink);
+        handle_key(&mut app, pressed('P'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![
+                Action::Pause {
+                    scope: PauseScope::Global,
+                    paused: false,
+                },
+                Action::Pause {
+                    scope: PauseScope::Global,
+                    paused: true,
+                },
+            ]
+        );
+        assert_eq!(app.visible_toast(), Some("sent pause all"));
+    }
+
+    #[test]
     fn r_refines_the_selected_ticket_and_follows_the_new_task() {
         let mut app = app_with_selection(8);
         let mut sink = FakeSink::default();
@@ -1356,6 +1598,21 @@ mod tests {
     }
 
     #[test]
+    fn repeated_r_capital_sends_one_retry_for_one_failure() {
+        let mut app = app_with_selection(5);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('R'), &mut sink);
+        handle_key(&mut app, pressed('R'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Retry {
+                task: "ryba/refine-i9".to_string(),
+            }]
+        );
+        assert_eq!(app.visible_toast(), Some("sent retry ryba/refine-i9"));
+    }
+
+    #[test]
     fn space_stacks_the_first_queue_entry_of_a_train() {
         let mut app = app_with_selection(18);
         let mut sink = FakeSink::default();
@@ -1374,6 +1631,45 @@ mod tests {
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed(' '), &mut sink);
         assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn repeated_space_toggles_the_same_queue_entry() {
+        let mut app = app_with_selection(18);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed(' '), &mut sink);
+        handle_key(&mut app, pressed(' '), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![
+                Action::Stack {
+                    repo: "borsuk".to_string(),
+                    pr: 7,
+                    on: true,
+                },
+                Action::Stack {
+                    repo: "borsuk".to_string(),
+                    pr: 7,
+                    on: false,
+                },
+            ]
+        );
+        assert_eq!(app.visible_toast(), Some("sent unstack #7 borsuk"));
+    }
+
+    #[test]
+    fn release_confirmation_includes_a_just_stacked_pull_request() {
+        let mut app = app_with_selection(18);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed(' '), &mut sink);
+        handle_key(&mut app, pressed('g'), &mut sink);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::Go {
+                repo: "borsuk".to_string(),
+                prs: vec![3, 7],
+            })
+        );
     }
 
     #[test]
@@ -1423,20 +1719,115 @@ mod tests {
     }
 
     #[test]
-    fn a_key_without_a_selection_changes_nothing() {
-        let mut app = App {
-            state: Some(sample_view()),
-            connected: true,
-            ..App::default()
-        };
+    fn repeated_s_completes_the_full_policy_cycle() {
+        let mut app = app_with_selection(18);
         let mut sink = FakeSink::default();
-        // P pauses everything by design, so it is not in this list.
-        for character in ['+', '-', 'p', 'r', 'n', 'x', 'R', ' ', 'g', 's'] {
-            handle_key(&mut app, pressed(character), &mut sink);
+        for _ in 0..3 {
+            handle_key(&mut app, pressed('s'), &mut sink);
         }
+        assert_eq!(
+            sink.0,
+            vec![
+                Action::Policy {
+                    repo: "borsuk".to_string(),
+                    policy: ReleasePolicy::Interval { minutes: 30 },
+                },
+                Action::Policy {
+                    repo: "borsuk".to_string(),
+                    policy: ReleasePolicy::Threshold { count: 3 },
+                },
+                Action::Policy {
+                    repo: "borsuk".to_string(),
+                    policy: ReleasePolicy::Manual,
+                },
+            ]
+        );
+        assert_eq!(app.visible_toast(), Some("sent policy borsuk manual"));
+    }
+
+    #[test]
+    fn a_control_modified_action_key_is_a_no_op() {
+        let mut app = app_with_selection(0);
+        let mut sink = FakeSink::default();
+        let key = KeyEvent::new(KeyCode::Char('p'), crossterm::event::KeyModifiers::CONTROL);
+        handle_key(&mut app, key, &mut sink);
         assert!(sink.0.is_empty());
         assert!(app.toast.is_none());
-        assert!(app.confirm.is_none());
-        assert_eq!(app.view, View::Pipeline);
+    }
+
+    #[test]
+    fn every_direct_action_toast_names_what_was_sent() {
+        let cases = [
+            (0, '+', "sent limit refine 4"),
+            (1, '+', "sent lane refine borsuk 1"),
+            (0, 'p', "sent pause refine"),
+            (0, 'P', "sent pause all"),
+            (8, 'r', "sent refine borsuk i140"),
+            (4, 'n', "sent new ticket ryba"),
+            (5, 'R', "sent retry ryba/refine-i9"),
+            (18, ' ', "sent stack #7 borsuk"),
+            (18, 's', "sent policy borsuk every 30m"),
+        ];
+        for (selection, character, expected) in cases {
+            let mut app = app_with_selection(selection);
+            let mut sink = FakeSink::default();
+            handle_key(&mut app, pressed(character), &mut sink);
+            assert_eq!(sink.0.len(), 1, "key {character}");
+            assert_eq!(app.visible_toast(), Some(expected), "key {character}");
+        }
+    }
+
+    #[test]
+    fn confirmed_actions_toast_the_exact_operation() {
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        Confirm::Abort {
+            task: "borsuk/implement-i140".to_string(),
+        }
+        .send(&mut app, &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Abort {
+                task: "borsuk/implement-i140".to_string(),
+            }]
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("sent abort borsuk/implement-i140")
+        );
+
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        Confirm::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![3, 7],
+        }
+        .send(&mut app, &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Go {
+                repo: "borsuk".to_string(),
+                prs: vec![3, 7],
+            }]
+        );
+        assert_eq!(app.visible_toast(), Some("sent release borsuk #3 #7"));
+    }
+
+    #[test]
+    fn a_key_without_a_selection_changes_nothing() {
+        // P pauses everything by design, so it is not in this list.
+        for character in ['+', '-', 'p', 'r', 'n', 'x', 'R', ' ', 'g', 's'] {
+            let mut app = App {
+                state: Some(sample_view()),
+                connected: true,
+                ..App::default()
+            };
+            let mut sink = FakeSink::default();
+            handle_key(&mut app, pressed(character), &mut sink);
+            assert!(sink.0.is_empty(), "key {character}");
+            assert!(app.toast.is_none(), "key {character}");
+            assert!(app.confirm.is_none(), "key {character}");
+            assert_eq!(app.view, View::Pipeline, "key {character}");
+        }
     }
 }
