@@ -7,7 +7,7 @@
 //!
 //! | Kind | Keys |
 //! |---|---|
-//! | `Permission` | `y` allow, `a` allow and apply the request suggestion, `n` type a deny reason, `enter` open the session |
+//! | `Permission` | `y` allow, `n` type a deny reason, `enter` open the session |
 //! | `Question` | `1`..`9` pick, `enter` submit, `i` type a free answer |
 //! | `Stuck` | `r` retry, `c` cancel, `enter` open the session |
 //! | `NeedsHuman` | `t` type a comment, `c` cancel the label |
@@ -236,9 +236,7 @@ impl Inbox {
             return InboxOutcome::None;
         }
         match (&decision.kind, key.code) {
-            (DecisionKind::Permission { .. }, KeyCode::Char('y' | 'a')) => {
-                // The wire carries one Allow variant. The daemon applies
-                // the request's own suggestion when the request has one.
+            (DecisionKind::Permission { .. }, KeyCode::Char('y')) => {
                 self.answer(&decision.id, Response::Allow, sink);
                 InboxOutcome::None
             }
@@ -868,7 +866,7 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
     };
     match &decision.kind {
         DecisionKind::Permission { .. } => {
-            "j k move · y allow · a allow with suggestion · n deny · enter session".to_string()
+            "j k move · y allow · n deny · enter session".to_string()
         }
         DecisionKind::Question { .. } => {
             "j k move · 1-9 pick · enter submit · i free answer".to_string()
@@ -1138,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_y_and_a_send_allow_and_enter_opens_the_session() {
+    fn permission_y_sends_allow_a_sends_nothing_and_enter_opens_the_session() {
         let state = full_state();
         let (mut tx, rx) = fake_sink();
         let mut inbox = selected(&state, 0);
@@ -1152,17 +1150,12 @@ mod tests {
                 response: Response::Allow,
             }
         );
-        assert!(rx.try_recv().is_err());
 
-        let outcome = inbox.handle_key(&state, press('a'), &mut tx);
-        assert_eq!(outcome, InboxOutcome::None);
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            Action::Answer {
-                response: Response::Allow,
-                ..
-            }
-        ));
+        // The a key is deliberately unbound: the wire carries no field for
+        // the request suggestion, so an a key would promise what it
+        // cannot do.
+        inbox.handle_key(&state, press('a'), &mut tx);
+        assert!(rx.try_recv().is_err());
 
         let outcome = inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
         assert_eq!(
@@ -1620,7 +1613,7 @@ mod tests {
     fn the_footer_shows_the_key_map_of_the_selected_kind() {
         let state = full_state();
         let cases: [(usize, &str); 5] = [
-            (0, "y allow · a allow with suggestion · n deny"),
+            (0, "y allow · n deny"),
             (1, "1-9 pick · enter submit · i free answer"),
             (2, "r retry · c cancel"),
             (3, "t comment · c cancel · no retry"),
