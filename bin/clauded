@@ -62,4 +62,6 @@ if [[ -n "$draft" && -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" &
     ) >/dev/null 2>&1 &
 fi
 
+export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS="${AIF_CLAUDE_MAX_SUBAGENTS:-3}"
+
 exec claude "${CLAUDE_FLAGS[@]}" "${args[@]}"

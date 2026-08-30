@@ -88,6 +88,6 @@ find_native_codex() {
 }
 
 if native="$(find_native_codex)"; then
-    exec "$native" -c "model_reasoning_effort=${effort}" "${args[@]}"
+    exec "$native" -c "model_reasoning_effort=${effort}" -c "features.multi_agent=true" "${args[@]}"
 fi
-exec codex -c "model_reasoning_effort=${effort}" "${args[@]}"
+exec codex -c "model_reasoning_effort=${effort}" -c "features.multi_agent=true" "${args[@]}"

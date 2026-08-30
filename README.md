@@ -189,9 +189,29 @@ Five agent TUIs are heavy. The workspace attacks this on four fronts:
 | Scope isolation + throttle | `aif start` runs the session in `aif-<repo>-factory.scope` with `MemoryHigh` (default 3 GiB, `AIF_MEMORY_HIGH` to change, `0` disables). The factory throttles itself before the user slice reaches systemd-oomd pressure. |
 | `aif top` | Per-process RSS from `/proc` plus scope totals, in the style of t3 Code's native resource monitor. |
 
-Measured: a full factory dropped from ~3.2 GiB to ~1.4 GiB. Graph-mode
-`exec auto` (v0.4.0) will remove idle TUIs entirely: agents spawn per task
-and exit, which is how t3 Code keeps five agents cheap.
+Measured: a full factory dropped from ~3.2 GiB to ~1.4 GiB.
+
+## Subagents at v3
+
+The loop prompts tell each pane to dispatch subagents. All three
+harnesses run subagents **inside the pane process** — a subagent costs
+tokens, never a process:
+
+| Harness | Mechanism | Notes |
+|---|---|---|
+| codex | `multi_agent.spawn` / `wait_agent` / `close_agent` tool set | In-process threads; children can spawn children; `codexd` pins `features.multi_agent=true`. Completed agents count toward concurrency until closed — tell agents to close finished work. |
+| opencode | `task` tool → child session (`parentSessionId`) | In-process; one nesting level (subagents cannot call `task`); `background` flag is experimental. |
+| claude | Task tool, `where:"in-process"` | In-process; nests to depth 3 (`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`); subagents inherit the parent model (`CLAUDE_CODE_SUBAGENT_MODEL`). The harness default allows 20 concurrent subagents — `clauded` pins `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3` (`AIF_CLAUDE_MAX_SUBAGENTS` to change) so the prompt's "at most 3" is enforced by the engine, not by hope. |
+
+So the v3 fleet scales by tokens, not RAM: ten parallel subagents under
+one codex pane still measure ~200 MiB total for the harness.
+
+For v0.4.0, `exec auto` no longer means a process per task. The plan now
+follows the t3 Code pattern with resident harness servers: one persistent
+`codex app-server` thread host and one `opencode serve` per factory, tasks
+dispatched as in-process threads or sessions over RPC, torn down after an
+idle timeout. Idle TUIs disappear the same way — the factory keeps one
+server per agent kind instead of five panes.
 
 Codex panes do not support the `/loop` line; `codexd` and the scheduler
 strip it automatically.
