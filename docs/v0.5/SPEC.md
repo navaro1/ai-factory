@@ -480,9 +480,14 @@ once per transition.
 - `Task::new` builds the id per the naming rules. `TaskTable::upsert_queued`
   refuses to add a second task for the same `(repo, stage, kind, number)` while
   one is not terminal, and reports which existing task blocked it.
-- Legal transitions only: Queued to Running; Running to AwaitingUser, Done, or
-  Failed; AwaitingUser to Running, Done, or Failed; Failed to Queued when the
-  attempt count is below 3. Everything else returns an error naming both
+- Legal transitions only: Queued to Running or Failed; Running to AwaitingUser,
+  Done, or Failed; AwaitingUser to Running, Done, or Failed; Failed to Queued
+  when the attempt count is below 3.
+- Queued to Failed exists so a task can be cancelled or dropped before it ever
+  starts. The UI offers abort on any listed task, and the daemon must be able
+  to drop queued work whose trigger has gone away. Without it the lifecycle
+  would need a second, separate removal path outside the state machine, which
+  is worse than one more legal edge. Everything else returns an error naming both
   states. `MAX_ATTEMPTS = 3`.
 - Helpers: `counts_by_stage()`, `counts_by_stage_repo()`, `running()`,
   `active()` where active means Queued, Running, or AwaitingUser.
