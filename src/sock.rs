@@ -1244,14 +1244,31 @@ mod tests {
         drop(pushes);
 
         // The daemon keeps publishing; the subscriber list self-cleans.
+        // The daemon attaches a connect before or after the publish below.
+        // The first push is therefore the state current at attach time: view
+        // 1 or view 2 itself. Read past an initial view 1 push until view 2
+        // arrives. The push bound and the read timeout keep the loop finite,
+        // and a daemon harmed by the dropped client never delivers view 2,
+        // so the test still fails in that case.
         let survivor = Client::connect(&path).unwrap();
         survivor.set_read_timeout(Duration::from_secs(5)).unwrap();
         let mut survivor_pushes = survivor.pushes().unwrap();
-        server.publish(sample_view(2));
-        assert_eq!(
-            survivor_pushes.next().unwrap().unwrap(),
-            Push::State(sample_view(2))
-        );
+        let second = sample_view(2);
+        server.publish(second.clone());
+        let mut saw_second = false;
+        for _ in 0..4 {
+            match survivor_pushes.next() {
+                Some(Ok(Push::State(state))) if state == second => {
+                    saw_second = true;
+                    break;
+                }
+                // The initial push of the state at attach time. Skip it.
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("the survivor read failed: {error}"),
+                None => panic!("the survivor stream ended before view 2"),
+            }
+        }
+        assert!(saw_second, "the survivor never received view 2");
     }
 
     #[test]
