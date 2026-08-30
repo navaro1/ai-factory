@@ -41,7 +41,7 @@ use crate::runner::claude::ClaudeRunner;
 use crate::runner::opencode::OpenCodeRunner;
 use crate::runner::{Answer, Job, RunEvent, Runner, Session};
 use crate::sched::{self, Limits, Paused, Verdict};
-use crate::sock::{Action, PauseScope, StateInput};
+use crate::sock::{Action, PauseScope};
 use crate::state::DaemonState;
 use crate::tasks::{self, Task, TaskState, TaskTable};
 use crate::trains::{Train, STACKED_LABEL};
@@ -87,6 +87,8 @@ pub struct Daemon {
     exec: Arc<dyn Exec>,
     /// One runner per stage, in stage order.
     runners: BTreeMap<Stage, Box<dyn Runner>>,
+    /// The interactive Claude runner used only for ticket creation.
+    ticket_runner: Box<dyn Runner>,
     /// The worktree manager; it owns the naming rules for worktrees.
     worktrees: WorktreeManager,
     /// The path of `state.json`.
@@ -109,6 +111,8 @@ pub struct Daemon {
     gates: GateTracker,
     /// Ready work the gates reported, until the next drive admits it.
     pending_ready: Vec<ReadyWork>,
+    /// Repositories whose last poll must refresh a train's stacked cache.
+    pending_stacked: BTreeSet<String>,
     /// All tasks, in insertion order.
     table: TaskTable,
     /// The decisions that wait for a human.
@@ -120,6 +124,10 @@ pub struct Daemon {
 
     /// One live session per running or parked task.
     sessions: BTreeMap<String, Box<dyn Session>>,
+    /// Tasks whose old process is stopping and still owes an exit event.
+    stopping_sessions: BTreeSet<String>,
+    /// Chat messages that wait for a stopped process or a live-process slot.
+    pending_chats: BTreeMap<String, Vec<String>>,
     /// The time of the last event of each task, for the idle reaper.
     last_event_ms: BTreeMap<String, u64>,
 
@@ -180,6 +188,8 @@ impl Daemon {
         }
         let state_dir = config::state_dir();
         let prompts_dir = config::config_dir().join("prompts");
+        let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_session_id: &str| {});
+        let ticket_runner: Box<dyn Runner> = Box::new(ClaudeRunner::new(sink));
         Self::with_runners(
             config,
             Arc::new(RealExec),
@@ -189,6 +199,7 @@ impl Daemon {
             wake,
             action_rx,
             runners,
+            ticket_runner,
         )
     }
 
@@ -209,6 +220,7 @@ impl Daemon {
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
         runners: BTreeMap<Stage, Box<dyn Runner>>,
+        ticket_runner: Box<dyn Runner>,
     ) -> Self {
         let state_path = state_dir.join("state.json");
         let stored = DaemonState::load(&state_path);
@@ -247,6 +259,7 @@ impl Daemon {
             config,
             exec,
             runners,
+            ticket_runner,
             worktrees: WorktreeManager::new(state_dir.clone()),
             state_path: state_path.clone(),
             prompts_dir,
@@ -257,11 +270,14 @@ impl Daemon {
             snapshot: Snapshot::default(),
             gates: GateTracker::new(),
             pending_ready: Vec::new(),
+            pending_stacked: BTreeSet::new(),
             table: TaskTable::new(),
             decisions: Decisions::new(),
             trains,
             release_batches: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            stopping_sessions: BTreeSet::new(),
+            pending_chats: BTreeMap::new(),
             last_event_ms: BTreeMap::new(),
             clock: Arc::new(now_ms),
             now_ms: 0,
@@ -360,6 +376,7 @@ impl Daemon {
         self.refresh_release_gates();
         self.reconcile_trains();
         self.reap_idle_sessions();
+        self.resume_pending_chats();
         self.dispatch_queued();
         self.save_state();
     }
@@ -412,20 +429,6 @@ impl Daemon {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Assemble the input the socket module builds its state view from.
-    pub fn state_input(&self) -> StateInput<'_> {
-        StateInput {
-            config: &self.config,
-            limits: &self.limits,
-            paused: &self.paused,
-            table: &self.table,
-            decisions: &self.decisions,
-            trains: &self.trains,
-            policies: &self.policies,
-            now_ms: self.now_ms,
-        }
-    }
-
     // ------------------------------------------------------------------
     // Poll handling
     // ------------------------------------------------------------------
@@ -449,6 +452,7 @@ impl Daemon {
         let old = self.snapshot.repos.get(repo).cloned();
         let unchanged = old.as_ref() == Some(&fresh);
         self.snapshot.apply(repo, fresh.clone());
+        self.pending_stacked.insert(repo.to_string());
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
         }
@@ -636,7 +640,7 @@ impl Daemon {
     /// Rebuild each train's stacked cache from the `release-stacked` labels
     /// of the last poll.
     fn rebuild_stacked(&mut self) {
-        let aliases: Vec<String> = self.trains.keys().cloned().collect();
+        let aliases = std::mem::take(&mut self.pending_stacked);
         for alias in aliases {
             let Some(snapshot) = self.snapshot.repos.get(&alias) else {
                 continue;
@@ -762,12 +766,63 @@ impl Daemon {
             }
         }
         for id in reaped {
-            if let Some(mut session) = self.sessions.remove(&id) {
+            if self.sessions.contains_key(&id) {
                 eprintln!("task {id}: the parked session passed the idle limit; stopping it");
-                if let Err(error) = session.stop() {
-                    eprintln!("task {id}: cannot stop the parked session: {error:#}");
-                }
+                self.stop_session(&id, "cannot stop the parked session");
                 self.changed = true;
+            }
+        }
+    }
+
+    /// Resume parked chats when their old process exited and capacity exists.
+    fn resume_pending_chats(&mut self) {
+        let ids: Vec<String> = self.pending_chats.keys().cloned().collect();
+        for id in ids {
+            if self.stopping_sessions.contains(&id) || self.sessions.contains_key(&id) {
+                continue;
+            }
+            let Some(task) = self.table.by_id.get(&id).cloned() else {
+                self.pending_chats.remove(&id);
+                eprintln!("the pending chat for {id}: no such task");
+                continue;
+            };
+            if task.state != TaskState::AwaitingUser {
+                self.pending_chats.remove(&id);
+                eprintln!(
+                    "the pending chat for {id}: the task is {}, not awaiting a user",
+                    task.state
+                );
+                continue;
+            }
+            if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
+                continue;
+            }
+            let Some(session_id) = task.session_id.clone() else {
+                self.pending_chats.remove(&id);
+                eprintln!("the pending chat for {id}: no session id to resume");
+                continue;
+            };
+            let Some(messages) = self.pending_chats.remove(&id) else {
+                continue;
+            };
+            let Some(first) = messages.first().cloned() else {
+                continue;
+            };
+            if let Err(error) = self.launch_task(&task, first, Some(session_id)) {
+                eprintln!("the pending chat for {id}: the runner could not resume: {error:#}");
+                self.pending_chats.insert(id, messages);
+                continue;
+            }
+            for text in messages.into_iter().skip(1) {
+                let result = self
+                    .sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| anyhow!("the resumed session vanished"))
+                    .and_then(|session| session.send_user(&text));
+                if let Err(error) = result {
+                    eprintln!("the pending chat for {id}: {error:#}");
+                    break;
+                }
             }
         }
     }
@@ -775,8 +830,9 @@ impl Daemon {
     /// Dispatch queued tasks while the scheduler yields one.
     fn dispatch_queued(&mut self) {
         let mut saturated: BTreeSet<Stage> = BTreeSet::new();
+        let mut failed: BTreeSet<String> = BTreeSet::new();
         loop {
-            let Some(id) = self.next_eligible(&saturated) else {
+            let Some(id) = self.next_eligible(&saturated, &failed) else {
                 break;
             };
             match self.dispatch_one(&id) {
@@ -786,7 +842,10 @@ impl Daemon {
                         saturated.insert(task.stage);
                     }
                 }
-                Err(_) => break,
+                Err(error) => {
+                    eprintln!("task {id}: dispatch failed: {error:#}");
+                    failed.insert(id);
+                }
             }
         }
     }
@@ -796,13 +855,19 @@ impl Daemon {
     /// This mirrors [`sched::next_dispatch`] with one daemon-side exception:
     /// a stage whose live-process slots are full yields to the later tasks of
     /// other stages until the reaper or an exit frees a slot.
-    fn next_eligible(&self, saturated: &BTreeSet<Stage>) -> Option<String> {
+    fn next_eligible(
+        &self,
+        saturated: &BTreeSet<Stage>,
+        failed: &BTreeSet<String>,
+    ) -> Option<String> {
         for id in &self.table.order {
             let Some(task) = self.table.by_id.get(id) else {
                 continue;
             };
             if task.state != TaskState::Queued
                 || saturated.contains(&task.stage)
+                || failed.contains(&task.id)
+                || self.stopping_sessions.contains(&task.id)
                 || self.sessions.contains_key(&task.id)
             {
                 continue;
@@ -898,24 +963,21 @@ impl Daemon {
             resume,
             yolo: stage_cfg.yolo,
         };
-        let Some(runner) = self.runners.get_mut(&task.stage) else {
-            bail!("no runner for the {} stage", task.stage);
+        let session = if Self::is_ticket_task(task) {
+            self.ticket_runner.start(&job, self.run_tx.clone())?
+        } else {
+            self.runners
+                .get_mut(&task.stage)
+                .ok_or_else(|| anyhow!("no runner for the {} stage", task.stage))?
+                .start(&job, self.run_tx.clone())?
         };
-        let session = runner.start(&job, self.run_tx.clone())?;
         self.sessions.insert(task.id.clone(), session);
         self.last_event_ms.insert(task.id.clone(), self.now_ms);
         if let Err(e) = self
             .table
             .transition(&task.id, TaskState::Running, self.now_ms)
         {
-            if let Some(mut session) = self.sessions.remove(&task.id) {
-                if let Err(stop_error) = session.stop() {
-                    eprintln!(
-                        "task {}: cannot stop the rejected session: {stop_error:#}",
-                        task.id
-                    );
-                }
-            }
+            self.stop_session(&task.id, "cannot stop the rejected session");
             return Err(e);
         }
         self.changed = true;
@@ -989,6 +1051,9 @@ impl Daemon {
     /// Map one runner event onto the task table, the decisions, and disk.
     fn on_run_event(&mut self, event: RunEvent) {
         let task_id = event_task(&event).to_string();
+        if self.stopping_sessions.contains(&task_id) && !matches!(event, RunEvent::Exit { .. }) {
+            return;
+        }
         self.last_event_ms.insert(task_id.clone(), self.now_ms);
         match event {
             RunEvent::Started {
@@ -1007,11 +1072,7 @@ impl Daemon {
                 if let Err(error) = marker {
                     let reason = format!("cannot write the session marker: {error:#}");
                     eprintln!("task {task_id}: {reason}");
-                    if let Some(mut session) = self.sessions.remove(&task_id) {
-                        if let Err(stop_error) = session.stop() {
-                            eprintln!("task {task_id}: cannot stop the session: {stop_error:#}");
-                        }
-                    }
+                    self.stop_session(&task_id, "cannot stop the session");
                     if let Some(task) = self.table.by_id.get(&task_id).cloned() {
                         self.fail_run(&task, &reason);
                     }
@@ -1060,9 +1121,7 @@ impl Daemon {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
-        if task.state != TaskState::Running
-            || self.config.stage(task.stage).runner.as_str() != "claude"
-        {
+        if task.state != TaskState::Running || !self.task_uses_claude(&task) {
             return;
         }
         if task.stage == Stage::Refine {
@@ -1092,8 +1151,11 @@ impl Daemon {
     /// An opencode exit supplies the task result.
     /// A claude exit without a prior result fails the active task.
     fn on_exit_event(&mut self, id: &str, ok: bool, detail: &str) {
-        self.sessions.remove(id);
         self.last_event_ms.remove(id);
+        if self.stopping_sessions.remove(id) {
+            return;
+        }
+        self.sessions.remove(id);
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
@@ -1103,7 +1165,7 @@ impl Daemon {
         if task.state == TaskState::AwaitingUser {
             return;
         }
-        if self.config.stage(task.stage).runner.as_str() == "claude" {
+        if self.task_uses_claude(&task) {
             if task.state == TaskState::Queued {
                 return;
             }
@@ -1138,6 +1200,7 @@ impl Daemon {
             return;
         }
         self.changed = true;
+        self.pending_chats.remove(&task.id);
         self.decisions.drop_for_task(&task.id);
         match task.stage {
             Stage::Release => self.finish_train(&task.repo, true),
@@ -1297,16 +1360,33 @@ impl Daemon {
 
     /// Send a chat message to a live session, or resume a parked task.
     fn chat(&mut self, id: &str, text: &str) {
+        let task = self.table.by_id.get(id).cloned();
+        if task.as_ref().is_some_and(|task| task.state.is_terminal()) {
+            eprintln!("the chat message for {id}: the task is terminal");
+            return;
+        }
         if let Some(session) = self.sessions.get_mut(id) {
             match session.send_user(text) {
                 Ok(()) => {
                     self.last_event_ms.insert(id.to_string(), self.now_ms);
+                    if task
+                        .as_ref()
+                        .is_some_and(|task| task.state == TaskState::AwaitingUser)
+                    {
+                        if let Err(error) =
+                            self.table.transition(id, TaskState::Running, self.now_ms)
+                        {
+                            eprintln!("the chat message for {id}: {error:#}");
+                        } else {
+                            self.changed = true;
+                        }
+                    }
                 }
                 Err(error) => eprintln!("the chat message for {id}: {error:#}"),
             }
             return;
         }
-        let Some(task) = self.table.by_id.get(id).cloned() else {
+        let Some(task) = task else {
             eprintln!("the chat message for {id}: no such task");
             return;
         };
@@ -1321,9 +1401,11 @@ impl Daemon {
             eprintln!("the chat message for {id}: no session id to resume");
             return;
         };
-        if let Err(e) = self.launch_task(&task, text.to_string(), Some(session_id)) {
-            eprintln!("the chat message for {id}: the runner could not resume: {e:#}");
-        }
+        let _ = session_id;
+        self.pending_chats
+            .entry(id.to_string())
+            .or_default()
+            .push(text.to_string());
     }
 
     /// Route one answered decision to its sink.
@@ -1514,8 +1596,8 @@ impl Daemon {
             eprintln!("the retry of {id}: no such task");
             return;
         };
-        if !task.state.is_terminal() {
-            eprintln!("the retry of {id}: the task is still active");
+        if !matches!(task.state, TaskState::Failed(_)) {
+            eprintln!("the retry of {id}: the task is {}, not failed", task.state);
             return;
         }
         if task.stage == Stage::Release {
@@ -1558,11 +1640,8 @@ impl Daemon {
 
     /// Abort one task: stop its process, cancel it, and drop its decisions.
     fn cancel_task(&mut self, id: &str) {
-        if let Some(mut session) = self.sessions.remove(id) {
-            if let Err(error) = session.stop() {
-                eprintln!("the abort of {id}: cannot stop the session: {error:#}");
-            }
-        }
+        self.stop_session(id, "cannot stop the session during the abort");
+        self.pending_chats.remove(id);
         let active = self
             .table
             .by_id
@@ -1669,6 +1748,17 @@ impl Daemon {
             .count()
     }
 
+    /// Stop one live session and wait for its exit before a replacement.
+    fn stop_session(&mut self, id: &str, context: &str) {
+        let Some(mut session) = self.sessions.remove(id) else {
+            return;
+        };
+        self.stopping_sessions.insert(id.to_string());
+        if let Err(error) = session.stop() {
+            eprintln!("task {id}: {context}: {error:#}");
+        }
+    }
+
     /// The working directory of a task's run.
     fn task_cwd(&self, id: &str) -> Option<PathBuf> {
         let task = self.table.by_id.get(id)?;
@@ -1683,6 +1773,11 @@ impl Daemon {
     /// True when the task is a ticket-creation session.
     fn is_ticket_task(task: &Task) -> bool {
         task.stage == Stage::Refine && task.kind == ItemKind::Issue && task.number == TICKET_NUMBER
+    }
+
+    /// True when this task uses the interactive Claude protocol.
+    fn task_uses_claude(&self, task: &Task) -> bool {
+        Self::is_ticket_task(task) || self.config.stage(task.stage).runner == "claude"
     }
 
     /// The task log path: `<state_dir>/logs/<repo>__<stage>-<kind><n>.jsonl`.
@@ -2230,7 +2325,7 @@ mod tests {
     #[derive(Clone)]
     struct SessionHandle {
         stopped: Arc<AtomicBool>,
-        answers: Arc<Mutex<Vec<String>>>,
+        answers: Arc<Mutex<Vec<(String, Answer)>>>,
         sends: Arc<Mutex<Vec<String>>>,
         fail_answer: Arc<AtomicBool>,
         fail_send: Arc<AtomicBool>,
@@ -2266,15 +2361,11 @@ mod tests {
             if self.handle.fail_answer.load(Ordering::SeqCst) {
                 bail!("the fake session refuses the answer");
             }
-            let tag = match answer {
-                Answer::Allow { .. } => "allow",
-                Answer::Deny { .. } => "deny",
-            };
             self.handle
                 .answers
                 .lock()
                 .unwrap()
-                .push(format!("{request_id}:{tag}"));
+                .push((request_id.to_string(), answer));
             Ok(())
         }
 
@@ -2440,6 +2531,7 @@ mod tests {
                 wake,
                 action_rx,
                 runners,
+                Box::new(FakeRunner::new(jobs.clone(), sessions.clone())),
             );
             let clock_t = t.clone();
             daemon.clock = Arc::new(move || *clock_t.lock().unwrap());
@@ -2577,12 +2669,7 @@ mod tests {
         // A poll that repeats the same snapshot opens no gate again.
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(rig.job_count(), 1);
-        assert!(rig
-            .daemon
-            .state_input()
-            .table
-            .by_id
-            .contains_key("borsuk/refine-i142"));
+        assert!(rig.daemon.table.by_id.contains_key("borsuk/refine-i142"));
     }
 
     #[test]
@@ -2596,7 +2683,43 @@ mod tests {
 
         assert!(first.stopped.load(Ordering::SeqCst));
         assert_eq!(rig.task("borsuk/refine-i142").attempt, 2);
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the replacement waits for the stopped process exit"
+        );
+
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the stopped process exited",
+        ));
+
         assert_eq!(rig.job_count(), 2);
+    }
+
+    #[test]
+    fn one_dispatch_error_does_not_block_another_stage() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 143),
+            143,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("refine.md"), "bad {unknown}").unwrap();
+
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["refined"])],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/implement-i143");
+        assert_eq!(rig.task("borsuk/refine-i142").attempt, 2);
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
     }
 
     #[test]
@@ -2721,8 +2844,65 @@ mod tests {
             },
         });
         let answers = rig.session(0).answers.lock().unwrap().clone();
-        assert_eq!(answers, vec!["req-1:allow", "req-2:deny"]);
+        assert_eq!(
+            answers,
+            vec![
+                (
+                    "req-1".to_string(),
+                    Answer::Allow {
+                        updated_input: None,
+                    },
+                ),
+                (
+                    "req-2".to_string(),
+                    Answer::Deny {
+                        message: "not now".to_string(),
+                    },
+                ),
+            ]
+        );
         assert!(rig.decision("perm:borsuk/refine-i142:req-1").is_none());
+    }
+
+    #[test]
+    fn a_question_answer_reaches_the_runner_verbatim() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(RunEvent::Ask {
+            task: "borsuk/refine-i142".to_string(),
+            request_id: "q-answers".to_string(),
+            tool: "AskUserQuestion".to_string(),
+            input: json!({"questions": [{"question": "Which database?"}]}),
+            suggestions: serde_json::Value::Null,
+            needs_human: true,
+        });
+        let updated_input = json!({
+            "questions": [{
+                "question": "Which database?",
+                "header": "Database",
+                "multiSelect": false,
+                "options": [{"label": "Postgres", "description": "Use Postgres."}],
+                "answer": "Postgres"
+            }],
+            "keep_exactly": [1, "two", {"three": true}]
+        });
+
+        rig.act(Action::Answer {
+            decision_id: "perm:borsuk/refine-i142:q-answers".to_string(),
+            response: Response::Answers {
+                updated_input: updated_input.clone(),
+            },
+        });
+
+        assert_eq!(
+            rig.session(0).answers.lock().unwrap().as_slice(),
+            &[(
+                "q-answers".to_string(),
+                Answer::Allow {
+                    updated_input: Some(updated_input),
+                },
+            )]
+        );
     }
 
     #[test]
@@ -2790,6 +2970,70 @@ mod tests {
             "the task stays parked and resumable"
         );
         assert_eq!(rig.job_count(), 2, "the freed slot admits the second task");
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
+
+    #[test]
+    fn a_live_chat_marks_the_parked_task_running() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "continue with Postgres".to_string(),
+        });
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert_eq!(
+            rig.session(0).sends.lock().unwrap().as_slice(),
+            &["continue with Postgres".to_string()]
+        );
+        assert_eq!(rig.daemon.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_reaped_chat_waits_for_a_live_process_slot() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
+        });
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.set_now(T0 + 31 * 60_000);
+        rig.drive();
+        assert_eq!(rig.job_count(), 2);
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "resume this exact message".to_string(),
+        });
+
+        assert_eq!(rig.job_count(), 2, "the running task keeps the only slot");
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser
+        );
+
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the reaped process exited",
+        ));
+        assert_eq!(rig.job_count(), 2, "the other task still holds the slot");
+        rig.event(exited(
+            "borsuk/refine-i143",
+            false,
+            "the active process exited",
+        ));
+
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).task, "borsuk/refine-i142");
+        assert_eq!(rig.job(2).prompt, "resume this exact message");
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
         assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
     }
 
@@ -2996,13 +3240,23 @@ mod tests {
             vec![],
             vec![pr(2, false, &["release-stacked"]), pr(3, false, &[])],
         );
+        rig.set_now(T0 + 1);
         rig.act(Action::Stack {
             repo: "borsuk".to_string(),
             pr: 3,
             on: true,
         });
-        // The next poll confirms the label, and the row refreshes to the new set.
-        rig.set_now(T0 + 1);
+        let second = rig
+            .decision("gate:borsuk")
+            .expect("the row refreshes after the label call");
+        assert_eq!(sorted(&second), vec![2, 3]);
+        assert_eq!(
+            second.opened_ms,
+            T0 + 1,
+            "a changed batch replaces the stale approval row"
+        );
+
+        // The next poll confirms the label and keeps the same row.
         rig.poll(
             vec![],
             vec![
@@ -3014,11 +3268,6 @@ mod tests {
         let mut prs = sorted(&second);
         prs.sort();
         assert_eq!(prs, vec![2, 3]);
-        assert_eq!(
-            second.opened_ms,
-            T0 + 1,
-            "a changed batch replaces the stale approval row"
-        );
 
         rig.act(Action::Stack {
             repo: "borsuk".to_string(),
@@ -3272,6 +3521,31 @@ mod tests {
     }
 
     #[test]
+    fn ticket_create_uses_the_interactive_runner() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().runner = "opencode".to_string();
+        });
+        let ticket_jobs = Arc::new(Mutex::new(Vec::new()));
+        let ticket_sessions = Arc::new(Mutex::new(Vec::new()));
+        rig.daemon.ticket_runner = Box::new(FakeRunner::new(ticket_jobs.clone(), ticket_sessions));
+
+        rig.act(Action::TicketCreate {
+            repo: "borsuk".to_string(),
+        });
+
+        assert!(rig.jobs.lock().unwrap().is_empty());
+        let jobs = ticket_jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].task, "borsuk/refine-i0");
+        assert!(jobs[0].prompt.contains("gh issue create"));
+        drop(jobs);
+
+        rig.event(turn_ended("borsuk/refine-i0"));
+
+        assert_eq!(rig.task("borsuk/refine-i0").state, TaskState::AwaitingUser);
+    }
+
+    #[test]
     fn unknown_repository_actions_change_no_domain_state() {
         let mut rig = Rig::make(vec![]);
         rig.act(Action::Refine {
@@ -3379,6 +3653,32 @@ mod tests {
             TaskState::Failed("cancelled".to_string())
         );
         assert!(rig.decision("stuck:borsuk/implement-i144:3").is_none());
+    }
+
+    #[test]
+    fn retry_refuses_a_completed_task() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(reuse_issue_steps(
+                    &rig_repo(&dir),
+                    &worktree,
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(turn_finished("borsuk/implement-i142", true, "done"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+
+        rig.act(Action::Retry {
+            task: "borsuk/implement-i142".to_string(),
+        });
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 1);
     }
 
     #[test]
@@ -3664,6 +3964,18 @@ mod tests {
         rig.poll(vec![], vec![updated]);
 
         assert!(first.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the replacement waits for the superseded process exit"
+        );
+
+        rig.event(exited(
+            "borsuk/review-p5",
+            false,
+            "the superseded process exited",
+        ));
+
         assert_eq!(rig.job_count(), 2);
         assert_eq!(
             rig.task("borsuk/review-p5").head_sha.as_deref(),
