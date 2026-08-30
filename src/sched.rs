@@ -133,15 +133,8 @@ impl Paused {
 
 /// Whether one stage of one repository may start a task now.
 ///
-/// This is the capacity check only. It ignores the pause flags. Use
-/// [`verdict`] for the full check that includes them.
-pub fn can_start(limits: &Limits, table: &TaskTable, stage: Stage, repo: &str) -> Verdict {
-    verdict(limits, table, &Paused::default(), stage, repo)
-}
-
-/// The full verdict for one stage of one repository, pauses included.
-///
-/// A paused stage, repository, or factory reports
+/// This is the only start predicate. A paused stage, repository, or factory
+/// reports
 /// `Verdict::No(Reason::Paused)` at once. Otherwise the check counts running
 /// tasks only. A count at or above the stage limit reports
 /// `Verdict::No(Reason::StageFull)`. Otherwise the strict lane reservations
@@ -154,10 +147,10 @@ pub fn can_start(limits: &Limits, table: &TaskTable, stage: Stage, repo: &str) -
 /// The repository's own reservation never works against itself. Queued,
 /// awaiting, and terminal tasks hold no slot; the reservation of a repository
 /// stays blocked for others even while that repository has nothing to run.
-pub fn verdict(
+pub fn can_start(
     limits: &Limits,
-    table: &TaskTable,
     paused: &Paused,
+    table: &TaskTable,
     stage: Stage,
     repo: &str,
 ) -> Verdict {
@@ -202,7 +195,7 @@ pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Opt
         if task.state != TaskState::Queued {
             continue;
         }
-        if verdict(limits, table, paused, task.stage, &task.repo).is_yes() {
+        if can_start(limits, paused, table, task.stage, &task.repo).is_yes() {
             return Some(task.id.clone());
         }
     }
@@ -300,7 +293,13 @@ mod tests {
         start(&mut table, &second);
 
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "qubitsok"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "qubitsok"
+            ),
             Verdict::No(Reason::LaneBlocked)
         );
         assert_eq!(next_dispatch(&limits, &table, &Paused::default()), None);
@@ -315,11 +314,23 @@ mod tests {
         start(&mut table, &ids[1]);
 
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "qubitsok"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "qubitsok"
+            ),
             Verdict::No(Reason::LaneBlocked)
         );
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "borsuk"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "borsuk"
+            ),
             Verdict::Yes
         );
         assert_eq!(
@@ -337,7 +348,13 @@ mod tests {
 
         for id in &ids {
             assert_eq!(
-                can_start(&limits, &table, Stage::Implement, "qubitsok"),
+                can_start(
+                    &limits,
+                    &Paused::default(),
+                    &table,
+                    Stage::Implement,
+                    "qubitsok"
+                ),
                 Verdict::Yes
             );
             let next = next_dispatch(&limits, &table, &Paused::default()).unwrap();
@@ -346,7 +363,13 @@ mod tests {
         }
 
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "qubitsok"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "qubitsok"
+            ),
             Verdict::No(Reason::StageFull)
         );
     }
@@ -381,7 +404,7 @@ mod tests {
         };
         assert_eq!(next_dispatch(&limits, &table, &global), None);
         assert_eq!(
-            verdict(&limits, &table, &global, Stage::Implement, "borsuk"),
+            can_start(&limits, &global, &table, Stage::Implement, "borsuk"),
             Verdict::No(Reason::Paused)
         );
 
@@ -391,7 +414,7 @@ mod tests {
         };
         assert_eq!(next_dispatch(&limits, &table, &stage), None);
         assert_eq!(
-            verdict(&limits, &table, &stage, Stage::Implement, "qubitsok"),
+            can_start(&limits, &stage, &table, Stage::Implement, "qubitsok"),
             Verdict::No(Reason::Paused)
         );
 
@@ -400,7 +423,7 @@ mod tests {
             ..Paused::default()
         };
         assert_eq!(
-            verdict(&limits, &table, &repo, Stage::Implement, "borsuk"),
+            can_start(&limits, &repo, &table, Stage::Implement, "borsuk"),
             Verdict::No(Reason::Paused)
         );
         assert_eq!(
@@ -409,9 +432,15 @@ mod tests {
             "the paused repository is skipped, the free one still dispatches"
         );
 
-        // The capacity-only check ignores the pause flags.
+        // Unpaused and free, can_start says yes.
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "borsuk"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "borsuk"
+            ),
             Verdict::Yes
         );
         assert_eq!(next_dispatch(&limits, &table, &none), Some(ids[0].clone()));
@@ -486,11 +515,23 @@ mod tests {
         let (mut table, ids) = queued_implement(&[("borsuk", 1)]);
         start(&mut table, &ids[0]);
         assert_eq!(
-            can_start(&full, &table, Stage::Implement, "borsuk"),
+            can_start(
+                &full,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "borsuk"
+            ),
             Verdict::No(Reason::StageFull)
         );
         assert_eq!(
-            can_start(&full, &table, Stage::Implement, "qubitsok"),
+            can_start(
+                &full,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "qubitsok"
+            ),
             Verdict::No(Reason::StageFull)
         );
 
@@ -501,7 +542,7 @@ mod tests {
         );
         let (table, _) = queued_implement(&[("c", 9)]);
         assert_eq!(
-            can_start(&lanes, &table, Stage::Implement, "c"),
+            can_start(&lanes, &Paused::default(), &table, Stage::Implement, "c"),
             Verdict::No(Reason::LaneBlocked)
         );
     }
@@ -540,7 +581,13 @@ mod tests {
 
         assert_eq!(next_dispatch(&limits, &table, &Paused::default()), None);
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "borsuk"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "borsuk"
+            ),
             Verdict::Yes
         );
     }
@@ -553,7 +600,13 @@ mod tests {
         let (mut table, ids) = queued_implement(&[("borsuk", 1)]);
         start(&mut table, &ids[0]);
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "qubitsok"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "qubitsok"
+            ),
             Verdict::No(Reason::StageFull)
         );
 
@@ -561,7 +614,13 @@ mod tests {
             .transition(&ids[0], TaskState::AwaitingUser, NOW + 2)
             .unwrap();
         assert_eq!(
-            can_start(&limits, &table, Stage::Implement, "qubitsok"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                Stage::Implement,
+                "qubitsok"
+            ),
             Verdict::Yes,
             "the parked chat freed the slot"
         );
@@ -576,7 +635,13 @@ mod tests {
             None
         );
         assert_eq!(
-            can_start(&limits, &TaskTable::new(), Stage::Implement, "borsuk"),
+            can_start(
+                &limits,
+                &Paused::default(),
+                &TaskTable::new(),
+                Stage::Implement,
+                "borsuk"
+            ),
             Verdict::Yes
         );
     }
