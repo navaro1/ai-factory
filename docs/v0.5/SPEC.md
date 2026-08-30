@@ -1187,7 +1187,31 @@ chunks 18 to 21.
 
 ---
 
-## Task 19 — Pipeline interactions
+## Task 19 — Wire the views, then add the pipeline interactions
+
+Chunk 19 now covers BOTH the TUI integration and the pipeline key actions,
+because they touch the same files and no other chunk owns the wiring.
+
+**Part A, integration.** Chunk 18 shipped `render()` with placeholder arms for
+the session and inbox views, since it could not see them. Wire them now:
+- Drive the session view with `show`, `on_redraw`, `poll`, `handle_key`, `draw`.
+- Drive the inbox with `observe`, `draw`, `handle_key`.
+- Render `inbox::badge` in the status bar of EVERY view, not only the inbox.
+- Bind `!` globally to enter the inbox and select its oldest row.
+- Map `InboxOutcome::OpenSession` to switching to the session view for that task.
+- Rebind the session view's six local style functions onto `theme.rs`.
+- The help overlay must list PageUp, PageDown and End.
+
+**The `q` hazard, and it is a real one.** Chunk 18 binds `q` to quit GLOBALLY.
+The session view has a text input bar and the inbox has a deny-reason input, so
+as it stands, typing the letter q into a message to an agent QUITS THE WHOLE
+UI. Gate `q` so it never reaches the global handler while any view holds text
+input focus. Write a test that types `q` into the session input and asserts the
+app does not quit and the character lands in the buffer.
+
+**Part B, the pipeline interactions.** As below.
+
+
 
 **Goal.** Drive the factory from the home view.
 
