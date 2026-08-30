@@ -2,9 +2,12 @@
 //!
 //! One task is one `opencode run` child. [`crate::proc`] tees the child's
 //! raw NDJSON into the task log; this module parses the same lines into
-//! [`RunEvent`]s: a `step_start` line starts the run, a `text` line or a tool
-//! part carries assistant activity, and a `step_finish` line ends a step. A
-//! malformed or unknown line is logged and skipped, never fatal.
+//! [`RunEvent`]s: a `step_start` line starts the run, a `text` line carries
+//! assistant text, a `tool_use` line carries tool activity, and a
+//! `step_finish` line ends one step. One run can carry several steps, so a
+//! step ending is not the task ending; the task ends only when the process
+//! exits, as [`RunEvent::Exit`]. A malformed or unknown line is logged and
+//! skipped, never fatal.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -111,14 +114,19 @@ pub struct OpenCodeSession {
 }
 
 impl Session for OpenCodeSession {
-    /// Kill the child with SIGKILL.
+    /// Stop the child through the chunk 9 escalation, without a protocol
+    /// interrupt: opencode has no interrupt channel.
     ///
-    /// opencode sends no protocol interrupt, so the plain kill is the whole
-    /// policy; the death arrives as [`RunEvent::Exit`]. A second stop is a
-    /// no-op.
+    /// The escalation waits up to 10 s for a natural exit, sends SIGTERM,
+    /// waits 5 s, then sends SIGKILL. A polite stop protects the session
+    /// state opencode writes to disk for a later resume. The death arrives
+    /// as [`RunEvent::Exit`]. A second stop is a no-op.
     fn stop(&mut self) -> anyhow::Result<()> {
         match self.handle.take() {
-            Some(handle) => handle.kill(),
+            Some(handle) => {
+                proc::stop_gracefully(handle, false);
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -202,9 +210,14 @@ impl NdjsonParser {
 
     /// Parse one output line into zero or more run events.
     ///
-    /// An empty line produces nothing. A malformed line, a line without a
-    /// usable shape, and an unknown line type are logged to stderr and
-    /// skipped; the raw line stays in the task log either way.
+    /// The verified line types are `step_start`, `text`, `tool_use`, and
+    /// `step_finish`. A tool line has line type `tool_use` and part type
+    /// `tool`; the name sits at `part.tool` and the state under
+    /// `part.state`. A tool part under any other line type still yields a
+    /// `Tool` event. An empty line produces nothing. A malformed line, a
+    /// line without a usable shape, and an unknown line type without a tool
+    /// part are logged to stderr and skipped; the raw line stays in the
+    /// task log either way.
     pub fn parse_line(&mut self, line: &str) -> Vec<RunEvent> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -231,7 +244,10 @@ impl NdjsonParser {
             Some("step_start") => self.on_step_start(),
             Some("text") => self.on_text_part(&part),
             Some("step_finish") => self.on_step_finish(&part),
-            Some("tool") => self.on_tool_part(&part),
+            // The verified tool line: line type "tool_use", part type
+            // "tool". Any other line type falls through, and its part still
+            // counts when it is a tool part.
+            Some("tool_use") => self.on_tool_part(&part),
             _ => {
                 if part.get("type").and_then(Value::as_str) == Some("tool") {
                     self.on_tool_part(&part)
@@ -294,8 +310,10 @@ impl NdjsonParser {
 
     /// Emit `TurnEnd` for one finished step.
     ///
-    /// A step failed only when its reason names an error; the exit code of
-    /// the whole child is reported separately as [`RunEvent::Exit`].
+    /// One run carries several steps, so several `TurnEnd` events can
+    /// precede the one [`RunEvent::Exit`]. A step ending is not the task
+    /// ending. A step failed only when its reason names an error; the exit
+    /// code of the whole child is reported separately as [`RunEvent::Exit`].
     fn on_step_finish(&mut self, part: &Value) -> Vec<RunEvent> {
         let reason = part.get("reason").and_then(Value::as_str);
         vec![RunEvent::TurnEnd {
@@ -350,11 +368,13 @@ mod tests {
 
     /// A recorded opencode NDJSON run, in the verified shapes: one object per
     /// line, `sessionID` and a `part` object on each, assistant text at
-    /// `part.text`, and one tool part. It also carries one malformed line and
-    /// one unknown line type, both of which the run must survive.
+    /// `part.text`, and one `tool_use` line in the shape probed from a real
+    /// run (line type `tool_use`, part type `tool`, name at `part.tool`,
+    /// state under `part.state`). It also carries one malformed line and one
+    /// unknown line type, both of which the run must survive.
     const FIXTURE: &str = r#"{"type":"step_start","sessionID":"ses_fix01","part":{"id":"prt_1","messageID":"msg_1","sessionID":"ses_fix01","type":"step-start"}}
 {"type":"text","sessionID":"ses_fix01","part":{"id":"prt_2","messageID":"msg_1","sessionID":"ses_fix01","type":"text","text":"Reading the failing test first."}}
-{"type":"text","sessionID":"ses_fix01","part":{"id":"prt_3","messageID":"msg_1","sessionID":"ses_fix01","type":"tool","tool":"bash","state":{"status":"completed","title":"cargo test -p aif","input":{"command":"cargo test"}},"output":"ok"}}
+{"type":"tool_use","timestamp":1756500000000,"sessionID":"ses_fix01","part":{"type":"tool","tool":"read","callID":"call_01","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"fn main() {}","metadata":{},"time":{"start":1756500000100,"end":1756500000150},"title":"src/main.rs"}}}
 not json at all
 {"type":"file_watched","sessionID":"ses_fix01","part":{"id":"prt_4","path":"src/main.rs"}}
 {"type":"text","sessionID":"ses_fix01","part":{"id":"prt_5","messageID":"msg_1","sessionID":"ses_fix01","type":"text","text":"Fixed the parser and opened draft PR 142."}}
@@ -487,8 +507,8 @@ not json at all
                 },
                 RunEvent::Tool {
                     task: "borsuk/review-p7".to_string(),
-                    name: "bash".to_string(),
-                    summary: "cargo test -p aif".to_string(),
+                    name: "read".to_string(),
+                    summary: "src/main.rs".to_string(),
                 },
                 RunEvent::Text {
                     task: "borsuk/review-p7".to_string(),
@@ -671,8 +691,8 @@ not json at all
             },
             RunEvent::Tool {
                 task: TASK.to_string(),
-                name: "bash".to_string(),
-                summary: "cargo test -p aif".to_string(),
+                name: "read".to_string(),
+                summary: "src/main.rs".to_string(),
             },
             RunEvent::Text {
                 task: TASK.to_string(),
@@ -708,21 +728,29 @@ not json at all
     }
 
     #[test]
-    fn stop_kills_a_running_child() {
+    fn stop_runs_the_escalation_and_spares_a_finishing_child() {
         let dir = temp_dir("stop");
-        let program = script(&dir, "sleeper", "#!/bin/sh\nwhile :; do sleep 0.05; done\n");
+        let program = script(&dir, "finisher", "#!/bin/sh\nsleep 0.3\nexit 0\n");
         let job = job(&dir, None);
         let mut runner = OpenCodeRunner::with_program(program.display().to_string());
 
         let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let started = Instant::now();
         session.stop().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "stop blocked the caller for {started:?}"
+        );
 
+        // The escalation waits 10 s before it signals anything, so this
+        // child exits on its own with code 0. A plain SIGKILL instead would
+        // report a signal death with ok false.
         assert_eq!(
             collect_until_exit(&rx).last(),
             Some(&RunEvent::Exit {
                 task: TASK.to_string(),
-                ok: false,
-                detail: "opencode was killed by a signal".to_string(),
+                ok: true,
+                detail: "opencode exited with code 0".to_string(),
             })
         );
         // A second stop after the child is gone is a no-op.

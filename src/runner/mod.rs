@@ -88,6 +88,9 @@ pub enum RunEvent {
         needs_human: bool,
     },
     /// One agent turn finished.
+    ///
+    /// A turn ending is not the task ending. A run can carry several turns,
+    /// and only [`RunEvent::Exit`] ends the run's process.
     TurnEnd {
         /// The task id the run works for.
         task: String,
