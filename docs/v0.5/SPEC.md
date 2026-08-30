@@ -983,6 +983,15 @@ loop {
   waiting for a gate: `Refine` queues a refine task for the named issue, and
   `TicketCreate` starts an interactive claude session whose prompt tells it to
   create a ticket with `gh`.
+- Contracts the socket module imposes on you, reported by its author:
+  - `Server::bind` returns `(Server, Receiver<Action>)`. Take the receiver into
+    your event loop as another message source.
+  - `publish(StateView)` never blocks and coalesces to at most one push every
+    50 ms. Call it whenever your `dirty` flag is set; do not throttle it
+    yourself.
+  - Drop the `Server` before the process exits, so clients see EOF and the
+    socket file disappears. A daemon that exits without dropping it leaves a
+    stale socket that the next start has to clean up.
 - Contracts the decisions module imposes on you, reported by its author:
   - A `ReleaseGate` row snapshots its pull request list when it opens. If the
     stacked set changes while that row is open, you must take the row and push
