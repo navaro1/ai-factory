@@ -1,2 +1,3 @@
-ui/console/target/
 /target
+ui/console/target/
+.superpowers/
