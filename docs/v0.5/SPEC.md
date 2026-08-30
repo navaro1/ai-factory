@@ -805,6 +805,15 @@ pub enum Response { Allow, Deny { message: String },
   `human:<repo>:<kind><number>`, `gate:<repo>`.
 - `validate(&Decision, &Response) -> Result<()>` refuses a mismatched pair, for
   example `Go` against a `Permission`.
+- `NeedsHuman` accepts only `Text` and `Cancel`. `Text` posts the text as a
+  comment on the item and removes the `needs-human` label; `Cancel` removes the
+  label without comment. It must NOT accept `Retry`: a `needs-human` label can
+  outlive its task, so there may be nothing to retry, and an inbox that offers
+  an action which quietly does nothing is worse than one that offers fewer.
+- `Permission` and `Question` share one id namespace (`perm:<task>:<request_id>`)
+  because they are the same underlying `can_use_tool` request from the claude
+  control channel, told apart only by `requires_user_interaction`. One namespace
+  is what stops a single request opening two rows.
 - Sources are wired by the daemon in chunk 15; this chunk owns the type, the
   queue, the id rules, and the validation.
 - The `NeedsHuman` source reads the `needs-human` label. Opening it must not
@@ -921,6 +930,14 @@ loop {
   requeues, otherwise fails the task and opens a Stuck decision.
 - Review success writes `.aif/reviewed-sha` only after the task reports
   success, never before.
+- Contracts the decisions module imposes on you, reported by its author:
+  - A `ReleaseGate` row snapshots its pull request list when it opens. If the
+    stacked set changes while that row is open, you must take the row and push
+    a fresh one, or the human will approve a list that no longer matches what
+    would actually ship.
+  - Build a stuck row with `Decision::stuck(&task, ..)`, not `Decision::new`;
+    only the former carries the attempt number that makes the id unique per
+    attempt.
 - Contracts the release-train module imposes on you, reported by its author:
   - Build a train with `Train::new(repo)`, never a struct literal. It carries
     private state that `finish` needs to reconstruct the exact fired batch.
