@@ -4,8 +4,11 @@
 //! whole [`RepoSnapshot`] to the daemon on one shared channel. Between passes
 //! the poller waits on its own wake channel, so the daemon can force an early
 //! pass. A failed pass is reported and the poller backs off, at most five
-//! minutes, so one broken repository never stops the others.
+//! minutes, so one broken repository never stops the others. [`spawn_pollers`]
+//! returns the wake sender of every repository, so the daemon holds them from
+//! the start.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -26,21 +29,11 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// One inbound message of the daemon event loop.
 ///
-/// The pollers of this module send [`PollerOnline`][DaemonMsg::PollerOnline],
-/// [`Polled`][DaemonMsg::Polled], and [`PollFailed`][DaemonMsg::PollFailed].
-/// Later chunks add the variants of the runners, the trains, and the control
-/// socket.
-#[derive(Debug)]
+/// The pollers of this module send [`Polled`][DaemonMsg::Polled] and
+/// [`PollFailed`][DaemonMsg::PollFailed]. Later chunks add the variants of the
+/// runners, the trains, and the control socket.
+#[derive(Debug, Clone, PartialEq)]
 pub enum DaemonMsg {
-    /// The first message of each poller. The daemon stores `wake` and sends
-    /// on it to force an early pass. Dropping the sender ends that poller
-    /// after its current wait.
-    PollerOnline {
-        /// The repository alias of the poller.
-        repo: String,
-        /// The wake channel of that one poller.
-        wake: Sender<()>,
-    },
     /// One finished poll pass. `snapshot` holds the complete current state of
     /// the repository; the reader already merged the cached entries of the
     /// pages that answered 304 into it.
@@ -61,75 +54,91 @@ pub enum DaemonMsg {
     Shutdown,
 }
 
+/// The join handles and the wake senders of a set of spawned pollers.
+#[derive(Debug)]
+pub struct Pollers {
+    /// One join handle per spawned poller, in the config order.
+    pub handles: Vec<JoinHandle<()>>,
+    /// The wake sender of each repository, keyed by alias. The daemon sends
+    /// on a sender to force an early pass, and drops it to end that poller.
+    pub wake: BTreeMap<String, Sender<()>>,
+}
+
 /// Spawn one poller thread per configured repository.
 ///
-/// Each thread announces itself with [`DaemonMsg::PollerOnline`] and then
-/// loops: fetch, send [`DaemonMsg::Polled`], wait [`POLL_INTERVAL`] on its
-/// wake channel. A failed pass sends [`DaemonMsg::PollFailed`] and doubles
-/// the wait, at most [`MAX_BACKOFF`]. Each thread runs until the daemon
-/// drops its wake sender or the channel closes. The join handles follow the
-/// config order of the repositories.
-pub fn spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Vec<JoinHandle<()>> {
+/// Each thread loops: fetch, send [`DaemonMsg::Polled`], wait
+/// [`POLL_INTERVAL`] on its wake channel. A failed pass sends
+/// [`DaemonMsg::PollFailed`] and doubles the wait, at most [`MAX_BACKOFF`].
+/// Each thread runs until the daemon drops its wake sender or the channel
+/// closes. The join handles follow the config order of the repositories.
+pub fn spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Pollers {
     let exec_for = |_alias: &str| Arc::new(RealExec) as Arc<dyn Exec>;
     spawn_all(cfg, tx, &exec_for, POLL_INTERVAL, MAX_BACKOFF)
 }
 
 /// Spawn every poller with an explicit [`Exec`] factory and waits.
 ///
-/// The tests use it to inject a [`ScriptExec`][crate::exec::ScriptExec] and
-/// short waits; production uses [`spawn_pollers`]. A repository whose thread
-/// cannot start contributes no handle and sends [`DaemonMsg::PollFailed`].
+/// The function creates each wake channel before it spawns the thread, gives
+/// the receiver to the thread, and returns the sender in the map. The tests
+/// use it to inject a [`ScriptExec`][crate::exec::ScriptExec] and short
+/// waits; production uses [`spawn_pollers`]. A repository whose thread cannot
+/// start contributes no handle, no sender, and sends
+/// [`DaemonMsg::PollFailed`].
 fn spawn_all(
     cfg: &Config,
     tx: Sender<DaemonMsg>,
     exec_for: &dyn Fn(&str) -> Arc<dyn Exec>,
     interval: Duration,
     max_backoff: Duration,
-) -> Vec<JoinHandle<()>> {
+) -> Pollers {
     let mut handles = Vec::new();
+    let mut wake = BTreeMap::new();
     for repo in cfg.repos.values() {
+        let (wake_tx, wake_rx) = mpsc::channel();
         if let Some(handle) = spawn_one(
             repo.alias.clone(),
             repo.owner_repo.clone(),
             exec_for(&repo.alias),
             tx.clone(),
+            wake_rx,
             interval,
             max_backoff,
         ) {
             handles.push(handle);
+            wake.insert(repo.alias.clone(), wake_tx);
         }
     }
-    handles
+    Pollers { handles, wake }
 }
 
-/// Spawn the poller thread of one repository and create its wake channel.
+/// Spawn the poller thread of one repository.
 ///
-/// Returns `None` when the thread cannot start or the daemon channel is
-/// already closed; both cases send [`DaemonMsg::PollFailed`].
+/// Returns `None` when the thread cannot start; the case sends
+/// [`DaemonMsg::PollFailed`].
 fn spawn_one(
     repo: String,
     owner_repo: String,
     exec: Arc<dyn Exec>,
     tx: Sender<DaemonMsg>,
+    wake_rx: Receiver<()>,
     interval: Duration,
     max_backoff: Duration,
 ) -> Option<JoinHandle<()>> {
-    let (wake_tx, wake_rx) = mpsc::channel();
-    let spec = PollerSpec {
-        repo: repo.clone(),
-        owner_repo,
-        exec,
-        tx: tx.clone(),
-        wake_tx,
-        wake_rx,
-        interval,
-        max_backoff,
-    };
     let name = format!("poll-{repo}");
-    match thread::Builder::new()
-        .name(name)
-        .spawn(move || poller_loop(spec))
-    {
+    let thread_repo = repo.clone();
+    let thread_tx = tx.clone();
+    let spawned = thread::Builder::new().name(name).spawn(move || {
+        poller_loop(
+            thread_repo,
+            owner_repo,
+            exec,
+            thread_tx,
+            wake_rx,
+            interval,
+            max_backoff,
+        )
+    });
+    match spawned {
         Ok(handle) => Some(handle),
         Err(error) => {
             let _ = tx.send(DaemonMsg::PollFailed {
@@ -141,46 +150,16 @@ fn spawn_one(
     }
 }
 
-/// Everything one poller thread needs.
-struct PollerSpec {
-    /// The repository alias it reports under.
-    repo: String,
-    /// The `owner/name` slug it fetches.
-    owner_repo: String,
-    /// The command indirection it fetches through.
-    exec: Arc<dyn Exec>,
-    /// The daemon channel it reports on.
-    tx: Sender<DaemonMsg>,
-    /// The sender half of its wake channel; the poller hands it to the
-    /// daemon with its first message.
-    wake_tx: Sender<()>,
-    /// The receiver half of its wake channel.
-    wake_rx: Receiver<()>,
-    /// The wait between two passes.
-    interval: Duration,
-    /// The cap the wait grows to after failures.
-    max_backoff: Duration,
-}
-
 /// Run the poll loop of one repository until its wake channel disconnects.
-fn poller_loop(spec: PollerSpec) {
-    let PollerSpec {
-        repo,
-        owner_repo,
-        exec,
-        tx,
-        wake_tx,
-        wake_rx,
-        interval,
-        max_backoff,
-    } = spec;
-    let online = DaemonMsg::PollerOnline {
-        repo: repo.clone(),
-        wake: wake_tx,
-    };
-    if tx.send(online).is_err() {
-        return;
-    }
+fn poller_loop(
+    repo: String,
+    owner_repo: String,
+    exec: Arc<dyn Exec>,
+    tx: Sender<DaemonMsg>,
+    wake_rx: Receiver<()>,
+    interval: Duration,
+    max_backoff: Duration,
+) {
     let mut client = GhClient::new(exec.as_ref());
     let mut backoff = interval;
     loop {
@@ -409,26 +388,24 @@ mod tests {
             ),
         );
         let (tx, rx) = mpsc::channel();
+        let (wake, wake_rx) = mpsc::channel();
         let handle = spawn_one(
             REPO.to_string(),
             OWNER_REPO.to_string(),
             exec.clone(),
             tx,
+            wake_rx,
             Duration::from_secs(10),
             Duration::from_secs(20),
         )
         .unwrap();
 
-        let DaemonMsg::PollerOnline { repo, wake } = next_msg(&rx, "the online message") else {
-            panic!("the first message was not PollerOnline");
-        };
-        assert_eq!(repo, REPO);
         let DaemonMsg::Polled {
             repo,
             snapshot: first,
         } = next_msg(&rx, "the first poll")
         else {
-            panic!("the second message was not Polled");
+            panic!("the first message was not Polled");
         };
         assert_eq!(repo, REPO);
         assert_eq!(
@@ -515,21 +492,20 @@ mod tests {
             ),
         ));
         let (tx, rx) = mpsc::channel();
+        let (wake, wake_rx) = mpsc::channel();
         let handle = spawn_one(
             REPO.to_string(),
             OWNER_REPO.to_string(),
             exec,
             tx,
+            wake_rx,
             Duration::from_millis(20),
             Duration::from_millis(40),
         )
         .unwrap();
 
-        let DaemonMsg::PollerOnline { wake, .. } = next_msg(&rx, "the online message") else {
-            panic!("the first message was not PollerOnline");
-        };
         let DaemonMsg::PollFailed { repo, error } = next_msg(&rx, "the first failure") else {
-            panic!("the second message was not PollFailed");
+            panic!("the first message was not PollFailed");
         };
         assert_eq!(repo, REPO);
         assert!(error.contains("gh is unhappy"), "error was: {error}");
@@ -570,9 +546,9 @@ mod tests {
         assert_eq!(next_backoff(Duration::MAX, MAX_BACKOFF), MAX_BACKOFF);
     }
 
-    #[test]
-    fn a_wake_reaches_only_its_own_repository() {
-        let mut config = Config::parse(
+    /// A config with the four stages and the two repositories `a` and `b`.
+    fn two_repo_config() -> Config {
+        Config::parse(
             r#"
 [stage.refine]
 model = "m"
@@ -597,7 +573,12 @@ path = "/repos/a"
 path = "/repos/b"
 "#,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn a_wake_reaches_only_its_own_repository() {
+        let mut config = two_repo_config();
         config.repos.get_mut("a").unwrap().owner_repo = "acme/one".to_string();
         config.repos.get_mut("b").unwrap().owner_repo = "acme/two".to_string();
 
@@ -697,29 +678,24 @@ path = "/repos/b"
         let exec_for = move |alias: &str| execs[alias].clone();
 
         let (tx, rx) = mpsc::channel();
-        let handles = spawn_all(
+        let pollers = spawn_all(
             &config,
             tx,
             &exec_for,
             Duration::from_millis(30),
             Duration::from_millis(60),
         );
-        assert_eq!(handles.len(), 2);
+        assert_eq!(pollers.handles.len(), 2);
 
-        let mut wakes = BTreeMap::new();
         let mut first_polls = BTreeMap::new();
-        for _ in 0..4 {
-            match next_msg(&rx, "the first messages of both pollers") {
-                DaemonMsg::PollerOnline { repo, wake } => {
-                    wakes.insert(repo, wake);
-                }
+        for _ in 0..2 {
+            match next_msg(&rx, "the first poll of each repository") {
                 DaemonMsg::Polled { repo, snapshot } => {
                     first_polls.insert(repo, snapshot);
                 }
                 other => panic!("unexpected message: {other:?}"),
             }
         }
-        assert_eq!(wakes.len(), 2);
         assert_eq!(
             first_polls["a"],
             snapshot(vec![model_issue(1)], vec![model_pr(2, "aaa")])
@@ -729,7 +705,7 @@ path = "/repos/b"
             snapshot(vec![model_issue(3)], vec![model_pr(5, "bbb")])
         );
 
-        wakes["a"].send(()).unwrap();
+        pollers.wake["a"].send(()).unwrap();
         let mut saw_a_update = false;
         while !saw_a_update {
             match next_msg(&rx, "the woken poll of a") {
@@ -756,8 +732,141 @@ path = "/repos/b"
             }
         }
 
-        drop(wakes);
-        for handle in handles {
+        drop(pollers.wake);
+        for handle in pollers.handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_wake_map_holds_one_sender_per_repository() {
+        let mut config = two_repo_config();
+        config.repos.get_mut("a").unwrap().owner_repo = "acme/one".to_string();
+        config.repos.get_mut("b").unwrap().owner_repo = "acme/two".to_string();
+
+        let exec_a: Arc<dyn Exec> = Arc::new(pass_steps(
+            ScriptExec::new(),
+            (
+                vec![
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/one/issues?state=open&per_page=100&page=1",
+                ],
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"ia1\""],
+                    &format!("[{}]", issue_json(1)),
+                )),
+            ),
+            (
+                vec![
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/one/pulls?state=open&per_page=100&page=1",
+                ],
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"pa1\""],
+                    &format!("[{}]", pr_json(2, "aaa")),
+                )),
+            ),
+        ));
+        // The second pass of b answers 304 on both lists, so the wake of b
+        // produces a second Polled with the same snapshot.
+        let exec_b: Arc<dyn Exec> = Arc::new(
+            pass_steps(
+                ScriptExec::new(),
+                (
+                    vec![
+                        "api",
+                        "-i",
+                        "-X",
+                        "GET",
+                        "repos/acme/two/issues?state=open&per_page=100&page=1",
+                    ],
+                    CmdOut::ok(response(
+                        "HTTP/2 200",
+                        &["etag: \"ib1\""],
+                        &format!("[{}]", issue_json(3)),
+                    )),
+                ),
+                (
+                    vec![
+                        "api",
+                        "-i",
+                        "-X",
+                        "GET",
+                        "repos/acme/two/pulls?state=open&per_page=100&page=1",
+                    ],
+                    CmdOut::ok(response(
+                        "HTTP/2 200",
+                        &["etag: \"pb1\""],
+                        &format!("[{}]", pr_json(5, "bbb")),
+                    )),
+                ),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"ib1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/two/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &[], "")),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"pb1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/two/pulls?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &[], "")),
+            ),
+        );
+        let execs = BTreeMap::from([("a", exec_a), ("b", exec_b)]);
+        let exec_for = move |alias: &str| execs[alias].clone();
+
+        // The interval is ten seconds, so the second pass of b can only come
+        // from the wake; the test would time out otherwise.
+        let (tx, rx) = mpsc::channel();
+        let pollers = spawn_all(
+            &config,
+            tx,
+            &exec_for,
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        );
+
+        assert_eq!(pollers.handles.len(), 2);
+        let aliases: Vec<&str> = pollers.wake.keys().map(String::as_str).collect();
+        assert_eq!(aliases, ["a", "b"]);
+
+        for _ in 0..2 {
+            match next_msg(&rx, "the first poll of each repository") {
+                DaemonMsg::Polled { .. } => {}
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        pollers.wake["b"].send(()).unwrap();
+        match next_msg(&rx, "the woken poll of b") {
+            DaemonMsg::Polled { repo, .. } => assert_eq!(repo, "b"),
+            other => panic!("the wake did not produce a Polled message: {other:?}"),
+        }
+
+        drop(pollers.wake);
+        for handle in pollers.handles {
             handle.join().unwrap();
         }
     }
