@@ -67,31 +67,43 @@ impl ListKind {
     }
 }
 
+/// What the reader remembers about one page.
+#[derive(Debug, Clone)]
+struct CachedPage {
+    /// The ETag of the last 200 answer; the next request sends it as
+    /// `If-None-Match`.
+    etag: String,
+    /// The page held exactly [`PAGE_SIZE`] items at its last 200.
+    full: bool,
+    /// The `Link` head named a `rel="next"` page at its last 200.
+    next: bool,
+}
+
 /// A GitHub reader for one poller thread.
 ///
-/// The client runs `gh api` through the [`Exec`] indirection and remembers
-/// one ETag per list and page. A page that answered 200 stores its ETag, and
-/// the next request for that page sends `If-None-Match`. A page that answers
-/// 304 keeps its stored ETag.
+/// The client runs `gh api` through the [`Exec`] indirection and remembers,
+/// per list and page, the ETag of the last 200 answer and the two pagination
+/// flags learned from it. The next request for that page sends
+/// `If-None-Match`. A page that answers 304 keeps its cache entry.
 pub struct GhClient<'a> {
     exec: &'a dyn Exec,
-    etags: BTreeMap<(ListKind, u64), String>,
+    pages: BTreeMap<(ListKind, u64), CachedPage>,
 }
 
 impl<'a> GhClient<'a> {
-    /// A client with an empty ETag cache.
+    /// A client with an empty page cache.
     pub fn new(exec: &'a dyn Exec) -> Self {
         GhClient {
             exec,
-            etags: BTreeMap::new(),
+            pages: BTreeMap::new(),
         }
     }
 
     /// Fetch the open issues of `owner_repo` and follow pagination.
     ///
     /// Objects that carry a `pull_request` key are pull requests; the method
-    /// drops them. A 304 page is reported in `unchanged` and ends the
-    /// pagination, because the body is absent.
+    /// drops them. A 304 page is reported in `unchanged`, and the walk goes
+    /// on while the cached flags of that page know a next page.
     pub fn fetch_issues(&mut self, owner_repo: &str) -> Result<Collection<Issue>> {
         self.fetch_list(owner_repo, ListKind::Issues, issue_from_value)
     }
@@ -105,20 +117,24 @@ impl<'a> GhClient<'a> {
 
     /// The stored ETag of one issues page.
     pub fn issue_etag(&self, page: u64) -> Option<&str> {
-        self.etags
+        self.pages
             .get(&(ListKind::Issues, page))
-            .map(String::as_str)
+            .map(|cached| cached.etag.as_str())
     }
 
     /// The stored ETag of one pull requests page.
     pub fn pull_etag(&self, page: u64) -> Option<&str> {
-        self.etags.get(&(ListKind::Pulls, page)).map(String::as_str)
+        self.pages
+            .get(&(ListKind::Pulls, page))
+            .map(|cached| cached.etag.as_str())
     }
 
     /// Fetch every page of one list and merge the changed pages.
     ///
-    /// The walk continues while a page returns exactly [`PAGE_SIZE`] items
-    /// and its `Link` head names a `rel="next"` page.
+    /// The walk goes to the next page while the current page is known to
+    /// carry one: a 200 with exactly [`PAGE_SIZE`] items and a `Link` head
+    /// that names `rel="next"`, or a 304 whose cached flags say both. A 304
+    /// without a cache entry stops the walk instead of looping.
     fn fetch_list<T>(
         &mut self,
         owner_repo: &str,
@@ -134,11 +150,11 @@ impl<'a> GhClient<'a> {
             let path = kind.path();
             let url =
                 format!("repos/{owner_repo}/{path}?state=open&per_page={PAGE_SIZE}&page={page}");
-            let cached = self.etags.get(&(kind, page)).cloned();
+            let cached = self.pages.get(&(kind, page)).cloned();
             let mut args: Vec<&str> = vec!["api", "-i"];
             let header;
-            if let Some(etag) = &cached {
-                header = format!("If-None-Match: {etag}");
+            if let Some(cached_page) = &cached {
+                header = format!("If-None-Match: {}", cached_page.etag);
                 args.push("-H");
                 args.push(&header);
             }
@@ -150,27 +166,42 @@ impl<'a> GhClient<'a> {
             let response = parse_response(&out.stdout)?;
             ensure_ok(&response, &out.stderr)?;
             if response.status == 304 {
+                // A 304 says only that this page is byte-identical. Pages
+                // after it can still carry changes, so the walk continues
+                // while the cached flags know a next page.
                 fetched.unchanged.push(page);
-                break;
-            }
-            match &response.etag {
-                Some(etag) => {
-                    self.etags.insert((kind, page), etag.clone());
+                if !cached.is_some_and(|entry| entry.full && entry.next) {
+                    break;
                 }
-                None => {
-                    self.etags.remove(&(kind, page));
-                }
+                page += 1;
+                continue;
             }
             let items: Vec<Value> = serde_json::from_str(&response.body)
                 .context("gh api returned a body that is not a JSON array")?;
+            let full = items.len() == PAGE_SIZE;
+            let next = response.link_next;
+            match &response.etag {
+                Some(etag) => {
+                    self.pages.insert(
+                        (kind, page),
+                        CachedPage {
+                            etag: etag.clone(),
+                            full,
+                            next,
+                        },
+                    );
+                }
+                None => {
+                    self.pages.remove(&(kind, page));
+                }
+            }
             for item in &items {
                 let number = u64_field(item, "number")?;
                 if let Some(mapped) = map_item(item)? {
                     fetched.changed.insert(number, mapped);
                 }
             }
-            let full = items.len() == PAGE_SIZE;
-            if !full || !response.link_next {
+            if !full || !next {
                 break;
             }
             page += 1;
@@ -529,6 +560,135 @@ mod tests {
 
         assert!(second.changed.is_empty());
         assert_eq!(second.unchanged, vec![1]);
+    }
+
+    #[test]
+    fn a_304_page_with_a_cached_next_page_does_not_end_the_walk() {
+        let next_link = "link: <https://api.github.com/repositories/1/issues?state=open&page=2>\
+             ; rel=\"next\", <https://api.github.com/repositories/1/issues?state=open&page=2>\
+             ; rel=\"last\"";
+        let edited_page = r#"[{"number":101,"node_id":"node-101","title":"issue 101","body":"body 101","state":"open","labels":[{"name":"refined"}]}]"#;
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"p1\"", next_link],
+                    &issues_json(1, 100),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=2",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"p2\""],
+                    &issues_json(101, 103),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"p1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &["etag: \"p1\""], "")),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"p2\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=2",
+                ]),
+                CmdOut::ok(response("HTTP/2 200", &["etag: \"p2b\""], edited_page)),
+            );
+        let mut client = GhClient::new(&exec);
+        client.fetch_issues("acme/borsuk").unwrap();
+        let second = client.fetch_issues("acme/borsuk").unwrap();
+
+        assert_eq!(second.unchanged, vec![1]);
+        assert_eq!(second.changed.len(), 1);
+        assert_eq!(second.changed[&101].labels, vec!["refined".to_string()]);
+        assert_eq!(client.issue_etag(1), Some("\"p1\""));
+        assert_eq!(client.issue_etag(2), Some("\"p2b\""));
+        assert_eq!(exec.calls().len(), 4);
+    }
+
+    #[test]
+    fn a_304_page_known_to_be_short_ends_the_walk() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"s1\""],
+                    &issues_json(1, 1),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"s1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &["etag: \"s1\""], "")),
+            );
+        let mut client = GhClient::new(&exec);
+        client.fetch_issues("acme/borsuk").unwrap();
+        let second = client.fetch_issues("acme/borsuk").unwrap();
+
+        assert_eq!(second.unchanged, vec![1]);
+        assert!(second.changed.is_empty());
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_page_that_answers_304_ends_the_walk() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok("HTTP/2 304\r\n\r\n"),
+        );
+        let mut client = GhClient::new(&exec);
+        let fetched = client.fetch_issues("acme/borsuk").unwrap();
+
+        assert_eq!(fetched.unchanged, vec![1]);
+        assert!(fetched.changed.is_empty());
+        assert_eq!(exec.calls().len(), 1);
     }
 
     #[test]
