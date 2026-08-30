@@ -75,6 +75,15 @@ enum GraphCommand {
         #[arg(long, default_value = graph::DEFAULT_GRAPH_PATH)]
         path: PathBuf,
     },
+    /// Write a starter .aif/graph.kdl for this repo
+    Init {
+        /// Path to the graph file
+        #[arg(long, default_value = graph::DEFAULT_GRAPH_PATH)]
+        path: PathBuf,
+        /// Directory with the prompt files
+        #[arg(long, default_value = "~/.config/zellij/prompts")]
+        prompts: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -169,6 +178,32 @@ fn run() -> Result<()> {
                 print!("{}", graph.to_dot());
                 Ok(())
             }
+            GraphCommand::Init { path, prompts } => {
+                let root = status::repo_root()?;
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                };
+                if path.exists() {
+                    bail!("{} already exists; refusing to overwrite", path.display());
+                }
+                let prompts = if prompts.is_absolute() {
+                    prompts
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    PathBuf::from(prompts.to_string_lossy().replacen('~', &home, 1))
+                };
+                let text = graph::Graph::template(&prompts);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, text)?;
+                println!("wrote {}", path.display());
+                println!("validate it with: aif graph validate");
+                println!("then run the loop with: aif run");
+                Ok(())
+            }
         },
     }
 }
@@ -219,6 +254,14 @@ fn start_factory(skip: Option<&str>) -> Result<()> {
     let template = aif::layout::installed_template()?;
     let rendered =
         aif::layout::render(&template, &root, &repo, &zdir.join("prompts"), &skip_items)?;
+
+    if !root.join(graph::DEFAULT_GRAPH_PATH).exists() {
+        eprintln!(
+            "aif: no {} found; codex panes do not loop on their own - \
+             run `aif graph init` and `aif run` for the 30m dispatch clock",
+            graph::DEFAULT_GRAPH_PATH
+        );
+    }
 
     let state_base = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)

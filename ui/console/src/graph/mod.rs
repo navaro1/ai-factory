@@ -223,6 +223,59 @@ impl Graph {
         out.push_str("}\n");
         out
     }
+
+    pub fn template(prompts_dir: &std::path::Path) -> String {
+        let p = |name: &str| prompts_dir.join(format!("{name}.md")).display().to_string();
+        format!(
+            r#"graph {{
+    tick "30m"
+    limit 3
+
+    node "planner" {{
+        agent "claude"
+        model "claude-fable-5[1m]"
+        exec "supervised"
+    }}
+    node "refiner" {{
+        agent "codex"
+        model "gpt-5.6-sol"
+        exec "supervised"
+        when "issue has label 'to-refine'"
+        prompt "{refiner}"
+    }}
+    node "implementer" {{
+        agent "opencode"
+        model "zai-coding-plan/glm-5.3-flash"
+        exec "supervised"
+        when "issue has label 'refined' and dependencies met"
+        prompt "{implementer}"
+    }}
+    node "reviewer" {{
+        agent "codex"
+        model "gpt-5.6-sol"
+        exec "supervised"
+        when "pr is draft"
+        prompt "{reviewer}"
+    }}
+    node "releaser" {{
+        agent "claude"
+        model "claude-opus-5[1m]"
+        exec "supervised"
+        when "pr is open and not draft"
+        prompt "{releaser}"
+    }}
+
+    edge from="refiner" to="implementer" on="label flips to refined"
+    edge from="implementer" to="reviewer" on="draft pr opens"
+    edge from="reviewer" to="releaser" on="pr leaves draft"
+}}
+"#,
+            refiner = p("refiner"),
+            implementer = p("implementer"),
+            reviewer = p("reviewer"),
+            releaser = p("releaser"),
+        )
+    }
 }
 
 pub fn parse_duration(raw: &str) -> Result<u64> {
@@ -391,6 +444,24 @@ graph {
         let dot = graph.to_dot();
         assert!(dot.contains("\"refiner\" -> \"releaser\""));
         assert!(dot.contains("planner"));
+    }
+
+    #[test]
+    fn template_parses_and_points_at_installed_prompts() {
+        let text = Graph::template(std::path::Path::new("/home/x/.config/zellij/prompts"));
+        let graph = Graph::parse(&text).unwrap();
+        graph.validate().unwrap();
+        assert_eq!(graph.tick_secs, 1800);
+        assert_eq!(graph.limit, 3);
+        assert_eq!(graph.nodes.len(), 5);
+        assert_eq!(graph.edges.len(), 3);
+        assert_eq!(graph.node("refiner").unwrap().agent, Agent::Codex);
+        assert_eq!(
+            graph.node("refiner").unwrap().prompt.as_deref(),
+            Some(std::path::Path::new(
+                "/home/x/.config/zellij/prompts/refiner.md"
+            ))
+        );
     }
 
     #[test]

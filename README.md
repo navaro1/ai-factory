@@ -214,7 +214,10 @@ idle timeout. Idle TUIs disappear the same way — the factory keeps one
 server per agent kind instead of five panes.
 
 Codex panes do not support the `/loop` line; `codexd` and the scheduler
-strip it automatically.
+strip it automatically. The 30-minute clock comes from the scheduler, not
+from prompt magic: run `aif graph init` once per repo to write a starter
+`.aif/graph.kdl`, then `aif run` dispatches on every tick. `aif start`
+prints a reminder when a repo has no graph file.
 
 ## Known limits
 
