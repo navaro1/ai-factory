@@ -536,25 +536,18 @@ fn start_v4_ui_detached(root: &Path, session: &str, graph: &graph::Graph) -> Res
     if !status.success() {
         bail!("zellij failed to start detached session {session}");
     }
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     let configured = (|| -> Result<()> {
         zellij_action(session, &["rename-tab", "--tab-id", "0", "Cockpit"])?;
         zellij_action(
             session,
-            &[
-                "new-pane",
-                "--in-place",
-                "--close-replaced-pane",
-                "--pane-id",
-                "terminal_0",
-                "--name",
-                "Cockpit",
-                "--cwd",
-                root.to_string_lossy().as_ref(),
-                "--",
-                "aif",
-                "tui",
-            ],
+            &["write-chars", "--pane-id", "terminal_0", "exec aif tui"],
+        )?;
+        zellij_action(session, &["send-keys", "--pane-id", "terminal_0", "ENTER"])?;
+        zellij_action(
+            session,
+            &["rename-pane", "--pane-id", "terminal_0", "Cockpit"],
         )?;
         let _ = zellij_action(session, &["close-pane", "--pane-id", "plugin_3"]);
 
