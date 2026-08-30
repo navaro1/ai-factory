@@ -230,7 +230,10 @@ graph {
         assert!(text.contains("exec \"auto\""));
         let releaser = text.split("node \"releaser\"").nth(1).unwrap();
         assert!(releaser.contains("exec \"supervised\""));
-        assert!(!releaser.contains("retrigger"), "supervised claude keeps gate retrigger");
+        assert!(
+            !releaser.contains("retrigger"),
+            "supervised claude keeps gate retrigger"
+        );
         assert!(text.contains("retrigger=\"head-sha\""));
     }
 
