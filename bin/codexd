@@ -87,7 +87,12 @@ find_native_codex() {
     return 1
 }
 
-if native="$(find_native_codex)"; then
-    exec "$native" -c "model_reasoning_effort=${effort}" -c "features.multi_agent=true" "${args[@]}"
+yolo=(--dangerously-bypass-approvals-and-sandbox)
+if [[ "${AIF_CODEX_YOLO:-1}" == "0" ]]; then
+    yolo=(-a never)
 fi
-exec codex -c "model_reasoning_effort=${effort}" -c "features.multi_agent=true" "${args[@]}"
+
+if native="$(find_native_codex)"; then
+    exec "$native" -c "model_reasoning_effort=${effort}" -c "features.multi_agent=true" "${yolo[@]}" "${args[@]}"
+fi
+exec codex -c "model_reasoning_effort=${effort}" -c "features.multi_agent=true" "${yolo[@]}" "${args[@]}"
