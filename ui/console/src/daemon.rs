@@ -603,10 +603,18 @@ impl Daemon {
     pub fn on_adapter(&mut self, _name: &'static str, event: AdapterEvent) {
         match event {
             AdapterEvent::DispatchAccepted { task, ext } => {
-                let _ = self.append(Rec::External {
-                    id: task.clone(),
-                    ext,
-                });
+                if self
+                    .append(Rec::External {
+                        id: task.clone(),
+                        ext: ext.clone(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if let Some(record) = self.tasks.get_mut(&task) {
+                    record.ext = ext;
+                }
                 self.transition(&task, TaskState::Accepted, "");
             }
             AdapterEvent::DispatchFailed {
@@ -1530,6 +1538,13 @@ mod tests {
         let mut rig = rig();
         paths_setup(&rig.daemon);
         rig.daemon.paths.write_trust(true).unwrap();
+        rig.codex.script_next(vec![AdapterEvent::DispatchAccepted {
+            task: "refiner-issue1-r1000003a1".into(),
+            ext: crate::task::ExtIds {
+                session: Some("session-1".into()),
+                ..Default::default()
+            },
+        }]);
         rig.daemon.observe(Observation {
             items: vec![item("I_1", 1, &["to-refine"])],
             forced: true,
@@ -1545,6 +1560,7 @@ mod tests {
             "state was {:?}",
             task["state"]
         );
+        assert_eq!(task["ext"]["session"], "session-1");
         let id = task["id"].as_str().unwrap().to_owned();
         rig.codex.signal(
             &id,
