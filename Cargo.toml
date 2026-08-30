@@ -1,0 +1,25 @@
+[package]
+name = "aif"
+version = "0.5.0"
+edition = "2021"
+
+[lib]
+name = "aif"
+
+[[bin]]
+name = "aifd"
+path = "src/bin/aifd.rs"
+
+[[bin]]
+name = "aif"
+path = "src/bin/aif.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }

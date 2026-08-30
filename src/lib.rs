@@ -1,0 +1,22 @@
+//! AI Factory v0.5: a daemon and a terminal UI that drive AI coding agents
+//! against GitHub issues.
+//!
+//! The modules below mirror the source layout in `docs/v0.5/SPEC.md`.
+//! Later chunks fill them in.
+
+pub mod config;
+pub mod daemon;
+pub mod decisions;
+pub mod gates;
+pub mod gh;
+pub mod model;
+pub mod poll;
+pub mod proc;
+pub mod runner;
+pub mod sched;
+pub mod sock;
+pub mod state;
+pub mod tasks;
+pub mod trains;
+pub mod tui;
+pub mod worktree;
