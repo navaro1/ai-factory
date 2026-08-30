@@ -7,10 +7,16 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use anyhow::Context;
+
 use aif::config;
-use aif::doctor::{self, DoctorEnv};
 use aif::exec::RealExec;
 use aif::sock::{Action, Client};
+
+#[path = "../doctor.rs"]
+mod doctor;
+
+use doctor::DoctorEnv;
 
 /// How long `aif` waits for a started daemon to open the socket.
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,14 +157,15 @@ fn doctor_main(config_path: Option<PathBuf>, do_clean: bool, yes: bool) -> i32 {
 
 /// Ask the operator on the terminal to confirm the removal.
 ///
-/// The answer is no on end of input or on any read error, so a pipe never
-/// removes work by accident.
-fn ask_to_remove() -> bool {
+/// End of input means no. An input or output error propagates.
+fn ask_to_remove() -> anyhow::Result<bool> {
     print!("Remove these worktrees? [y/N] ");
-    let _ = std::io::stdout().flush();
+    std::io::stdout()
+        .flush()
+        .context("cannot write the removal confirmation")?;
     let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => false,
-        Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-    }
+    let count = std::io::stdin()
+        .read_line(&mut line)
+        .context("cannot read the removal confirmation")?;
+    Ok(count != 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }

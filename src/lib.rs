@@ -7,7 +7,6 @@
 pub mod config;
 pub mod daemon;
 pub mod decisions;
-pub mod doctor;
 pub mod exec;
 pub mod gates;
 pub mod gh;
