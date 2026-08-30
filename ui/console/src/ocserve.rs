@@ -510,10 +510,12 @@ fn error_summary(err: &serde_json::Value) -> String {
     err.get("name")
         .and_then(|n| n.as_str())
         .map(|name| {
-            format!(
-                "{name}: {}",
-                err.get("message").and_then(|m| m.as_str()).unwrap_or("")
-            )
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err.pointer("/data/message").and_then(|m| m.as_str()))
+                .unwrap_or("");
+            format!("{name}: {}", message)
         })
         .unwrap_or_else(|| "unknown error".into())
 }
@@ -660,6 +662,15 @@ mod tests {
     #[test]
     fn message_id_has_required_prefix() {
         assert_eq!(message_id("task-1", 2), "msg_aif-task-1-a2");
+    }
+
+    #[test]
+    fn nested_api_error_keeps_provider_message() {
+        let error = serde_json::json!({
+            "name": "APIError",
+            "data": { "message": "Usage limit reached" }
+        });
+        assert_eq!(error_summary(&error), "APIError: Usage limit reached");
     }
 
     #[test]
