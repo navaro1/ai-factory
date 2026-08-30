@@ -72,7 +72,7 @@ pub struct Task {
     pub number: u64,
     /// The current state.
     pub state: TaskState,
-    /// The number of started runs. The first run is attempt 1.
+    /// The current attempt number. The first queued run is attempt 1.
     pub attempt: u32,
     /// The session id of the current or last run, when one exists.
     pub session_id: Option<String>,
@@ -113,21 +113,6 @@ impl Task {
             created_ms: now_ms,
             updated_ms: now_ms,
         }
-    }
-
-    /// The log file name for one task, without its directory.
-    ///
-    /// The naming rules define the name as
-    /// `<repo>__<stage>-<kind><number>.jsonl`. The caller joins the name with
-    /// the `logs` folder of the state directory.
-    pub fn log_file_name(repo: &str, stage: Stage, kind: ItemKind, number: u64) -> String {
-        format!(
-            "{}__{}-{}{}.jsonl",
-            repo,
-            stage.as_str(),
-            kind.as_str(),
-            number
-        )
     }
 }
 
@@ -267,25 +252,26 @@ impl TaskTable {
             .collect()
     }
 
-    /// The number of active tasks of each stage.
+    /// The number of running tasks of each stage.
     ///
-    /// Terminal tasks do not count, so the result fits the stage limits of
-    /// the scheduler. Every stage appears, with 0 when nothing is active.
+    /// Queued, awaiting, and terminal tasks do not use a scheduler slot.
+    /// Every stage appears, with 0 when nothing runs.
     pub fn counts_by_stage(&self) -> BTreeMap<Stage, usize> {
         let mut counts: BTreeMap<Stage, usize> =
             Stage::ALL.iter().map(|stage| (*stage, 0)).collect();
         for task in self.by_id.values() {
-            if !task.state.is_terminal() {
+            if task.state == TaskState::Running {
                 *counts.entry(task.stage).or_insert(0) += 1;
             }
         }
         counts
     }
 
-    /// The number of active tasks per repository and stage.
+    /// The number of running tasks per repository and stage.
     ///
-    /// Terminal tasks do not count. Every stage of every repository in the
-    /// table appears, with 0 when nothing is active.
+    /// Queued, awaiting, and terminal tasks do not use a scheduler slot.
+    /// Every stage of every repository in the table appears, with 0 when
+    /// nothing runs.
     pub fn counts_by_stage_repo(&self) -> BTreeMap<(String, Stage), usize> {
         let mut counts: BTreeMap<(String, Stage), usize> = BTreeMap::new();
         let repos: BTreeSet<&str> = self.by_id.values().map(|task| task.repo.as_str()).collect();
@@ -295,7 +281,7 @@ impl TaskTable {
             }
         }
         for task in self.by_id.values() {
-            if !task.state.is_terminal() {
+            if task.state == TaskState::Running {
                 *counts.entry((task.repo.clone(), task.stage)).or_default() += 1;
             }
         }
@@ -387,18 +373,6 @@ mod tests {
             NOW,
         );
         assert_eq!(pr.id, "borsuk/review-p7");
-    }
-
-    #[test]
-    fn log_file_name_matches_the_naming_rules() {
-        assert_eq!(
-            Task::log_file_name("borsuk", Stage::Implement, ItemKind::Issue, 142),
-            "borsuk__implement-i142.jsonl"
-        );
-        assert_eq!(
-            Task::log_file_name("qubitsok", Stage::Review, ItemKind::Pr, 3),
-            "qubitsok__review-p3.jsonl"
-        );
     }
 
     #[test]
@@ -495,12 +469,19 @@ mod tests {
         for (from_index, from) in states.iter().enumerate() {
             for (to_index, to) in states.iter().enumerate() {
                 let (mut table, id) = table_in_state(from.clone());
+                let before = table.by_id[&id].clone();
                 let result = table.transition(&id, to.clone(), LATER);
-                assert_eq!(
-                    result.is_ok(),
-                    legal.contains(&(from_index, to_index)),
-                    "transition {from} -> {to} was wrong",
-                );
+                if legal.contains(&(from_index, to_index)) {
+                    assert!(result.is_ok(), "transition {from} -> {to} was rejected");
+                    assert_eq!(&table.by_id[&id].state, to);
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("{from} -> {to}")),
+                        "message: {error}"
+                    );
+                    assert_eq!(table.by_id[&id], before);
+                }
             }
         }
     }
@@ -558,13 +539,14 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_queued_task_frees_the_stage_limit() {
+    fn cancelling_a_queued_task_removes_it_from_active_tasks() {
         let mut table = TaskTable::new();
         let id = queued(&mut table, "borsuk", Stage::Refine, ItemKind::Issue, 1);
-        assert_eq!(table.counts_by_stage()[&Stage::Refine], 1);
+        assert_eq!(table.active().len(), 1);
+        assert_eq!(table.counts_by_stage()[&Stage::Refine], 0);
         assert_eq!(
             table.counts_by_stage_repo()[&("borsuk".to_string(), Stage::Refine)],
-            1
+            0
         );
 
         table.cancel(&id, LATER).unwrap();
@@ -652,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_by_stage_count_active_tasks_only() {
+    fn counts_by_stage_count_running_tasks_only() {
         let mut table = TaskTable::new();
         let refine = queued(&mut table, "borsuk", Stage::Refine, ItemKind::Issue, 1);
         queued(&mut table, "borsuk", Stage::Refine, ItemKind::Issue, 2);
@@ -668,10 +650,14 @@ mod tests {
 
         let counts = table.counts_by_stage();
         assert_eq!(counts.len(), Stage::ALL.len(), "every stage appears");
-        assert_eq!(counts[&Stage::Refine], 1, "the done task does not count");
+        assert_eq!(
+            counts[&Stage::Refine],
+            0,
+            "queued and done tasks do not count"
+        );
         assert_eq!(counts[&Stage::Implement], 1);
         assert_eq!(counts[&Stage::Review], 0);
-        assert_eq!(counts[&Stage::Release], 1);
+        assert_eq!(counts[&Stage::Release], 0);
     }
 
     #[test]
@@ -684,7 +670,7 @@ mod tests {
         let counts = table.counts_by_stage_repo();
         assert_eq!(counts[&("borsuk".to_string(), Stage::Refine)], 1);
         assert_eq!(counts[&("borsuk".to_string(), Stage::Implement)], 0);
-        assert_eq!(counts[&("qubitsok".to_string(), Stage::Refine)], 1);
+        assert_eq!(counts[&("qubitsok".to_string(), Stage::Refine)], 0);
         assert_eq!(counts[&("qubitsok".to_string(), Stage::Review)], 0);
         assert_eq!(counts.len(), 8, "two repositories times four stages");
     }
