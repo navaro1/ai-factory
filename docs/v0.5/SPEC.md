@@ -103,7 +103,20 @@ flag separates a real question to the human from an ordinary tool approval.
 
 Output line types: `system` (subtypes `hook_started`, `hook_response`, `init`,
 `thinking_tokens`, `permission_denied`), `assistant`, `user`,
-`rate_limit_event`, `control_request`, `control_response`, `result`. The
+`rate_limit_event`, `control_request`, `control_response`, `result`.
+
+An `assistant` line, probed on this machine, carries `message`,
+`parent_tool_use_id`, `request_id`, `session_id`, `timestamp`, `type`, `uuid`.
+Its `message` carries `content`, `id`, `model`, `role`, `stop_reason`,
+`usage`. Walk `message.content[]`; the block types seen are `thinking`, `text`,
+and `tool_use`. A `tool_use` block carries `id`, `name` and `input`. Skip
+blocks whose line has a non-null `parent_tool_use_id`, which are subagent
+output.
+
+A `result` line carries `subtype`, `result`, `is_error`, `session_id`,
+`num_turns`, `total_cost_usd`, `usage`, `duration_ms`, `permission_denials`
+and more. Treat `subtype == "success"` as success and read the human-readable
+outcome from `result`. The
 `system`/`init` line and the `result` line both carry `session_id`. The
 `result` line carries `subtype` (`success` or an error kind), `total_cost_usd`,
 and `usage`.
