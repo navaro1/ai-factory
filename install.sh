@@ -13,6 +13,15 @@ install -m 644 "${here}/zellij/layouts/ai-factory.kdl" "${zdir}/layouts/"
 install -m 644 "${here}"/zellij/prompts/*.md "${zdir}/prompts/"
 install -m 755 "${here}/bin/ai-factory" "${here}/bin/clauded" "${here}/bin/opencoded" "${bin_dir}/"
 
+if command -v cargo >/dev/null 2>&1; then
+    printf 'Building the aif binary...\n'
+    (cd "${here}/ui/console" && cargo build --release -q)
+    install -m 755 "${here}/ui/console/target/release/aif" "${bin_dir}/"
+else
+    printf 'Warning: cargo not found; the aif binary was not built.\n' >&2
+    printf 'Session start (ai-factory, aif start) will not work without it.\n' >&2
+fi
+
 config="${zdir}/config.kdl"
 if [[ ! -f "${config}" ]]; then
     printf 'theme "retro-future"\n' >"${config}"
@@ -32,6 +41,6 @@ case ":${PATH}:" in
 esac
 
 printf 'Installed.\n'
-printf 'Requirements: zellij, claude, opencode, gh, git, python3.\n'
-printf 'Start it inside a git repository with: ai-factory\n'
-printf 'Run ai-factory help for the full guide.\n'
+printf 'Requirements: zellij, claude, opencode, gh, git.\n'
+printf 'Start it inside a git repository with: aif start (or ai-factory).\n'
+printf 'Run aif --help for the full guide.\n'

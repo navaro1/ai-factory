@@ -35,8 +35,8 @@ The session name is `<repo>-factory`. Start the command again to re-attach.
 - zellij (tested on 0.45.1)
 - Claude Code CLI (`claude`), logged in
 - opencode CLI (tested on 1.18.25), with your providers configured
-- GitHub CLI (`gh`), logged in — the default prompts use it
-- git, python3, bash
+- GitHub CLI (`gh`), logged in — the graph engine queries it
+- git, bash; the `aif` binary ships from this repo (cargo builds it)
 
 ## Install
 
@@ -46,12 +46,13 @@ cd ai-factory
 ./install.sh
 ```
 
-The installer copies the layout, prompts, theme, and commands into place:
+The installer copies the layout, prompts, theme, and commands into place
+and builds the `aif` binary when cargo is available:
 
 - `~/.config/zellij/themes/retro-future.kdl`
 - `~/.config/zellij/layouts/ai-factory.kdl`
 - `~/.config/zellij/prompts/*.md`
-- `~/.local/bin/ai-factory`, `clauded`, `opencoded`
+- `~/.local/bin/aif`, `ai-factory` (shim), `clauded`, `opencoded`
 
 It also sets `theme "retro-future"` in your zellij config. The theme applies
 to all your zellij sessions. Remove the line if you do not want that.
@@ -107,15 +108,42 @@ to change this.
 ## Use
 
 ```sh
-ai-factory                        # start the full workspace
-ai-factory help                   # full guide
-ai-factory --skip planner         # factory tab only
-ai-factory --skip refiner,reviewer
-ai-factory --skip factory         # planner tab only
+aif start                       # start the factory session (ai-factory is a shim)
+aif                             # open the cockpit TUI
+aif status [--json]            # one-shot pane map
+aif start --skip planner       # factory tab only
+aif start --skip refiner,reviewer
 ```
 
 zellij keys: `Ctrl t` tabs, `Ctrl p` panes, `Alt hjkl` move focus,
 `Ctrl q` leave the session. The session keeps running in the background.
+
+Cockpit keys: `1-5` select, `Enter` submit a waiting draft, `r` press
+enter in the pane, `s` next pane, `l` scrollback, `q` quit.
+
+## Graph mode
+
+A repo can carry `.aif/graph.kdl`. It declares the agent graph: nodes with
+agents, models, and `when` conditions over GitHub state; edges for
+documentation. See this repo's own `.aif/graph.kdl` as the example.
+
+```sh
+aif graph validate             # parse and check the graph
+aif graph dot                  # Graphviz export
+aif run --once --dry-run       # show what would dispatch
+aif run --once                 # dispatch ready tasks into idle panes
+aif run                        # loop on the graph tick
+aif events                     # the JSONL dispatch log
+```
+
+When the graph file exists, the static pane drafts stand down. The
+scheduler owns the prompts: it fills the ticket number into
+`{github_issue_no}` or `{gh_ticket_no}` and pastes the prompt into an
+idle pane. You press Enter in the pane to send it.
+
+Rules: one task per pane, `limit` concurrent dispatches, one dispatch per
+ticket per cycle. Dependencies come from "blocked by #N" in the issue
+body; a ticket with open blockers never reaches the Implementer.
 
 ## How the typed prompts work
 

@@ -112,15 +112,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Start { skip }) => {
-            use std::os::unix::process::CommandExt;
-            let mut cmd = std::process::Command::new("ai-factory");
-            if let Some(skip) = skip {
-                cmd.arg("--skip").arg(skip);
-            }
-            let err = cmd.exec();
-            bail!("failed to run ai-factory (run install.sh first): {err}");
-        }
+        Some(Command::Start { skip }) => start_factory(skip.as_deref()),
         Some(Command::Tokens { command }) => match command {
             TokensCommand::Zellij { tokens, out, check } => {
                 render_zellij_theme(&tokens, &out, check)
@@ -172,6 +164,73 @@ fn run() -> Result<()> {
             }
         },
     }
+}
+
+fn start_factory(skip: Option<&str>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let root = status::repo_root()?;
+    let repo = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".into());
+    let session = format!("{repo}-factory");
+
+    for line in aif::zellij::list_sessions()? {
+        if line.split_whitespace().next() == Some(session.as_str()) {
+            if line.contains("EXITED") {
+                eprintln!("aif: session {session} is dead; deleting it and starting fresh");
+                let out = std::process::Command::new("zellij")
+                    .args(["delete-session", &session])
+                    .output()?;
+                if !out.status.success() {
+                    bail!("failed to delete dead session {session}");
+                }
+            } else {
+                eprintln!("aif: session {session} already runs; attaching");
+                let err = std::process::Command::new("zellij")
+                    .args(["attach", &session])
+                    .exec();
+                bail!("failed to attach: {err}");
+            }
+        }
+    }
+
+    let skip_items: Vec<String> = skip
+        .map(|raw| raw.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
+    let zdir = std::env::var("ZELLIJ_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                    PathBuf::from(home).join(".config")
+                })
+                .join("zellij")
+        });
+    let template = aif::layout::installed_template()?;
+    let rendered =
+        aif::layout::render(&template, &root, &repo, &zdir.join("prompts"), &skip_items)?;
+
+    let runtime_base = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let registry = runtime_base.join("aif-registry").join(&session);
+    let _ = std::fs::remove_dir_all(&registry);
+
+    let layout_file =
+        std::env::temp_dir().join(format!("aif-{session}-{}.kdl", std::process::id()));
+    std::fs::write(&layout_file, &rendered)?;
+
+    let err = std::process::Command::new("zellij")
+        .arg("--new-session-with-layout")
+        .arg(&layout_file)
+        .arg("--session")
+        .arg(&session)
+        .exec();
+    bail!("failed to start zellij: {err}");
 }
 
 fn render_zellij_theme(tokens_path: &Path, out: &Path, check: bool) -> Result<()> {

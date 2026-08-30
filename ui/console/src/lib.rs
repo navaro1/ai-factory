@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod app;
 pub mod graph;
+pub mod layout;
 pub mod probe;
 pub mod runner;
 pub mod scheduler;
