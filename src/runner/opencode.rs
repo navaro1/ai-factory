@@ -3,7 +3,7 @@
 //! One task is one `opencode run` child. [`crate::proc`] tees the child's
 //! raw NDJSON into the task log; this module parses the same lines into
 //! [`RunEvent`]s: a `step_start` line starts the run, a `text` line carries
-//! assistant text, a `tool_use` line carries tool activity, and a
+//! assistant text, a part with type `tool` carries tool activity, and a
 //! `step_finish` line ends one step. One run can carry several steps, so a
 //! step ending is not the task ending; the task ends only when the process
 //! exits, as [`RunEvent::Exit`]. A malformed or unknown line is logged and
@@ -29,7 +29,7 @@ const SUMMARY_CHARS: usize = 120;
 /// build -m <model> [--variant <v>] --dir <cwd> <prompt>`. `--auto` is always
 /// present, because yolo is the factory policy and the run is one-shot.
 /// `job.resume` plays no part: a one-shot opencode run never resumes.
-pub fn build_args(job: &Job) -> Vec<String> {
+fn build_args(job: &Job) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--format".to_string(),
@@ -54,28 +54,13 @@ pub fn build_args(job: &Job) -> Vec<String> {
 ///
 /// Every [`Runner::start`] spawns one short-lived child that runs the whole
 /// task and exits on its own.
-#[derive(Debug, Clone)]
-pub struct OpenCodeRunner {
-    /// The program to start. Tests point this at a fake script.
-    program: String,
-}
+#[derive(Debug, Clone, Copy)]
+pub struct OpenCodeRunner;
 
 impl OpenCodeRunner {
     /// A runner that starts the real `opencode` program.
     pub fn new() -> Self {
-        Self {
-            program: PROGRAM.to_string(),
-        }
-    }
-
-    /// A runner that starts `program` instead of `opencode`.
-    ///
-    /// Tests use this to replay a fixture through a fake script, so no test
-    /// ever runs the real tool.
-    pub fn with_program(program: impl Into<String>) -> Self {
-        Self {
-            program: program.into(),
-        }
+        Self
     }
 }
 
@@ -90,7 +75,7 @@ impl Runner for OpenCodeRunner {
         let spec = RunSpec {
             task: job.task.clone(),
             cwd: job.cwd.clone(),
-            program: self.program.clone(),
+            program: PROGRAM.to_string(),
             args: build_args(job),
             env: Vec::new(),
             log: job.log.clone(),
@@ -109,26 +94,18 @@ impl Runner for OpenCodeRunner {
 ///
 /// opencode is one-shot and has no steering channel, so `send_user` and
 /// `answer` keep the trait defaults, which refuse steering.
-pub struct OpenCodeSession {
+struct OpenCodeSession {
     handle: Option<ProcHandle>,
 }
 
 impl Session for OpenCodeSession {
-    /// Stop the child through the chunk 9 escalation, without a protocol
-    /// interrupt: opencode has no interrupt channel.
-    ///
-    /// The escalation waits up to 10 s for a natural exit, sends SIGTERM,
-    /// waits 5 s, then sends SIGKILL. A polite stop protects the session
-    /// state opencode writes to disk for a later resume. The death arrives
-    /// as [`RunEvent::Exit`]. A second stop is a no-op.
+    /// Kill the one-shot child. A second stop is a no-op.
     fn stop(&mut self) -> anyhow::Result<()> {
-        match self.handle.take() {
-            Some(handle) => {
-                proc::stop_gracefully(handle, false);
-                Ok(())
-            }
-            None => Ok(()),
+        if let Some(handle) = self.handle.as_ref() {
+            handle.kill()?;
         }
+        self.handle = None;
+        Ok(())
     }
 }
 
@@ -170,7 +147,9 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
                 break;
             }
             ProcEvent::Error(message) => eprintln!("task {task}: {message}"),
-            ProcEvent::Stopped(_) => {}
+            ProcEvent::Stopped(outcome) => {
+                eprintln!("task {task}: unexpected opencode stop outcome: {outcome:?}")
+            }
         }
     }
     if !exited {
@@ -187,7 +166,7 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
 /// It holds the run-wide state: the task id stamped on every event, whether
 /// `Started` went out, and the first session id the output carried.
 #[derive(Debug, Clone)]
-pub struct NdjsonParser {
+struct NdjsonParser {
     task: String,
     started: bool,
     session_id: Option<String>,
@@ -195,7 +174,7 @@ pub struct NdjsonParser {
 
 impl NdjsonParser {
     /// A parser that emits events for `task`.
-    pub fn new(task: impl AsRef<str>) -> Self {
+    fn new(task: impl AsRef<str>) -> Self {
         Self {
             task: task.as_ref().to_string(),
             started: false,
@@ -203,22 +182,15 @@ impl NdjsonParser {
         }
     }
 
-    /// The session id captured from the output so far, if any.
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
-    }
-
     /// Parse one output line into zero or more run events.
     ///
-    /// The verified line types are `step_start`, `text`, `tool_use`, and
-    /// `step_finish`. A tool line has line type `tool_use` and part type
-    /// `tool`; the name sits at `part.tool` and the state under
-    /// `part.state`. A tool part under any other line type still yields a
-    /// `Tool` event. An empty line produces nothing. A malformed line, a
-    /// line without a usable shape, and an unknown line type without a tool
-    /// part are logged to stderr and skipped; the raw line stays in the
-    /// task log either way.
-    pub fn parse_line(&mut self, line: &str) -> Vec<RunEvent> {
+    /// The verified line types are `step_start`, `text`, and `step_finish`.
+    /// Any line with a tool part yields a `Tool` event. The name sits at
+    /// `part.tool`, and the state sits under `part.state`. An empty line
+    /// produces nothing. A malformed line, a line without a usable shape,
+    /// and an unknown line type without a tool part are logged to stderr and
+    /// skipped. The raw line stays in the task log.
+    fn parse_line(&mut self, line: &str) -> Vec<RunEvent> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Vec::new();
@@ -234,32 +206,25 @@ impl NdjsonParser {
         if self.session_id.is_none() {
             let id = value
                 .get("sessionID")
-                .or_else(|| part.get("sessionID"))
-                .and_then(Value::as_str);
+                .and_then(Value::as_str)
+                .or_else(|| part.get("sessionID").and_then(Value::as_str));
             if let Some(id) = id {
                 self.session_id = Some(id.to_string());
             }
+        }
+        if part.get("type").and_then(Value::as_str) == Some("tool") {
+            return self.on_tool_part(&part);
         }
         match value.get("type").and_then(Value::as_str) {
             Some("step_start") => self.on_step_start(),
             Some("text") => self.on_text_part(&part),
             Some("step_finish") => self.on_step_finish(&part),
-            // The verified tool line: line type "tool_use", part type
-            // "tool". Any other line type falls through, and its part still
-            // counts when it is a tool part.
-            Some("tool_use") => self.on_tool_part(&part),
             _ => {
-                if part.get("type").and_then(Value::as_str) == Some("tool") {
-                    self.on_tool_part(&part)
-                } else {
-                    self.log_skipped(&match value.get("type") {
-                        Some(Value::String(kind)) => {
-                            format!("unknown line type \"{kind}\"")
-                        }
-                        _ => "line without a usable type".to_string(),
-                    });
-                    Vec::new()
-                }
+                self.log_skipped(&match value.get("type") {
+                    Some(Value::String(kind)) => format!("unknown line type \"{kind}\""),
+                    _ => "line without a usable type".to_string(),
+                });
+                Vec::new()
             }
         }
     }
@@ -276,11 +241,8 @@ impl NdjsonParser {
         }]
     }
 
-    /// Emit `Text` for an assistant text part, or `Tool` for a tool part.
+    /// Emit `Text` for an assistant text part.
     fn on_text_part(&mut self, part: &Value) -> Vec<RunEvent> {
-        if part.get("type").and_then(Value::as_str) == Some("tool") {
-            return self.on_tool_part(part);
-        }
         match part.get("text").and_then(Value::as_str) {
             Some(text) => vec![RunEvent::Text {
                 task: self.task.clone(),
@@ -357,21 +319,58 @@ fn truncate(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::time::Instant;
     use uuid::Uuid;
 
     /// The timeout one test waits for a child exit.
     const TEST_TIMEOUT: u64 = 2;
 
+    /// Serializes tests that replace the process `PATH`.
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores `PATH` after one fake-program test.
+    struct PathGuard {
+        original: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl PathGuard {
+        /// Put `dir` first on `PATH` until this guard drops.
+        fn prepend(dir: &Path) -> Self {
+            let lock = PATH_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            let original = env::var_os("PATH");
+            let mut paths = vec![dir.to_path_buf()];
+            if let Some(value) = original.as_ref() {
+                paths.extend(env::split_paths(value));
+            }
+            env::set_var("PATH", env::join_paths(paths).unwrap());
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+
     /// A recorded opencode NDJSON run, in the verified shapes: one object per
     /// line, `sessionID` and a `part` object on each, assistant text at
-    /// `part.text`, and one `tool_use` line in the shape probed from a real
-    /// run (line type `tool_use`, part type `tool`, name at `part.tool`,
-    /// state under `part.state`). It also carries one malformed line and one
-    /// unknown line type, both of which the run must survive.
+    /// `part.text`, and one tool part with its name at `part.tool` and state
+    /// under `part.state`. It also carries one malformed line and one unknown
+    /// line type. The run must survive both lines.
     const FIXTURE: &str = r#"{"type":"step_start","sessionID":"ses_fix01","part":{"id":"prt_1","messageID":"msg_1","sessionID":"ses_fix01","type":"step-start"}}
 {"type":"text","sessionID":"ses_fix01","part":{"id":"prt_2","messageID":"msg_1","sessionID":"ses_fix01","type":"text","text":"Reading the failing test first."}}
 {"type":"tool_use","timestamp":1756500000000,"sessionID":"ses_fix01","part":{"type":"tool","tool":"read","callID":"call_01","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"fn main() {}","metadata":{},"time":{"start":1756500000100,"end":1756500000150},"title":"src/main.rs"}}}
@@ -488,9 +487,13 @@ not json at all
 
     #[test]
     fn fixture_replay_produces_the_expected_run_events() {
+        let dir = temp_dir("fixture-replay");
+        let fixture = dir.join("recorded.ndjson");
+        fs::write(&fixture, FIXTURE).unwrap();
+        let recorded = fs::read_to_string(&fixture).unwrap();
         let mut parser = NdjsonParser::new("borsuk/review-p7");
         let mut events = Vec::new();
-        for line in FIXTURE.lines() {
+        for line in recorded.lines() {
             events.extend(parser.parse_line(line));
         }
 
@@ -522,7 +525,8 @@ not json at all
                 },
             ]
         );
-        assert_eq!(parser.session_id(), Some("ses_fix01"));
+        assert_eq!(parser.session_id.as_deref(), Some("ses_fix01"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -563,6 +567,22 @@ not json at all
     }
 
     #[test]
+    fn an_invalid_top_level_session_id_does_not_hide_the_part_session_id() {
+        let mut parser = NdjsonParser::new("t/x");
+        let events = parser.parse_line(
+            r#"{"type":"step_start","sessionID":null,"part":{"type":"step-start","sessionID":"ses_part"}}"#,
+        );
+        assert_eq!(
+            events,
+            vec![RunEvent::Started {
+                task: "t/x".to_string(),
+                session_id: Some("ses_part".to_string()),
+            }]
+        );
+        assert_eq!(parser.session_id.as_deref(), Some("ses_part"));
+    }
+
+    #[test]
     fn only_the_first_step_start_emits_started() {
         let mut parser = NdjsonParser::new("t/x");
         let one = parser.parse_line(r#"{"type":"step_start","sessionID":"s1","part":{}}"#);
@@ -585,18 +605,35 @@ not json at all
 
     #[test]
     fn a_tool_part_yields_a_tool_event_whatever_the_line_type() {
+        for line_type in [
+            "step_start",
+            "text",
+            "step_finish",
+            "tool_use",
+            "future_type",
+        ] {
+            let mut parser = NdjsonParser::new("t/x");
+            let line = format!(
+                r#"{{"type":"{line_type}","part":{{"type":"tool","tool":"write","state":{{"title":"src/proc.rs"}}}}}}"#,
+            );
+            assert_eq!(
+                parser.parse_line(&line),
+                vec![RunEvent::Tool {
+                    task: "t/x".to_string(),
+                    name: "write".to_string(),
+                    summary: "src/proc.rs".to_string(),
+                }],
+                "outer line type {line_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_use_line_without_a_tool_part_is_ignored() {
         let mut parser = NdjsonParser::new("t/x");
-        let events = parser.parse_line(
-            r#"{"type":"tool_use_line","part":{"type":"tool","tool":"write","state":{"title":"src/proc.rs"}}}"#,
-        );
-        assert_eq!(
-            events,
-            vec![RunEvent::Tool {
-                task: "t/x".to_string(),
-                name: "write".to_string(),
-                summary: "src/proc.rs".to_string(),
-            }]
-        );
+        let events =
+            parser.parse_line(r#"{"type":"tool_use","part":{"type":"text","text":"not a tool"}}"#);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -663,9 +700,9 @@ not json at all
         let fixture = dir.join("fixture.ndjson");
         fs::write(&fixture, FIXTURE).unwrap();
         let argv = dir.join("argv.txt");
-        let program = script(
+        script(
             &dir,
-            "fake-opencode",
+            PROGRAM,
             &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\n",
                 argv.display(),
@@ -673,7 +710,8 @@ not json at all
             ),
         );
         let job = job(&dir, None);
-        let mut runner = OpenCodeRunner::with_program(program.display().to_string());
+        let path = PathGuard::prepend(&dir);
+        let mut runner = OpenCodeRunner::new();
 
         let (mut session, rx) = start_with_retry(&mut runner, &job);
         let events = collect_until_exit(&rx);
@@ -725,35 +763,31 @@ not json at all
 
         // Every raw line, the malformed one included, reached the log.
         assert_eq!(fs::read_to_string(job.log).unwrap(), FIXTURE);
+        drop(path);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn stop_runs_the_escalation_and_spares_a_finishing_child() {
+    fn stop_kills_the_child() {
         let dir = temp_dir("stop");
-        let program = script(&dir, "finisher", "#!/bin/sh\nsleep 0.3\nexit 0\n");
+        script(&dir, PROGRAM, "#!/bin/sh\nsleep 0.3\nexit 0\n");
         let job = job(&dir, None);
-        let mut runner = OpenCodeRunner::with_program(program.display().to_string());
+        let path = PathGuard::prepend(&dir);
+        let mut runner = OpenCodeRunner::new();
 
         let (mut session, rx) = start_with_retry(&mut runner, &job);
-        let started = Instant::now();
         session.stop().unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(200),
-            "stop blocked the caller for {started:?}"
-        );
-
-        // The escalation waits 10 s before it signals anything, so this
-        // child exits on its own with code 0. A plain SIGKILL instead would
-        // report a signal death with ok false.
         assert_eq!(
             collect_until_exit(&rx).last(),
             Some(&RunEvent::Exit {
                 task: TASK.to_string(),
-                ok: true,
-                detail: "opencode exited with code 0".to_string(),
+                ok: false,
+                detail: "opencode was killed by a signal".to_string(),
             })
         );
         // A second stop after the child is gone is a no-op.
         session.stop().unwrap();
+        drop(path);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
