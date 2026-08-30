@@ -465,10 +465,10 @@ that carry state instead of a database.
   Provide typed read and write helpers for both. Write with a temporary file
   and a rename so a crash cannot leave a half-written marker.
 - `exists_issue(repo, number) -> bool` is the dispatch dedupe check.
-- `remove_issue(repo, number, force: bool)` runs `git worktree remove` and then
-  deletes the branch. It refuses unless the caller passes a proof value
-  `Cleanable::MergedOrClosed`, so no code path can delete the worktree of a
-  live issue by accident.
+- `remove_issue(repo, number, proof: Cleanable)` runs `git worktree remove` and
+  then deletes the branch. `Cleanable` has one variant, `MergedOrClosed`, so no
+  code path can delete the worktree of a live issue by accident. There is no
+  boolean force flag.
 - Git runs through the same `Exec` indirection as `gh`.
 
 **Acceptance criteria.**
@@ -587,7 +587,11 @@ pub trait Session: Send {
 ```
 
   The two interactive methods have default bodies returning an error that says
-  the runner does not support steering.
+  the runner does not support steering. `stop` has no default.
+- `Answer { Allow { updated_input: Option<serde_json::Value> },
+  Deny { message: String } }` is defined in this chunk, in `runner/mod.rs`,
+  because the trait signature above names it. Chunk 12 uses it; it does not
+  redefine it.
 - `Job { task: String, stage: Stage, repo: String, model: String,
   variant: Option<String>, prompt: String, cwd: PathBuf, log: PathBuf,
   resume: Option<String>, yolo: bool }`.
@@ -639,7 +643,11 @@ prompt, and map ordinary output.
   characters of the JSON; `result` gives `TurnEnd` with `ok` from `subtype ==
   "success"`, the `result` text as the summary, and `total_cost_usd`.
   `system`/`thinking_tokens` and `rate_limit_event` are ignored.
-- `Session::send_user` writes another user message line.
+- `Session::send_user` writes another user message line. `Session::answer`
+  keeps its default error body in this chunk.
+- `Session::stop` in this chunk is a plain kill of the child, so the type
+  compiles. Chunk 12 replaces it with the interrupt escalation. Do not build
+  the escalation here.
 - Persist the session id into the worktree marker as soon as it is known, so a
   restart can resume. The runner receives a callback for this; it does not
   import the worktree module directly.
@@ -813,8 +821,12 @@ loop {
   idle claude session's reaper expiry. When there is none, block on `recv`.
 - `drive()` runs after every message and does, in order: apply gate results to
   the task table and the trains; fire any due train; reap idle sessions;
-  dispatch while `next_dispatch` yields a task; push state to subscribers when
-  anything changed. It must be idempotent and must not recurse.
+  dispatch while `next_dispatch` yields a task; set a `dirty` flag when anything
+  changed. It must be idempotent and must not recurse.
+- This chunk does NOT define the wire state type and does not push anything.
+  `StateView` belongs to chunk 16. Here the daemon only owns the `dirty` flag
+  and an empty subscriber list, so chunk 16 can attach the socket without
+  reshaping the loop.
 - Dispatch: ensure the worktree, render the prompt, start the runner, move the
   task to Running. Refine tasks run in the repository checkout, not a
   worktree, and never create one.
@@ -1065,7 +1077,8 @@ loop {
 - Rewrite `README.md` for v0.5: what it is, the four stages, install, the
   config file, the keys, and the known limits. Keep it in Simplified Technical
   English. Remove every zellij and v3 reference.
-- Move `docs/v0.5/SPEC.md` to `docs/SPEC.md` and update links.
+- Leave `docs/v0.5/SPEC.md` where it is. It is the delivery authority and
+  moving it breaks the chunk briefs.
 
 **Acceptance criteria.**
 - `rg -i zellij` finds nothing outside `.git` and the changelog.
