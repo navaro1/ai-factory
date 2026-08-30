@@ -128,7 +128,7 @@ fn resolve_blockers(snapshot: &mut Snapshot) {
     }
 }
 
-fn parse_blocked_by(body: &str) -> Vec<u64> {
+pub fn parse_blocked_by(body: &str) -> Vec<u64> {
     let mut out = Vec::new();
     for word in body.split_whitespace() {
         let candidate = word.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '#');

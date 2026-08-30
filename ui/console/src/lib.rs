@@ -1,12 +1,17 @@
 pub mod actions;
 pub mod app;
+pub mod factory;
 pub mod graph;
+pub mod ids;
+pub mod journal;
 pub mod layout;
 pub mod mem;
 pub mod probe;
 pub mod runner;
 pub mod scheduler;
+pub mod snapshot;
 pub mod status;
+pub mod task;
 pub mod theme;
 pub mod view;
 pub mod zellij;

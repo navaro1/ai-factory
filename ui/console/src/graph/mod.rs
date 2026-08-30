@@ -57,6 +57,30 @@ impl Exec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Retrigger {
+    #[default]
+    Gate,
+    HeadSha,
+}
+
+impl Retrigger {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "gate" => Ok(Retrigger::Gate),
+            "head-sha" => Ok(Retrigger::HeadSha),
+            other => bail!("unknown retrigger {other:?}; expected \"gate\" or \"head-sha\""),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Retrigger::Gate => "gate",
+            Retrigger::HeadSha => "head-sha",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeSpec {
     pub name: String,
@@ -65,6 +89,8 @@ pub struct NodeSpec {
     pub exec: Exec,
     pub when: Option<Condition>,
     pub prompt: Option<PathBuf>,
+    pub limit: Option<usize>,
+    pub retrigger: Retrigger,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +102,7 @@ pub struct EdgeSpec {
 
 #[derive(Debug, Clone)]
 pub struct Graph {
+    pub version: u32,
     pub tick_secs: u64,
     pub limit: usize,
     pub nodes: Vec<NodeSpec>,
@@ -83,6 +110,7 @@ pub struct Graph {
 }
 
 pub const DEFAULT_GRAPH_PATH: &str = ".aif/graph.kdl";
+pub const SUPPORTED_VERSIONS: [u32; 2] = [3, 4];
 
 impl Graph {
     pub fn load(path: &Path) -> Result<Graph> {
@@ -102,11 +130,28 @@ impl Graph {
             .find(|n| n.name().value() == "graph")
             .ok_or_else(|| anyhow::anyhow!("missing top-level `graph` node"))?;
 
+        let version = field_u64(graph_node, "version")
+            .map(|v| v as u32)
+            .unwrap_or(3);
+        if !SUPPORTED_VERSIONS.contains(&version) {
+            bail!(
+                "unsupported graph version {version}; supported: {}",
+                SUPPORTED_VERSIONS
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let tick_secs = match field_string(graph_node, "tick") {
+            Some(raw) => parse_duration(&raw)?,
+            None if version >= 4 => 600,
+            None => bail!("missing `tick`, for example tick \"30m\""),
+        };
         let mut graph = Graph {
-            tick_secs: parse_duration(
-                &field_string(graph_node, "tick")
-                    .ok_or_else(|| anyhow::anyhow!("missing `tick`, for example tick \"30m\""))?,
-            )?,
+            version,
+            tick_secs,
             limit: field_usize(graph_node, "limit").unwrap_or(3),
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -144,6 +189,26 @@ impl Graph {
                         })
                         .transpose()?;
                     let prompt = field_string(node, "prompt").map(PathBuf::from);
+                    let node_limit = field_usize(node, "limit");
+                    let retrigger = match field_string(node, "retrigger") {
+                        Some(raw) => Retrigger::parse(&raw)
+                            .with_context(|| format!("node {name}: invalid `retrigger`"))?,
+                        None => Retrigger::Gate,
+                    };
+                    if let Some(limit) = node_limit {
+                        if version < 4 {
+                            bail!("node {name}: `limit` requires graph version 4");
+                        }
+                        if limit == 0 {
+                            bail!("node {name}: `limit` must be at least 1");
+                        }
+                    }
+                    if retrigger != Retrigger::Gate && version < 4 {
+                        bail!("node {name}: `retrigger` requires graph version 4");
+                    }
+                    if version >= 4 && agent == Agent::Claude && exec == Exec::Auto {
+                        bail!("node {name}: claude cannot run with exec \"auto\"; keep it supervised");
+                    }
                     graph.nodes.push(NodeSpec {
                         name,
                         agent,
@@ -151,6 +216,8 @@ impl Graph {
                         exec,
                         when,
                         prompt,
+                        limit: node_limit,
+                        retrigger,
                     });
                 }
                 "edge" => {
@@ -335,6 +402,23 @@ fn field_usize(node: &kdl::KdlNode, name: &str) -> Option<usize> {
     }
     let child = node.children()?.get(name)?;
     arg_usize(child, 0)
+}
+
+fn field_u64(node: &kdl::KdlNode, name: &str) -> Option<u64> {
+    if let Some(value) = node.get(name).and_then(|v| v.as_integer()) {
+        return u64::try_from(value).ok();
+    }
+    let child = node.children()?.get(name)?;
+    node_u64(child)
+}
+
+fn node_u64(node: &kdl::KdlNode) -> Option<u64> {
+    node.entries()
+        .iter()
+        .filter(|e| e.name().is_none())
+        .nth(0)
+        .and_then(|e| e.value().as_integer())
+        .and_then(|v| u64::try_from(v).ok())
 }
 
 fn arg_usize(node: &kdl::KdlNode, index: usize) -> Option<usize> {

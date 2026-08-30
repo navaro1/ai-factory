@@ -266,11 +266,14 @@ mod tests {
             exec: Exec::Supervised,
             when: when.map(|w| Condition::parse(w).unwrap()),
             prompt: Some(PathBuf::from("prompts/x.md")),
+            limit: None,
+            retrigger: crate::graph::Retrigger::Gate,
         }
     }
 
     fn graph_with(nodes: Vec<NodeSpec>, limit: usize) -> Graph {
         Graph {
+            version: 3,
             tick_secs: 60,
             limit,
             nodes,
