@@ -568,9 +568,12 @@ repository lane reservations.
   Free capacity for any other repository is
   `limit(stage) - running(stage) - sum_over_other_repos(max(0, reserve(other) -
   running(stage, other)))`.
-- `can_start(&Limits, &TaskTable, stage, repo) -> Verdict` where `Verdict` is
-  `Yes`, or `No(Reason)` with `Reason` naming `StageFull`, `LaneBlocked`, or
-  `Paused`.
+- `can_start(&Limits, &Paused, &TaskTable, stage, repo) -> Verdict` where
+  `Verdict` is `Yes`, or `No(Reason)` with `Reason` naming `StageFull`,
+  `LaneBlocked`, or `Paused`. There is exactly ONE such predicate. Do not also
+  expose a capacity-only variant that ignores pause: two near-identical
+  predicates invite a caller to reach for the wrong one, and the wrong one
+  would dispatch into a paused stage silently.
 - `next_dispatch(&Limits, &TaskTable, &Paused) -> Option<TaskId>` walks queued
   tasks in insertion order, skips those blocked, and returns the first that may
   start. It never reorders and never starves an earlier task by preferring a
