@@ -146,7 +146,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let Some(state) = app.state.as_ref() else {
         let hint = Line::from(Span::styled(
             " waiting for the first state push from the daemon",
-            THEME.dimmed(),
+            THEME.dim(),
         ));
         f.render_widget(Paragraph::new(hint), area);
         return;
@@ -178,14 +178,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
         if let Row::Stage { stage } = row {
             if stage_is_empty(state, *stage) {
-                lines.push(Line::from(Span::styled("    no tasks", THEME.dimmed())));
+                lines.push(Line::from(Span::styled("    no tasks", THEME.dim())));
             }
         }
     }
     if state.stages.iter().any(|stage| stage.overridden) {
         lines.push(Line::from(Span::styled(
             "  * limit differs from the config file",
-            THEME.dimmed(),
+            THEME.dim(),
         )));
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -223,9 +223,9 @@ fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
         view.running.to_string(),
         Style::default().fg(running_color),
     ));
-    spans.push(Span::styled("/", THEME.dimmed()));
+    spans.push(Span::styled("/", THEME.dim()));
     spans.push(Span::raw(view.queued.to_string()));
-    spans.push(Span::styled(" of ", THEME.dimmed()));
+    spans.push(Span::styled(" of ", THEME.dim()));
     spans.push(Span::raw(view.limit.to_string()));
     if view.overridden {
         spans.push(Span::styled(
@@ -246,10 +246,7 @@ fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
 fn repo_spans(repo: &str) -> Vec<Span<'static>> {
     vec![
         Span::raw("  "),
-        Span::styled(
-            repo.to_string(),
-            THEME.dimmed().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(repo.to_string(), THEME.dim().add_modifier(Modifier::BOLD)),
     ]
 }
 
@@ -267,7 +264,7 @@ fn ticket_spans(task: &TaskView) -> Vec<Span<'static>> {
     if task.attempt > 1 {
         spans.push(Span::styled(
             format!("  attempt {}", task.attempt),
-            THEME.dimmed(),
+            THEME.dim(),
         ));
     }
     spans
@@ -276,7 +273,7 @@ fn ticket_spans(task: &TaskView) -> Vec<Span<'static>> {
 /// The colored label of one task state.
 fn state_span(state: &TaskState) -> Span<'static> {
     match state {
-        TaskState::Queued => Span::styled("queued", THEME.dimmed()),
+        TaskState::Queued => Span::styled("queued", THEME.dim()),
         TaskState::Running => Span::styled("running", Style::default().fg(THEME.accent)),
         TaskState::AwaitingUser => Span::styled("awaiting user", Style::default().fg(THEME.warn)),
         TaskState::Done => Span::styled("done", Style::default().fg(THEME.ok)),
@@ -296,19 +293,19 @@ fn train_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
     let Some(train) = state.trains.iter().find(|t| t.repo == repo) else {
         return spans;
     };
-    spans.push(Span::styled("  queue ", THEME.dimmed()));
+    spans.push(Span::styled("  queue ", THEME.dim()));
     spans.push(Span::raw(numbers(&train.queue)));
-    spans.push(Span::styled("  stacked ", THEME.dimmed()));
+    spans.push(Span::styled("  stacked ", THEME.dim()));
     spans.push(Span::raw(numbers(&train.stacked)));
-    spans.push(Span::styled("  policy ", THEME.dimmed()));
+    spans.push(Span::styled("  policy ", THEME.dim()));
     spans.push(Span::raw(policy_label(&train.policy)));
     if let Some(fire) = train.next_fire_ms {
         let remaining = fire.saturating_sub(epoch_ms());
-        spans.push(Span::styled("  fires in ", THEME.dimmed()));
+        spans.push(Span::styled("  fires in ", THEME.dim()));
         spans.push(Span::raw(format_countdown(remaining)));
     }
     if let Some(batch) = &train.in_flight {
-        spans.push(Span::styled("  batch ", THEME.dimmed()));
+        spans.push(Span::styled("  batch ", THEME.dim()));
         spans.push(Span::raw(batch.clone()));
     }
     spans

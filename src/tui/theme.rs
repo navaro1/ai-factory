@@ -39,9 +39,34 @@ pub const THEME: Theme = Theme {
 };
 
 impl Theme {
+    /// The style of normal text.
+    pub fn text(self) -> Style {
+        Style::default().fg(self.text)
+    }
+
     /// The style of secondary text.
-    pub fn dimmed(self) -> Style {
+    pub fn dim(self) -> Style {
         Style::default().fg(self.dim)
+    }
+
+    /// The style of highlights, headers, and the active tab.
+    pub fn accent(self) -> Style {
+        Style::default().fg(self.accent)
+    }
+
+    /// The style of attention state, such as a pause or a toast.
+    pub fn warn(self) -> Style {
+        Style::default().fg(self.warn)
+    }
+
+    /// The style of failure state.
+    pub fn error(self) -> Style {
+        Style::default().fg(self.error)
+    }
+
+    /// The style of healthy state.
+    pub fn ok(self) -> Style {
+        Style::default().fg(self.ok)
     }
 
     /// The style of the selected row. The row keeps its own colors.
@@ -68,8 +93,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn styles_carry_the_palette_colors() {
-        assert_eq!(THEME.dimmed().fg, Some(THEME.dim));
+    fn semantic_styles_carry_the_palette_colors() {
+        assert_eq!(THEME.text().fg, Some(THEME.text));
+        assert_eq!(THEME.dim().fg, Some(THEME.dim));
+        assert_eq!(THEME.accent().fg, Some(THEME.accent));
+        assert_eq!(THEME.warn().fg, Some(THEME.warn));
+        assert_eq!(THEME.error().fg, Some(THEME.error));
+        assert_eq!(THEME.ok().fg, Some(THEME.ok));
         assert_eq!(THEME.selected().bg, Some(THEME.selected_bg));
         assert_eq!(THEME.banner().bg, Some(THEME.error));
         assert_eq!(THEME.toast().bg, Some(THEME.warn));

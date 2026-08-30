@@ -9,9 +9,19 @@
 //!   one frame per message. Nothing draws on a timer.
 //!
 //! The shell draws the pipeline view itself. The session view and the inbox
-//! view arrive in later chunks; their modules expose a draw function with
-//! the shape `fn draw(f: &mut Frame, app: &App, area: Rect)`, and the
-//! `render` function below wires them into their match arms.
+//! view arrive in later chunks and keep ownership of their modules. The shell
+//! drives each of them with one view lifecycle, always with the app as the
+//! first argument:
+//!
+//! - `session.show(app)` / `inbox.observe(app)` when the view becomes visible
+//! - `session.poll(app)` on every frame, to pull new log lines
+//! - `session.handle_key(app)` / `inbox.handle_key(app)` for every key, with
+//!   [`InboxOutcome::OpenSession`] mapped to a switch to [`View::Session`]
+//! - `session.draw(f, app, area)` / `inbox.draw(f, app, area)` inside the
+//!   match arms of `render`
+//!
+//! `inbox::badge(app)` renders in the status bar of every view. The call
+//! sites sit in this module, marked with an `Integration:` comment.
 
 pub mod inbox;
 pub mod pipeline;
@@ -146,14 +156,25 @@ impl App {
     }
 
     /// Apply one key press. Returns false when the app wants to quit.
+    ///
+    /// Keys of the hidden views route through the view lifecycle at
+    /// integration: the session view gets `session.handle_key(app)` and the
+    /// inbox gets `inbox.handle_key(app)`, whose outcome maps
+    /// [`InboxOutcome::OpenSession`] to [`View::Session`] for that task.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('?') => self.help = !self.help,
+            // Global key: from anywhere, even over the help overlay. The
+            // other half of this key selects the inbox's oldest row, and
+            // the inbox owns that selection.
+            KeyCode::Char('!') => self.view = View::Inbox,
             KeyCode::Esc if self.help => self.help = false,
             _ if self.help => {}
             KeyCode::Char('1') => self.view = View::Pipeline,
+            // Integration: a switch to the session calls `session.show(app)`.
             KeyCode::Char('2') => self.view = View::Session,
+            // Integration: a switch to the inbox calls `inbox.observe(app)`.
             KeyCode::Char('3') => self.view = View::Inbox,
             KeyCode::Char('j') if self.view == View::Pipeline => pipeline::move_selection(self, 1),
             KeyCode::Char('k') if self.view == View::Pipeline => pipeline::move_selection(self, -1),
@@ -309,7 +330,9 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
 /// Consume messages until the app quits or the channel dies.
 ///
 /// Every message leads to exactly one draw. A quiet channel leads to no
-/// draw at all; there is no tick and no timer.
+/// draw at all; there is no tick and no timer. The session view pulls its
+/// log lines at the same pace: `session.poll(app)` runs right before the
+/// draw of every frame, so the poll rate follows the message rate.
 pub fn run_loop(
     surface: &mut impl Surface,
     app: &mut App,
@@ -328,6 +351,7 @@ pub fn run_loop(
             Msg::Input(reason) => return Err(anyhow!("terminal input stopped: {reason}")),
             Msg::Resize => {}
         }
+        // Integration: `session.poll(app)` runs here, before the draw.
         surface.draw(app)?;
     }
     Ok(())
@@ -335,9 +359,15 @@ pub fn run_loop(
 
 /// Draw the whole shell into the frame.
 ///
-/// The session view and the inbox view arrive in later chunks. Their draw
-/// functions take the same `(frame, app, area)` shape and go into the
-/// match arms below.
+/// The session view and the inbox view arrive in later chunks and keep
+/// ownership of their files. The shell drives each of them with one
+/// lifecycle, and the arms below hold the `session.draw(f, app, area)` and
+/// `inbox.draw(f, app, area)` calls at integration:
+///
+/// - switch to it: `session.show(app)` / `inbox.observe(app)`
+/// - each frame: `session.poll(app)` before the draw
+/// - each key: `session.handle_key(app)` / `inbox.handle_key(app)`
+/// - each frame: the draw arm
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
     let (header, body, footer) = if app.connected {
@@ -362,7 +392,9 @@ pub fn render(f: &mut Frame, app: &App) {
     draw_header(f, app, header);
     match app.view {
         View::Pipeline => pipeline::draw(f, app, body),
+        // Integration: `session.draw(f, app, body)`.
         View::Session => draw_placeholder(f, "session", body),
+        // Integration: `inbox.draw(f, app, body)`.
         View::Inbox => draw_placeholder(f, "inbox", body),
     }
     draw_toast(f, app, body);
@@ -385,6 +417,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
+    // Integration: render `inbox::badge(app)` here, on every view.
     if app.state.as_ref().is_some_and(|state| state.paused.global) {
         status.push(Span::styled(
             "paused ",
@@ -415,7 +448,7 @@ fn tab_span(number: &str, label: &str, active: bool) -> Span<'static> {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled(text, THEME.dimmed())
+        Span::styled(text, THEME.dim())
     }
 }
 
@@ -441,16 +474,16 @@ fn banner_text(app: &App) -> String {
 
 /// Draw the key hints of this chunk.
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let hints = Span::styled(" 1/2/3 views   j/k move   ? help   q quit ", THEME.dimmed());
+    let hints = Span::styled(
+        " 1/2/3 views   j/k move   ! inbox   ? help   q quit ",
+        THEME.dim(),
+    );
     f.render_widget(Paragraph::new(Line::from(hints)), area);
 }
 
 /// Draw a placeholder for a view that a later chunk wires in.
 fn draw_placeholder(f: &mut Frame, name: &str, area: Rect) {
-    let text = Span::styled(
-        format!(" the {name} view is not wired yet "),
-        THEME.dimmed(),
-    );
+    let text = Span::styled(format!(" the {name} view is not wired yet "), THEME.dim());
     f.render_widget(Paragraph::new(Line::from(text)), area);
 }
 
@@ -474,15 +507,22 @@ fn draw_toast(f: &mut Frame, app: &App, body: Rect) {
 }
 
 /// Draw the help overlay over the whole frame.
+///
+/// The overlay lists the keys of the whole UI, so it also names the
+/// session scroll keys that the session view binds.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(40, 9, area);
+    let panel = centered(44, 13, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 7] = [
+    let rows: [(&str, &str); 11] = [
         ("1", "pipeline view"),
         ("2", "session view"),
         ("3", "inbox view"),
         ("j", "move down"),
         ("k", "move up"),
+        ("PageUp", "scroll the session back"),
+        ("PageDown", "scroll the session forward"),
+        ("End", "follow the session tail"),
+        ("!", "inbox, oldest row"),
         ("?", "toggle this help"),
         ("q", "quit"),
     ];
@@ -721,10 +761,31 @@ mod tests {
         assert!(text.contains("pipeline view"));
         assert!(text.contains("move down"));
         assert!(text.contains("quit"));
+        // The session scroll keys belong to the whole UI.
+        assert!(text.contains("PageUp"));
+        assert!(text.contains("PageDown"));
+        assert!(text.contains("End"));
+        assert!(text.contains("inbox, oldest row"));
 
         let closed = App::default();
         let text = render_to_string(&closed);
         assert!(!text.contains("pipeline view"));
+    }
+
+    #[test]
+    fn the_bang_key_opens_the_inbox_from_anywhere() {
+        let mut surface = CountingSurface { draws: 0 };
+        // From the pipeline view.
+        let mut app = App::default();
+        run_loop(&mut surface, &mut app, vec![key('!')].into_iter()).unwrap();
+        assert_eq!(app.view, View::Inbox);
+        // Back to pipeline, with the help overlay open.
+        run_loop(&mut surface, &mut app, vec![key('1'), key('?')].into_iter()).unwrap();
+        assert_eq!(app.view, View::Pipeline);
+        assert!(app.help);
+        // The bang key also works over the overlay.
+        run_loop(&mut surface, &mut app, vec![key('!')].into_iter()).unwrap();
+        assert_eq!(app.view, View::Inbox);
     }
 
     #[test]
