@@ -1215,7 +1215,10 @@ app does not quit and the character lands in the buffer.
 
 **Goal.** Drive the factory from the home view.
 
-**Files.** `src/tui/pipeline.rs`.
+**Files.** `src/tui/mod.rs` and `src/tui/pipeline.rs`. You may ALSO edit
+`src/tui/session.rs` and `src/tui/inbox.rs` where the wiring genuinely requires
+it — this chunk is the integrator, and the seams it must close run through
+those files. Say in the report which of them you touched and why. No other file.
 
 **Detail.**
 - `+` and `-` change the selected stage limit and send `Action::Limit`.
