@@ -31,6 +31,9 @@ enum Command {
         /// Panes or tabs to skip, comma separated (v3 only)
         #[arg(long)]
         skip: Option<String>,
+        /// Start the v4 UI without attaching to it
+        #[arg(long)]
+        detach: bool,
     },
     /// Stop the running v4 daemon
     Stop {
@@ -226,7 +229,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Start { skip }) => start_factory(skip.as_deref()),
+        Some(Command::Start { skip, detach }) => start_factory(skip.as_deref(), detach),
         Some(Command::Stop { force }) => {
             let root = status::repo_root()?;
             ops::stop_daemon(&v4_paths(&root)?, force)
@@ -464,7 +467,7 @@ fn events_v4(root: &Path, last: usize, follow: bool) -> Result<()> {
     Ok(())
 }
 
-fn start_factory(skip: Option<&str>) -> Result<()> {
+fn start_factory(skip: Option<&str>, detach: bool) -> Result<()> {
     let root = status::repo_root()?;
     let graph = graph::Graph::load(&root.join(graph::DEFAULT_GRAPH_PATH)).ok();
     if graph.as_ref().map(|g| g.version).unwrap_or(3) >= 4 {
@@ -473,7 +476,10 @@ fn start_factory(skip: Option<&str>) -> Result<()> {
         paths.ensure()?;
         ops::ensure_daemon(&paths, &root)?;
         println!("aif: daemon ready at {}", paths.socket().display());
-        return start_v4_ui(&root, &paths, &graph);
+        return start_v4_ui(&root, &paths, &graph, detach);
+    }
+    if detach {
+        bail!("--detach requires a v4 graph");
     }
     aif::legacy::start_v3(skip)
 }
@@ -482,6 +488,7 @@ fn start_v4_ui(
     root: &Path,
     paths: &aif::factory::FactoryPaths,
     graph: &graph::Graph,
+    detach: bool,
 ) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let session = format!("aif-{}-factory", paths.short_id());
@@ -492,6 +499,10 @@ fn start_v4_ui(
                     .args(["delete-session", &session])
                     .output();
             } else {
+                if detach {
+                    println!("aif: session {session} already runs");
+                    return Ok(());
+                }
                 eprintln!("aif: session {session} already runs; attaching");
                 let err = std::process::Command::new("zellij")
                     .args(["attach", &session])
@@ -504,6 +515,20 @@ fn start_v4_ui(
     let layout_file =
         std::env::temp_dir().join(format!("aif-{session}-{}.kdl", std::process::id()));
     std::fs::write(&layout_file, layout)?;
+    if detach {
+        let status = std::process::Command::new("zellij")
+            .arg("--layout")
+            .arg(&layout_file)
+            .args(["attach", "--create-background", "--create", &session])
+            .status()
+            .context("failed to start detached zellij session")?;
+        let _ = std::fs::remove_file(&layout_file);
+        if !status.success() {
+            bail!("zellij failed to start detached session {session}");
+        }
+        println!("aif: session {session} started in the background");
+        return Ok(());
+    }
     let err = std::process::Command::new("zellij")
         .arg("--new-session-with-layout")
         .arg(&layout_file)
