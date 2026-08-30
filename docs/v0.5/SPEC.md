@@ -921,6 +921,16 @@ loop {
   requeues, otherwise fails the task and opens a Stuck decision.
 - Review success writes `.aif/reviewed-sha` only after the task reports
   success, never before.
+- Contracts the release-train module imposes on you, reported by its author:
+  - Build a train with `Train::new(repo)`, never a struct literal. It carries
+    private state that `finish` needs to reconstruct the exact fired batch.
+  - `fire` stamps `last_fire_ms` on EVERY fire, manual included. You must
+    restore `last_fire_ms` from `state.json` BEFORE the first `drive()`, or an
+    interval policy will see no previous fire and release immediately on every
+    daemon start. That is a release to production caused purely by a restart.
+  - `finish(false)` deliberately leaves the batch queued and still labelled so
+    a retry reuses the identical set. Do not dequeue it yourself; a human who
+    stacked five pull requests must not silently get a different five.
 - Restart derives everything: the first poll rebuilds gates, trains from the
   `release-stacked` labels, and `NeedsHuman` decisions from labels. Tasks that
   were running are gone with their processes; their worktrees remain and the
