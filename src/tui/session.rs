@@ -393,12 +393,11 @@ impl SessionView {
                 Some(Action::Abort { task })
             }
             (KeyCode::Enter, _) => {
+                let task = self.task.as_ref()?.id.clone();
                 let text = std::mem::take(&mut self.input);
-                let text = text.trim().to_string();
-                if text.is_empty() {
+                if text.trim().is_empty() {
                     return None;
                 }
-                let task = self.task.as_ref()?.id.clone();
                 Some(Action::Chat { task, text })
             }
             (KeyCode::Char(letter), modifiers)
@@ -819,7 +818,7 @@ mod tests {
         let mut view = SessionView::new();
         view.show(&sample_task(&log));
 
-        for key in [letter('h'), letter('i')] {
+        for key in [letter(' '), letter('h'), letter('i'), letter(' ')] {
             assert_eq!(view.handle_key(key, 10), None);
         }
         let action = view.handle_key(key(KeyCode::Enter), 10);
@@ -828,7 +827,7 @@ mod tests {
             action,
             Some(Action::Chat {
                 task: "borsuk/implement-i142".to_string(),
-                text: "hi".to_string(),
+                text: " hi ".to_string(),
             })
         );
         assert_eq!(

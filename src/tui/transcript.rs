@@ -9,14 +9,8 @@
 //! functions are pure: they touch no terminal, no file, and no clock, so
 //! tests run offline.
 //!
-//! A line that parses to nothing known renders as a dim raw line. The
-//! transcript is the only window a human has into the agent, so no line is
-//! ever dropped and no input can panic the renderer.
-//!
-//! One limitation: [`wrap`] counts every `char` as one terminal column.
-//! Wide characters from scripts such as CJK can overflow the pane by a
-//! little. The crate adds no unicode-width dependency, so the renderer
-//! accepts that cost.
+//! A line that parses to nothing known renders as a dim raw line. Verified
+//! claude subagent output is excluded. No input can panic the renderer.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -131,6 +125,9 @@ pub fn parse(raw: &str) -> Vec<Entry> {
 ///
 /// `raw` is the original line text for the raw fallback.
 fn parse_value(value: &Value, raw: &str) -> Vec<Entry> {
+    if value.pointer("/part/type").and_then(Value::as_str) == Some("tool") {
+        return opencode_tool(value, raw);
+    }
     let kind = value.get("type").and_then(Value::as_str);
     match kind {
         // The claude dialect.
@@ -162,23 +159,13 @@ fn parse_value(value: &Value, raw: &str) -> Vec<Entry> {
 /// Parse one claude `assistant` line into its content blocks.
 ///
 /// A line with a non-null `parent_tool_use_id` is subagent output. The
-/// runner skips it, and so does the transcript, but the transcript keeps a
-/// dim note so the human still sees that output arrived.
+/// verified protocol says to skip its content blocks.
 fn claude_assistant(value: &Value, raw: &str) -> Vec<Entry> {
-    let parent = value.get("parent_tool_use_id").and_then(Value::as_str);
-    if let Some(parent) = parent {
-        let note = value
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-            .and_then(|blocks| {
-                blocks
-                    .iter()
-                    .find_map(|block| block.get("text").and_then(Value::as_str))
-            })
-            .unwrap_or("output");
-        return vec![Entry::System {
-            text: format!("subagent ({parent}): {}", truncate(note)),
-        }];
+    if value
+        .get("parent_tool_use_id")
+        .is_some_and(|parent| !parent.is_null())
+    {
+        return Vec::new();
     }
     let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
         return raw_fallback(raw);
@@ -421,8 +408,8 @@ fn truncate(text: &str) -> String {
 
 /// Render one entry into wrapped display lines for a pane `width`.
 ///
-/// The width counts every `char` as one column; see the module note. The
-/// call never returns an empty vector and never panics, even at width 0.
+/// The width uses terminal display columns. The call never returns an empty
+/// vector and never panics, even at width 0.
 pub fn render(entry: &Entry, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     match entry {
@@ -465,7 +452,28 @@ pub fn render(entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
 /// Render `text` with a two-column prefix and a hanging indent.
 fn prefixed_lines(prefix: &str, style: Style, text: &str, width: usize) -> Vec<Line<'static>> {
-    let lead_width = prefix.chars().count();
+    let lead_width = display_width(prefix);
+    if lead_width >= width {
+        let prefix_end = prefix_at_width(prefix, width);
+        let mut lines = Vec::new();
+        if prefix_end > 0 {
+            lines.push(Line::from(Span::styled(
+                prefix[..prefix_end].to_string(),
+                style,
+            )));
+        }
+        if !text.is_empty() {
+            lines.extend(
+                wrap(text, width)
+                    .into_iter()
+                    .map(|chunk| Line::from(Span::styled(chunk, style))),
+            );
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(String::new(), style)));
+        }
+        return lines;
+    }
     let body_width = width.saturating_sub(lead_width).max(1);
     let indent = " ".repeat(lead_width);
     wrap(text, body_width)
@@ -481,7 +489,7 @@ fn prefixed_lines(prefix: &str, style: Style, text: &str, width: usize) -> Vec<L
         .collect()
 }
 
-/// Wrap `text` to `width` columns, one `char` per column.
+/// Wrap `text` to `width` terminal display columns.
 ///
 /// The function splits on newlines first, then word-wraps each paragraph on
 /// spaces. A word wider than the width is split hard. A width of 0 counts
@@ -503,7 +511,7 @@ fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
     for word in text.split_whitespace() {
         let mut word = word;
         loop {
-            let word_len = word.chars().count();
+            let word_len = display_width(word);
             let space = usize::from(line_len > 0);
             if line_len + space + word_len <= width {
                 if space == 1 {
@@ -520,7 +528,7 @@ fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
             // The word alone is wider than the width: split it hard.
-            let take: usize = word.chars().take(width).map(char::len_utf8).sum();
+            let take = prefix_at_width(word, width);
             let (head, tail) = word.split_at(take);
             lines.push(head.to_string());
             word = tail;
@@ -530,16 +538,38 @@ fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Return the terminal display width of `text`.
+fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Return the byte end of the longest non-empty prefix within `width`.
+fn prefix_at_width(text: &str, width: usize) -> usize {
+    let mut end = 0;
+    let mut used = 0;
+    for (index, character) in text.char_indices() {
+        let next = index + character.len_utf8();
+        let character_width = display_width(&text[index..next]);
+        if used + character_width > width {
+            break;
+        }
+        used += character_width;
+        end = next;
+    }
+    if end == 0 {
+        text.chars().next().map_or(0, char::len_utf8)
+    } else {
+        end
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The sum of the span widths of one rendered line.
     fn line_width(line: &Line<'_>) -> usize {
-        line.spans
-            .iter()
-            .map(|span| span.content.chars().count())
-            .sum()
+        line.width()
     }
 
     /// The text of one rendered line.
@@ -643,6 +673,22 @@ mod tests {
     }
 
     #[test]
+    fn an_opencode_tool_part_does_not_depend_on_the_outer_line_type() {
+        let line = r#"{"type":"future_type","part":{"type":"tool","tool":"read","state":{"status":"completed","title":"src/main.rs"}}}"#;
+
+        let entries = parse(line);
+
+        assert_eq!(
+            entries,
+            vec![Entry::Tool {
+                name: "read".to_string(),
+                summary: "src/main.rs".to_string(),
+                failed: false,
+            }]
+        );
+    }
+
+    #[test]
     fn a_claude_failed_tool_result_is_marked() {
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"boom"}]}}"#;
         let entries = parse(line);
@@ -725,10 +771,7 @@ mod tests {
         let lines = render(&entry, 0);
         assert!(!lines.is_empty());
         for line in &lines {
-            assert!(
-                line_width(line) <= 3,
-                "two prefix columns plus one body column at most"
-            );
+            assert!(line_width(line) <= 1, "a zero width uses one column");
         }
     }
 
@@ -785,18 +828,10 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_line_is_replaced_by_a_dim_note() {
+    fn a_subagent_line_is_skipped() {
         let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_9","message":{"content":[{"type":"text","text":"nested work"}]}}"#;
-        let entries = parse(line);
 
-        let Entry::System { text } = &entries[0] else {
-            panic!("expected a system note");
-        };
-        assert!(text.contains("subagent"));
-        assert!(text.contains("nested work"));
-
-        let lines = render(&entries[0], 80);
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::DIM));
+        assert!(parse(line).is_empty());
     }
 
     #[test]
@@ -887,5 +922,28 @@ mod tests {
             wrap("abc", 0),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn prefixed_and_wide_text_stays_inside_the_pane_width() {
+        let narrow = render(
+            &Entry::Assistant {
+                text: "ab".to_string(),
+            },
+            1,
+        );
+        assert!(narrow.iter().all(|line| line_width(line) <= 1));
+        assert_eq!(line_text(&narrow[0]), "▌");
+
+        let wide = render(
+            &Entry::Assistant {
+                text: "界界".to_string(),
+            },
+            4,
+        );
+        assert_eq!(wide.len(), 2);
+        assert!(wide.iter().all(|line| line_width(line) <= 4));
+        assert_eq!(line_text(&wide[0]), "▌ 界");
+        assert_eq!(line_text(&wide[1]), "  界");
     }
 }
