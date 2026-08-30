@@ -102,14 +102,16 @@ pub fn parse_blocked_by(body: &str) -> Vec<u64> {
 /// Collect the `#N` list that follows one phrasing.
 ///
 /// `pos` points just past the phrasing. Separators between numbers are
-/// plain spaces, tabs, commas, and the standalone word `and`. The list
+/// plain spaces, commas, and the standalone word `and`. The list
 /// ends at the first other token or at the end of the text. Found
 /// numbers are appended to `found`.
 fn take_blocker_list(lower: &str, mut pos: usize, found: &mut Vec<u64>) {
+    let mut has_number = false;
     loop {
+        let before_separator = pos;
         loop {
             let rest = &lower[pos..];
-            let trimmed = rest.trim_start_matches([' ', '\t']);
+            let trimmed = rest.trim_start_matches(' ');
             pos += rest.len() - trimmed.len();
             let rest = &lower[pos..];
             if rest.starts_with(',') {
@@ -121,6 +123,9 @@ fn take_blocker_list(lower: &str, mut pos: usize, found: &mut Vec<u64>) {
                 continue;
             }
             break;
+        }
+        if has_number && pos == before_separator {
+            return;
         }
         let Some(rest) = lower[pos..].strip_prefix('#') else {
             return;
@@ -134,6 +139,7 @@ fn take_blocker_list(lower: &str, mut pos: usize, found: &mut Vec<u64>) {
         };
         found.push(number);
         pos += 1 + digits;
+        has_number = true;
     }
 }
 
@@ -145,15 +151,8 @@ fn standalone_and_at(lower: &str, pos: usize) -> bool {
     if !lower[pos..].starts_with("and") {
         return false;
     }
-    let before_ok = pos > 0
-        && matches!(
-            lower[..pos].chars().next_back(),
-            Some(' ') | Some('\t') | Some(',')
-        );
-    let after_ok = matches!(
-        lower[pos + "and".len()..].chars().next(),
-        Some(' ') | Some('\t')
-    );
+    let before_ok = pos > 0 && matches!(lower[..pos].chars().next_back(), Some(' ') | Some(','));
+    let after_ok = matches!(lower[pos + "and".len()..].chars().next(), Some(' '));
     before_ok && after_ok
 }
 
@@ -378,6 +377,16 @@ mod tests {
         assert_eq!(parse_blocked_by("blocked by #1 and then #2"), vec![1]);
         // The tail of a longer word is not the word "and".
         assert_eq!(parse_blocked_by("blocked by #1 android #2"), vec![1]);
+    }
+
+    #[test]
+    fn a_list_requires_a_separator_between_numbers() {
+        assert_eq!(parse_blocked_by("blocked by #1#2"), vec![1]);
+    }
+
+    #[test]
+    fn a_tab_does_not_separate_numbers() {
+        assert_eq!(parse_blocked_by("blocked by #1\t#2"), vec![1]);
     }
 
     #[test]
