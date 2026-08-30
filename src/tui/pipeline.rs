@@ -7,7 +7,7 @@
 //! repository with the queue, the stacked set, the policy, and the
 //! countdown.
 //!
-//! Chunk 19 adds the interaction keys to this file. The [`Row`] model and
+//! Chunk 19 adds the interaction keys to this file. The `Row` model and
 //! the selection movement exist so those keys can resolve their target.
 
 use super::theme::THEME;
@@ -30,7 +30,7 @@ use super::{App, Selection};
 /// ticket, and every release train row. `j` and `k` walk this list, so a
 /// later chunk can act on the selected row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Row {
+pub(super) enum Row {
     /// The header row of one stage.
     Stage {
         /// The stage.
@@ -58,7 +58,7 @@ pub enum Row {
 /// The current time in milliseconds since the Unix epoch.
 ///
 /// The value is 0 before the epoch, which no real clock reports.
-pub fn epoch_ms() -> u64 {
+fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)
@@ -66,7 +66,7 @@ pub fn epoch_ms() -> u64 {
 }
 
 /// The selectable rows of the pipeline view, in draw order.
-pub fn rows(state: &StateView) -> Vec<Row> {
+pub(super) fn rows(state: &StateView) -> Vec<Row> {
     let mut rows = Vec::new();
     for stage in Stage::ALL {
         rows.push(Row::Stage { stage });
@@ -114,7 +114,7 @@ fn stage_is_paused(state: &StateView, stage: Stage) -> bool {
 ///
 /// `1` moves down and `-1` moves up. The movement clamps at the ends. With
 /// no selection, `j` picks the first row and `k` picks the last one.
-pub fn move_selection(app: &mut App, delta: isize) {
+pub(super) fn move_selection(app: &mut App, delta: isize) {
     let Some(state) = app.state.as_ref() else {
         app.selection = Selection::None;
         return;
@@ -142,7 +142,7 @@ pub fn move_selection(app: &mut App, delta: isize) {
 }
 
 /// Draw the pipeline view into `area`.
-pub fn draw(f: &mut Frame, app: &App, area: Rect) {
+pub(super) fn draw(f: &mut Frame, app: &App, area: Rect) {
     let Some(state) = app.state.as_ref() else {
         let hint = Line::from(Span::styled(
             " waiting for the first state push from the daemon",
@@ -324,7 +324,7 @@ fn numbers(values: &[u64]) -> String {
 }
 
 /// The short label of one release policy.
-pub fn policy_label(policy: &ReleasePolicy) -> String {
+fn policy_label(policy: &ReleasePolicy) -> String {
     match policy {
         ReleasePolicy::Manual => "manual".to_string(),
         ReleasePolicy::Interval { minutes } => format!("every {minutes}m"),
@@ -333,7 +333,7 @@ pub fn policy_label(policy: &ReleasePolicy) -> String {
 }
 
 /// The remaining time as `4m12s`, `1h02m`, or `59s`.
-pub fn format_countdown(ms: u64) -> String {
+fn format_countdown(ms: u64) -> String {
     let seconds = ms / 1000;
     if seconds >= 3600 {
         format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
@@ -357,7 +357,7 @@ fn task(
     attempt: u32,
 ) -> TaskView {
     TaskView {
-        id: format!("{repo}/{}{}{number}", stage.as_str(), kind.as_str()),
+        id: format!("{repo}/{}-{}{number}", stage.as_str(), kind.as_str()),
         repo: repo.to_string(),
         stage,
         kind,
@@ -512,7 +512,7 @@ pub(crate) fn sample_view() -> StateView {
 ///
 /// Test support for this file and for the shell tests in `mod.rs`.
 #[cfg(test)]
-pub(crate) fn render_to_string(app: &App) -> String {
+pub(super) fn render_to_string(app: &App) -> String {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| super::render(frame, app)).unwrap();
@@ -523,7 +523,7 @@ pub(crate) fn render_to_string(app: &App) -> String {
 ///
 /// Test support for this file and for the shell tests in `mod.rs`.
 #[cfg(test)]
-pub(crate) fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     let mut out = String::new();
     for y in 0..buffer.area.height {
         let mut line = String::new();

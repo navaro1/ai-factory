@@ -2,26 +2,14 @@
 //!
 //! Three threads cooperate:
 //!
-//! - The key reader thread turns crossterm events into [`Msg`] values.
+//! - The key reader thread turns crossterm events into `Msg` values.
 //! - The socket reader thread connects to the daemon, turns pushes into
-//!   [`Msg`] values, and reconnects with [`backoff_delay`].
-//! - The main thread owns the [`App`], blocks on the one channel, and draws
+//!   `Msg` values, and reconnects with `backoff_delay`.
+//! - The main thread owns the `App`, blocks on the one channel, and draws
 //!   one frame per message. Nothing draws on a timer.
 //!
-//! The shell draws the pipeline view itself. The session view and the inbox
-//! view arrive in later chunks and keep ownership of their modules. The shell
-//! drives each of them with one view lifecycle, always with the app as the
-//! first argument:
-//!
-//! - `session.show(app)` / `inbox.observe(app)` when the view becomes visible
-//! - `session.poll(app)` on every frame, to pull new log lines
-//! - `session.handle_key(app)` / `inbox.handle_key(app)` for every key, with
-//!   [`InboxOutcome::OpenSession`] mapped to a switch to [`View::Session`]
-//! - `session.draw(f, app, area)` / `inbox.draw(f, app, area)` inside the
-//!   match arms of `render`
-//!
-//! `inbox::badge(app)` renders in the status bar of every view. The call
-//! sites sit in this module, marked with an `Integration:` comment.
+//! The shell draws the pipeline view itself. Later chunks replace the session
+//! and inbox placeholders.
 
 pub mod inbox;
 pub mod pipeline;
@@ -51,12 +39,9 @@ use ratatui::{Frame, Terminal};
 use crate::sock::{Client, Push, StateView};
 use theme::THEME;
 
-/// How long one toast stays visible.
-pub const TOAST_DURATION: Duration = Duration::from_secs(4);
-
 /// The view the shell shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum View {
+enum View {
     /// The pipeline view. This is the home view.
     #[default]
     Pipeline,
@@ -68,7 +53,7 @@ pub enum View {
 
 /// What the operator has marked in the visible view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Selection {
+enum Selection {
     /// Nothing is marked.
     #[default]
     None,
@@ -81,7 +66,7 @@ pub enum Selection {
 /// Every value is either an input event or a socket event. The main loop
 /// draws one frame per message and never wakes up on its own.
 #[derive(Debug)]
-pub enum Msg {
+enum Msg {
     /// A key press.
     Key(KeyEvent),
     /// The terminal changed its size.
@@ -98,21 +83,21 @@ pub enum Msg {
 
 /// The model the main loop owns.
 #[derive(Debug, Default)]
-pub struct App {
+struct App {
     /// The last state the daemon pushed. None before the first push.
-    pub state: Option<StateView>,
+    state: Option<StateView>,
     /// True while the socket reader holds a connection.
-    pub connected: bool,
+    connected: bool,
     /// The view the shell shows.
-    pub view: View,
+    view: View,
     /// The row the operator marked.
-    pub selection: Selection,
+    selection: Selection,
     /// The toast text and the instant it expires at.
-    pub toast: Option<(String, Instant)>,
+    toast: Option<(String, Instant)>,
     /// True while the help overlay covers the view.
-    pub help: bool,
+    help: bool,
     /// The reason the daemon went away, for the banner.
-    pub disconnect: Option<String>,
+    disconnect: Option<String>,
 }
 
 impl App {
@@ -120,7 +105,7 @@ impl App {
     ///
     /// The push proves the connection, clamps the selection to the new row
     /// count, and drops an expired toast.
-    pub fn apply_state(&mut self, view: StateView) {
+    fn apply_state(&mut self, view: StateView) {
         let count = pipeline::rows(&view).len();
         self.state = Some(view);
         self.connected = true;
@@ -139,42 +124,26 @@ impl App {
     }
 
     /// Mark the daemon as gone and remember the reason.
-    pub fn mark_disconnected(&mut self, reason: String) {
+    fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
     }
 
-    /// Show a toast until [`TOAST_DURATION`] passes.
-    pub fn set_toast(&mut self, text: impl Into<String>) {
-        self.toast = Some((text.into(), Instant::now() + TOAST_DURATION));
-    }
-
     /// The toast text while it is still fresh.
-    pub fn visible_toast(&self) -> Option<&str> {
+    fn visible_toast(&self) -> Option<&str> {
         let (text, until) = self.toast.as_ref()?;
         (Instant::now() < *until).then_some(text.as_str())
     }
 
     /// Apply one key press. Returns false when the app wants to quit.
-    ///
-    /// Keys of the hidden views route through the view lifecycle at
-    /// integration: the session view gets `session.handle_key(app)` and the
-    /// inbox gets `inbox.handle_key(app)`, whose outcome maps
-    /// [`InboxOutcome::OpenSession`] to [`View::Session`] for that task.
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('?') => self.help = !self.help,
-            // Global key: from anywhere, even over the help overlay. The
-            // other half of this key selects the inbox's oldest row, and
-            // the inbox owns that selection.
-            KeyCode::Char('!') => self.view = View::Inbox,
             KeyCode::Esc if self.help => self.help = false,
             _ if self.help => {}
             KeyCode::Char('1') => self.view = View::Pipeline,
-            // Integration: a switch to the session calls `session.show(app)`.
             KeyCode::Char('2') => self.view = View::Session,
-            // Integration: a switch to the inbox calls `inbox.observe(app)`.
             KeyCode::Char('3') => self.view = View::Inbox,
             KeyCode::Char('j') if self.view == View::Pipeline => pipeline::move_selection(self, 1),
             KeyCode::Char('k') if self.view == View::Pipeline => pipeline::move_selection(self, -1),
@@ -188,7 +157,7 @@ impl App {
 ///
 /// The wait starts at one second and doubles per failed attempt, capped at
 /// ten seconds.
-pub fn backoff_delay(attempt: u32) -> Duration {
+fn backoff_delay(attempt: u32) -> Duration {
     let shift = attempt.min(4);
     Duration::from_secs(1u64 << shift).min(Duration::from_secs(10))
 }
@@ -196,7 +165,7 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 /// The drawing surface the main loop paints on.
 ///
 /// The trait exists so tests can count draws without a real terminal.
-pub trait Surface {
+trait Surface {
     /// Draw one frame of the app.
     fn draw(&mut self, app: &App) -> Result<()>;
 }
@@ -221,16 +190,64 @@ struct RawMode;
 impl RawMode {
     /// Switch the terminal into raw mode and the alternate screen.
     fn enable() -> Result<RawMode> {
-        enable_raw_mode().context("cannot enable raw mode")?;
-        execute!(stdout(), EnterAlternateScreen).context("cannot enter the alternate screen")?;
+        enable_terminal_with(
+            enable_raw_mode,
+            || execute!(stdout(), EnterAlternateScreen),
+            restore_terminal,
+        )?;
         Ok(RawMode)
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        if let Err(error) = restore_terminal() {
+            eprintln!("cannot restore the terminal: {error:#}");
+        }
+    }
+}
+
+/// Enable terminal modes and restore the terminal if screen entry fails.
+fn enable_terminal_with(
+    enable: impl FnOnce() -> std::io::Result<()>,
+    enter: impl FnOnce() -> std::io::Result<()>,
+    restore: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    enable().context("cannot enable raw mode")?;
+    if let Err(enter_error) = enter() {
+        let enter_error = anyhow!("cannot enter the alternate screen: {enter_error}");
+        return match restore() {
+            Ok(()) => Err(enter_error),
+            Err(restore_error) => Err(anyhow!(
+                "{enter_error:#}; cannot restore the terminal: {restore_error:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// Restore the real terminal after the terminal UI stops.
+fn restore_terminal() -> Result<()> {
+    restore_terminal_with(
+        || execute!(stdout(), LeaveAlternateScreen),
+        disable_raw_mode,
+    )
+}
+
+/// Attempt both terminal restore steps and report all failures.
+fn restore_terminal_with(
+    leave: impl FnOnce() -> std::io::Result<()>,
+    disable: impl FnOnce() -> std::io::Result<()>,
+) -> Result<()> {
+    let leave_error = leave().err();
+    let disable_error = disable().err();
+    match (leave_error, disable_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(anyhow!("cannot leave the alternate screen: {error}")),
+        (None, Some(error)) => Err(anyhow!("cannot disable raw mode: {error}")),
+        (Some(leave_error), Some(disable_error)) => Err(anyhow!(
+            "cannot leave the alternate screen: {leave_error}; cannot disable raw mode: {disable_error}"
+        )),
     }
 }
 
@@ -267,7 +284,9 @@ fn spawn_key_thread(tx: Sender<Msg>) {
             }
             Ok(_) => {}
             Err(error) => {
-                let _ = tx.send(Msg::Input(error.to_string()));
+                if let Err(send_error) = tx.send(Msg::Input(error.to_string())) {
+                    eprintln!("cannot report the terminal input failure: {send_error}");
+                }
                 return;
             }
         }
@@ -276,18 +295,15 @@ fn spawn_key_thread(tx: Sender<Msg>) {
 
 /// Connect to the daemon, forward its pushes, and reconnect with backoff.
 ///
-/// The thread reports only state changes: one [`Msg::Connected`] per
-/// successful connect and one [`Msg::Disconnected`] per lost connection or
-/// first failed attempt. A quiet retry sends nothing and draws nothing.
+/// The thread reports each connect result. This rule keeps every connection
+/// error visible to the main loop.
 fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
     thread::spawn(move || {
         let mut attempt: u32 = 0;
-        let mut was_connected = false;
         loop {
             let mut failure: Option<String> = None;
             match Client::connect(&socket) {
                 Ok(client) => {
-                    was_connected = true;
                     attempt = 0;
                     if tx.send(Msg::Connected).is_err() {
                         return;
@@ -313,13 +329,9 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                 }
                 Err(error) => failure = Some(format!("{error:#}")),
             }
-            if was_connected || attempt == 0 {
-                let reason =
-                    failure.unwrap_or_else(|| "the daemon closed the connection".to_string());
-                if tx.send(Msg::Disconnected(reason)).is_err() {
-                    return;
-                }
-                was_connected = false;
+            let reason = failure.unwrap_or_else(|| "the daemon closed the connection".to_string());
+            if tx.send(Msg::Disconnected(reason)).is_err() {
+                return;
             }
             thread::sleep(backoff_delay(attempt));
             attempt = attempt.saturating_add(1);
@@ -329,11 +341,8 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
 
 /// Consume messages until the app quits or the channel dies.
 ///
-/// Every message leads to exactly one draw. A quiet channel leads to no
-/// draw at all; there is no tick and no timer. The session view pulls its
-/// log lines at the same pace: `session.poll(app)` runs right before the
-/// draw of every frame, so the poll rate follows the message rate.
-pub fn run_loop(
+/// Every handled message leads to one draw. A quiet channel causes no draw.
+fn run_loop(
     surface: &mut impl Surface,
     app: &mut App,
     msgs: impl Iterator<Item = Msg>,
@@ -351,7 +360,6 @@ pub fn run_loop(
             Msg::Input(reason) => return Err(anyhow!("terminal input stopped: {reason}")),
             Msg::Resize => {}
         }
-        // Integration: `session.poll(app)` runs here, before the draw.
         surface.draw(app)?;
     }
     Ok(())
@@ -359,16 +367,8 @@ pub fn run_loop(
 
 /// Draw the whole shell into the frame.
 ///
-/// The session view and the inbox view arrive in later chunks and keep
-/// ownership of their files. The shell drives each of them with one
-/// lifecycle, and the arms below hold the `session.draw(f, app, area)` and
-/// `inbox.draw(f, app, area)` calls at integration:
-///
-/// - switch to it: `session.show(app)` / `inbox.observe(app)`
-/// - each frame: `session.poll(app)` before the draw
-/// - each key: `session.handle_key(app)` / `inbox.handle_key(app)`
-/// - each frame: the draw arm
-pub fn render(f: &mut Frame, app: &App) {
+/// Later chunks replace the session and inbox placeholders.
+fn render(f: &mut Frame, app: &App) {
     let area = f.area();
     let (header, body, footer) = if app.connected {
         let chunks = Layout::vertical([
@@ -392,9 +392,7 @@ pub fn render(f: &mut Frame, app: &App) {
     draw_header(f, app, header);
     match app.view {
         View::Pipeline => pipeline::draw(f, app, body),
-        // Integration: `session.draw(f, app, body)`.
         View::Session => draw_placeholder(f, "session", body),
-        // Integration: `inbox.draw(f, app, body)`.
         View::Inbox => draw_placeholder(f, "inbox", body),
     }
     draw_toast(f, app, body);
@@ -417,7 +415,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
-    // Integration: render `inbox::badge(app)` here, on every view.
     if app.state.as_ref().is_some_and(|state| state.paused.global) {
         status.push(Span::styled(
             "paused ",
@@ -474,10 +471,7 @@ fn banner_text(app: &App) -> String {
 
 /// Draw the key hints of this chunk.
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let hints = Span::styled(
-        " 1/2/3 views   j/k move   ! inbox   ? help   q quit ",
-        THEME.dim(),
-    );
+    let hints = Span::styled(" 1/2/3 views   j/k move   ? help   q quit ", THEME.dim());
     f.render_widget(Paragraph::new(Line::from(hints)), area);
 }
 
@@ -507,22 +501,15 @@ fn draw_toast(f: &mut Frame, app: &App, body: Rect) {
 }
 
 /// Draw the help overlay over the whole frame.
-///
-/// The overlay lists the keys of the whole UI, so it also names the
-/// session scroll keys that the session view binds.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 13, area);
+    let panel = centered(40, 9, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 11] = [
+    let rows: [(&str, &str); 7] = [
         ("1", "pipeline view"),
         ("2", "session view"),
         ("3", "inbox view"),
         ("j", "move down"),
         ("k", "move up"),
-        ("PageUp", "scroll the session back"),
-        ("PageDown", "scroll the session forward"),
-        ("End", "follow the session tail"),
-        ("!", "inbox, oldest row"),
         ("?", "toggle this help"),
         ("q", "quit"),
     ];
@@ -558,7 +545,10 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::model::Stage;
-    use ratatui::backend::TestBackend;
+    use crate::tui::pipeline::render_to_string;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// A surface that counts draws.
     struct CountingSurface {
@@ -572,23 +562,17 @@ mod tests {
         }
     }
 
-    /// An iterator that yields its messages and then stays quiet.
-    struct ThenQuiet {
-        msgs: std::vec::IntoIter<Msg>,
-        quiet: Duration,
+    /// A surface that publishes each draw to its test.
+    struct SharedCountingSurface {
+        draws: Arc<AtomicUsize>,
+        drew: Sender<()>,
     }
 
-    impl Iterator for ThenQuiet {
-        type Item = Msg;
-
-        fn next(&mut self) -> Option<Msg> {
-            match self.msgs.next() {
-                Some(msg) => Some(msg),
-                None => {
-                    thread::sleep(self.quiet);
-                    None
-                }
-            }
+    impl Surface for SharedCountingSurface {
+        fn draw(&mut self, _app: &App) -> Result<()> {
+            self.draws.fetch_add(1, Ordering::SeqCst);
+            self.drew.send(()).context("cannot report a test draw")?;
+            Ok(())
         }
     }
 
@@ -598,13 +582,6 @@ mod tests {
             KeyCode::Char(character),
             crossterm::event::KeyModifiers::empty(),
         ))
-    }
-
-    /// Render the app into a test backend and return the visible text.
-    fn render_to_string(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| render(frame, app)).unwrap();
-        crate::tui::pipeline::buffer_text(terminal.backend().buffer())
     }
 
     #[test]
@@ -623,30 +600,50 @@ mod tests {
     }
 
     #[test]
+    fn every_reconnect_failure_reaches_the_main_loop() {
+        let socket =
+            std::env::temp_dir().join(format!("aif-missing-daemon-{}.sock", uuid::Uuid::new_v4()));
+        let (tx, rx) = channel();
+        spawn_socket_thread(tx, socket);
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(Msg::Disconnected(_))
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(Msg::Disconnected(_))
+        ));
+    }
+
+    #[test]
     fn the_loop_draws_once_per_message_and_not_during_a_quiet_interval() {
         let quiet = Duration::from_millis(80);
-        let mut surface = CountingSurface { draws: 0 };
-        let mut app = App::default();
-        let msgs = vec![
-            Msg::State(crate::tui::pipeline::sample_view()),
-            Msg::Connected,
-            Msg::Resize,
-        ];
-        let started = Instant::now();
-        run_loop(
-            &mut surface,
-            &mut app,
-            ThenQuiet {
-                msgs: msgs.into_iter(),
-                quiet,
-            },
-        )
-        .unwrap();
-        assert_eq!(surface.draws, 3);
-        assert!(
-            started.elapsed() >= quiet,
-            "the loop did not stay quiet for {quiet:?}"
+        let draws = Arc::new(AtomicUsize::new(0));
+        let (draw_tx, draw_rx) = channel();
+        let (msg_tx, msg_rx) = channel();
+        let thread_draws = Arc::clone(&draws);
+        let handle = thread::spawn(move || {
+            let mut surface = SharedCountingSurface {
+                draws: thread_draws,
+                drew: draw_tx,
+            };
+            let mut app = App::default();
+            run_loop(&mut surface, &mut app, msg_rx.into_iter())
+        });
+
+        msg_tx.send(Msg::Resize).unwrap();
+        draw_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let before = draws.load(Ordering::SeqCst);
+        assert_eq!(before, 1);
+        assert_eq!(
+            draw_rx.recv_timeout(quiet),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         );
+        assert_eq!(draws.load(Ordering::SeqCst), before);
+
+        msg_tx.send(key('q')).unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -761,11 +758,6 @@ mod tests {
         assert!(text.contains("pipeline view"));
         assert!(text.contains("move down"));
         assert!(text.contains("quit"));
-        // The session scroll keys belong to the whole UI.
-        assert!(text.contains("PageUp"));
-        assert!(text.contains("PageDown"));
-        assert!(text.contains("End"));
-        assert!(text.contains("inbox, oldest row"));
 
         let closed = App::default();
         let text = render_to_string(&closed);
@@ -773,25 +765,9 @@ mod tests {
     }
 
     #[test]
-    fn the_bang_key_opens_the_inbox_from_anywhere() {
-        let mut surface = CountingSurface { draws: 0 };
-        // From the pipeline view.
-        let mut app = App::default();
-        run_loop(&mut surface, &mut app, vec![key('!')].into_iter()).unwrap();
-        assert_eq!(app.view, View::Inbox);
-        // Back to pipeline, with the help overlay open.
-        run_loop(&mut surface, &mut app, vec![key('1'), key('?')].into_iter()).unwrap();
-        assert_eq!(app.view, View::Pipeline);
-        assert!(app.help);
-        // The bang key also works over the overlay.
-        run_loop(&mut surface, &mut app, vec![key('!')].into_iter()).unwrap();
-        assert_eq!(app.view, View::Inbox);
-    }
-
-    #[test]
     fn a_fresh_toast_shows_and_an_expired_one_does_not() {
         let fresh = App {
-            toast: Some(("sent".to_string(), Instant::now() + TOAST_DURATION)),
+            toast: Some(("sent".to_string(), Instant::now() + Duration::from_secs(4))),
             ..App::default()
         };
         assert!(render_to_string(&fresh).contains("sent"));
@@ -815,5 +791,40 @@ mod tests {
         let text = render_to_string(&app);
         assert!(text.contains("live"));
         assert!(text.contains("paused"));
+    }
+
+    #[test]
+    fn an_alternate_screen_failure_restores_the_terminal() {
+        let restored = Cell::new(false);
+        let error = enable_terminal_with(
+            || Ok(()),
+            || Err(std::io::Error::other("enter failed")),
+            || {
+                restored.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(restored.get());
+        assert!(error.to_string().contains("enter failed"));
+    }
+
+    #[test]
+    fn terminal_restore_attempts_both_steps_and_reports_both_errors() {
+        let disabled = Cell::new(false);
+        let error = restore_terminal_with(
+            || Err(std::io::Error::other("leave failed")),
+            || {
+                disabled.set(true);
+                Err(std::io::Error::other("disable failed"))
+            },
+        )
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(disabled.get());
+        assert!(message.contains("leave failed"));
+        assert!(message.contains("disable failed"));
     }
 }
