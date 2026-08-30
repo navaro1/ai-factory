@@ -90,12 +90,10 @@ struct Step {
 
 /// The test double for [`Exec`].
 ///
-/// Build it with scripted `(matcher, output)` steps. Each call takes the
-/// first unconsumed step whose matcher accepts the call, so scripted steps
-/// answer in order among themselves regardless of the order the code under
-/// test issues different commands. Every call is recorded; [`ScriptExec::calls`]
-/// returns them for exact argument-vector assertions. A call that no
-/// remaining step matches is an error, which fails the test.
+/// Build it with scripted `(matcher, output)` steps. Each call must match the
+/// next step. The executor records every call. [`ScriptExec::calls`] returns
+/// the calls for exact argument vector checks. An unexpected call returns an
+/// error.
 pub struct ScriptExec {
     steps: Mutex<Vec<Step>>,
     calls: Mutex<Vec<Call>>,
@@ -126,12 +124,6 @@ impl ScriptExec {
         self
     }
 
-    /// Script one step that matches calls of exactly `program`.
-    pub fn expect_program(self, program: &str, out: CmdOut) -> Self {
-        let program = program.to_string();
-        self.expect(move |call| call.program == program, out)
-    }
-
     /// Every recorded call, in call order.
     pub fn calls(&self) -> Vec<Call> {
         self.calls
@@ -160,16 +152,15 @@ impl Exec for ScriptExec {
             .push(call.clone());
 
         let mut steps = self.steps.lock().unwrap_or_else(PoisonError::into_inner);
-        let total = steps.len();
-        let index = steps.iter().position(|step| (step.matches)(&call));
-        match index {
-            Some(index) => Ok(steps.remove(index).out),
-            None => Err(anyhow!(
-                "unexpected command: {}; {} of {} scripted steps remain",
+        let next_matches = steps.first().is_some_and(|step| (step.matches)(&call));
+        if next_matches {
+            Ok(steps.remove(0).out)
+        } else {
+            Err(anyhow!(
+                "unexpected command: {}; {} scripted steps remain",
                 describe(&call.program, &call.argv()),
-                steps.len(),
-                total
-            )),
+                steps.len()
+            ))
         }
     }
 }
@@ -195,14 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn script_returns_steps_in_order_per_matcher() {
+    fn script_returns_steps_in_order() {
         let exec = ScriptExec::new()
             .expect(
                 |call| call.program == "git" && call.argv() == ["status", "--porcelain"],
                 CmdOut::ok("M file\n"),
             )
-            .expect_program(
-                "gh",
+            .expect(
+                |call| call.program == "gh" && call.argv() == ["api", "x"],
                 CmdOut {
                     status: 0,
                     stdout: "[]\n".into(),
@@ -210,20 +201,32 @@ mod tests {
                 },
             );
 
-        // The code under test may issue the gh call first.
-        let gh = exec.run("gh", &["api", "x"], None).unwrap();
-        assert_eq!(gh.stdout, "[]\n");
         let git = exec
             .run("git", &["status", "--porcelain"], Some(Path::new("/tmp")))
             .unwrap();
         assert_eq!(git.stdout, "M file\n");
+        let gh = exec.run("gh", &["api", "x"], None).unwrap();
+        assert_eq!(gh.stdout, "[]\n");
     }
 
     #[test]
     fn script_records_every_call_with_its_exact_argument_vector() {
         let exec = ScriptExec::new()
-            .expect_program("git", CmdOut::ok(""))
-            .expect_program("git", CmdOut::ok(""));
+            .expect(
+                |call| {
+                    call.program == "git"
+                        && call.argv() == ["-C", "/repo", "remote", "get-url", "origin"]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(
+                |call| {
+                    call.program == "git"
+                        && call.argv() == ["worktree", "list"]
+                        && call.cwd == Some(PathBuf::from("/repo"))
+                },
+                CmdOut::ok(""),
+            );
         exec.run("git", &["-C", "/repo", "remote", "get-url", "origin"], None)
             .unwrap();
         exec.run("git", &["worktree", "list"], Some(Path::new("/repo")))
@@ -243,7 +246,7 @@ mod tests {
 
     #[test]
     fn script_fails_on_an_unmatched_command() {
-        let exec = ScriptExec::new().expect_program("git", CmdOut::ok(""));
+        let exec = ScriptExec::new().expect(|call| call.program == "git", CmdOut::ok(""));
         let err = exec.run("claude", &["-p"], None).unwrap_err();
         assert!(err.to_string().contains("unexpected command"));
         assert!(err.to_string().contains("claude -p"));
@@ -251,7 +254,7 @@ mod tests {
 
     #[test]
     fn script_fails_once_its_steps_are_used_up() {
-        let exec = ScriptExec::new().expect_program("gh", CmdOut::ok("one\n"));
+        let exec = ScriptExec::new().expect(|call| call.program == "gh", CmdOut::ok("one\n"));
         assert_eq!(exec.run("gh", &[], None).unwrap().stdout, "one\n");
         let err = exec.run("gh", &[], None).unwrap_err();
         assert!(err.to_string().contains("unexpected command"));

@@ -1,6 +1,6 @@
 # Example factory.toml for AI Factory v0.5.
 # Copy this file to ~/.config/aif/factory.toml and adjust the paths.
-# Every key shown here is optional except each repository's path.
+# Each stage needs a model and runner. Each repository needs a path.
 
 [stage.refine]
 model = "claude-opus-5[1m]"

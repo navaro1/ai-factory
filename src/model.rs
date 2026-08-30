@@ -79,27 +79,6 @@ impl ItemKind {
     }
 }
 
-impl fmt::Display for ItemKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ItemKind::Issue => "issue",
-            ItemKind::Pr => "pr",
-        })
-    }
-}
-
-impl FromStr for ItemKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "i" | "issue" => Ok(ItemKind::Issue),
-            "p" | "pr" => Ok(ItemKind::Pr),
-            _ => Err(format!("unknown item kind \"{s}\"")),
-        }
-    }
-}
-
 /// One open GitHub issue, as the poller saw it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
@@ -159,8 +138,7 @@ impl Snapshot {
     ///
     /// Only the named repository's entry changes. On the first poll for a
     /// repository every item is `Added`. A title or body edit is stored but
-    /// produces no change. Labels compare as sets, so a label reorder is not
-    /// a change.
+    /// produces no change. The method compares label vectors directly.
     pub fn apply(&mut self, repo: &str, fresh: RepoSnapshot) -> Vec<Change> {
         let mut changes = Vec::new();
         match self.repos.get(repo) {
@@ -192,7 +170,7 @@ impl Snapshot {
                             what: ChangeWhat::Removed,
                         }),
                         Some(new_item)
-                            if label_set(&new_item.labels) != label_set(&old_item.labels)
+                            if new_item.labels != old_item.labels
                                 || new_item.open != old_item.open =>
                         {
                             changes.push(Change {
@@ -224,7 +202,7 @@ impl Snapshot {
                             what: ChangeWhat::Removed,
                         }),
                         Some(new_item)
-                            if label_set(&new_item.labels) != label_set(&old_item.labels)
+                            if new_item.labels != old_item.labels
                                 || new_item.open != old_item.open
                                 || new_item.draft != old_item.draft
                                 || new_item.head_sha != old_item.head_sha =>
@@ -254,11 +232,6 @@ impl Snapshot {
         self.repos.insert(repo.to_string(), fresh);
         changes
     }
-}
-
-/// Compare label lists as sets, so a reorder is not a change.
-fn label_set(labels: &[String]) -> std::collections::BTreeSet<&str> {
-    labels.iter().map(String::as_str).collect()
 }
 
 /// One observable change to one item of one repository.
@@ -343,12 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn item_kind_gives_short_and_long_names() {
+    fn item_kind_gives_task_id_names() {
         assert_eq!(ItemKind::Issue.as_str(), "i");
         assert_eq!(ItemKind::Pr.as_str(), "p");
-        assert_eq!("issue".parse::<ItemKind>().unwrap(), ItemKind::Issue);
-        assert_eq!("p".parse::<ItemKind>().unwrap(), ItemKind::Pr);
-        assert_eq!(ItemKind::Issue.to_string(), "issue");
     }
 
     #[test]
@@ -368,7 +338,11 @@ mod tests {
     fn apply_never_touches_another_repository() {
         let mut snap = Snapshot::default();
         snap.apply("borsuk", repo(vec![issue(1, &["to-refine"])], vec![]));
-        snap.apply("qubitsok", repo(vec![issue(7, &["refined"])], vec![]));
+        let other = repo(
+            vec![issue(7, &["refined"])],
+            vec![pr(8, true, "sha-8", &["needs-human"])],
+        );
+        snap.apply("qubitsok", other.clone());
 
         // A fresh empty borsuk poll must remove only borsuk entries.
         let changes = snap.apply("borsuk", repo(vec![], vec![]));
@@ -381,12 +355,75 @@ mod tests {
                 what: ChangeWhat::Removed,
             }]
         );
-        assert_eq!(snap.repos["qubitsok"].issues.len(), 1);
-        assert_eq!(
-            snap.repos["qubitsok"].issues[&7].labels,
-            vec!["refined".to_string()]
+        assert_eq!(snap.repos["qubitsok"], other);
+        assert!(snap.repos["borsuk"].issues.is_empty());
+    }
+
+    #[test]
+    fn later_additions_and_removals_report_the_item_identity() {
+        let mut snap = Snapshot::default();
+        snap.apply(
+            "borsuk",
+            repo(vec![issue(1, &[])], vec![pr(2, true, "sha-2", &[])]),
         );
-        assert!(!snap.repos.contains_key("borsuk") || snap.repos["borsuk"].issues.is_empty());
+
+        let changes = snap.apply(
+            "borsuk",
+            repo(vec![issue(3, &[])], vec![pr(4, false, "sha-4", &[])]),
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                Change {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Issue,
+                    number: 1,
+                    what: ChangeWhat::Removed,
+                },
+                Change {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Issue,
+                    number: 3,
+                    what: ChangeWhat::Added,
+                },
+                Change {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Pr,
+                    number: 2,
+                    what: ChangeWhat::Removed,
+                },
+                Change {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Pr,
+                    number: 4,
+                    what: ChangeWhat::Added,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn text_and_node_edits_are_stored_without_a_change() {
+        let mut snap = Snapshot::default();
+        snap.apply(
+            "borsuk",
+            repo(vec![issue(1, &[])], vec![pr(2, true, "sha-2", &[])]),
+        );
+        let mut fresh = repo(vec![issue(1, &[])], vec![pr(2, true, "sha-2", &[])]);
+        let issue = fresh.issues.get_mut(&1).unwrap();
+        issue.node_id = "new-issue-node".to_string();
+        issue.title = "new issue title".to_string();
+        issue.body = "new issue body".to_string();
+        let pr = fresh.prs.get_mut(&2).unwrap();
+        pr.node_id = "new-pr-node".to_string();
+        pr.title = "new pull request title".to_string();
+        pr.body = "new pull request body".to_string();
+
+        let changes = snap.apply("borsuk", fresh.clone());
+
+        assert!(changes.is_empty());
+        assert_eq!(snap.repos["borsuk"], fresh);
     }
 
     #[test]
@@ -445,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_flip_is_a_change_and_reorder_of_labels_is_not() {
+    fn an_open_flip_is_a_change() {
         let mut snap = Snapshot::default();
         snap.apply("borsuk", repo(vec![issue(1, &["a", "b"])], vec![]));
 
@@ -455,6 +492,24 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].what, ChangeWhat::Modified);
         assert_eq!(changes[0].number, 1);
+    }
+
+    #[test]
+    fn a_label_vector_order_change_is_modified() {
+        let mut snap = Snapshot::default();
+        snap.apply("borsuk", repo(vec![issue(1, &["a", "b"])], vec![]));
+
+        let changes = snap.apply("borsuk", repo(vec![issue(1, &["b", "a"])], vec![]));
+
+        assert_eq!(
+            changes,
+            vec![Change {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 1,
+                what: ChangeWhat::Modified,
+            }]
+        );
     }
 
     #[test]

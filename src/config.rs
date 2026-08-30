@@ -49,26 +49,12 @@ pub struct StageConfig {
 }
 
 impl StageConfig {
-    /// The built-in settings for a stage. A missing config key falls back to
-    /// these.
-    fn builtin(stage: Stage) -> Self {
-        let (model, runner) = match stage {
-            Stage::Refine => ("claude-opus-5[1m]", "claude"),
-            Stage::Implement => ("zai-coding-plan/glm-5.3-flash", "opencode"),
-            Stage::Review => ("openai/gpt-5.6-sol", "opencode"),
-            Stage::Release => ("claude-opus-5[1m]", "claude"),
-        };
-        let limit = match stage {
+    /// Return the default task limit for one stage.
+    fn default_limit(stage: Stage) -> usize {
+        match stage {
             Stage::Refine | Stage::Implement => 3,
             Stage::Review => 7,
             Stage::Release => 1,
-        };
-        StageConfig {
-            model: model.to_string(),
-            runner: runner.to_string(),
-            variant: None,
-            limit,
-            yolo: true,
         }
     }
 }
@@ -112,38 +98,40 @@ impl Config {
     }
 
     /// Parse configuration text and run every check that needs no
-    /// filesystem or git access. Absent keys take their defaults.
+    /// filesystem or git access. Absent optional keys take their defaults.
     pub fn parse(text: &str) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text).context("invalid TOML")?;
 
         let mut stages = BTreeMap::new();
         for (name, raw_stage) in raw.stage {
             let stage = Stage::from_str(&name).map_err(|e| anyhow!("stage.{name}: {e}"))?;
-            let mut stage_config = StageConfig::builtin(stage);
-            if let Some(model) = raw_stage.model {
-                stage_config.model = model;
+            let model = raw_stage
+                .model
+                .ok_or_else(|| anyhow!("stage.{stage}.model is required"))?;
+            let runner = raw_stage
+                .runner
+                .ok_or_else(|| anyhow!("stage.{stage}.runner is required"))?;
+            let limit = raw_stage
+                .limit
+                .unwrap_or_else(|| StageConfig::default_limit(stage));
+            if limit < 1 {
+                bail!("stage.{stage}.limit must be at least 1, got {limit}");
             }
-            if let Some(runner) = raw_stage.runner {
-                stage_config.runner = runner;
-            }
-            if let Some(variant) = raw_stage.variant {
-                stage_config.variant = Some(variant);
-            }
-            if let Some(limit) = raw_stage.limit {
-                if limit < 1 {
-                    bail!("stage.{stage}.limit must be at least 1, got {limit}");
-                }
-                stage_config.limit = limit;
-            }
-            if let Some(yolo) = raw_stage.yolo {
-                stage_config.yolo = yolo;
-            }
-            stages.insert(stage, stage_config);
+            stages.insert(
+                stage,
+                StageConfig {
+                    model,
+                    runner,
+                    variant: raw_stage.variant,
+                    limit,
+                    yolo: raw_stage.yolo.unwrap_or(true),
+                },
+            );
         }
         for stage in Stage::ALL {
-            stages
-                .entry(stage)
-                .or_insert_with(|| StageConfig::builtin(stage));
+            if !stages.contains_key(&stage) {
+                bail!("stage.{stage} is required");
+            }
         }
 
         let mut repos = BTreeMap::new();
@@ -186,10 +174,13 @@ impl Config {
         }
 
         for stage in Stage::ALL {
-            let sum: usize = repos
+            let sum = repos
                 .values()
                 .filter_map(|repo| repo.lanes.get(&stage))
-                .sum();
+                .try_fold(0usize, |sum, count| {
+                    sum.checked_add(*count)
+                        .ok_or_else(|| anyhow!("stage.{stage}: lane reservations overflow usize"))
+                })?;
             let limit = stages[&stage].limit;
             if sum > limit {
                 bail!(
@@ -208,6 +199,11 @@ impl Config {
     /// repository path is checked on disk and its `owner/name` is resolved
     /// from the origin remote.
     pub fn load(path: Option<&Path>) -> Result<Self> {
+        Self::load_with_exec(path, &RealExec)
+    }
+
+    /// Load a file with the specified command executor.
+    fn load_with_exec(path: Option<&Path>, exec: &dyn Exec) -> Result<Self> {
         let path = path.map_or_else(default_config_path, Path::to_path_buf);
         if !path.exists() {
             bail!(
@@ -219,14 +215,13 @@ impl Config {
         let text =
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let mut config = Config::parse(&text).with_context(|| format!("in {}", path.display()))?;
-        config.resolve()?;
+        config.resolve(exec)?;
         Ok(config)
     }
 
     /// Check every repository path on disk and fill `owner_repo` from the
     /// origin remote. Needs no network.
-    fn resolve(&mut self) -> Result<()> {
-        let exec = RealExec;
+    fn resolve(&mut self, exec: &dyn Exec) -> Result<()> {
         for repo in self.repos.values_mut() {
             let alias = repo.alias.clone();
             let path = repo.path.clone();
@@ -375,6 +370,7 @@ fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::{CmdOut, ScriptExec};
 
     const EXAMPLE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -383,6 +379,24 @@ mod tests {
 
     fn parse_err(text: &str) -> String {
         Config::parse(text).unwrap_err().to_string()
+    }
+
+    fn config_text(stage_overrides: &[(Stage, &str)], suffix: &str) -> String {
+        let mut text = String::new();
+        for stage in Stage::ALL {
+            text.push_str(&format!(
+                "[stage.{stage}]\nmodel = \"model\"\nrunner = \"runner\"\n"
+            ));
+            if let Some((_, value)) = stage_overrides
+                .iter()
+                .find(|(candidate, _)| *candidate == stage)
+            {
+                text.push_str(value);
+                text.push('\n');
+            }
+        }
+        text.push_str(suffix);
+        text
     }
 
     #[test]
@@ -406,12 +420,20 @@ mod tests {
 
         let review = config.stage(Stage::Review);
         assert_eq!(review.model, "openai/gpt-5.6-sol");
+        assert_eq!(review.runner, "opencode");
         assert_eq!(review.variant, Some("xhigh".to_string()));
         assert_eq!(review.limit, 7);
+        assert!(review.yolo);
 
-        assert_eq!(config.stage(Stage::Release).limit, 1);
+        let release = config.stage(Stage::Release);
+        assert_eq!(release.model, "claude-opus-5[1m]");
+        assert_eq!(release.runner, "claude");
+        assert_eq!(release.variant, None);
+        assert_eq!(release.limit, 1);
+        assert!(release.yolo);
 
         let borsuk = &config.repos["borsuk"];
+        assert_eq!(borsuk.alias, "borsuk");
         assert_eq!(borsuk.path, PathBuf::from("/home/navaro/Workplace/borsuk"));
         assert_eq!(
             borsuk.lanes.get(&Stage::Implement),
@@ -423,6 +445,12 @@ mod tests {
         assert_eq!(borsuk.owner_repo, "", "parse does not resolve remotes");
 
         let qubitsok = &config.repos["qubitsok"];
+        assert_eq!(qubitsok.alias, "qubitsok");
+        assert_eq!(
+            qubitsok.path,
+            PathBuf::from("/home/navaro/Workplace/qubitsok")
+        );
+        assert_eq!(qubitsok.owner_repo, "");
         assert!(qubitsok.lanes.is_empty(), "lanes default to empty");
         assert_eq!(
             qubitsok.release,
@@ -432,8 +460,9 @@ mod tests {
     }
 
     #[test]
-    fn absent_keys_take_the_built_in_defaults() {
-        let config = Config::parse("[repo.x]\npath = \"/tmp/x\"\n").unwrap();
+    fn absent_optional_keys_take_the_specified_defaults() {
+        let text = config_text(&[], "[repo.x]\npath = \"/tmp/x\"\n");
+        let config = Config::parse(&text).unwrap();
 
         assert_eq!(config.stage(Stage::Refine).limit, 3);
         assert_eq!(config.stage(Stage::Implement).limit, 3);
@@ -441,17 +470,36 @@ mod tests {
         assert_eq!(config.stage(Stage::Release).limit, 1);
         assert!(config.stage(Stage::Review).yolo);
         assert_eq!(config.stage(Stage::Release).variant, None);
-        assert_eq!(
-            config.stage(Stage::Refine).model,
-            "claude-opus-5[1m]",
-            "the built-in model applies when the stage table is absent"
-        );
-        assert_eq!(config.stage(Stage::Review).runner, "opencode");
+        assert_eq!(config.stage(Stage::Refine).model, "model");
+        assert_eq!(config.stage(Stage::Review).runner, "runner");
 
         let repo = &config.repos["x"];
         assert!(repo.lanes.is_empty());
         assert_eq!(repo.release, ReleasePolicy::Manual);
         assert_eq!(repo.owner_repo, "");
+    }
+
+    #[test]
+    fn a_missing_model_names_the_stage_key() {
+        let err = parse_err("[stage.refine]\nrunner = \"claude\"\n");
+        assert!(err.contains("stage.refine.model"), "message was: {err}");
+    }
+
+    #[test]
+    fn a_missing_runner_names_the_stage_key() {
+        let err = parse_err("[stage.refine]\nmodel = \"model\"\n");
+        assert!(err.contains("stage.refine.runner"), "message was: {err}");
+    }
+
+    #[test]
+    fn a_missing_stage_table_names_the_stage_key() {
+        let text = concat!(
+            "[stage.refine]\nmodel = \"m\"\nrunner = \"r\"\n",
+            "[stage.implement]\nmodel = \"m\"\nrunner = \"r\"\n",
+            "[stage.review]\nmodel = \"m\"\nrunner = \"r\"\n",
+        );
+        let err = parse_err(text);
+        assert!(err.contains("stage.release"), "message was: {err}");
     }
 
     #[test]
@@ -479,26 +527,33 @@ mod tests {
 
     #[test]
     fn a_bad_alias_names_the_repo_key() {
-        let err = parse_err("[repo.\"Borsuk\"]\npath = \"/tmp/x\"\n");
+        let text = config_text(&[], "[repo.\"Borsuk\"]\npath = \"/tmp/x\"\n");
+        let err = parse_err(&text);
         assert!(err.contains("repo.\"Borsuk\""), "message was: {err}");
         assert!(err.contains("alias must match"), "message was: {err}");
     }
 
     #[test]
     fn a_zero_limit_names_the_stage_key() {
-        let err = parse_err("[stage.review]\nlimit = 0\n");
+        let text = config_text(&[(Stage::Review, "limit = 0")], "");
+        let err = parse_err(&text);
         assert!(err.contains("stage.review.limit"), "message was: {err}");
     }
 
     #[test]
     fn an_unknown_stage_section_names_the_key() {
-        let err = parse_err("[stage.refin]\nmodel = \"x\"\n");
+        let text = config_text(&[], "[stage.refin]\nmodel = \"x\"\nrunner = \"r\"\n");
+        let err = parse_err(&text);
         assert!(err.contains("stage.refin"), "message was: {err}");
     }
 
     #[test]
     fn an_unknown_lane_stage_names_the_lane_key() {
-        let err = parse_err("[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { refin = 1 }\n");
+        let text = config_text(
+            &[],
+            "[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { refin = 1 }\n",
+        );
+        let err = parse_err(&text);
         assert!(
             err.contains("repo.borsuk.lanes.refin"),
             "message was: {err}"
@@ -507,55 +562,79 @@ mod tests {
 
     #[test]
     fn a_lane_sum_over_the_stage_limit_is_rejected() {
-        let text = concat!(
-            "[stage.implement]\n",
-            "limit = 2\n",
-            "[repo.borsuk]\n",
-            "path = \"/tmp/b\"\n",
-            "lanes = { implement = 2 }\n",
-            "[repo.qubitsok]\n",
-            "path = \"/tmp/q\"\n",
-            "lanes = { implement = 1 }\n"
+        let text = config_text(
+            &[(Stage::Implement, "limit = 2")],
+            concat!(
+                "[repo.borsuk]\n",
+                "path = \"/tmp/b\"\n",
+                "lanes = { implement = 2 }\n",
+                "[repo.qubitsok]\n",
+                "path = \"/tmp/q\"\n",
+                "lanes = { implement = 1 }\n"
+            ),
         );
-        let err = parse_err(text);
+        let err = parse_err(&text);
         assert!(err.contains("stage.implement"), "message was: {err}");
         assert!(err.contains("sum to 3"), "message was: {err}");
     }
 
     #[test]
     fn a_lane_sum_equal_to_the_limit_is_accepted() {
-        let text = concat!(
-            "[stage.implement]\n",
-            "limit = 3\n",
-            "[repo.borsuk]\n",
-            "path = \"/tmp/b\"\n",
-            "lanes = { implement = 1 }\n",
-            "[repo.qubitsok]\n",
-            "path = \"/tmp/q\"\n",
-            "lanes = { implement = 2 }\n"
+        let text = config_text(
+            &[(Stage::Implement, "limit = 3")],
+            concat!(
+                "[repo.borsuk]\n",
+                "path = \"/tmp/b\"\n",
+                "lanes = { implement = 1 }\n",
+                "[repo.qubitsok]\n",
+                "path = \"/tmp/q\"\n",
+                "lanes = { implement = 2 }\n"
+            ),
         );
-        assert!(Config::parse(text).is_ok());
+        assert!(Config::parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_lane_sum_overflow_names_the_stage_key() {
+        let text = config_text(
+            &[],
+            concat!(
+                "[repo.a]\npath = \"/tmp/a\"\nlanes = { implement = 9223372036854775807 }\n",
+                "[repo.b]\npath = \"/tmp/b\"\nlanes = { implement = 9223372036854775807 }\n",
+                "[repo.c]\npath = \"/tmp/c\"\nlanes = { implement = 9223372036854775807 }\n",
+            ),
+        );
+
+        let err = parse_err(&text);
+
+        assert!(err.contains("stage.implement"), "message was: {err}");
+        assert!(err.contains("overflow"), "message was: {err}");
     }
 
     #[test]
     fn a_threshold_count_below_one_names_the_key() {
-        let err = parse_err(
+        let text = config_text(
+            &[],
             "[repo.x]\npath = \"/tmp/x\"\nrelease = { policy = \"threshold\", count = 0 }\n",
         );
+        let err = parse_err(&text);
         assert!(err.contains("repo.x.release.count"), "message was: {err}");
     }
 
     #[test]
     fn an_interval_below_one_minute_names_the_key() {
-        let err = parse_err(
+        let text = config_text(
+            &[],
             "[repo.x]\npath = \"/tmp/x\"\nrelease = { policy = \"interval\", minutes = 0 }\n",
         );
+        let err = parse_err(&text);
         assert!(err.contains("repo.x.release.minutes"), "message was: {err}");
     }
 
     #[test]
     fn a_missing_path_names_the_repo_key() {
-        let err = parse_err("[repo.x]\n");
+        let text = config_text(&[], "[repo.x]\n");
+        let err = parse_err(&text);
         assert!(err.contains("repo.x.path"), "message was: {err}");
     }
 
@@ -581,7 +660,7 @@ mod tests {
         assert!(socket_path().ends_with("daemon.sock"));
     }
 
-    // --- Filesystem and git resolution; offline, local git only. ---
+    // --- Filesystem and scripted command resolution. ---
 
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -595,21 +674,26 @@ mod tests {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
-        let _ = fs::remove_dir_all(&dir);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).expect("the old temp dir must be removable");
+        }
         fs::create_dir_all(&dir).expect("the temp dir must be creatable");
         dir
     }
 
     #[test]
     fn a_missing_repository_path_names_the_key() {
-        let text = concat!(
-            "[repo.ghost]\n",
-            "path = \"",
-            "/nonexistent/aif-task2-path-check",
-            "\"\n"
+        let text = config_text(
+            &[],
+            concat!(
+                "[repo.ghost]\n",
+                "path = \"",
+                "/nonexistent/aif-task2-path-check",
+                "\"\n"
+            ),
         );
-        let mut config = Config::parse(text).unwrap();
-        let err = config.resolve().unwrap_err().to_string();
+        let mut config = Config::parse(&text).unwrap();
+        let err = config.resolve(&ScriptExec::new()).unwrap_err().to_string();
         assert!(err.contains("repo.ghost.path"), "message was: {err}");
         assert!(err.contains("does not exist"), "message was: {err}");
     }
@@ -617,59 +701,84 @@ mod tests {
     #[test]
     fn a_directory_without_git_names_the_key() {
         let dir = temp_dir("no-git");
-        let text = format!("[repo.plain]\npath = \"{}\"\n", dir.display());
+        let text = config_text(
+            &[],
+            &format!("[repo.plain]\npath = \"{}\"\n", dir.display()),
+        );
         let mut config = Config::parse(&text).unwrap();
-        let err = config.resolve().unwrap_err().to_string();
+        let err = config.resolve(&ScriptExec::new()).unwrap_err().to_string();
         assert!(err.contains("repo.plain.path"), "message was: {err}");
         assert!(err.contains(".git"), "message was: {err}");
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 
     #[test]
     fn a_git_failure_names_the_repo() {
         let dir = temp_dir("fake-git");
         fs::create_dir(dir.join(".git")).expect("the .git dir must be creatable");
-        let text = format!("[repo.broken]\npath = \"{}\"\n", dir.display());
+        let text = config_text(
+            &[],
+            &format!("[repo.broken]\npath = \"{}\"\n", dir.display()),
+        );
         let mut config = Config::parse(&text).unwrap();
-        let err = config.resolve().unwrap_err().to_string();
+        let repo_path = dir.to_string_lossy().into_owned();
+        let exec = ScriptExec::new().expect(
+            move |call| {
+                call.program == "git"
+                    && call.argv() == ["-C", &repo_path, "remote", "get-url", "origin"]
+            },
+            CmdOut {
+                status: 2,
+                stdout: String::new(),
+                stderr: "no origin\n".to_string(),
+            },
+        );
+        let err = config.resolve(&exec).unwrap_err().to_string();
         assert!(err.contains("repo.broken"), "message was: {err}");
-        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("no origin"), "message was: {err}");
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 
     #[test]
-    fn load_resolves_owner_repo_from_a_local_remote() {
-        let dir = temp_dir("real-repo");
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .output()
-                .expect("git must be runnable")
-        };
-        assert!(run(&["init", "-q"]).status.success());
-        assert!(run(&["remote", "add", "origin", "git@github.com:o/r.git"])
-            .status
-            .success());
+    fn load_resolves_owner_repo_through_the_executor() {
+        let dir = temp_dir("scripted-repo");
+        fs::create_dir(dir.join(".git")).expect("the .git dir must be creatable");
 
         let config_path = dir.join("factory.toml");
         fs::write(
             &config_path,
-            format!("[repo.local]\npath = \"{}\"\n", dir.display()),
+            config_text(
+                &[],
+                &format!("[repo.local]\npath = \"{}\"\n", dir.display()),
+            ),
         )
         .expect("the config write must succeed");
-        let config = Config::load(Some(&config_path)).expect("load must succeed");
+        let repo_path = dir.to_string_lossy().into_owned();
+        let exec = ScriptExec::new().expect(
+            move |call| {
+                call.program == "git"
+                    && call.argv() == ["-C", &repo_path, "remote", "get-url", "origin"]
+            },
+            CmdOut::ok("git@github.com:o/r.git\n"),
+        );
+
+        let config = Config::load_with_exec(Some(&config_path), &exec)
+            .expect("the scripted load must succeed");
         assert_eq!(config.repos["local"].owner_repo, "o/r");
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(exec.calls().len(), 1);
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 
     #[test]
     fn a_missing_config_file_names_where_to_create_it_and_the_example() {
-        let missing = temp_dir("missing").join("factory.toml");
+        let dir = temp_dir("missing");
+        let missing = dir.join("factory.toml");
         let err = Config::load(Some(&missing)).unwrap_err().to_string();
         assert!(
             err.contains(&missing.display().to_string()),
             "message was: {err}"
         );
         assert!(err.contains("factory.example.toml"), "message was: {err}");
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 }
