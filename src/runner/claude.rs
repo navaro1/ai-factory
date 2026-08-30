@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,8 +45,8 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The extra time the starter waits past the worker's own handshake deadline.
 const HANDSHAKE_WAIT_SLACK: Duration = Duration::from_secs(5);
 
-/// How long a steering call waits for the worker to write its line.
-const WRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a steering call waits for the worker to report its result.
+const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The summary length limit for a tool without a usable detail field.
 const SUMMARY_CHARS: usize = 120;
@@ -57,8 +57,8 @@ const SUMMARY_CHARS: usize = 120;
 /// --output-format stream-json --verbose --model <model> --session-id <uuid>
 /// --permission-prompt-tool stdio`. `--permission-prompt-tool stdio` is a
 /// hidden but required flag; without it the CLI denies tools by itself and no
-/// request ever reaches this runner. A resume run passes `--resume <id>` and
-/// no `--session-id`.
+/// request ever reaches this runner. A resume run omits `--session-id` and
+/// appends `--resume <id>` after the permission flag.
 fn build_args(job: &Job, session_id: &str) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -70,18 +70,16 @@ fn build_args(job: &Job, session_id: &str) -> Vec<String> {
         "--model".to_string(),
         job.model.clone(),
     ];
-    match job.resume.as_deref() {
-        Some(resume_id) => {
-            args.push("--resume".to_string());
-            args.push(resume_id.to_string());
-        }
-        None => {
-            args.push("--session-id".to_string());
-            args.push(session_id.to_string());
-        }
+    if job.resume.is_none() {
+        args.push("--session-id".to_string());
+        args.push(session_id.to_string());
     }
     args.push("--permission-prompt-tool".to_string());
     args.push("stdio".to_string());
+    if let Some(resume_id) = job.resume.as_deref() {
+        args.push("--resume".to_string());
+        args.push(resume_id.to_string());
+    }
     args
 }
 
@@ -280,6 +278,9 @@ fn assistant_events(task: &str, value: &Value) -> Parsed {
 /// Returns none for every other line shape. `requires_user_interaction`
 /// defaults to false, per the verified protocol.
 fn parse_tool_request(value: &Value) -> Option<ToolRequest> {
+    if value.get("type").and_then(Value::as_str) != Some("control_request") {
+        return None;
+    }
     let request = value.get("request")?;
     if request.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
         return None;
@@ -314,6 +315,7 @@ pub type SessionIdSink = Arc<dyn Fn(&str) + Send + Sync>;
 /// the initialize handshake, and hands back a [`ClaudeSession`]. The runner
 /// can start many sessions in sequence.
 pub struct ClaudeRunner {
+    program: String,
     handshake_timeout: Duration,
     sink: SessionIdSink,
 }
@@ -323,14 +325,22 @@ impl ClaudeRunner {
     /// session id to `sink` exactly once, as soon as it is known.
     pub fn new(sink: SessionIdSink) -> Self {
         Self {
+            program: PROGRAM.to_string(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             sink,
         }
     }
 
-    /// Set how long the initialize handshake may take. The default is 30
-    /// seconds; tests use a shorter value.
-    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+    /// Set the fake claude program for an offline test.
+    #[cfg(test)]
+    fn with_program(mut self, program: &std::path::Path) -> Self {
+        self.program = program.to_string_lossy().into_owned();
+        self
+    }
+
+    /// Set a short initialize timeout for an offline test.
+    #[cfg(test)]
+    fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
     }
@@ -355,16 +365,19 @@ impl ClaudeRunner {
         let spec = RunSpec {
             task: job.task.clone(),
             cwd: job.cwd.clone(),
-            program: PROGRAM.to_string(),
+            program: self.program.clone(),
             args,
             env: Vec::new(),
             log: job.log.clone(),
         };
-        let handle = proc::spawn(spec, proc_tx)
-            .with_context(|| format!("task {}: failed to start {PROGRAM}", job.task))?;
+        let handle = proc::spawn(spec, proc_tx).with_context(|| {
+            format!(
+                "task {}: failed to start the claude program {}",
+                job.task, self.program
+            )
+        })?;
         (self.sink)(&session_id);
 
-        let pending: PendingAsks = Arc::new(Mutex::new(HashMap::new()));
         let idle_ms = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
 
@@ -392,7 +405,7 @@ impl ClaudeRunner {
                 deadline: Instant::now() + self.handshake_timeout,
             },
             tx,
-            pending: Arc::clone(&pending),
+            pending: HashMap::new(),
             idle_ms: Arc::clone(&idle_ms),
             started,
             hs_tx: Some(hs_tx),
@@ -403,7 +416,6 @@ impl ClaudeRunner {
             Ok(Ok(())) => Ok(ClaudeSession {
                 task: job.task.clone(),
                 cmd_tx,
-                pending,
                 idle_ms,
                 started,
             }),
@@ -426,12 +438,11 @@ impl Runner for ClaudeRunner {
 /// The control handle for one live claude session.
 ///
 /// The methods write protocol lines through the worker thread that owns the
-/// child. Dropping the session kills the child: nobody is left to steer it.
+/// child. Dropping the session starts the same graceful stop as [`Session::stop`].
 #[derive(Debug)]
 pub struct ClaudeSession {
     task: String,
     cmd_tx: Sender<WorkerMsg>,
-    pending: PendingAsks,
     idle_ms: Arc<AtomicU64>,
     started: Instant,
 }
@@ -456,10 +467,22 @@ impl ClaudeSession {
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("task {}: the claude session worker is gone", self.task))?;
-        match reply_rx.recv_timeout(WRITE_REPLY_TIMEOUT) {
+        self.wait_for_worker(reply_rx, "writing to the claude child")
+    }
+
+    /// Wait for one command result from the worker.
+    fn wait_for_worker(
+        &self,
+        reply_rx: Receiver<anyhow::Result<()>>,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        match reply_rx.recv_timeout(COMMAND_REPLY_TIMEOUT) {
             Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "task {}: timed out writing to the claude child",
+            Err(RecvTimeoutError::Timeout) => {
+                Err(anyhow!("task {}: timed out {action}", self.task))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(anyhow!(
+                "task {}: the claude session worker stopped while {action}",
                 self.task
             )),
         }
@@ -476,48 +499,34 @@ impl Session for ClaudeSession {
     ///
     /// An allow without new input echoes the request's own input as
     /// `updatedInput`. Answering an unknown request id is an error, not a
-    /// panic. The pending ask is consumed even when the later write fails;
-    /// a child that cannot be written to is gone anyway.
+    /// panic.
     fn answer(&mut self, request_id: &str, answer: Answer) -> anyhow::Result<()> {
-        let requested = {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            pending.remove(request_id)
-        };
-        let Some(request_input) = requested else {
-            return Err(anyhow!(
-                "task {}: no pending claude ask with request id {request_id}",
-                self.task
-            ));
-        };
-        let line = match answer {
-            Answer::Allow { updated_input } => {
-                allow_response(request_id, updated_input.unwrap_or(request_input))
-            }
-            Answer::Deny { message } => deny_response(request_id, &message),
-        };
-        self.write_via_worker(line)
+        let (reply_tx, reply_rx) = channel();
+        self.cmd_tx
+            .send(WorkerMsg::Answer {
+                request_id: request_id.to_string(),
+                answer,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("task {}: the claude session worker is gone", self.task))?;
+        self.wait_for_worker(reply_rx, "answering a claude request")
     }
 
     /// Stop the session: the interrupt line goes out first, then the
     /// escalation from [`crate::proc`] waits, sends SIGTERM, and finally
     /// SIGKILL. A second stop is a no-op.
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
         self.cmd_tx
             .send(WorkerMsg::Stop)
             .map_err(|_| anyhow!("task {}: the claude session worker is gone", self.task))
     }
 }
 
-/// The asks that wait for a human answer, keyed by the claude request id.
-///
-/// The value is the request's own input, which an allow without an edit
-/// echoes back. The worker inserts on ask, the session removes on answer,
-/// and every stop or exit path clears the map.
-type PendingAsks = Arc<Mutex<HashMap<String, Value>>>;
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(WorkerMsg::Stop);
+    }
+}
 
 /// One message to the worker thread that owns the child.
 enum WorkerMsg {
@@ -529,6 +538,15 @@ enum WorkerMsg {
         /// The complete protocol line, newline terminated by the writer.
         line: String,
         /// Where the write result goes back to the caller.
+        reply: Sender<anyhow::Result<()>>,
+    },
+    /// Answer one pending permission request.
+    Answer {
+        /// The request id the answer must echo.
+        request_id: String,
+        /// The caller's answer.
+        answer: Answer,
+        /// Where the answer result goes back to the caller.
         reply: Sender<anyhow::Result<()>>,
     },
     /// Stop the child: interrupt line first, then the escalation.
@@ -562,8 +580,8 @@ struct SessionWorker {
     phase: Phase,
     /// Where run events go.
     tx: Sender<RunEvent>,
-    /// The asks that wait for a human answer.
-    pending: PendingAsks,
+    /// The request input for each ask that waits for a human answer.
+    pending: HashMap<String, Value>,
     /// Milliseconds since `started` at the last emitted event.
     idle_ms: Arc<AtomicU64>,
     /// The shared start instant of the session.
@@ -578,7 +596,7 @@ impl SessionWorker {
     /// The worker writes the initialize request, then loops over the merged
     /// stream of child events and steering commands. During the handshake
     /// the loop runs against a deadline; past it, the job fails. When the
-    /// session is dropped the worker kills the child.
+    /// session is dropped its handle sends the normal stop command.
     fn run(mut self, cmd_rx: Receiver<WorkerMsg>) {
         if let Err(error) = self.write_line(&initialize_request()) {
             let message = format!(
@@ -589,12 +607,17 @@ impl SessionWorker {
             return;
         }
         let mut exit_sent = false;
-        // The flag only guards the exit emission in `on_exit` and
-        // `on_stopped`; `on_line` cannot end a run.
-        let _ = &mut exit_sent;
         loop {
             let message = match self.phase {
                 Phase::Handshake { deadline } => {
+                    if Instant::now() >= deadline {
+                        let message = format!(
+                            "task {}: the claude initialize handshake got no control_response within {:?}",
+                            self.task, self.timeout
+                        );
+                        self.fail_handshake(message);
+                        return;
+                    }
                     match cmd_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(message) => message,
                         Err(RecvTimeoutError::Timeout) => {
@@ -620,7 +643,7 @@ impl SessionWorker {
                 },
             };
             let keep_going = match message {
-                WorkerMsg::Proc(ProcEvent::Line(line)) => self.on_line(&line, &mut exit_sent),
+                WorkerMsg::Proc(ProcEvent::Line(line)) => self.on_line(&line),
                 WorkerMsg::Proc(ProcEvent::Exit { code, ok }) => {
                     self.on_exit(code, ok, &mut exit_sent)
                 }
@@ -635,6 +658,15 @@ impl SessionWorker {
                     let _ = reply.send(self.write_line(&line));
                     true
                 }
+                WorkerMsg::Answer {
+                    request_id,
+                    answer,
+                    reply,
+                } => {
+                    let result = self.answer_request(&request_id, answer);
+                    let _ = reply.send(result);
+                    true
+                }
                 WorkerMsg::Stop => {
                     self.stop_child();
                     true
@@ -647,7 +679,7 @@ impl SessionWorker {
     }
 
     /// Handle one output line. Returns false when the worker must stop.
-    fn on_line(&mut self, line: &str, exit_sent: &mut bool) -> bool {
+    fn on_line(&mut self, line: &str) -> bool {
         let parsed: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
@@ -660,6 +692,10 @@ impl SessionWorker {
         };
         if matches!(self.phase, Phase::Handshake { .. })
             && parsed.get("type").and_then(Value::as_str) == Some("control_response")
+            && parsed
+                .pointer("/response/request_id")
+                .and_then(Value::as_str)
+                == Some(HANDSHAKE_REQUEST_ID)
         {
             return self.complete_handshake(&parsed);
         }
@@ -672,7 +708,6 @@ impl SessionWorker {
             Parsed::ToolAsk(request) => self.on_tool_ask(request),
             Parsed::Ignored => {}
         }
-        let _ = exit_sent;
         true
     }
 
@@ -683,17 +718,28 @@ impl SessionWorker {
     /// that fails, fails the job. Returns false when the worker must stop.
     fn complete_handshake(&mut self, response: &Value) -> bool {
         let payload = response.get("response").cloned().unwrap_or(Value::Null);
-        if payload.get("subtype").and_then(Value::as_str) == Some("error") {
-            let reason = payload
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            let message = format!(
-                "task {}: the claude initialize handshake was refused: {reason}",
-                self.task
-            );
-            self.fail_handshake(message);
-            return false;
+        match payload.get("subtype").and_then(Value::as_str) {
+            Some("success") => {}
+            Some("error") => {
+                let reason = payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                let message = format!(
+                    "task {}: the claude initialize handshake was refused: {reason}",
+                    self.task
+                );
+                self.fail_handshake(message);
+                return false;
+            }
+            _ => {
+                let message = format!(
+                    "task {}: the claude initialize handshake got an invalid response",
+                    self.task
+                );
+                self.fail_handshake(message);
+                return false;
+            }
         }
         match self.write_line(&self.prompt_line) {
             Ok(()) => {
@@ -735,8 +781,6 @@ impl SessionWorker {
             return;
         }
         self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
             .insert(request.request_id.clone(), request.input.clone());
         self.emit(RunEvent::Ask {
             task: self.task.clone(),
@@ -746,6 +790,23 @@ impl SessionWorker {
             suggestions: request.suggestions,
             needs_human: request.requires_human,
         });
+    }
+
+    /// Write one answer for a pending request.
+    fn answer_request(&mut self, request_id: &str, answer: Answer) -> anyhow::Result<()> {
+        let Some(request_input) = self.pending.remove(request_id) else {
+            return Err(anyhow!(
+                "task {}: no pending claude ask with request id {request_id}",
+                self.task
+            ));
+        };
+        let line = match answer {
+            Answer::Allow { updated_input } => {
+                allow_response(request_id, updated_input.unwrap_or(request_input))
+            }
+            Answer::Deny { message } => deny_response(request_id, &message),
+        };
+        self.write_line(&line)
     }
 
     /// Emit one run event and stamp the idle clock.
@@ -785,10 +846,7 @@ impl SessionWorker {
                 detail,
             });
         }
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.pending.clear();
         self.handle = None;
         true
     }
@@ -808,10 +866,7 @@ impl SessionWorker {
                     detail: format!("the claude stop escalation failed: {notes}"),
                 });
             }
-            self.pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
+            self.pending.clear();
             return true;
         }
         eprintln!("task {}: claude stop outcome: {outcome:?}", self.task);
@@ -833,10 +888,7 @@ impl SessionWorker {
     /// escalation from chunk 9, which waits, sends SIGTERM, and finally
     /// SIGKILL. The worker hands the handle over to the escalation thread.
     fn stop_child(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.pending.clear();
         if let Some(handle) = self.handle.take() {
             if let Err(error) = handle.write_line(&interrupt_line()) {
                 eprintln!(
@@ -865,12 +917,10 @@ impl SessionWorker {
 mod tests {
     use super::*;
     use crate::model::Stage;
-    use std::env;
-    use std::ffi::OsString;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
-    use std::sync::{MutexGuard, PoisonError as TestPoisonError};
+    use std::sync::{Mutex, PoisonError as TestPoisonError};
     use std::time::Duration as TestDuration;
 
     use serde_json::json;
@@ -900,41 +950,6 @@ not json at all
 {"type":"control_response","response":{"subtype":"success","request_id":"init-1"}}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}
 {"type":"result","subtype":"success","result":"Ticket refined.","session_id":"sess-fix","total_cost_usd":0.21,"usage":{"input_tokens":9,"output_tokens":4}}"#;
-
-    /// Serializes tests that replace the process `PATH`.
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Restores `PATH` after one fake-program test.
-    struct PathGuard {
-        original: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl PathGuard {
-        /// Put `dir` first on `PATH` until this guard drops.
-        fn prepend(dir: &Path) -> Self {
-            let lock = PATH_LOCK.lock().unwrap_or_else(TestPoisonError::into_inner);
-            let original = env::var_os("PATH");
-            let mut paths = vec![dir.to_path_buf()];
-            if let Some(value) = original.as_ref() {
-                paths.extend(env::split_paths(value));
-            }
-            env::set_var("PATH", env::join_paths(paths).unwrap());
-            Self {
-                original,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            match self.original.as_ref() {
-                Some(value) => env::set_var("PATH", value),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     /// A fresh temporary directory for one test.
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -972,6 +987,11 @@ not json at all
         }
     }
 
+    /// Build a runner that starts this test's fake program by absolute path.
+    fn test_runner(dir: &Path, sink: SessionIdSink) -> ClaudeRunner {
+        ClaudeRunner::new(sink).with_program(&dir.join(PROGRAM))
+    }
+
     /// Start the run, retrying the transient `Text file busy` race.
     ///
     /// The test writes its fake child and executes it at once. On this
@@ -987,7 +1007,11 @@ not json at all
         for _ in 0..100 {
             match runner.start_session(job, tx.clone()) {
                 Ok(session) => return (session, rx),
-                Err(error) if error.to_string().contains("Text file busy") => {
+                Err(error)
+                    if error
+                        .chain()
+                        .any(|cause| cause.to_string().contains("Text file busy")) =>
+                {
                     std::thread::sleep(TestDuration::from_millis(10));
                 }
                 Err(error) => panic!("the fake child did not start: {error}"),
@@ -1223,11 +1247,23 @@ cat > /dev/null
                 "--verbose",
                 "--model",
                 "claude-opus-5[1m]",
-                "--resume",
-                "11111111-2222-4333-8444-555555555555",
                 "--permission-prompt-tool",
                 "stdio",
+                "--resume",
+                "11111111-2222-4333-8444-555555555555",
             ]
+        );
+    }
+
+    #[test]
+    fn the_initialize_request_matches_the_verified_shape() {
+        assert_eq!(
+            serde_json::from_str::<Value>(&initialize_request()).unwrap(),
+            json!({
+                "type": "control_request",
+                "request_id": "init-1",
+                "request": {"subtype": "initialize", "hooks": {}},
+            })
         );
     }
 
@@ -1360,11 +1396,21 @@ cat > /dev/null
     }
 
     #[test]
+    fn a_non_control_line_cannot_create_a_tool_ask() {
+        let line = json!({
+            "type": "assistant",
+            "request_id": "req-1",
+            "request": {"subtype": "can_use_tool", "tool_name": "Write", "input": {}},
+        })
+        .to_string();
+        assert!(matches!(map_line("t/x", &line), Parsed::Ignored));
+    }
+
+    #[test]
     fn the_session_id_callback_fires_once_with_the_minted_id() {
         let dir = temp_dir("callback-fresh");
         let argv = dir.join("argv.txt");
         args_child(&dir, &argv);
-        let path = PathGuard::prepend(&dir);
 
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_sink = Arc::clone(&seen);
@@ -1374,7 +1420,7 @@ cat > /dev/null
                 .unwrap_or_else(TestPoisonError::into_inner)
                 .push(id.to_string());
         });
-        let mut runner = ClaudeRunner::new(sink);
+        let mut runner = test_runner(&dir, sink);
         let (session, _rx) = start_with_retry(&mut runner, &job(&dir, None, true));
 
         let called = seen
@@ -1390,7 +1436,6 @@ cat > /dev/null
         assert_eq!(child_args, build_args(&job(&dir, None, true), &minted));
 
         drop(session);
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1399,7 +1444,6 @@ cat > /dev/null
         let dir = temp_dir("callback-resume");
         let argv = dir.join("argv.txt");
         args_child(&dir, &argv);
-        let path = PathGuard::prepend(&dir);
         let resume_id = "11111111-2222-4333-8444-555555555555";
 
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1410,7 +1454,7 @@ cat > /dev/null
                 .unwrap_or_else(TestPoisonError::into_inner)
                 .push(id.to_string());
         });
-        let mut runner = ClaudeRunner::new(sink);
+        let mut runner = test_runner(&dir, sink);
         let (session, _rx) = start_with_retry(&mut runner, &job(&dir, Some(resume_id), true));
 
         let called = seen
@@ -1427,7 +1471,6 @@ cat > /dev/null
         assert!(!child_args.contains(&"--session-id".to_string()));
 
         drop(session);
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1435,8 +1478,7 @@ cat > /dev/null
     fn a_missing_control_response_fails_the_job_naming_the_handshake() {
         let dir = temp_dir("handshake-timeout");
         script(&dir, PROGRAM, "#!/bin/sh\nwhile :; do sleep 0.05; done\n");
-        let path = PathGuard::prepend(&dir);
-        let mut runner = ClaudeRunner::new(Arc::new(|_| {}))
+        let mut runner = test_runner(&dir, Arc::new(|_| {}))
             .with_handshake_timeout(TestDuration::from_millis(300));
 
         let error = runner
@@ -1446,7 +1488,78 @@ cat > /dev/null
             error.to_string().contains("initialize handshake"),
             "wrong error: {error}"
         );
-        drop(path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_noisy_child_cannot_postpone_the_handshake_timeout() {
+        let dir = temp_dir("handshake-noise");
+        let body = r#"#!/bin/sh
+IFS= read -r initialize
+while :; do
+  printf '%s\n' '{"type":"rate_limit_event","reset":123}'
+done
+"#;
+        script(&dir, PROGRAM, body);
+        let mut runner = test_runner(&dir, Arc::new(|_| {}))
+            .with_handshake_timeout(TestDuration::from_millis(300));
+        let started = Instant::now();
+
+        let error = runner
+            .start_session(&job(&dir, None, true), channel().0)
+            .expect_err("noise must not postpone the handshake timeout");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < TestDuration::from_secs(2),
+            "the handshake ignored its deadline for {elapsed:?}"
+        );
+        assert!(
+            error.to_string().contains("within 300ms"),
+            "wrong error: {error}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unrelated_control_response_does_not_finish_the_handshake() {
+        let dir = temp_dir("handshake-unrelated");
+        let body = r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"other"}}'
+IFS= read -r prompt
+"#;
+        script(&dir, PROGRAM, body);
+        let mut runner = test_runner(&dir, Arc::new(|_| {}))
+            .with_handshake_timeout(TestDuration::from_millis(300));
+
+        let error = runner
+            .start_session(&job(&dir, None, true), channel().0)
+            .expect_err("an unrelated response must not finish the handshake");
+        assert!(
+            error.to_string().contains("initialize handshake"),
+            "wrong error: {error}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_matching_response_without_success_fails_the_handshake() {
+        let dir = temp_dir("handshake-invalid");
+        let body = r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"type":"control_response","response":{"request_id":"init-1"}}'
+cat > /dev/null
+"#;
+        script(&dir, PROGRAM, body);
+        let mut runner =
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+
+        let error = runner
+            .start_session(&job(&dir, None, true), channel().0)
+            .expect_err("an invalid matching response must fail the handshake");
+        let text = error.to_string();
+        assert!(text.contains("initialize handshake"), "wrong error: {text}");
+        assert!(text.contains("invalid response"), "wrong error: {text}");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1454,13 +1567,12 @@ cat > /dev/null
     fn an_error_control_response_fails_the_handshake() {
         let dir = temp_dir("handshake-error");
         let body = r#"#!/bin/sh
-printf '%s\n' '{"type":"control_response","response":{"subtype":"error","error":"nope"}}'
+printf '%s\n' '{"type":"control_response","response":{"subtype":"error","request_id":"init-1","error":"nope"}}'
 cat > /dev/null
 "#;
         script(&dir, PROGRAM, body);
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let error = runner
             .start_session(&job(&dir, None, true), channel().0)
@@ -1468,7 +1580,6 @@ cat > /dev/null
         let text = error.to_string();
         assert!(text.contains("initialize handshake"), "wrong error: {text}");
         assert!(text.contains("nope"), "wrong error: {text}");
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1476,9 +1587,8 @@ cat > /dev/null
     fn a_child_that_exits_during_the_handshake_fails_the_job() {
         let dir = temp_dir("handshake-exit");
         script(&dir, PROGRAM, "#!/bin/sh\nexit 7\n");
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let error = runner
             .start_session(&job(&dir, None, true), channel().0)
@@ -1487,7 +1597,6 @@ cat > /dev/null
             error.to_string().contains("initialize handshake"),
             "wrong error: {error}"
         );
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1495,9 +1604,8 @@ cat > /dev/null
     fn a_fake_child_drives_the_full_happy_path() {
         let dir = temp_dir("wiring");
         happy_child(&dir);
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
         let events = collect_until_exit(&rx);
@@ -1527,7 +1635,6 @@ cat > /dev/null
             ]
         );
         session.stop().unwrap();
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1547,9 +1654,8 @@ done
 "#
         .replace("__INIT__", INIT_RESPONSE);
         script(&dir, PROGRAM, &body);
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
         session.send_user("one more turn").unwrap();
@@ -1569,7 +1675,6 @@ done
             logged.contains(&user_message("one more turn")),
             "the extra user line never reached the child: {logged:?}"
         );
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1577,9 +1682,8 @@ done
     fn yolo_auto_allows_an_ordinary_ask_in_the_verified_shape() {
         let dir = temp_dir("yolo-allow");
         ask_child(&dir, &write_ask_line());
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
         let events = collect_until_exit(&rx);
@@ -1616,7 +1720,6 @@ done
                 },
             })
         );
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1624,9 +1727,8 @@ done
     fn a_human_question_is_never_auto_answered_even_under_yolo() {
         let dir = temp_dir("yolo-question");
         ask_child(&dir, &question_ask_line());
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
 
@@ -1668,7 +1770,6 @@ done
                 },
             })
         );
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1676,9 +1777,8 @@ done
     fn an_ordinary_ask_reaches_the_caller_and_a_deny_goes_out() {
         let dir = temp_dir("deny");
         ask_child(&dir, &write_ask_line());
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, false));
 
@@ -1714,7 +1814,6 @@ done
                 },
             })
         );
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1722,9 +1821,8 @@ done
     fn an_unknown_request_id_is_an_error_and_a_plain_allow_echoes_the_input() {
         let dir = temp_dir("unknown-id");
         ask_child(&dir, &write_ask_line());
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, false));
         let ask = wait_for_ask(&rx);
@@ -1760,7 +1858,31 @@ done
             Some(&json!({"file_path": "probe.txt", "content": "hi"}))
         );
         drop(ask);
-        drop(path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stop_clears_every_pending_ask() {
+        let dir = temp_dir("stop-clears-asks");
+        ask_child(&dir, &write_ask_line());
+        let mut runner =
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, false));
+        let ask = wait_for_ask(&rx);
+        session.stop().unwrap();
+
+        let error = session
+            .answer(
+                "req-write",
+                Answer::Deny {
+                    message: "too late".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no pending claude ask"));
+        collect_until_exit(&rx);
+        drop(ask);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1768,9 +1890,8 @@ done
     fn stop_writes_the_interrupt_line_before_any_signal() {
         let dir = temp_dir("stop");
         init_only_child(&dir);
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
         session.stop().unwrap();
@@ -1799,7 +1920,26 @@ done
 
         // A second stop is a no-op.
         session.stop().unwrap();
-        drop(path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_session_stops_its_child_with_an_interrupt() {
+        let dir = temp_dir("drop");
+        init_only_child(&dir);
+        let mut runner =
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+
+        let (session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
+        drop(session);
+
+        let events = collect_until_exit(&rx);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RunEvent::Text { text, .. } if text == "got-interrupt"
+            )
+        }));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1834,9 +1974,8 @@ done
         // message with the init system line, so the session emits an event
         // on demand and stays alive on the interrupt exit.
         init_only_child(&dir);
-        let path = PathGuard::prepend(&dir);
         let mut runner =
-            ClaudeRunner::new(Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
 
@@ -1873,7 +2012,6 @@ done
         assert!(session.idle_for() < TestDuration::from_millis(100));
 
         session.stop().unwrap();
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
