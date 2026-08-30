@@ -40,6 +40,7 @@ pub fn v4_graph_text(graph: &Graph, auto_workers: bool) -> String {
             node.exec.as_str()
         };
         let retrigger = if auto_workers
+            && node.agent != crate::graph::Agent::Claude
             && node
                 .when
                 .as_ref()
@@ -193,6 +194,13 @@ graph {
         when "issue has label 'to-refine'"
         prompt "zellij/prompts/refiner.md"
     }
+    node "reviewer" {
+        agent "codex"
+        model "gpt-5.6-sol"
+        exec "supervised"
+        when "pr is draft"
+        prompt "zellij/prompts/reviewer.md"
+    }
     node "releaser" {
         agent "claude"
         model "claude-opus-5[1m]"
@@ -222,6 +230,7 @@ graph {
         assert!(text.contains("exec \"auto\""));
         let releaser = text.split("node \"releaser\"").nth(1).unwrap();
         assert!(releaser.contains("exec \"supervised\""));
+        assert!(!releaser.contains("retrigger"), "supervised claude keeps gate retrigger");
         assert!(text.contains("retrigger=\"head-sha\""));
     }
 
@@ -230,7 +239,7 @@ graph {
         let plan = plan(&v3(), true);
         let graph = Graph::parse(&plan.graph_text).unwrap();
         assert_eq!(graph.version, 4);
-        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(graph.nodes.len(), 4);
     }
 
     #[test]
