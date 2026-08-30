@@ -1279,8 +1279,12 @@ app does not quit and the character lands in the buffer.
 **Detail.**
 - Rows list every open decision across repositories with age, repository,
   stage, and a one-line summary.
-- `y` allows, `n` denies with a typed reason, `a` allows and applies the
-  request's own suggestion when it carries one.
+- `y` allows and `n` denies with a typed reason. There is deliberately NO
+  "allow always" key: `Response::Allow` carries no field for the request's
+  `permission_suggestions`, so such a key would send exactly the same message
+  as `y` while claiming to do more. Offering a key that does not do what it
+  says is worse than offering one fewer key, in a view whose whole purpose is
+  to be trusted. Recorded as deferred, not a defect.
 - A `Question` row expands to its options; digits pick, `enter` submits, and
   `i` types a free answer.
 - A `ReleaseGate` row expands to the pull request list with checkboxes; space
