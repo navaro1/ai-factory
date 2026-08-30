@@ -130,15 +130,21 @@ fn resolve_blockers(snapshot: &mut Snapshot) {
 
 pub fn parse_blocked_by(body: &str) -> Vec<u64> {
     let mut out = Vec::new();
-    for word in body.split_whitespace() {
-        let candidate = word.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '#');
-        let digits = candidate
-            .strip_prefix('#')
-            .or_else(|| candidate.strip_prefix("fw/"));
-        if let Some(digits) = digits {
-            if let Ok(number) = digits.parse::<u64>() {
-                if number > 0 && !out.contains(&number) {
-                    out.push(number);
+    for line in body.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("blocked") && lower.contains("by")) {
+            continue;
+        }
+        for word in line.split_whitespace() {
+            let candidate = word.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '#');
+            let digits = candidate
+                .strip_prefix('#')
+                .or_else(|| candidate.strip_prefix("fw/"));
+            if let Some(digits) = digits {
+                if let Ok(number) = digits.parse::<u64>() {
+                    if number > 0 && !out.contains(&number) {
+                        out.push(number);
+                    }
                 }
             }
         }
@@ -197,9 +203,15 @@ mod tests {
 
     #[test]
     fn blocked_by_extraction() {
-        let body = "Implement X.\n\nBlocked by #12 and blocked-by #30. See also fw/7 and #12 again. Not a ref: #abc";
+        let body = "Implement X.\n\nBlocked by #12 and blocked-by #30.\nSee also fw/7 and #12 again.\nDepends on #9 (no phrase). Not a ref: #abc";
         let blocked = parse_blocked_by(body);
-        assert_eq!(blocked, vec![12, 30, 7]);
+        assert_eq!(blocked, vec![12, 30]);
+    }
+
+    #[test]
+    fn plain_references_are_not_blockers() {
+        let body = "Task list:\n- [ ] #1 ship it\n- [ ] #43 other\n\nFixes #113";
+        assert!(parse_blocked_by(body).is_empty());
     }
 
     #[test]
