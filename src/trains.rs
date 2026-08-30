@@ -17,19 +17,16 @@ use crate::gh::GhClient;
 /// this process, holds it.
 pub const STACKED_LABEL: &str = "release-stacked";
 
-/// The release train of one repository: its queue, its stacked subset, and
-/// the batch in flight.
+/// The release train of one repository.
 ///
-/// The queue holds ready pull requests in arrival order. [`Train::stacked`]
-/// mirrors the `release-stacked` labels on GitHub, and every poll rebuilds
-/// it with [`Train::rebuild_stacked`]. The daemon persists
-/// [`Train::last_fire_ms`] in `state.json` and restores it here after a
-/// restart. Build a train with [`Train::new`].
+/// The queue holds ready pull requests. [`Train::stacked`] mirrors the
+/// `release-stacked` labels on GitHub. Each poll rebuilds that cache with
+/// [`Train::rebuild_stacked`]. Build a train with [`Train::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Train {
     /// The repository alias this train belongs to.
     pub repo: String,
-    /// The ready pull request numbers, in arrival order.
+    /// The ready pull request numbers that no active train holds.
     pub queue: Vec<u64>,
     /// The stacked subset, as the last poll or stack call saw it.
     pub stacked: Vec<u64>,
@@ -37,9 +34,9 @@ pub struct Train {
     pub in_flight: Option<String>,
     /// When the train last fired, in milliseconds since the Unix epoch.
     pub last_fire_ms: Option<u64>,
-    /// The batch the in-flight train fires. It lives only between
-    /// [`Train::fire`] and [`Train::finish`], so `finish` knows the exact
-    /// set to drain or return, even when the queue changed meanwhile.
+    /// The active batch or the saved batch from a failed train.
+    ///
+    /// This value keeps a retry stable when the queue changes.
     fired: Option<Vec<u64>>,
 }
 
@@ -56,22 +53,28 @@ impl Train {
         }
     }
 
-    /// Add a ready pull request to the queue, unless it is already there.
+    /// Add a ready pull request unless the queue or a saved batch holds it.
     pub fn enqueue(&mut self, pr: u64) {
-        if !self.queue.contains(&pr) {
+        let batch_contains_pr = self.fired.as_ref().is_some_and(|batch| batch.contains(&pr));
+        if !self.queue.contains(&pr) && !batch_contains_pr {
             self.queue.push(pr);
         }
     }
 
     /// Remove a pull request that closed, merged, or went back to draft.
     ///
-    /// The number leaves both the queue and the stacked cache. The GitHub
-    /// label of a still-open pull request stays, so the stack choice of the
-    /// human survives a round trip through draft; the next rebuild applies
-    /// it again once the pull request is ready.
+    /// The number leaves the queue, the stacked cache, and a saved batch.
+    /// The GitHub label stays on a draft pull request. A later poll can add
+    /// the number to the stack again after the pull request becomes ready.
     pub fn dequeue(&mut self, pr: u64) {
         self.queue.retain(|n| *n != pr);
         self.stacked.retain(|n| *n != pr);
+        if let Some(batch) = &mut self.fired {
+            batch.retain(|n| *n != pr);
+            if batch.is_empty() {
+                self.fired = None;
+            }
+        }
     }
 
     /// Stack or unstack one pull request for the next batch.
@@ -107,21 +110,31 @@ impl Train {
     /// Rebuild the stacked cache from the labels the last poll saw.
     ///
     /// `labeled` holds the pull request numbers that carry the
-    /// [`STACKED_LABEL`] label. Only numbers that are also in the queue
-    /// stay, so a draft or closed pull request never fires even when its
-    /// label is still on GitHub. The order follows the queue.
+    /// [`STACKED_LABEL`] label. The cache keeps queued and active numbers.
+    /// A draft or closed pull request does not stay in either set.
     pub fn rebuild_stacked(&mut self, labeled: &[u64]) {
-        self.stacked = self
-            .queue
+        let mut eligible = self.queue.clone();
+        if let Some(batch) = &self.fired {
+            for pr in batch {
+                if !eligible.contains(pr) {
+                    eligible.push(*pr);
+                }
+            }
+        }
+        self.stacked = eligible
             .iter()
             .copied()
             .filter(|pr| labeled.contains(pr))
             .collect();
     }
 
-    /// The batch the next fire would send: the stacked subset when one is
-    /// stacked, otherwise the whole queue.
+    /// Return the saved retry, the stacked subset, or the whole queue.
     pub fn fired_set(&self) -> Vec<u64> {
+        if self.in_flight.is_none() {
+            if let Some(retry) = &self.fired {
+                return retry.clone();
+            }
+        }
         if self.stacked.is_empty() {
             self.queue.clone()
         } else {
@@ -153,11 +166,14 @@ impl Train {
 
     /// Whether `minutes` passed since the last fire.
     fn interval_due(&self, minutes: u64, now_ms: u64) -> bool {
+        now_ms >= self.interval_deadline_ms(minutes, now_ms)
+    }
+
+    /// Return the next interval deadline within the `u64` time range.
+    fn interval_deadline_ms(&self, minutes: u64, now_ms: u64) -> u64 {
         let interval_ms = minutes.saturating_mul(60_000);
-        match self.last_fire_ms {
-            None => true,
-            Some(last) => now_ms.saturating_sub(last) >= interval_ms,
-        }
+        self.last_fire_ms
+            .map_or(now_ms, |last| last.saturating_add(interval_ms))
     }
 
     /// The moment the event loop must wake for this train, or `None` when
@@ -179,20 +195,18 @@ impl Train {
         if self.queue.is_empty() {
             return None;
         }
-        let interval_ms = minutes.saturating_mul(60_000);
-        let fire_at = self
-            .last_fire_ms
-            .map_or(now_ms, |last| last.saturating_add(interval_ms));
+        let fire_at = self.interval_deadline_ms(minutes, now_ms);
         Some(fire_at.max(now_ms))
     }
 
     /// Start a train with `prs` and return its task id.
     ///
-    /// The id follows the naming rules: `<repo>/release-p<n>`, where `n` is
-    /// the lowest number in the batch, so a retry of the same batch reuses
-    /// the same id. The call records the batch, marks the train in flight,
-    /// and stamps [`Train::last_fire_ms`] with `now_ms`. The daemon creates
-    /// the task itself under the returned id; this method does not.
+    /// Each pull request must occur once in the queue. A failed train must
+    /// retry its saved batch. The call removes the batch from the queue.
+    /// It also marks the train as active and records `now_ms`.
+    ///
+    /// The id is `<repo>/release-p<n>`. The value `n` is the lowest pull
+    /// request number. A retry of the same batch reuses the same id.
     pub fn fire(&mut self, prs: &[u64], now_ms: u64) -> Result<String> {
         if let Some(id) = &self.in_flight {
             bail!("a train is already in flight as {id}");
@@ -201,7 +215,19 @@ impl Train {
             Some(first) => *first,
             None => bail!("cannot fire an empty train"),
         };
+        if self.fired.as_deref().is_some_and(|retry| retry != prs) {
+            bail!("cannot replace a failed train; retry the saved batch");
+        }
+        for (index, pr) in prs.iter().enumerate() {
+            if !self.queue.contains(pr) {
+                bail!("cannot fire pr {pr}: it is not in the release queue");
+            }
+            if prs[..index].contains(pr) {
+                bail!("cannot fire pr {pr} more than once");
+            }
+        }
         let id = format!("{}/release-p{first}", self.repo);
+        self.queue.retain(|pr| !prs.contains(pr));
         self.in_flight = Some(id.clone());
         self.fired = Some(prs.to_vec());
         self.last_fire_ms = Some(now_ms);
@@ -210,27 +236,39 @@ impl Train {
 
     /// Close the batch in flight and return it.
     ///
-    /// On success the batch leaves the queue and the stacked cache, and the
-    /// [`STACKED_LABEL`] labels go off GitHub. On failure the pull requests
-    /// stay in the queue and keep their labels, so a retry fires the same
-    /// set again. Each pull request is cleared in turn: label first, then
-    /// cache entry. A label call that fails stops the drain with an error;
-    /// the rest of the batch stays queued, and the next poll rebuilds the
-    /// cache from GitHub. `finish` without a batch in flight is a no-op.
+    /// On success, this call clears each stacked label and the local cache.
+    /// Unstacked pull requests need no label call. On failure, this call
+    /// returns the batch to the queue and saves the exact retry set.
+    ///
+    /// A label error keeps the train active. A later call can retry the label
+    /// cleanup. A call without an active batch changes nothing.
     pub fn finish(&mut self, ok: bool, owner_repo: &str, gh: &GhClient<'_>) -> Result<Vec<u64>> {
-        self.in_flight = None;
-        let Some(fired) = self.fired.take() else {
+        if self.in_flight.is_none() {
+            return Ok(Vec::new());
+        }
+        let Some(fired) = self.fired.clone() else {
+            self.in_flight = None;
             return Ok(Vec::new());
         };
         if !ok {
+            for pr in &fired {
+                if !self.queue.contains(pr) {
+                    self.queue.push(*pr);
+                }
+            }
+            self.in_flight = None;
             return Ok(fired);
         }
         for pr in &fired {
-            gh.remove_label(owner_repo, *pr, STACKED_LABEL)
-                .with_context(|| format!("cannot remove {STACKED_LABEL} from pr {pr}"))?;
+            if self.stacked.contains(pr) {
+                gh.remove_label(owner_repo, *pr, STACKED_LABEL)
+                    .with_context(|| format!("cannot remove {STACKED_LABEL} from pr {pr}"))?;
+            }
             self.queue.retain(|n| *n != *pr);
             self.stacked.retain(|n| *n != *pr);
         }
+        self.in_flight = None;
+        self.fired = None;
         Ok(fired)
     }
 }
@@ -281,6 +319,21 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_pr_does_not_return_after_an_in_flight_failure() {
+        let mut t = train(&[1, 2]);
+        t.fire(&[1, 2], 1_000).unwrap();
+        t.dequeue(1);
+        let exec = ScriptExec::new();
+        let client = GhClient::new(&exec);
+
+        let returned = t.finish(false, "acme/borsuk", &client).unwrap();
+
+        assert_eq!(returned, vec![2]);
+        assert_eq!(t.queue, vec![2]);
+        assert_eq!(t.fired_set(), vec![2]);
+    }
+
+    #[test]
     fn a_threshold_policy_fires_when_the_count_is_reached() {
         let mut t = train(&[1, 2]);
         let policy = ReleasePolicy::Threshold { count: 3 };
@@ -298,22 +351,10 @@ mod tests {
         assert_eq!(id, "borsuk/release-p1");
         t.enqueue(4);
         assert_eq!(t.should_fire(&policy, 2_000), None);
-        let mut exec = ScriptExec::new();
-        for pr in [1, 2, 3] {
-            exec = exec.expect(
-                gh(&[
-                    "api",
-                    "-i",
-                    "-X",
-                    "DELETE",
-                    &format!("repos/acme/borsuk/issues/{pr}/labels/release-stacked"),
-                ]),
-                CmdOut::ok(response("HTTP/2 204", "")),
-            );
-        }
+        let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
         t.finish(true, "acme/borsuk", &client).unwrap();
-        assert_eq!(exec.calls().len(), 3);
+        assert!(exec.calls().is_empty());
         assert_eq!(t.queue, vec![4], "only the fired batch drains");
         assert_eq!(t.should_fire(&policy, 3_000), None);
     }
@@ -351,6 +392,17 @@ mod tests {
     }
 
     #[test]
+    fn a_saturated_interval_fires_at_its_returned_deadline() {
+        let mut t = train(&[1]);
+        t.last_fire_ms = Some(1);
+        let policy = ReleasePolicy::Interval { minutes: u64::MAX };
+
+        assert_eq!(t.next_deadline_ms(&policy, 1), Some(u64::MAX));
+        assert_eq!(t.should_fire(&policy, u64::MAX - 1), None);
+        assert_eq!(t.should_fire(&policy, u64::MAX), Some(vec![1]));
+    }
+
+    #[test]
     fn an_interval_train_with_an_empty_queue_has_no_deadline() {
         let mut t = Train::new("borsuk");
         t.last_fire_ms = Some(0);
@@ -383,20 +435,43 @@ mod tests {
     #[test]
     fn a_failed_train_returns_its_prs_and_a_retry_reuses_the_same_set() {
         let mut t = train(&[1, 2, 3]);
-        t.stacked = vec![2, 3];
         let policy = ReleasePolicy::Threshold { count: 3 };
         let batch = t.should_fire(&policy, 1_000).unwrap();
-        assert_eq!(batch, vec![2, 3]);
+        assert_eq!(batch, vec![1, 2, 3]);
         t.fire(&batch, 1_000).unwrap();
+        assert!(t.queue.is_empty(), "the fired batch leaves the queue");
+        t.enqueue(1);
+        assert!(
+            t.queue.is_empty(),
+            "a poll does not enqueue an in-flight pr"
+        );
+        t.enqueue(4);
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
         let finished = t.finish(false, "acme/borsuk", &client).unwrap();
-        assert_eq!(finished, vec![2, 3]);
+        assert_eq!(finished, vec![1, 2, 3]);
         assert_eq!(t.in_flight, None);
-        assert_eq!(t.queue, vec![1, 2, 3], "the batch is back in the queue");
+        assert_eq!(t.queue, vec![4, 1, 2, 3], "the batch is back in the queue");
         assert_eq!(exec.calls().len(), 0, "failure makes no label call");
         let again = t.should_fire(&policy, 2_000).unwrap();
-        assert_eq!(again, vec![2, 3], "the retry reuses the same set");
+        assert_eq!(again, vec![1, 2, 3], "the retry reuses the same set");
+    }
+
+    #[test]
+    fn a_failed_train_refuses_a_different_retry_set() {
+        let mut t = train(&[1, 2]);
+        t.fire(&[1, 2], 1_000).unwrap();
+        let exec = ScriptExec::new();
+        let client = GhClient::new(&exec);
+        t.finish(false, "acme/borsuk", &client).unwrap();
+        t.enqueue(3);
+
+        let err = t.fire(&[3], 2_000).unwrap_err();
+
+        assert!(err.to_string().contains("retry the saved batch"));
+        assert_eq!(t.fired_set(), vec![1, 2]);
+        assert_eq!(t.queue, vec![1, 2, 3]);
+        assert_eq!(t.in_flight, None);
     }
 
     #[test]
@@ -488,6 +563,30 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_keeps_an_in_flight_label_for_success_cleanup() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                "repos/acme/borsuk/issues/2/labels/release-stacked",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", "{}")),
+        );
+        let client = GhClient::new(&exec);
+        let mut t = train(&[1, 2]);
+        t.stacked = vec![2];
+        t.fire(&[2], 1_000).unwrap();
+
+        t.rebuild_stacked(&[2]);
+
+        assert_eq!(t.stacked, vec![2]);
+        assert_eq!(t.finish(true, "acme/borsuk", &client).unwrap(), vec![2]);
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
     fn a_successful_train_drains_the_batch_and_clears_the_labels() {
         let exec = ScriptExec::new()
             .expect(
@@ -524,6 +623,62 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_unstacked_train_makes_no_label_call() {
+        let exec = ScriptExec::new();
+        let client = GhClient::new(&exec);
+        let mut t = train(&[1, 2]);
+        let batch = t.fired_set();
+        t.fire(&batch, 1_000).unwrap();
+
+        let finished = t.finish(true, "acme/borsuk", &client).unwrap();
+
+        assert_eq!(finished, vec![1, 2]);
+        assert!(t.queue.is_empty());
+        assert_eq!(t.in_flight, None);
+        assert!(exec.calls().is_empty());
+    }
+
+    #[test]
+    fn a_label_error_keeps_the_train_in_flight_for_a_finish_retry() {
+        let delete_label = || {
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                "repos/acme/borsuk/issues/2/labels/release-stacked",
+            ])
+        };
+        let exec = ScriptExec::new()
+            .expect(
+                delete_label(),
+                CmdOut {
+                    status: 1,
+                    stdout: response("HTTP/2 500", "{}"),
+                    stderr: "HTTP 500\n".into(),
+                },
+            )
+            .expect(delete_label(), CmdOut::ok(response("HTTP/2 200", "{}")));
+        let client = GhClient::new(&exec);
+        let mut t = train(&[2]);
+        t.stacked = vec![2];
+        let id = t.fire(&[2], 1_000).unwrap();
+
+        let err = t.finish(true, "acme/borsuk", &client).unwrap_err();
+
+        assert!(err.to_string().contains("cannot remove release-stacked"));
+        assert_eq!(t.in_flight.as_deref(), Some(id.as_str()));
+        assert_eq!(t.stacked, vec![2]);
+        assert!(t.queue.is_empty());
+
+        let finished = t.finish(true, "acme/borsuk", &client).unwrap();
+        assert_eq!(finished, vec![2]);
+        assert_eq!(t.in_flight, None);
+        assert!(t.stacked.is_empty());
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
     fn finish_without_a_train_touches_nothing() {
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
@@ -546,6 +701,29 @@ mod tests {
         let mut t = Train::new("borsuk");
         let err = t.fire(&[], 1_000).unwrap_err();
         assert!(err.to_string().contains("empty"));
+        assert_eq!(t.in_flight, None);
+    }
+
+    #[test]
+    fn firing_a_pr_outside_the_queue_is_refused() {
+        let mut t = train(&[1]);
+
+        let err = t.fire(&[2], 1_000).unwrap_err();
+
+        assert!(err.to_string().contains("not in the release queue"));
+        assert_eq!(t.queue, vec![1]);
+        assert_eq!(t.in_flight, None);
+        assert_eq!(t.last_fire_ms, None);
+    }
+
+    #[test]
+    fn firing_a_duplicate_pr_is_refused() {
+        let mut t = train(&[1]);
+
+        let err = t.fire(&[1, 1], 1_000).unwrap_err();
+
+        assert!(err.to_string().contains("more than once"));
+        assert_eq!(t.queue, vec![1]);
         assert_eq!(t.in_flight, None);
     }
 
