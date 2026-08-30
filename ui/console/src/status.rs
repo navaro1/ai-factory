@@ -154,7 +154,10 @@ pub fn classify(content: &str) -> Classification {
             state: "exited".into(),
         };
     }
-    if content.contains("Claude Code v") || content.contains("auto mode on") {
+    if content.contains("Claude Code v")
+        || content.contains("auto mode on")
+        || content.contains("trust this folder")
+    {
         let (model, role) = if content.contains("Fable 5") {
             ("claude-fable-5", "Planner")
         } else if content.contains("Opus 5") {
