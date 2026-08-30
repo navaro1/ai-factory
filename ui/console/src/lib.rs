@@ -1,7 +1,9 @@
 pub mod actions;
 pub mod app;
+pub mod codex;
 pub mod factory;
 pub mod graph;
+pub mod harness;
 pub mod ids;
 pub mod journal;
 pub mod layout;
