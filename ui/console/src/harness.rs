@@ -48,8 +48,9 @@ pub trait HarnessAdapter: Send {
     fn shutdown(&mut self);
 }
 
+#[derive(Default)]
 pub struct SharedClock {
-    last_activity: Mutex<Instant>,
+    last_activity: Option<Mutex<Instant>>,
     active: AtomicUsize,
     running: AtomicBool,
 }
@@ -57,18 +58,23 @@ pub struct SharedClock {
 impl SharedClock {
     pub fn new() -> Self {
         SharedClock {
-            last_activity: Mutex::new(Instant::now()),
+            last_activity: Some(Mutex::new(Instant::now())),
             active: AtomicUsize::new(0),
             running: AtomicBool::new(false),
         }
     }
 
     pub fn touch_now(&self) {
-        *self.last_activity.lock().unwrap() = Instant::now();
+        if let Some(clock) = &self.last_activity {
+            *clock.lock().unwrap() = Instant::now();
+        }
     }
 
     pub fn idle_for(&self) -> Duration {
-        self.last_activity.lock().unwrap().elapsed()
+        match &self.last_activity {
+            Some(clock) => clock.lock().unwrap().elapsed(),
+            None => Duration::ZERO,
+        }
     }
 
     pub fn active_count(&self) -> usize {

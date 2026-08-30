@@ -415,8 +415,7 @@ fn field_u64(node: &kdl::KdlNode, name: &str) -> Option<u64> {
 fn node_u64(node: &kdl::KdlNode) -> Option<u64> {
     node.entries()
         .iter()
-        .filter(|e| e.name().is_none())
-        .nth(0)
+        .find(|e| e.name().is_none())
         .and_then(|e| e.value().as_integer())
         .and_then(|v| u64::try_from(v).ok())
 }

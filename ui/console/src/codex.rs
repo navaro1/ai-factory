@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -28,11 +28,6 @@ pub struct LinkEnds {
 
 pub type LinkFactory = Box<dyn FnMut() -> Result<LinkEnds> + Send>;
 
-struct Pending {
-    next_id: AtomicU64,
-    waits: Arc<Mutex<HashMap<u64, Sender<serde_json::Value>>>>,
-}
-
 struct Registry {
     by_thread: HashMap<String, String>,
     by_task: HashMap<String, (String, String)>,
@@ -40,7 +35,6 @@ struct Registry {
 
 pub struct CodexAdapter {
     tx: Sender<CodexCmd>,
-    events: Sender<AdapterEvent>,
     clock: Arc<SharedClock>,
     compat: Arc<Mutex<Option<Result<(), String>>>>,
 }
@@ -216,7 +210,6 @@ impl CodexAdapter {
         spawn_worker(link_factory, rx, events.clone(), clock.clone(), compat.clone());
         CodexAdapter {
             tx,
-            events,
             clock,
             compat,
         }
@@ -234,7 +227,6 @@ impl CodexAdapter {
         spawn_worker(link_factory, rx, events.clone(), clock.clone(), compat.clone());
         CodexAdapter {
             tx,
-            events,
             clock,
             compat,
         }
@@ -290,7 +282,7 @@ fn spawn_worker(
     rx: Receiver<CodexCmd>,
     events: Sender<AdapterEvent>,
     clock: Arc<SharedClock>,
-    compat: Arc<Mutex<Option<Result<(), String>>>>,
+    _compat: Arc<Mutex<Option<Result<(), String>>>>,
 ) {
     std::thread::spawn(move || {
         let mut session: Option<Session> = None;
@@ -639,12 +631,10 @@ fn task_of(params: &serde_json::Value, registry: &Arc<Mutex<Registry>>, key: &st
     registry.lock().unwrap().by_thread.get(thread).cloned()
 }
 
-pub fn mem_pipe() -> (
-    Box<dyn Read + Send + 'static>,
-    Box<dyn Write + Send + 'static>,
-    Box<dyn Read + Send + 'static>,
-    Box<dyn Write + Send + 'static>,
-) {
+pub type BoxRead = Box<dyn Read + Send + 'static>;
+pub type BoxWrite = Box<dyn Write + Send + 'static>;
+
+pub fn mem_pipe() -> (BoxRead, BoxWrite, BoxRead, BoxWrite) {
     let (a_to_b_tx, a_to_b_rx) = channel::<Vec<u8>>();
     let (b_to_a_tx, b_to_a_rx) = channel::<Vec<u8>>();
     let a_read = MemRead::new(a_to_b_rx);
@@ -726,7 +716,7 @@ impl Write for MemWrite {
 mod tests {
     use super::*;
     use crate::harness::AdapterEvent;
-    use std::io::{BufReader, Read as _, Write as _};
+    use std::io::BufReader;
 
     fn script_server(read: Box<dyn Read + Send>, mut write: Box<dyn Write + Send>) {
         std::thread::spawn(move || {
