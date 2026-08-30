@@ -21,13 +21,11 @@ use anyhow::{anyhow, Context};
 
 use crate::exec::{Exec, RealExec};
 
-/// How long a graceful stop waits for the child after the protocol
-/// interrupt.
-pub const TERM_GRACE: Duration = Duration::from_secs(10);
+/// The first wait before SIGTERM.
+const TERM_GRACE: Duration = Duration::from_secs(10);
 
-/// How long a graceful stop waits for the child after SIGTERM and after
-/// SIGKILL.
-pub const KILL_GRACE: Duration = Duration::from_secs(5);
+/// The wait after SIGTERM and SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// Everything needed to start one supervised child.
 #[derive(Debug, Clone)]
@@ -67,9 +65,8 @@ pub enum ProcEvent {
     },
     /// A [`stop_gracefully`] escalation finished.
     Stopped(StopOutcome),
-    /// A log write or a pipe read failed. The stream that failed may be
-    /// incomplete from this point on.
-    LogError(String),
+    /// A pipe, log, wait, hook, or signal operation failed.
+    Error(String),
 }
 
 /// How a graceful-stop escalation ended.
@@ -102,7 +99,7 @@ impl LogSink {
     /// Write `prefix` and then `bytes` to the log. When `complete` is true,
     /// the entry is made newline-terminated so two entries never share a
     /// line. On the first write failure the sink is marked broken, one
-    /// [`ProcEvent::LogError`] is sent, and later writes are skipped.
+    /// [`ProcEvent::Error`] is sent, and later writes are skipped.
     fn write_bytes(
         &self,
         prefix: &[u8],
@@ -121,9 +118,12 @@ impl LogSink {
             chunk.push(b'\n');
         }
         let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.broken.load(Ordering::Acquire) {
+            return;
+        }
         if let Err(error) = file.write_all(&chunk) {
             self.broken.store(true, Ordering::Release);
-            let _ = tx.send(ProcEvent::LogError(format!(
+            let _ = tx.send(ProcEvent::Error(format!(
                 "{context}: log write failed: {error}"
             )));
         }
@@ -156,9 +156,8 @@ pub fn spawn(spec: RunSpec, tx: Sender<ProcEvent>) -> anyhow::Result<ProcHandle>
     spawn_with_exec(spec, tx, Arc::new(RealExec))
 }
 
-/// Like [`spawn`], but with an injected [`Exec`], so a test can script the
-/// `kill -TERM` call.
-pub fn spawn_with_exec(
+/// Spawn a child with the specified command executor.
+fn spawn_with_exec(
     spec: RunSpec,
     tx: Sender<ProcEvent>,
     exec: Arc<dyn Exec>,
@@ -191,13 +190,16 @@ pub fn spawn_with_exec(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = start_child(&mut command, &spec.task, &spec.program)?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("task {}: failed to start {}", spec.task, spec.program))?;
     let pid = child.id();
 
     let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("task {}: child stdin unavailable", spec.task))?;
+    let stdin = Arc::new(Mutex::new(Some(stdin)));
     let stdout = child
         .stdout
         .take()
@@ -231,7 +233,7 @@ pub fn spawn_with_exec(
                         }
                     }
                     Err(error) => {
-                        let _ = tx.send(ProcEvent::LogError(format!(
+                        let _ = tx.send(ProcEvent::Error(format!(
                             "task {task}: stdout read failed: {error}"
                         )));
                         break;
@@ -256,7 +258,7 @@ pub fn spawn_with_exec(
                     Ok(0) => break,
                     Ok(_) => sink.write_bytes(b"stderr ", &buf, true, &task, &tx),
                     Err(error) => {
-                        let _ = tx.send(ProcEvent::LogError(format!(
+                        let _ = tx.send(ProcEvent::Error(format!(
                             "task {task}: stderr read failed: {error}"
                         )));
                         break;
@@ -271,16 +273,17 @@ pub fn spawn_with_exec(
     let child_cell: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
     {
         let child_cell = Arc::clone(&child_cell);
+        let stdin = Arc::clone(&stdin);
         let tx = tx.clone();
         let task = spec.task.clone();
         thread::spawn(move || {
             if let Err(error) = stdout_reader.join() {
-                let _ = tx.send(ProcEvent::LogError(format!(
+                let _ = tx.send(ProcEvent::Error(format!(
                     "task {task}: stdout reader stopped: {error:?}"
                 )));
             }
             if let Err(error) = stderr_reader.join() {
-                let _ = tx.send(ProcEvent::LogError(format!(
+                let _ = tx.send(ProcEvent::Error(format!(
                     "task {task}: stderr reader stopped: {error:?}"
                 )));
             }
@@ -295,11 +298,12 @@ pub fn spawn_with_exec(
                 Ok(status) => {
                     let code = status.code();
                     let ok = status.success();
+                    *stdin.lock().unwrap_or_else(PoisonError::into_inner) = None;
                     let _ = exit_tx.send(());
                     let _ = tx.send(ProcEvent::Exit { code, ok });
                 }
                 Err(error) => {
-                    let _ = tx.send(ProcEvent::LogError(format!(
+                    let _ = tx.send(ProcEvent::Error(format!(
                         "task {task}: waiting for the child failed: {error}"
                     )));
                 }
@@ -310,46 +314,13 @@ pub fn spawn_with_exec(
     Ok(ProcHandle {
         task: spec.task,
         pid,
-        stdin: Arc::new(Mutex::new(Some(stdin))),
+        stdin,
         child: child_cell,
         hook: Mutex::new(None),
         exit: exit_rx,
         exec,
         tx,
     })
-}
-
-/// Start the child command, retrying briefly on a transient `ETXTBSY`.
-///
-/// A program that was written and executed at once, as the tests do with
-/// their script files, can fail to start for a few milliseconds while the
-/// last write handle lingers. This is not a polling loop: it retries one
-/// known transient error a bounded number of times.
-fn start_child(command: &mut Command, task: &str, program: &str) -> anyhow::Result<Child> {
-    const ATTEMPTS: u32 = 10;
-    const RETRY_PAUSE: Duration = Duration::from_millis(10);
-    let mut last_busy: Option<std::io::Error> = None;
-    for attempt in 1..=ATTEMPTS {
-        match command.spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                last_busy = Some(error);
-                if attempt < ATTEMPTS {
-                    thread::sleep(RETRY_PAUSE);
-                }
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("task {task}: failed to start {program}"));
-            }
-        }
-    }
-    match last_busy {
-        Some(error) => {
-            Err(error).with_context(|| format!("task {task}: failed to start {program}"))
-        }
-        None => Err(anyhow!("task {task}: failed to start {program}")),
-    }
 }
 
 /// A live handle to one supervised child.
@@ -370,16 +341,6 @@ pub struct ProcHandle {
 }
 
 impl ProcHandle {
-    /// The task id the child works for.
-    pub fn task(&self) -> &str {
-        &self.task
-    }
-
-    /// The process id the child was spawned with.
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
     /// Install the closure a graceful stop calls as the protocol interrupt.
     ///
     /// A runner uses this to send its own protocol-level interrupt, for
@@ -475,12 +436,11 @@ impl ProcHandle {
 /// The escalation runs on its own thread, so this never blocks the caller.
 /// The outcome arrives as a [`ProcEvent::Stopped`] on the spawn channel.
 pub fn stop_gracefully(handle: ProcHandle, protocol_interrupt: bool) {
-    thread::spawn(move || escalate(handle, protocol_interrupt, TERM_GRACE, KILL_GRACE));
+    start_escalation(handle, protocol_interrupt, TERM_GRACE, KILL_GRACE);
 }
 
-/// Like [`stop_gracefully`], but with injectable waits, so a test can run
-/// the full escalation in milliseconds.
-pub fn stop_gracefully_with_grace(
+/// Start the escalation with the specified waits.
+fn start_escalation(
     handle: ProcHandle,
     protocol_interrupt: bool,
     interrupt_grace: Duration,
@@ -510,21 +470,25 @@ fn escalate(
                 .clone();
             if let Some(hook) = hook {
                 if let Err(error) = hook() {
-                    notes.push(format!("interrupt hook failed: {error}"));
+                    report_stop_error(
+                        &handle,
+                        &mut notes,
+                        format!("interrupt hook failed: {error}"),
+                    );
                 }
             }
-            if wait_for_exit(&handle.exit, interrupt_grace) {
-                break 'ladder StopOutcome::Exited;
-            }
+        }
+        if wait_for_exit(&handle.exit, interrupt_grace) {
+            break 'ladder StopOutcome::Exited;
         }
         if let Err(error) = handle.terminate() {
-            notes.push(format!("SIGTERM failed: {error}"));
+            report_stop_error(&handle, &mut notes, format!("SIGTERM failed: {error}"));
         }
         if wait_for_exit(&handle.exit, term_grace) {
             break 'ladder StopOutcome::Terminated;
         }
         if let Err(error) = handle.kill() {
-            notes.push(format!("SIGKILL failed: {error}"));
+            report_stop_error(&handle, &mut notes, format!("SIGKILL failed: {error}"));
         }
         if wait_for_exit(&handle.exit, term_grace) {
             break 'ladder StopOutcome::Killed;
@@ -538,6 +502,14 @@ fn escalate(
     let _ = handle.tx.send(ProcEvent::Stopped(outcome));
 }
 
+/// Keep one stop error for the final outcome and report it at once.
+fn report_stop_error(handle: &ProcHandle, notes: &mut Vec<String>, message: String) {
+    notes.push(message.clone());
+    let _ = handle
+        .tx
+        .send(ProcEvent::Error(format!("task {}: {message}", handle.task)));
+}
+
 /// Wait up to `grace` for the waiter thread's exit report.
 fn wait_for_exit(exit: &Receiver<()>, grace: Duration) -> bool {
     exit.recv_timeout(grace).is_ok()
@@ -549,61 +521,97 @@ mod tests {
     use crate::exec::{CmdOut, ScriptExec};
     use std::fs;
     use std::path::Path;
+    use std::time::Instant;
+    use uuid::Uuid;
 
-    /// One 10 s timeout covers a whole test; every wait inside is shorter.
-    fn recv_timeout(rx: &Receiver<ProcEvent>, millis: u64) -> Option<ProcEvent> {
-        rx.recv_timeout(Duration::from_millis(millis)).ok()
-    }
+    const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-    /// Collect events until [`ProcEvent::Exit`] arrives, then drain briefly.
+    /// Collect events until [`ProcEvent::Exit`] arrives.
     fn collect_until_exit(rx: &Receiver<ProcEvent>) -> Vec<ProcEvent> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
         let mut events = Vec::new();
-        while let Some(event) = recv_timeout(rx, 10_000) {
-            let exit_seen = matches!(event, ProcEvent::Exit { .. });
-            events.push(event);
-            if exit_seen {
-                break;
+        loop {
+            match rx.recv_timeout(time_left(deadline)) {
+                Ok(event) => {
+                    let exit_seen = matches!(event, ProcEvent::Exit { .. });
+                    events.push(event);
+                    if exit_seen {
+                        return events;
+                    }
+                }
+                Err(error) => panic!("the child exit was not reported: {error}"),
             }
         }
-        while let Some(event) = recv_timeout(rx, 100) {
-            events.push(event);
+    }
+
+    /// Collect all events until every sender closes.
+    fn collect_until_disconnect(rx: &Receiver<ProcEvent>) -> Vec<ProcEvent> {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        let mut events = Vec::new();
+        loop {
+            match rx.recv_timeout(time_left(deadline)) {
+                Ok(event) => events.push(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return events,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the event channel did not close")
+                }
+            }
         }
-        events
+    }
+
+    /// Return the time left in one test deadline.
+    fn time_left(deadline: Instant) -> Duration {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "the test timed out");
+        remaining
     }
 
     /// A fresh temporary directory for one test.
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aif-proc-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("aif-proc-{name}-{}", Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
         dir
     }
 
-    /// Write an executable POSIX shell script into `dir`.
-    ///
-    /// The write goes to a temporary name and a rename puts it in place, so
-    /// the exec never races a still-open write handle (`ETXTBSY`).
+    /// Write a POSIX shell script into `dir`.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
-        let staging = dir.join(format!(".{name}.tmp"));
-        fs::write(&staging, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut permissions = fs::metadata(&staging).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o755);
-        fs::set_permissions(&staging, permissions).unwrap();
-        fs::rename(&staging, &path).unwrap();
+        fs::write(&path, format!("{body}\n")).unwrap();
         path
     }
 
     /// A `RunSpec` for `program` with its log inside `dir`.
     fn spec(dir: &Path, task: &str, program: &Path, args: &[String]) -> RunSpec {
+        let args = std::iter::once(program.display().to_string())
+            .chain(args.iter().cloned())
+            .collect();
         RunSpec {
             task: task.to_string(),
             cwd: dir.to_path_buf(),
-            program: program.display().to_string(),
-            args: args.to_vec(),
+            program: "/bin/sh".to_string(),
+            args,
             env: Vec::new(),
             log: dir.join("log.jsonl"),
+        }
+    }
+
+    /// A fake SIGTERM command that tells a script to exit through a file.
+    struct FileSignalExec {
+        flag: PathBuf,
+    }
+
+    impl Exec for FileSignalExec {
+        fn run(&self, program: &str, args: &[&str], cwd: Option<&Path>) -> anyhow::Result<CmdOut> {
+            if program != "kill"
+                || args.len() != 2
+                || args[0] != "-TERM"
+                || args[1].parse::<u32>().is_err()
+                || cwd.is_some()
+            {
+                return Err(anyhow!("unexpected fake SIGTERM command"));
+            }
+            fs::write(&self.flag, b"term")?;
+            Ok(CmdOut::ok(""))
         }
     }
 
@@ -618,8 +626,9 @@ mod tests {
         let (tx, rx) = channel();
         let handle = spawn(spec(&dir, "t/raw", &program, &[]), tx).unwrap();
 
-        let events = collect_until_exit(&rx);
+        let mut events = collect_until_exit(&rx);
         drop(handle);
+        events.extend(collect_until_disconnect(&rx));
 
         let lines: Vec<&String> = events
             .iter()
@@ -646,13 +655,34 @@ mod tests {
     }
 
     #[test]
+    fn spawn_creates_the_log_parent_and_appends_to_the_log() {
+        let dir = temp_dir("log-append");
+        let program = script(&dir, "printer", "printf '%s\\n' \"$1\"");
+        let log = dir.join("nested").join("task.log");
+
+        for line in ["first", "second"] {
+            let mut run = spec(&dir, "t/append", &program, &[line.to_string()]);
+            run.log = log.clone();
+            let (tx, rx) = channel();
+            let handle = spawn(run, tx).unwrap();
+            let events = collect_until_exit(&rx);
+            assert!(events.contains(&ProcEvent::Line(line.to_string())));
+            drop(handle);
+            collect_until_disconnect(&rx);
+        }
+
+        assert_eq!(fs::read_to_string(log).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
     fn exit_code_and_success_flag_are_reported_exactly_once() {
         let dir = temp_dir("exit-once");
         let failing = script(&dir, "fail", "exit 3");
         let (tx, rx) = channel();
         let handle = spawn(spec(&dir, "t/fail", &failing, &[]), tx).unwrap();
-        let events = collect_until_exit(&rx);
+        let mut events = collect_until_exit(&rx);
         drop(handle);
+        events.extend(collect_until_disconnect(&rx));
         let exits: Vec<_> = events
             .iter()
             .filter(|event| matches!(event, ProcEvent::Exit { .. }))
@@ -668,8 +698,9 @@ mod tests {
         let ok = script(&dir, "ok", "exit 0");
         let (tx, rx) = channel();
         let handle = spawn(spec(&dir, "t/ok", &ok, &[]), tx).unwrap();
-        let events = collect_until_exit(&rx);
+        let mut events = collect_until_exit(&rx);
         drop(handle);
+        events.extend(collect_until_disconnect(&rx));
         assert_eq!(
             events
                 .iter()
@@ -696,26 +727,18 @@ mod tests {
         handle.write_line("hello").unwrap();
 
         // The echo comes back while the child still waits for more input.
-        let mut saw_echo = false;
-        while !saw_echo {
-            match recv_timeout(&rx, 10_000) {
-                Some(ProcEvent::Line(line)) if line == "got:hello" => saw_echo = true,
-                Some(_) => {}
-                None => panic!("the child never echoed the written line"),
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        loop {
+            match rx.recv_timeout(time_left(deadline)) {
+                Ok(ProcEvent::Line(line)) if line == "got:hello" => break,
+                Ok(_) => {}
+                Err(error) => panic!("the child never echoed the written line: {error}"),
             }
         }
 
         // Closing stdin ends the child's read loop and its turn.
         handle.close_stdin();
-        let mut events = Vec::new();
-        while let Some(event) = recv_timeout(&rx, 10_000) {
-            let exit_seen = matches!(event, ProcEvent::Exit { .. });
-            events.push(event);
-            if exit_seen {
-                break;
-            }
-        }
-        assert!(saw_echo);
+        let events = collect_until_exit(&rx);
         assert!(events.contains(&ProcEvent::Line("done".to_string())));
         assert!(events.contains(&ProcEvent::Exit {
             code: Some(0),
@@ -733,11 +756,35 @@ mod tests {
         let program = script(&dir, "instant", "exit 0");
         let (tx, rx) = channel();
         let handle = spawn(spec(&dir, "t/dead", &program, &[]), tx).unwrap();
-        while !matches!(recv_timeout(&rx, 10_000), Some(ProcEvent::Exit { .. })) {}
+        let events = collect_until_exit(&rx);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProcEvent::Exit { .. })));
         let error = handle
             .write_line("too late")
             .expect_err("write after exit must fail");
         assert!(error.to_string().contains("t/dead"));
+    }
+
+    #[test]
+    fn write_after_exit_fails_when_a_descendant_keeps_stdin_open() {
+        let dir = temp_dir("dead-stdin-descendant");
+        let program = script(
+            &dir,
+            "exit-with-descendant",
+            "exec 3<&0; sleep 1 <&3 >/dev/null 2>&1 & exec 3<&-; exit 0",
+        );
+        let (tx, rx) = channel();
+        let handle = spawn(spec(&dir, "t/dead-descendant", &program, &[]), tx).unwrap();
+        let events = collect_until_exit(&rx);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProcEvent::Exit { .. })));
+
+        let error = handle
+            .write_line("too late")
+            .expect_err("write after exit must fail");
+        assert!(error.to_string().contains("t/dead-descendant"));
     }
 
     #[test]
@@ -774,52 +821,88 @@ mod tests {
     #[test]
     fn a_polite_child_dies_at_sigterm() {
         let dir = temp_dir("sigterm-ok");
-        let program = script(&dir, "polite", "while :; do sleep 0.05; done");
+        let flag = dir.join("term-flag");
+        let program = script(
+            &dir,
+            "polite",
+            "while [ ! -f \"$1\" ]; do sleep 0.02; done; exit 0",
+        );
+        let exec = Arc::new(FileSignalExec { flag: flag.clone() });
         let (tx, rx) = channel();
-        let handle = spawn(spec(&dir, "t/polite", &program, &[]), tx).unwrap();
-        stop_gracefully_with_grace(
+        let handle = spawn_with_exec(
+            spec(&dir, "t/polite", &program, &[flag.display().to_string()]),
+            tx,
+            exec,
+        )
+        .unwrap();
+        start_escalation(
             handle,
             false,
-            Duration::from_millis(200),
-            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
         );
 
-        let mut stopped = None;
-        while let Some(event) = recv_timeout(&rx, 10_000) {
-            match event {
-                ProcEvent::Stopped(outcome) => stopped = Some(outcome),
-                ProcEvent::Exit { ok, .. } => assert!(!ok),
-                _ => {}
-            }
-        }
-        assert_eq!(stopped, Some(StopOutcome::Terminated));
+        let events = collect_until_disconnect(&rx);
+        assert!(events.contains(&ProcEvent::Stopped(StopOutcome::Terminated)));
+        assert!(events.contains(&ProcEvent::Exit {
+            code: Some(0),
+            ok: true,
+        }));
+    }
+
+    #[test]
+    fn a_sigterm_error_is_reported_when_the_child_later_exits() {
+        let dir = temp_dir("sigterm-error");
+        let program = script(&dir, "natural-exit", "sleep 0.20; exit 0");
+        let exec = Arc::new(ScriptExec::new());
+        let (tx, rx) = channel();
+        let handle =
+            spawn_with_exec(spec(&dir, "t/sigterm-error", &program, &[]), tx, exec).unwrap();
+        start_escalation(
+            handle,
+            false,
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+        );
+
+        let events = collect_until_disconnect(&rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProcEvent::Error(message) if message.contains("SIGTERM failed")
+        )));
     }
 
     #[test]
     fn a_child_that_ignores_sigterm_reaches_sigkill() {
         let dir = temp_dir("sigkill");
-        let program = script(&dir, "stubborn", "trap '' TERM; while :; do :; done");
+        let program = script(
+            &dir,
+            "stubborn",
+            "trap '' TERM; while :; do sleep 0.02; done",
+        );
+        let exec = Arc::new(ScriptExec::new().expect(
+            |call| call.program == "kill" && call.argv().first() == Some(&"-TERM"),
+            CmdOut::ok(""),
+        ));
         let (tx, rx) = channel();
-        let handle = spawn(spec(&dir, "t/stubborn", &program, &[]), tx).unwrap();
-        stop_gracefully_with_grace(
+        let handle =
+            spawn_with_exec(spec(&dir, "t/stubborn", &program, &[]), tx, exec.clone()).unwrap();
+        let started = Instant::now();
+        start_escalation(
             handle,
             false,
-            Duration::from_millis(150),
-            Duration::from_millis(150),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
         );
 
-        let mut stopped = None;
-        while let Some(event) = recv_timeout(&rx, 10_000) {
-            match event {
-                ProcEvent::Stopped(outcome) => stopped = Some(outcome),
-                ProcEvent::Exit { code, ok } => {
-                    assert!(!ok);
-                    assert_eq!(code, None, "SIGKILL leaves no exit code");
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(stopped, Some(StopOutcome::Killed));
+        let events = collect_until_disconnect(&rx);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(events.contains(&ProcEvent::Stopped(StopOutcome::Killed)));
+        assert!(events.contains(&ProcEvent::Exit {
+            code: None,
+            ok: false,
+        }));
+        assert_eq!(exec.calls().len(), 1);
     }
 
     #[test]
@@ -831,10 +914,12 @@ mod tests {
             "waiter",
             "while [ ! -f \"$1\" ]; do sleep 0.02; done; exit 0",
         );
+        let exec = Arc::new(ScriptExec::new());
         let (tx, rx) = channel();
-        let handle = spawn(
+        let handle = spawn_with_exec(
             spec(&dir, "t/interrupt", &program, &[flag.display().to_string()]),
             tx,
+            exec,
         )
         .unwrap();
         let flag_for_hook = flag.clone();
@@ -842,42 +927,86 @@ mod tests {
             fs::write(&flag_for_hook, b"go")?;
             Ok(())
         }));
-        stop_gracefully_with_grace(
+        start_escalation(
             handle,
             true,
             Duration::from_millis(200),
             Duration::from_millis(200),
         );
 
-        let mut stopped = None;
-        while let Some(event) = recv_timeout(&rx, 10_000) {
-            if let ProcEvent::Stopped(outcome) = event {
-                stopped = Some(outcome);
-            }
-        }
-        assert_eq!(stopped, Some(StopOutcome::Exited));
+        let events = collect_until_disconnect(&rx);
+        assert!(events.contains(&ProcEvent::Stopped(StopOutcome::Exited)));
+    }
+
+    #[test]
+    fn a_protocol_interrupt_error_is_reported_when_the_child_later_exits() {
+        let dir = temp_dir("interrupt-error");
+        let program = script(&dir, "natural-exit", "sleep 0.20; exit 0");
+        let exec = Arc::new(ScriptExec::new());
+        let (tx, rx) = channel();
+        let handle =
+            spawn_with_exec(spec(&dir, "t/interrupt-error", &program, &[]), tx, exec).unwrap();
+        handle.set_interrupt_hook(Arc::new(|| Err(anyhow::anyhow!("hook broke"))));
+        start_escalation(
+            handle,
+            true,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+
+        let events = collect_until_disconnect(&rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProcEvent::Error(message) if message.contains("hook broke")
+        )));
+        assert!(events.contains(&ProcEvent::Stopped(StopOutcome::Exited)));
+    }
+
+    #[test]
+    fn the_initial_grace_allows_a_natural_exit_without_a_protocol_interrupt() {
+        let dir = temp_dir("initial-grace");
+        let program = script(&dir, "natural-exit", "sleep 0.20; exit 0");
+        let exec = Arc::new(ScriptExec::new());
+        let (tx, rx) = channel();
+        let handle = spawn_with_exec(
+            spec(&dir, "t/initial-grace", &program, &[]),
+            tx,
+            exec.clone(),
+        )
+        .unwrap();
+        start_escalation(
+            handle,
+            false,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+
+        let events = collect_until_disconnect(&rx);
+        assert!(events.contains(&ProcEvent::Stopped(StopOutcome::Exited)));
+        assert!(
+            exec.calls().is_empty(),
+            "SIGTERM ran during the grace period"
+        );
     }
 
     #[test]
     fn stop_gracefully_does_not_block_the_caller() {
         let dir = temp_dir("non-blocking");
-        let program = script(&dir, "polite2", "while :; do sleep 0.05; done");
+        let program = script(&dir, "natural-exit", "sleep 0.20; exit 0");
+        let exec = Arc::new(ScriptExec::new());
         let (tx, rx) = channel();
-        let handle = spawn(spec(&dir, "t/nonblocking", &program, &[]), tx).unwrap();
-        let started = std::time::Instant::now();
+        let handle =
+            spawn_with_exec(spec(&dir, "t/nonblocking", &program, &[]), tx, exec.clone()).unwrap();
+        let started = Instant::now();
         stop_gracefully(handle, false);
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_millis(500),
             "stop_gracefully blocked for {elapsed:?}"
         );
-        let mut stopped = None;
-        while let Some(event) = recv_timeout(&rx, 10_000) {
-            if let ProcEvent::Stopped(outcome) = event {
-                stopped = Some(outcome);
-            }
-        }
-        assert_eq!(stopped, Some(StopOutcome::Terminated));
+        let events = collect_until_disconnect(&rx);
+        assert!(events.contains(&ProcEvent::Stopped(StopOutcome::Exited)));
+        assert!(exec.calls().is_empty());
     }
 
     #[test]
@@ -893,10 +1022,13 @@ mod tests {
         handle.terminate().unwrap();
         let calls = exec.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].argv(), ["-TERM", &handle.pid().to_string()]);
+        assert_eq!(calls[0].argv(), ["-TERM", &handle.pid.to_string()]);
 
         // Clean up the child through the real SIGKILL path.
         handle.kill().unwrap();
-        while !matches!(recv_timeout(&rx, 10_000), Some(ProcEvent::Exit { .. })) {}
+        let events = collect_until_exit(&rx);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProcEvent::Exit { .. })));
     }
 }
