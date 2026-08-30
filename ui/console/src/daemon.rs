@@ -1397,7 +1397,7 @@ pub fn event_loop(daemon: &mut Daemon, rx: Receiver<Msg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::{fake_adapter, HarnessSignal};
+    use crate::harness::fake_adapter;
     use crate::snapshot::ItemState;
 
     fn paths(tmp: &std::path::Path) -> FactoryPaths {
@@ -1756,7 +1756,7 @@ mod tests {
 #[cfg(test)]
 mod replay_gate_tests {
     use super::*;
-    use crate::harness::{fake_adapter, HarnessSignal};
+    use crate::harness::fake_adapter;
 
     fn item(node_id: &str, number: u64, labels: &[&str]) -> ItemState {
         ItemState {
