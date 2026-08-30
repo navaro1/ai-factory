@@ -1020,6 +1020,31 @@ not json at all
         panic!("the fake child did not start after 100 attempts");
     }
 
+    /// Start the run and hand back its failure, retrying the transient
+    /// `Text file busy` race.
+    ///
+    /// The test writes its fake child and executes it at once. On this
+    /// kernel, that exec can lose against the write-count release of the
+    /// just-closed file and fail with `Text file busy` for a few
+    /// microseconds. Production never executes a file it just wrote, so the
+    /// retry lives in this helper and not in the runner.
+    fn failed_start_with_retry(runner: &mut ClaudeRunner, job: &Job) -> anyhow::Error {
+        for _ in 0..100 {
+            match runner.start_session(job, channel().0) {
+                Err(error)
+                    if error
+                        .chain()
+                        .any(|cause| cause.to_string().contains("Text file busy")) =>
+                {
+                    std::thread::sleep(TestDuration::from_millis(10));
+                }
+                Err(error) => return error,
+                Ok(_) => panic!("the job must fail, but the session started"),
+            }
+        }
+        panic!("the fake child did not start after 100 attempts");
+    }
+
     /// Collect run events until [`RunEvent::Exit`] arrives.
     fn collect_until_exit(rx: &Receiver<RunEvent>) -> Vec<RunEvent> {
         let deadline = Instant::now() + TEST_TIMEOUT;
@@ -1481,9 +1506,7 @@ cat > /dev/null
         let mut runner = test_runner(&dir, Arc::new(|_| {}))
             .with_handshake_timeout(TestDuration::from_millis(300));
 
-        let error = runner
-            .start_session(&job(&dir, None, true), channel().0)
-            .expect_err("the handshake must time out");
+        let error = failed_start_with_retry(&mut runner, &job(&dir, None, true));
         assert!(
             error.to_string().contains("initialize handshake"),
             "wrong error: {error}"
@@ -1505,9 +1528,7 @@ done
             .with_handshake_timeout(TestDuration::from_millis(300));
         let started = Instant::now();
 
-        let error = runner
-            .start_session(&job(&dir, None, true), channel().0)
-            .expect_err("noise must not postpone the handshake timeout");
+        let error = failed_start_with_retry(&mut runner, &job(&dir, None, true));
         let elapsed = started.elapsed();
         assert!(
             elapsed < TestDuration::from_secs(2),
@@ -1532,9 +1553,7 @@ IFS= read -r prompt
         let mut runner = test_runner(&dir, Arc::new(|_| {}))
             .with_handshake_timeout(TestDuration::from_millis(300));
 
-        let error = runner
-            .start_session(&job(&dir, None, true), channel().0)
-            .expect_err("an unrelated response must not finish the handshake");
+        let error = failed_start_with_retry(&mut runner, &job(&dir, None, true));
         assert!(
             error.to_string().contains("initialize handshake"),
             "wrong error: {error}"
@@ -1554,9 +1573,7 @@ cat > /dev/null
         let mut runner =
             test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
-        let error = runner
-            .start_session(&job(&dir, None, true), channel().0)
-            .expect_err("an invalid matching response must fail the handshake");
+        let error = failed_start_with_retry(&mut runner, &job(&dir, None, true));
         let text = error.to_string();
         assert!(text.contains("initialize handshake"), "wrong error: {text}");
         assert!(text.contains("invalid response"), "wrong error: {text}");
@@ -1574,9 +1591,7 @@ cat > /dev/null
         let mut runner =
             test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
-        let error = runner
-            .start_session(&job(&dir, None, true), channel().0)
-            .expect_err("the refused handshake must fail the job");
+        let error = failed_start_with_retry(&mut runner, &job(&dir, None, true));
         let text = error.to_string();
         assert!(text.contains("initialize handshake"), "wrong error: {text}");
         assert!(text.contains("nope"), "wrong error: {text}");
@@ -1590,9 +1605,7 @@ cat > /dev/null
         let mut runner =
             test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
-        let error = runner
-            .start_session(&job(&dir, None, true), channel().0)
-            .expect_err("the dead child must fail the job");
+        let error = failed_start_with_retry(&mut runner, &job(&dir, None, true));
         assert!(
             error.to_string().contains("initialize handshake"),
             "wrong error: {error}"
