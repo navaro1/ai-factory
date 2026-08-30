@@ -56,10 +56,7 @@ impl TaskState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            TaskState::Succeeded
-                | TaskState::Failed
-                | TaskState::Cancelled
-                | TaskState::Superseded
+            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled | TaskState::Superseded
         )
     }
 
@@ -148,7 +145,13 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
-    pub fn task_id(node: &str, kind: crate::snapshot::ItemKind, number: u64, revision: u64, attempt: u32) -> String {
+    pub fn task_id(
+        node: &str,
+        kind: crate::snapshot::ItemKind,
+        number: u64,
+        revision: u64,
+        attempt: u32,
+    ) -> String {
         format!(
             "{}-{}{}-r{}a{}",
             node,
@@ -180,7 +183,12 @@ mod tests {
 
     #[test]
     fn terminal_states_are_final() {
-        for state in [TaskState::Succeeded, TaskState::Failed, TaskState::Cancelled, TaskState::Superseded] {
+        for state in [
+            TaskState::Succeeded,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::Superseded,
+        ] {
             assert!(state.is_terminal());
             assert!(!state.can_reach(TaskState::Queued));
         }

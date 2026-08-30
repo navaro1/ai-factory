@@ -12,7 +12,7 @@ use crate::harness::{AdapterEvent, DispatchJob, HarnessAdapter, HarnessSignal, S
 use crate::task::ExtIds;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const SUPPORTED: &str = ">=0.150.1,<0.152.0";
+pub const SUPPORTED_VERSIONS: &str = ">=0.150.1,<0.152.0";
 
 pub enum CodexCmd {
     Dispatch(DispatchJob),
@@ -136,9 +136,9 @@ pub fn check_codex_version(bin: Option<&std::path::Path>) -> Result<()> {
         .split_whitespace()
         .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .ok_or_else(|| anyhow!("cannot parse codex version from {raw:?}"))?;
-    if !version_in_range(version, SUPPORTED) {
+    if !version_in_range(version, SUPPORTED_VERSIONS) {
         bail!(
-            "codex-cli {version} is outside the supported range {SUPPORTED}; \
+            "codex-cli {version} is outside the supported range {SUPPORTED_VERSIONS}; \
              set AIF_ALLOW_UNTESTED_HARNESS=1 to override"
         );
     }
@@ -207,29 +207,30 @@ impl CodexAdapter {
                 }),
             })
         });
-        spawn_worker(link_factory, rx, events.clone(), clock.clone(), compat.clone());
-        CodexAdapter {
-            tx,
-            clock,
-            compat,
-        }
+        spawn_worker(
+            link_factory,
+            rx,
+            events.clone(),
+            clock.clone(),
+            compat.clone(),
+        );
+        CodexAdapter { tx, clock, compat }
     }
 
-    pub fn with_link(
-        events: Sender<AdapterEvent>,
-        mut link_factory: LinkFactory,
-    ) -> Self {
+    pub fn with_link(events: Sender<AdapterEvent>, mut link_factory: LinkFactory) -> Self {
         let (tx, rx) = channel::<CodexCmd>();
         let clock = Arc::new(SharedClock::new());
         let compat = Arc::new(Mutex::new(Some(Ok(()))));
         let worker_link = link_factory.as_mut();
         let _ = worker_link;
-        spawn_worker(link_factory, rx, events.clone(), clock.clone(), compat.clone());
-        CodexAdapter {
-            tx,
-            clock,
-            compat,
-        }
+        spawn_worker(
+            link_factory,
+            rx,
+            events.clone(),
+            clock.clone(),
+            compat.clone(),
+        );
+        CodexAdapter { tx, clock, compat }
     }
 }
 
@@ -242,8 +243,7 @@ impl HarnessAdapter for CodexAdapter {
         let mut guard = self.compat.lock().unwrap();
         if guard.is_none() {
             *guard = Some(
-                check_codex_version(discover_native_codex().as_deref())
-                    .map_err(|e| e.to_string()),
+                check_codex_version(discover_native_codex().as_deref()).map_err(|e| e.to_string()),
             );
         }
         match guard.as_ref().unwrap() {
@@ -289,7 +289,9 @@ fn spawn_worker(
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 CodexCmd::Dispatch(job) => {
-                    if session.is_none() && !start_session(&mut session, &mut link_factory, &events, &clock) {
+                    if session.is_none()
+                        && !start_session(&mut session, &mut link_factory, &events, &clock)
+                    {
                         continue;
                     }
                     let Some(sess) = session.as_mut() else {
@@ -392,11 +394,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(
-        ends: LinkEnds,
-        events: Sender<AdapterEvent>,
-        clock: Arc<SharedClock>,
-    ) -> Self {
+    fn new(ends: LinkEnds, events: Sender<AdapterEvent>, clock: Arc<SharedClock>) -> Self {
         let LinkEnds {
             reader,
             writer,
@@ -457,7 +455,11 @@ impl Session {
             && self.notify("initialized", &serde_json::json!({})).is_ok()
     }
 
-    fn request(&mut self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, ReqErr> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ReqErr> {
         let id = self.ids.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = channel::<serde_json::Value>();
         self.pending.lock().unwrap().insert(id, tx);
@@ -482,7 +484,10 @@ impl Session {
                         .unwrap_or("unknown error");
                     return Err(definitive(format!("codex {method} error: {detail}")));
                 }
-                Ok(value.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                Ok(value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
             }
             Err(_) => Err(transport(format!("codex {method} timed out"))),
         }
@@ -583,7 +588,10 @@ fn handle_notification(
     clock: &Arc<SharedClock>,
 ) {
     let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    let params = value
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     match method {
         "turn/started" => {
             if let Some(task) = task_of(&params, registry, "threadId") {
@@ -626,7 +634,11 @@ fn handle_notification(
     }
 }
 
-fn task_of(params: &serde_json::Value, registry: &Arc<Mutex<Registry>>, key: &str) -> Option<String> {
+fn task_of(
+    params: &serde_json::Value,
+    registry: &Arc<Mutex<Registry>>,
+    key: &str,
+) -> Option<String> {
     let thread = params.get(key).and_then(|v| v.as_str())?;
     registry.lock().unwrap().by_thread.get(thread).cloned()
 }
@@ -763,9 +775,8 @@ mod tests {
             writer: _a_write,
             killer: Box::new(|| {}),
         });
-        let factory: LinkFactory = Box::new(move || {
-            ends.take().ok_or_else(|| anyhow!("already started"))
-        });
+        let factory: LinkFactory =
+            Box::new(move || ends.take().ok_or_else(|| anyhow!("already started")));
         CodexAdapter::with_link(events_tx, factory)
     }
 
@@ -795,10 +806,10 @@ mod tests {
 
     #[test]
     fn version_range_check() {
-        assert!(version_in_range("0.150.1", SUPPORTED));
-        assert!(version_in_range("0.150.9", SUPPORTED));
-        assert!(version_in_range("0.151.0", SUPPORTED));
-        assert!(!version_in_range("0.152.0", SUPPORTED));
-        assert!(!version_in_range("0.149.2", SUPPORTED));
+        assert!(version_in_range("0.150.1", SUPPORTED_VERSIONS));
+        assert!(version_in_range("0.150.9", SUPPORTED_VERSIONS));
+        assert!(version_in_range("0.151.0", SUPPORTED_VERSIONS));
+        assert!(!version_in_range("0.152.0", SUPPORTED_VERSIONS));
+        assert!(!version_in_range("0.149.2", SUPPORTED_VERSIONS));
     }
 }

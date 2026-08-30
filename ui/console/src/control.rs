@@ -58,7 +58,10 @@ impl Reply {
             ok: false,
             revision,
             result: None,
-            error: Some(ControlError { code: code.to_owned(), message }),
+            error: Some(ControlError {
+                code: code.to_owned(),
+                message,
+            }),
         }
     }
 }
@@ -76,7 +79,10 @@ pub enum Incoming {
 pub fn serve(socket_path: &Path, tx: Sender<Incoming>) -> Result<()> {
     if socket_path.exists() {
         if UnixStream::connect(socket_path).is_ok() {
-            anyhow::bail!("another daemon already listens on {}", socket_path.display());
+            anyhow::bail!(
+                "another daemon already listens on {}",
+                socket_path.display()
+            );
         }
         std::fs::remove_file(socket_path).ok();
     }
@@ -122,8 +128,8 @@ fn serve_conn(stream: UnixStream, tx: Sender<Incoming>) -> Result<()> {
             continue;
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Reply>();
-        let follow_pair = (envelope.method == "events.follow")
-            .then(std::sync::mpsc::channel::<String>);
+        let follow_pair =
+            (envelope.method == "events.follow").then(std::sync::mpsc::channel::<String>);
         if tx
             .send(Incoming::Request {
                 envelope,
@@ -160,11 +166,7 @@ fn write_reply(writer: &mut UnixStream, reply: &Reply) -> Result<()> {
     Ok(())
 }
 
-pub fn request(
-    socket_path: &Path,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<Reply> {
+pub fn request(socket_path: &Path, method: &str, params: serde_json::Value) -> Result<Reply> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("cannot reach daemon at {}", socket_path.display()))?;
     let envelope = Envelope {

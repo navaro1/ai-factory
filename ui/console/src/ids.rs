@@ -16,7 +16,13 @@ pub fn rand_hex(n_bytes: usize) -> std::io::Result<String> {
 }
 
 pub fn new_id() -> String {
-    rand_hex(8).unwrap_or_else(|_| format!("{}{:x}", std::process::id(), chrono::Utc::now().timestamp_millis() as u64))
+    rand_hex(8).unwrap_or_else(|_| {
+        format!(
+            "{}{:x}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis() as u64
+        )
+    })
 }
 
 pub fn now_iso() -> String {

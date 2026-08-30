@@ -176,6 +176,53 @@ pub fn installed_template() -> Result<String> {
         .with_context(|| format!("failed to read layout template {}", path.display()))
 }
 
+pub fn render_v4(graph: &crate::graph::Graph, root: &std::path::Path) -> Result<String> {
+    let supervised: Vec<&crate::graph::NodeSpec> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.exec == crate::graph::Exec::Supervised)
+        .collect();
+    let mut out = String::from("layout {\n");
+    out.push_str(&format!("    cwd \"{}\"\n", root.display()));
+    out.push_str("\n    default_tab_template {\n");
+    out.push_str("        pane size=1 borderless=true {\n");
+    out.push_str("            plugin location=\"zellij:tab-bar\"\n");
+    out.push_str("        }\n");
+    out.push_str("        children\n");
+    out.push_str("        pane size=2 borderless=true {\n");
+    out.push_str("            plugin location=\"zellij:status-bar\"\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("\n    tab name=\"Cockpit\" focus=true {\n");
+    out.push_str("        pane name=\"Cockpit\" command=\"aif\" {\n");
+    out.push_str("            args \"tui\"\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    for node in supervised {
+        let role = capitalize(&node.name);
+        out.push_str(&format!("\n    tab name=\"{role}\" {{\n",));
+        out.push_str(&format!(
+            "        pane name=\"{role}\" command=\"clauded\" {{\n"
+        ));
+        out.push_str(&format!(
+            "            args \"--role\" \"{role}\" \"--model\" \"{}\"\n",
+            node.model
+        ));
+        out.push_str("        }\n");
+        out.push_str("    }\n");
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn capitalize(raw: &str) -> String {
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +283,24 @@ mod tests {
     fn unknown_tokens_are_ignored() {
         let text = skip(&["bogus", "planner"]).unwrap();
         assert!(!text.contains("Planner - borsuk"));
+    }
+}
+
+#[cfg(test)]
+mod v4_tests {
+    use super::*;
+
+    #[test]
+    fn v4_layout_has_cockpit_and_supervised_panes_only() {
+        let graph = crate::graph::Graph::parse(
+            "graph version=4 {\n    node \"refiner\" {\n        agent \"codex\"\n        model \"m\"\n        exec \"auto\"\n        when \"issue is open\"\n        prompt \"p.md\"\n    }\n    node \"releaser\" {\n        agent \"claude\"\n        model \"c\"\n        exec \"supervised\"\n        when \"pr is open\"\n        prompt \"r.md\"\n    }\n}\n",
+        )
+        .unwrap();
+        let text = render_v4(&graph, std::path::Path::new("/repo")).unwrap();
+        assert!(text.contains("command=\"aif\""));
+        assert!(text.contains("clauded"));
+        assert!(!text.contains("codexd"));
+        assert!(!text.contains("opencoded"));
+        assert!(text.contains("name=\"Releaser\""));
     }
 }

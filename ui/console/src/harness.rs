@@ -26,15 +26,26 @@ pub enum HarnessSignal {
 
 #[derive(Debug, Clone)]
 pub enum AdapterEvent {
-    DispatchAccepted { task: String, ext: ExtIds },
+    DispatchAccepted {
+        task: String,
+        ext: ExtIds,
+    },
     DispatchFailed {
         task: String,
         definitive: bool,
         detail: String,
     },
-    Signal { task: String, signal: HarnessSignal },
-    Unknown { task: String, detail: String },
-    Notice { detail: String },
+    Signal {
+        task: String,
+        signal: HarnessSignal,
+    },
+    Unknown {
+        task: String,
+        detail: String,
+    },
+    Notice {
+        detail: String,
+    },
 }
 
 pub trait HarnessAdapter: Send {
@@ -189,7 +200,12 @@ impl FakeHandle {
         self.state
             .clock
             .set_active(self.state.clock.active_count().saturating_sub(1));
-        self.signal(task, HarnessSignal::Succeeded { summary: String::new() });
+        self.signal(
+            task,
+            HarnessSignal::Succeeded {
+                summary: String::new(),
+            },
+        );
     }
 }
 

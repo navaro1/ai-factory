@@ -196,7 +196,12 @@ mod tests {
         let dir = dir();
         let path = dir.join("journal.jsonl");
         let (mut journal, _) = Journal::open(&path).unwrap();
-        journal.append(Rec::SourceBatch { items: vec![item("I_1")], forced: false }).unwrap();
+        journal
+            .append(Rec::SourceBatch {
+                items: vec![item("I_1")],
+                forced: false,
+            })
+            .unwrap();
         journal
             .append(Rec::TaskTransition {
                 id: "t1".into(),
@@ -219,7 +224,11 @@ mod tests {
         let path = dir.join("journal.jsonl");
         let (mut journal, _) = Journal::open(&path).unwrap();
         journal.append(Rec::Trust { granted: true }).unwrap();
-        std::fs::write(&path, "{\"seq\":1,\"ts\":\"x\",\"v\":1,\"kind\":\"trust\",\"granted\":true}\n{torn").unwrap();
+        std::fs::write(
+            &path,
+            "{\"seq\":1,\"ts\":\"x\",\"v\":1,\"kind\":\"trust\",\"granted\":true}\n{torn",
+        )
+        .unwrap();
         let records = Journal::replay(&path).unwrap();
         assert_eq!(records.len(), 1);
 

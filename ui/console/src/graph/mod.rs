@@ -207,7 +207,9 @@ impl Graph {
                         bail!("node {name}: `retrigger` requires graph version 4");
                     }
                     if version >= 4 && agent == Agent::Claude && exec == Exec::Auto {
-                        bail!("node {name}: claude cannot run with exec \"auto\"; keep it supervised");
+                        bail!(
+                            "node {name}: claude cannot run with exec \"auto\"; keep it supervised"
+                        );
                     }
                     graph.nodes.push(NodeSpec {
                         name,

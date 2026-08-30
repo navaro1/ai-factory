@@ -138,7 +138,8 @@ impl FactoryPaths {
     }
 
     pub fn task_log(&self, task: &str) -> PathBuf {
-        self.logs_dir().join(format!("{}.log", ids::sanitize_component(task)))
+        self.logs_dir()
+            .join(format!("{}.log", ids::sanitize_component(task)))
     }
 
     pub fn worktrees_dir(&self) -> PathBuf {

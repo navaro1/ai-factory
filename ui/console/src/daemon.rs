@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use crate::codex::CodexAdapter;
 use crate::control::{self, Incoming, Reply};
 use crate::factory::FactoryPaths;
 use crate::graph::{Agent, Exec, Graph};
@@ -12,7 +13,6 @@ use crate::harness::{AdapterEvent, DispatchJob, HarnessAdapter, HarnessSignal};
 use crate::ids;
 use crate::journal::{Journal, Rec};
 use crate::ocserve::OcAdapter;
-use crate::codex::CodexAdapter;
 use crate::snapshot::{apply_batch, GateTracker, ItemKind, ItemState, ReadyWork};
 use crate::source::{GithubPoller, Observation, PollConfig, RealGh};
 use crate::task::{TaskRecord, TaskState};
@@ -25,7 +25,10 @@ pub enum Msg {
     Harness(&'static str, AdapterEvent),
     Control(Incoming),
     Tick,
-    Stop { force: bool, reply: Option<Sender<Reply>> },
+    Stop {
+        force: bool,
+        reply: Option<Sender<Reply>>,
+    },
 }
 
 pub type PresentFn = Box<dyn Fn(&str, &str, &str) -> Result<()> + Send>;
@@ -68,7 +71,13 @@ pub fn real_worktrees() -> WorktreeMaker {
             let branch = format!("aif/{}", ids::sanitize_component(&task.id));
             let out = std::process::Command::new("git")
                 .current_dir(&paths.root)
-                .args(["worktree", "add", "-b", &branch, dir.to_string_lossy().as_ref()])
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    dir.to_string_lossy().as_ref(),
+                ])
                 .output()
                 .with_context(|| "git worktree add failed to start")?;
             if !out.status.success() {
@@ -247,17 +256,22 @@ impl Daemon {
             let recovered = match (state, exec) {
                 (TaskState::Reserved, Exec::Auto) => {
                     if begun {
-                        Some((TaskState::Uncertain, "recovered after crash; dispatch may have started".to_owned()))
+                        Some((
+                            TaskState::Uncertain,
+                            "recovered after crash; dispatch may have started".to_owned(),
+                        ))
                     } else {
                         Some((TaskState::Queued, "recovered before transport".to_owned()))
                     }
                 }
-                (TaskState::Accepted, Exec::Auto) | (TaskState::Running, Exec::Auto) => {
-                    Some((TaskState::Uncertain, "harness state lost after restart".to_owned()))
-                }
-                (TaskState::CancelRequested, _) => {
-                    Some((TaskState::Uncertain, "cancellation outcome unknown after restart".to_owned()))
-                }
+                (TaskState::Accepted, Exec::Auto) | (TaskState::Running, Exec::Auto) => Some((
+                    TaskState::Uncertain,
+                    "harness state lost after restart".to_owned(),
+                )),
+                (TaskState::CancelRequested, _) => Some((
+                    TaskState::Uncertain,
+                    "cancellation outcome unknown after restart".to_owned(),
+                )),
                 _ => None,
             };
             if let Some((to, detail)) = recovered {
@@ -274,7 +288,8 @@ impl Daemon {
         let record = self.journal.append(rec)?;
         self.revision = record.seq;
         let line = serde_json::to_string(&record)?;
-        self.subscribers.retain(|(_, tx)| tx.send(line.clone()).is_ok());
+        self.subscribers
+            .retain(|(_, tx)| tx.send(line.clone()).is_ok());
         Ok(())
     }
 
@@ -324,10 +339,7 @@ impl Daemon {
     }
 
     fn node_limit(&self, node: &str) -> usize {
-        self.graph
-            .node(node)
-            .and_then(|n| n.limit)
-            .unwrap_or(1)
+        self.graph.node(node).and_then(|n| n.limit).unwrap_or(1)
     }
 
     fn node_count(&self, node: &str) -> usize {
@@ -403,9 +415,7 @@ impl Daemon {
             return;
         }
         let gate_key = GateTracker::gate_key(&work.node, &work.item_node_id);
-        self.gates
-            .last_tasked_rev
-            .insert(gate_key, work.revision);
+        self.gates.last_tasked_rev.insert(gate_key, work.revision);
         self.tasks.insert(
             id.clone(),
             TaskRecord {
@@ -464,10 +474,10 @@ impl Daemon {
             };
             let node = task.node.clone();
             if self.node_count(&node) >= self.node_limit(&node) {
-                                return;
+                return;
             }
             if task.state.consumes_global() || self.global_count() >= self.graph.limit {
-                                return;
+                return;
             }
             let exec = task.exec;
             let agent = task.agent;
@@ -488,7 +498,11 @@ impl Daemon {
                         let session = self.supervised.session.clone();
                         let presented = (self.supervised.present)(&session, &pane, &prompt);
                         if presented.is_ok() {
-                            self.transition(&id, TaskState::AwaitingUser, &format!("prefilled {pane}"));
+                            self.transition(
+                                &id,
+                                TaskState::AwaitingUser,
+                                &format!("prefilled {pane}"),
+                            );
                         } else {
                             self.transition(&id, TaskState::Failed, "pane prefill failed");
                         }
@@ -500,12 +514,14 @@ impl Daemon {
                 continue;
             }
             if !self.paths.trusted() {
-                self.log(format!("task {id} waits: factory is not trusted; run `aif trust`"));
-                                return;
+                self.log(format!(
+                    "task {id} waits: factory is not trusted; run `aif trust`"
+                ));
+                return;
             }
             if self.stale_source {
                 self.log(format!("task {id} waits: source is stale"));
-                                return;
+                return;
             }
             if !self.adapters.contains_key(agent.as_str()) {
                 self.transition(&id, TaskState::Failed, "no adapter for agent");
@@ -515,8 +531,8 @@ impl Daemon {
                 self.log(format!("task {id} waits: {}: {err:#}", agent.as_str()));
                 return;
             }
-                        if !self.transition(&id, TaskState::Reserved, "") {
-                                return;
+            if !self.transition(&id, TaskState::Reserved, "") {
+                return;
             }
             let worktree = {
                 let task = &self.tasks[&id];
@@ -561,17 +577,16 @@ impl Daemon {
                     .map(|n| n.model.clone())
                     .unwrap_or_default(),
                 prompt,
-                cwd: PathBuf::from(task.worktree.clone().unwrap_or_else(|| {
-                    self.paths.root.display().to_string()
-                })),
+                cwd: PathBuf::from(
+                    task.worktree
+                        .clone()
+                        .unwrap_or_else(|| self.paths.root.display().to_string()),
+                ),
                 attempt: task.attempt,
                 title: task.title.clone(),
             };
             self.log(format!("task {id} dispatched to {target}"));
-            self.adapters
-                .get_mut(agent.as_str())
-                .unwrap()
-                .dispatch(job);
+            self.adapters.get_mut(agent.as_str()).unwrap().dispatch(job);
         }
     }
 
@@ -727,7 +742,11 @@ impl Daemon {
             "ping" => self.reply_ok(&envelope.id, serde_json::json!({"pong": true})),
             "status" => self.reply_ok(&envelope.id, self.status_json()),
             "pause" => {
-                let node = envelope.params.get("node").and_then(|n| n.as_str()).map(str::to_owned);
+                let node = envelope
+                    .params
+                    .get("node")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned);
                 let _ = self.append(Rec::Paused {
                     node: node.clone(),
                     paused: true,
@@ -735,7 +754,10 @@ impl Daemon {
                 match node {
                     Some(node) => {
                         self.paused_nodes.insert(node.clone());
-                        self.reply_ok(&envelope.id, serde_json::json!({"node": node, "paused": true}))
+                        self.reply_ok(
+                            &envelope.id,
+                            serde_json::json!({"node": node, "paused": true}),
+                        )
                     }
                     None => {
                         self.paused_global = true;
@@ -744,7 +766,11 @@ impl Daemon {
                 }
             }
             "resume" => {
-                let node = envelope.params.get("node").and_then(|n| n.as_str()).map(str::to_owned);
+                let node = envelope
+                    .params
+                    .get("node")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned);
                 let _ = self.append(Rec::Paused {
                     node: node.clone(),
                     paused: false,
@@ -752,7 +778,10 @@ impl Daemon {
                 match node {
                     Some(node) => {
                         self.paused_nodes.remove(&node);
-                        self.reply_ok(&envelope.id, serde_json::json!({"node": node, "paused": false}))
+                        self.reply_ok(
+                            &envelope.id,
+                            serde_json::json!({"node": node, "paused": false}),
+                        )
                     }
                     None => {
                         self.paused_global = false;
@@ -768,19 +797,31 @@ impl Daemon {
                 self.reply_ok(&envelope.id, serde_json::json!({"reconcile": "requested"}))
             }
             "task.submit" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 self.submit_supervised(&id, &envelope.id)
             }
             "task.cancel" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 self.cancel(&id, &envelope.id)
             }
             "task.retry" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 self.retry(&id, &envelope.id)
             }
             "task.resolve" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 let outcome = envelope.params["outcome"].as_str().unwrap_or_default();
                 let to = match outcome {
                     "succeeded" => Some(TaskState::Succeeded),
@@ -800,36 +841,77 @@ impl Daemon {
                 };
                 if self.transition(&id, to, "operator resolved") {
                     self.pump();
-                    self.reply_ok(&envelope.id, serde_json::json!({"task": id, "state": to.as_str()}))
+                    self.reply_ok(
+                        &envelope.id,
+                        serde_json::json!({"task": id, "state": to.as_str()}),
+                    )
                 } else {
-                    Reply::err(&envelope.id, self.revision, "bad_state", "task is not uncertain".into())
+                    Reply::err(
+                        &envelope.id,
+                        self.revision,
+                        "bad_state",
+                        "task is not uncertain".into(),
+                    )
                 }
             }
             "task.dismiss" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 if self.transition(&id, TaskState::Superseded, "dismissed") {
                     self.pump();
-                    self.reply_ok(&envelope.id, serde_json::json!({"task": id, "state": "superseded"}))
+                    self.reply_ok(
+                        &envelope.id,
+                        serde_json::json!({"task": id, "state": "superseded"}),
+                    )
                 } else {
-                    Reply::err(&envelope.id, self.revision, "bad_state", "task is not dismissable".into())
+                    Reply::err(
+                        &envelope.id,
+                        self.revision,
+                        "bad_state",
+                        "task is not dismissable".into(),
+                    )
                 }
             }
             "task.complete" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 if self.transition(&id, TaskState::Succeeded, "operator completed") {
                     self.pump();
-                    self.reply_ok(&envelope.id, serde_json::json!({"task": id, "state": "succeeded"}))
+                    self.reply_ok(
+                        &envelope.id,
+                        serde_json::json!({"task": id, "state": "succeeded"}),
+                    )
                 } else {
-                    Reply::err(&envelope.id, self.revision, "bad_state", "task cannot complete".into())
+                    Reply::err(
+                        &envelope.id,
+                        self.revision,
+                        "bad_state",
+                        "task cannot complete".into(),
+                    )
                 }
             }
             "task.fail" => {
-                let id = envelope.params["task"].as_str().unwrap_or_default().to_owned();
+                let id = envelope.params["task"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
                 if self.transition(&id, TaskState::Failed, "operator failed") {
                     self.pump();
-                    self.reply_ok(&envelope.id, serde_json::json!({"task": id, "state": "failed"}))
+                    self.reply_ok(
+                        &envelope.id,
+                        serde_json::json!({"task": id, "state": "failed"}),
+                    )
                 } else {
-                    Reply::err(&envelope.id, self.revision, "bad_state", "task cannot fail".into())
+                    Reply::err(
+                        &envelope.id,
+                        self.revision,
+                        "bad_state",
+                        "task cannot fail".into(),
+                    )
                 }
             }
             "stop" => {
@@ -861,7 +943,8 @@ impl Daemon {
                             }
                         }
                     }
-                    let reply_msg = self.reply_ok(&envelope.id, serde_json::json!({"stopping": true}));
+                    let reply_msg =
+                        self.reply_ok(&envelope.id, serde_json::json!({"stopping": true}));
                     let _ = reply.send(reply_msg.clone());
                     self.stop_flag = true;
                     reply_msg
@@ -885,18 +968,38 @@ impl Daemon {
 
     fn submit_supervised(&mut self, id: &str, request_id: &str) -> Reply {
         let Some(task) = self.tasks.get(id) else {
-            return Reply::err(request_id, self.revision, "not_found", "no such task".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "not_found",
+                "no such task".into(),
+            );
         };
         if task.state != TaskState::AwaitingUser {
-            return Reply::err(request_id, self.revision, "bad_state", "task is not awaiting the user".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "bad_state",
+                "task is not awaiting the user".into(),
+            );
         }
         let node = task.node.clone();
         if !self.transition(id, TaskState::Reserved, "user submitted") {
-            return Reply::err(request_id, self.revision, "bad_state", "submit refused".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "bad_state",
+                "submit refused".into(),
+            );
         }
         let Some(pane) = self.pane_for(&node) else {
             self.transition(id, TaskState::Failed, "pane vanished");
-            return Reply::err(request_id, self.revision, "bad_state", "pane vanished".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "bad_state",
+                "pane vanished".into(),
+            );
         };
         let session = self.supervised.session.clone();
         let outcome = (self.supervised.submit)(&session, &pane);
@@ -904,27 +1007,48 @@ impl Daemon {
             Ok(()) => {
                 self.transition(id, TaskState::Accepted, "submitted to pane");
                 self.pump();
-                self.reply_ok(request_id, serde_json::json!({"task": id, "state": "accepted"}))
+                self.reply_ok(
+                    request_id,
+                    serde_json::json!({"task": id, "state": "accepted"}),
+                )
             }
             Err(err) => {
                 self.transition(id, TaskState::Failed, &format!("submit failed: {err:#}"));
-                Reply::err(request_id, self.revision, "submit_failed", format!("{err:#}"))
+                Reply::err(
+                    request_id,
+                    self.revision,
+                    "submit_failed",
+                    format!("{err:#}"),
+                )
             }
         }
     }
 
     fn cancel(&mut self, id: &str, request_id: &str) -> Reply {
         let Some(task) = self.tasks.get(id) else {
-            return Reply::err(request_id, self.revision, "not_found", "no such task".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "not_found",
+                "no such task".into(),
+            );
         };
         let (state, exec, agent) = (task.state, task.exec, task.agent);
         match state {
             TaskState::Queued | TaskState::Presenting | TaskState::AwaitingUser => {
                 if self.transition(id, TaskState::Cancelled, "operator cancelled") {
                     self.pump();
-                    self.reply_ok(request_id, serde_json::json!({"task": id, "state": "cancelled"}))
+                    self.reply_ok(
+                        request_id,
+                        serde_json::json!({"task": id, "state": "cancelled"}),
+                    )
                 } else {
-                    Reply::err(request_id, self.revision, "bad_state", "cancel refused".into())
+                    Reply::err(
+                        request_id,
+                        self.revision,
+                        "bad_state",
+                        "cancel refused".into(),
+                    )
                 }
             }
             TaskState::Reserved if exec == Exec::Auto => {
@@ -933,11 +1057,17 @@ impl Daemon {
                         adapter.cancel(id);
                     }
                     self.transition(id, TaskState::CancelRequested, "operator cancelled");
-                    self.reply_ok(request_id, serde_json::json!({"task": id, "state": "cancel_requested"}))
+                    self.reply_ok(
+                        request_id,
+                        serde_json::json!({"task": id, "state": "cancel_requested"}),
+                    )
                 } else {
                     self.transition(id, TaskState::Cancelled, "operator cancelled");
                     self.pump();
-                    self.reply_ok(request_id, serde_json::json!({"task": id, "state": "cancelled"}))
+                    self.reply_ok(
+                        request_id,
+                        serde_json::json!({"task": id, "state": "cancelled"}),
+                    )
                 }
             }
             TaskState::Accepted | TaskState::Running | TaskState::Reserved => {
@@ -945,15 +1075,28 @@ impl Daemon {
                     adapter.cancel(id);
                 }
                 self.transition(id, TaskState::CancelRequested, "operator cancelled");
-                self.reply_ok(request_id, serde_json::json!({"task": id, "state": "cancel_requested"}))
+                self.reply_ok(
+                    request_id,
+                    serde_json::json!({"task": id, "state": "cancel_requested"}),
+                )
             }
-            _ => Reply::err(request_id, self.revision, "bad_state", "task cannot be cancelled".into()),
+            _ => Reply::err(
+                request_id,
+                self.revision,
+                "bad_state",
+                "task cannot be cancelled".into(),
+            ),
         }
     }
 
     fn retry(&mut self, id: &str, request_id: &str) -> Reply {
         let Some(task) = self.tasks.get(id) else {
-            return Reply::err(request_id, self.revision, "not_found", "no such task".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "not_found",
+                "no such task".into(),
+            );
         };
         let (node, kind, number, revision, attempt, item_node_id, title) = (
             task.node.clone(),
@@ -978,12 +1121,14 @@ impl Daemon {
         let next_attempt = attempt + 1;
         let new_id = TaskRecord::task_id(&node, kind, number, revision, next_attempt);
         if self.tasks.contains_key(&new_id) {
-            return Reply::err(request_id, self.revision, "exists", "retry attempt already exists".into());
+            return Reply::err(
+                request_id,
+                self.revision,
+                "exists",
+                "retry attempt already exists".into(),
+            );
         }
-        let spec = self
-            .graph
-            .node(&node)
-            .map(|s| (s.agent, s.exec));
+        let spec = self.graph.node(&node).map(|s| (s.agent, s.exec));
         let record = Rec::TaskCreated {
             id: new_id.clone(),
             node: node.clone(),
@@ -1020,7 +1165,10 @@ impl Daemon {
         );
         self.order.push(new_id.clone());
         self.pump();
-        self.reply_ok(request_id, serde_json::json!({"task": new_id, "state": "queued"}))
+        self.reply_ok(
+            request_id,
+            serde_json::json!({"task": new_id, "state": "queued"}),
+        )
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -1028,11 +1176,7 @@ impl Daemon {
     }
 }
 
-pub fn run(
-    paths: FactoryPaths,
-    graph: Graph,
-    supervise_process: bool,
-) -> Result<()> {
+pub fn run(paths: FactoryPaths, graph: Graph, supervise_process: bool) -> Result<()> {
     paths.ensure()?;
     let (mut journal, records) = Journal::open(&paths.journal())?;
     let (events_tx, events_rx) = channel::<AdapterEvent>();
@@ -1062,6 +1206,10 @@ pub fn run(
         real_worktrees(),
         records,
     )?;
+
+    if !supervise_process {
+        return run_once_inline(&mut daemon, &paths, events_rx);
+    }
 
     let (msg_tx, msg_rx) = channel::<Msg>();
     let (wake_tx, wake_rx) = channel::<()>();
@@ -1161,6 +1309,34 @@ fn spawn_log_writer(dir: PathBuf, rx: Receiver<String>) {
     });
 }
 
+fn run_once_inline(
+    daemon: &mut Daemon,
+    paths: &FactoryPaths,
+    events_rx: Receiver<AdapterEvent>,
+) -> Result<()> {
+    match crate::source::owner_repo_of(&paths.root) {
+        Ok((owner_repo, repo_id)) => {
+            let mut poller = GithubPoller::new(RealGh, repo_id, owner_repo);
+            match poller.poll(true) {
+                Ok(obs) => daemon.observe(obs),
+                Err(err) => {
+                    eprintln!("aif: github poll failed: {err:#}");
+                }
+            }
+        }
+        Err(err) => eprintln!("aif: github source unavailable: {err:#}"),
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match events_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(event) => daemon.on_adapter("adapter", event),
+            Err(_) => break,
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&daemon.status_json())?);
+    Ok(())
+}
+
 pub fn event_loop(daemon: &mut Daemon, rx: Receiver<Msg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -1194,7 +1370,11 @@ pub fn event_loop(daemon: &mut Daemon, rx: Receiver<Msg>) {
                 }
                 daemon.stop_flag = true;
                 if let Some(reply) = reply {
-                    let _ = reply.send(Reply::ok("stop", daemon.revision(), serde_json::json!({"stopping": true})));
+                    let _ = reply.send(Reply::ok(
+                        "stop",
+                        daemon.revision(),
+                        serde_json::json!({"stopping": true}),
+                    ));
                 }
                 return;
             }
@@ -1221,8 +1401,8 @@ mod tests {
     }
 
     fn graph() -> Graph {
-        use crate::graph::{Agent, Exec, NodeSpec};
         use crate::graph::conditions::Condition;
+        use crate::graph::{Agent, Exec, NodeSpec};
         let spec = |name: &str, agent: Agent, exec: Exec, when: &str| NodeSpec {
             name: name.into(),
             agent,
@@ -1238,8 +1418,18 @@ mod tests {
             tick_secs: 600,
             limit: 2,
             nodes: vec![
-                spec("refiner", Agent::Codex, Exec::Auto, "issue has label 'to-refine'"),
-                spec("releaser", Agent::Claude, Exec::Supervised, "pr is open and not draft"),
+                spec(
+                    "refiner",
+                    Agent::Codex,
+                    Exec::Auto,
+                    "issue has label 'to-refine'",
+                ),
+                spec(
+                    "releaser",
+                    Agent::Claude,
+                    Exec::Supervised,
+                    "pr is open and not draft",
+                ),
             ],
             edges: vec![],
         }
@@ -1329,10 +1519,19 @@ mod tests {
         let status = rig.daemon.status_json();
         assert_eq!(status["tasks"].as_array().unwrap().len(), 1);
         let task = &status["tasks"][0];
-        assert!(task["state"].as_str().unwrap().starts_with("reserved") || task["state"].as_str().unwrap().starts_with("accepted"),
-            "state was {:?}", task["state"]);
+        assert!(
+            task["state"].as_str().unwrap().starts_with("reserved")
+                || task["state"].as_str().unwrap().starts_with("accepted"),
+            "state was {:?}",
+            task["state"]
+        );
         let id = task["id"].as_str().unwrap().to_owned();
-        rig.codex.signal(&id, HarnessSignal::Succeeded { summary: String::new() });
+        rig.codex.signal(
+            &id,
+            HarnessSignal::Succeeded {
+                summary: String::new(),
+            },
+        );
         drain(&mut rig.daemon, &rig.events_rx);
         let status = rig.daemon.status_json();
         assert_eq!(status["tasks"][0]["state"], "succeeded");
@@ -1402,19 +1601,35 @@ mod tests {
         };
         rig.daemon.graph = graph;
         rig.daemon.observe(Observation {
-            items: vec![item("I_1", 1, &["to-refine"]), item("I_2", 2, &["to-refine"])],
+            items: vec![
+                item("I_1", 1, &["to-refine"]),
+                item("I_2", 2, &["to-refine"]),
+            ],
             forced: true,
             stale: false,
         });
         drain(&mut rig.daemon, &rig.events_rx);
-        assert_eq!(rig.codex.jobs().len(), 1, "global limit one reserves one task");
+        assert_eq!(
+            rig.codex.jobs().len(),
+            1,
+            "global limit one reserves one task"
+        );
         let id = rig.daemon.status_json()["tasks"][0]["id"]
             .as_str()
             .unwrap()
             .to_owned();
-        rig.codex.signal(&id, HarnessSignal::Succeeded { summary: String::new() });
+        rig.codex.signal(
+            &id,
+            HarnessSignal::Succeeded {
+                summary: String::new(),
+            },
+        );
         drain(&mut rig.daemon, &rig.events_rx);
-        assert_eq!(rig.codex.jobs().len(), 2, "capacity released dispatches the next task");
+        assert_eq!(
+            rig.codex.jobs().len(),
+            2,
+            "capacity released dispatches the next task"
+        );
     }
 
     #[test]
@@ -1451,7 +1666,9 @@ mod tests {
             },
             AdapterEvent::Signal {
                 task: "refiner-issue1-r1000003a1".into(),
-                signal: HarnessSignal::Failed { summary: "boom".into() },
+                signal: HarnessSignal::Failed {
+                    summary: "boom".into(),
+                },
             },
         ]);
         rig.daemon.observe(Observation {
@@ -1463,7 +1680,12 @@ mod tests {
         let status = rig.daemon.status_json();
         if status["tasks"][0]["state"] == "queued" {
             let id = status["tasks"][0]["id"].as_str().unwrap().to_owned();
-            rig.codex.signal(&id, HarnessSignal::Failed { summary: "boom".into() });
+            rig.codex.signal(
+                &id,
+                HarnessSignal::Failed {
+                    summary: "boom".into(),
+                },
+            );
             drain(&mut rig.daemon, &rig.events_rx);
         }
         let status = rig.daemon.status_json();

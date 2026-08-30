@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod app;
+pub mod cockpit;
 pub mod codex;
 pub mod control;
 pub mod daemon;
@@ -9,8 +10,11 @@ pub mod harness;
 pub mod ids;
 pub mod journal;
 pub mod layout;
+pub mod legacy;
 pub mod mem;
+pub mod migrate;
 pub mod ocserve;
+pub mod ops;
 pub mod probe;
 pub mod runner;
 pub mod scheduler;

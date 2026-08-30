@@ -65,14 +65,12 @@ pub fn parse_gh_output(code: i32, stdout: &str, stderr: &str) -> std::io::Result
         }
     }
     if status == 0 && !stderr.trim().is_empty() {
-        return Err(std::io::Error::other(
-            stderr.trim().to_owned(),
-        ));
+        return Err(std::io::Error::other(stderr.trim().to_owned()));
     }
     if status == 0 {
-        return Err(std::io::Error::other(
-            format!("gh exited {code} without headers"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "gh exited {code} without headers"
+        )));
     }
     Ok(GhOut {
         status,
@@ -189,7 +187,9 @@ impl<R: GhRunner> GithubPoller<R> {
         let mut items = Vec::new();
         let mut page = 1u32;
         loop {
-            let url = format!("{base_url}?state=open&sort=created&direction=asc&per_page=100&page={page}");
+            let url = format!(
+                "{base_url}?state=open&sort=created&direction=asc&per_page=100&page={page}"
+            );
             let entry = self.pages.get(&url);
             let etag = entry.and_then(|p| p.etag.clone());
             let mut out = self.fetch_page(&url, etag.as_deref())?;
@@ -244,12 +244,13 @@ impl<R: GhRunner> GithubPoller<R> {
         let issues_url = self.issues_url.clone();
         let pulls_url = self.pulls_url.clone();
         let repo_id = self.repo_id;
-        let mut items = self.collect_kind::<IssueJson>(&issues_url, move |raw| {
-            issue_to_state(repo_id, raw)
-        })?;
-        items.extend(self.collect_kind::<PullJson>(&pulls_url, move |raw| {
-            Some(pull_to_state(repo_id, raw))
-        })?);
+        let mut items =
+            self.collect_kind::<IssueJson>(&issues_url, move |raw| issue_to_state(repo_id, raw))?;
+        items.extend(
+            self.collect_kind::<PullJson>(&pulls_url, move |raw| {
+                Some(pull_to_state(repo_id, raw))
+            })?,
+        );
         self.last_success = Some(Instant::now());
         if force {
             self.last_forced = Some(Instant::now());
@@ -353,7 +354,7 @@ mod tests {
             self.responses
                 .borrow_mut()
                 .pop_front()
-                .ok_or_else(|| std::io::Error::other( "script empty"))
+                .ok_or_else(|| std::io::Error::other("script empty"))
         }
     }
 
@@ -446,7 +447,10 @@ mod tests {
         assert_eq!(first.items.len(), 1);
 
         let gh2 = ScriptGh {
-            responses: RefCell::new(std::collections::VecDeque::from(vec![resp(200, "\"e1\"", &issue_body(1, "to-refine")), resp(500, "", "[]")])),
+            responses: RefCell::new(std::collections::VecDeque::from(vec![
+                resp(200, "\"e1\"", &issue_body(1, "to-refine")),
+                resp(500, "", "[]"),
+            ])),
             requests: RefCell::new(Vec::new()),
         };
         let mut poller2 = GithubPoller {

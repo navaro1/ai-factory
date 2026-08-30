@@ -12,7 +12,7 @@ use crate::harness::{AdapterEvent, DispatchJob, HarnessAdapter, HarnessSignal, S
 use crate::ids;
 use crate::task::ExtIds;
 
-const SUPPORTED: &str = ">=1.18.25,<1.20.0";
+pub const SUPPORTED_VERSIONS: &str = ">=1.18.25,<1.20.0";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -58,9 +58,9 @@ pub fn check_oc_version() -> Result<()> {
         .split_whitespace()
         .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .ok_or_else(|| anyhow!("cannot parse opencode version from {raw:?}"))?;
-    if !version_in_range(version, SUPPORTED) {
+    if !version_in_range(version, SUPPORTED_VERSIONS) {
         bail!(
-            "opencode {version} is outside the supported range {SUPPORTED}; \
+            "opencode {version} is outside the supported range {SUPPORTED_VERSIONS}; \
              set AIF_ALLOW_UNTESTED_HARNESS=1 to override"
         );
     }
@@ -155,17 +155,18 @@ impl OcAdapter {
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         OcCmd::Dispatch(job) => {
-                            let shared = match ensure_server(&worker_server, &mut child, &events, &clock) {
-                                Some(s) => s,
-                                None => {
-                                    let _ = events.send(AdapterEvent::DispatchFailed {
-                                        task: job.task.clone(),
-                                        definitive: true,
-                                        detail: "opencode server unavailable".into(),
-                                    });
-                                    continue;
-                                }
-                            };
+                            let shared =
+                                match ensure_server(&worker_server, &mut child, &events, &clock) {
+                                    Some(s) => s,
+                                    None => {
+                                        let _ = events.send(AdapterEvent::DispatchFailed {
+                                            task: job.task.clone(),
+                                            definitive: true,
+                                            detail: "opencode server unavailable".into(),
+                                        });
+                                        continue;
+                                    }
+                                };
                             dispatch_job(&shared, &job, &events, &clock);
                         }
                         OcCmd::Cancel(task) => {
@@ -174,7 +175,8 @@ impl OcAdapter {
                                 if let Some(session) =
                                     shared.owned.lock().unwrap().get(&task).cloned()
                                 {
-                                    let url = format!("{}/session/{session}/abort", shared.info.base_url);
+                                    let url =
+                                        format!("{}/session/{session}/abort", shared.info.base_url);
                                     let _ = shared
                                         .agent
                                         .post(&url)
@@ -277,10 +279,7 @@ fn dispatch_job(
         .send_json(body);
     let session = match create {
         Ok(resp) => match resp.into_json::<serde_json::Value>() {
-            Ok(value) => value["id"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_default(),
+            Ok(value) => value["id"].as_str().map(str::to_owned).unwrap_or_default(),
             Err(_) => String::new(),
         },
         Err(ureq::Error::Status(code, _)) => {
@@ -310,7 +309,10 @@ fn dispatch_job(
         Some((p, m)) => (p.to_owned(), m.to_owned()),
         None => (job.model.clone(), job.model.clone()),
     };
-    let prompt_url = format!("{base}/session/{session}/prompt_async?directory={}", job.cwd.display());
+    let prompt_url = format!(
+        "{base}/session/{session}/prompt_async?directory={}",
+        job.cwd.display()
+    );
     let prompt_body = serde_json::json!({
         "model": { "providerID": provider_id, "modelID": model_id },
         "agent": "build",
@@ -330,11 +332,7 @@ fn dispatch_job(
                 .lock()
                 .unwrap()
                 .insert(job.task.clone(), session.clone());
-            shared
-                .pending
-                .lock()
-                .unwrap()
-                .insert(session.clone(), None);
+            shared.pending.lock().unwrap().insert(session.clone(), None);
             clock.touch_now();
             let _ = events.send(AdapterEvent::DispatchAccepted {
                 task: job.task.clone(),
@@ -423,20 +421,24 @@ fn handle_sse_event(
             let session = info.get("sessionID").and_then(|s| s.as_str()).unwrap_or("");
             if owned_task(shared, session).is_some()
                 && info.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                    && info.get("time").and_then(|t| t.get("completed")).is_some() {
-                        let outcome = match info.get("error") {
-                            Some(err) => Err(error_summary(err)),
-                            None => Ok(()),
-                        };
-                        shared
-                            .pending
-                            .lock()
-                            .unwrap()
-                            .insert(session.to_owned(), Some(outcome));
-                    }
+                && info.get("time").and_then(|t| t.get("completed")).is_some()
+            {
+                let outcome = match info.get("error") {
+                    Some(err) => Err(error_summary(err)),
+                    None => Ok(()),
+                };
+                shared
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .insert(session.to_owned(), Some(outcome));
+            }
         }
         "session.idle" => {
-            let session = props.get("sessionID").and_then(|s| s.as_str()).unwrap_or("");
+            let session = props
+                .get("sessionID")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
             resolve_idle(shared, session, events);
         }
         "session.error" => {
@@ -449,11 +451,19 @@ fn handle_sse_event(
                 .map(error_summary)
                 .unwrap_or_else(|| "session error".into());
             if let Some(task) = owned_task(shared, session) {
-                finish_task(shared, events, &task, HarnessSignal::Failed { summary: detail });
+                finish_task(
+                    shared,
+                    events,
+                    &task,
+                    HarnessSignal::Failed { summary: detail },
+                );
             }
         }
         "session.status" => {
-            let session = props.get("sessionID").and_then(|s| s.as_str()).unwrap_or("");
+            let session = props
+                .get("sessionID")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
             if let Some(task) = owned_task(shared, session) {
                 let _ = events.send(AdapterEvent::Signal {
                     task,
@@ -462,7 +472,10 @@ fn handle_sse_event(
             }
         }
         "permission.updated" => {
-            let session = props.get("sessionID").and_then(|s| s.as_str()).unwrap_or("");
+            let session = props
+                .get("sessionID")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
             let permission = props.get("id").and_then(|s| s.as_str()).unwrap_or("");
             if auto_permissions() {
                 if let Some(task) = owned_task(shared, session) {
@@ -490,7 +503,12 @@ fn auto_permissions() -> bool {
 fn error_summary(err: &serde_json::Value) -> String {
     err.get("name")
         .and_then(|n| n.as_str())
-        .map(|name| format!("{name}: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("")))
+        .map(|name| {
+            format!(
+                "{name}: {}",
+                err.get("message").and_then(|m| m.as_str()).unwrap_or("")
+            )
+        })
         .unwrap_or_else(|| "unknown error".into())
 }
 
@@ -517,7 +535,14 @@ fn resolve_idle(shared: &Arc<ServerShared>, session: &str, events: &Sender<Adapt
         .flatten();
     match pending {
         None => {}
-        Some(Ok(())) => finish_task(shared, events, &task, HarnessSignal::Succeeded { summary: String::new() }),
+        Some(Ok(())) => finish_task(
+            shared,
+            events,
+            &task,
+            HarnessSignal::Succeeded {
+                summary: String::new(),
+            },
+        ),
         Some(Err(summary)) => finish_task(shared, events, &task, HarnessSignal::Failed { summary }),
     }
 }
@@ -624,9 +649,9 @@ mod tests {
 
     #[test]
     fn version_range() {
-        assert!(version_in_range("1.18.25", SUPPORTED));
-        assert!(version_in_range("1.19.2", SUPPORTED));
-        assert!(!version_in_range("1.20.0", SUPPORTED));
-        assert!(!version_in_range("1.17.0", SUPPORTED));
+        assert!(version_in_range("1.18.25", SUPPORTED_VERSIONS));
+        assert!(version_in_range("1.19.2", SUPPORTED_VERSIONS));
+        assert!(!version_in_range("1.20.0", SUPPORTED_VERSIONS));
+        assert!(!version_in_range("1.17.0", SUPPORTED_VERSIONS));
     }
 }

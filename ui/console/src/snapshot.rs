@@ -307,7 +307,10 @@ mod tests {
             tick_secs: 600,
             limit: 3,
             nodes: vec![
-                spec("refiner", "issue has label 'to-refine' and dependencies met"),
+                spec(
+                    "refiner",
+                    "issue has label 'to-refine' and dependencies met",
+                ),
                 NodeSpec {
                     name: "reviewer".into(),
                     retrigger,
@@ -346,10 +349,9 @@ mod tests {
         let ready = tracker.apply(&graph, &snap, &["I_1".into()]);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].node, "refiner");
-        tracker.last_tasked_rev.insert(
-            GateTracker::gate_key("refiner", "I_1"),
-            ready[0].revision,
-        );
+        tracker
+            .last_tasked_rev
+            .insert(GateTracker::gate_key("refiner", "I_1"), ready[0].revision);
         let again = tracker.apply(&graph, &snap, &[]);
         assert!(again.is_empty());
     }
@@ -362,10 +364,9 @@ mod tests {
         apply_batch(&mut snap, vec![issue("I_1", 1, &["to-refine"])]);
         let first = tracker.apply(&graph, &snap, &["I_1".into()]);
         assert_eq!(first.len(), 1);
-        tracker.last_tasked_rev.insert(
-            GateTracker::gate_key("refiner", "I_1"),
-            first[0].revision,
-        );
+        tracker
+            .last_tasked_rev
+            .insert(GateTracker::gate_key("refiner", "I_1"), first[0].revision);
         apply_batch(&mut snap, vec![issue("I_1", 1, &[])]);
         assert!(tracker.apply(&graph, &snap, &["I_1".into()]).is_empty());
         apply_batch(&mut snap, vec![issue("I_1", 1, &["to-refine"])]);
@@ -389,10 +390,9 @@ mod tests {
         apply_batch(&mut snap, vec![pr.clone()]);
         let first = tracker.apply(&graph, &snap, &["P_1".into()]);
         assert_eq!(first.len(), 1);
-        tracker.last_tasked_rev.insert(
-            GateTracker::gate_key("reviewer", "P_1"),
-            first[0].revision,
-        );
+        tracker
+            .last_tasked_rev
+            .insert(GateTracker::gate_key("reviewer", "P_1"), first[0].revision);
         assert!(tracker.apply(&graph, &snap, &[]).is_empty());
         pr.head = Some("bb".into());
         apply_batch(&mut snap, vec![pr]);

@@ -228,6 +228,139 @@ fn center(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+pub fn draw_cockpit(f: &mut Frame, state: &crate::cockpit::CockpitState) {
+    let p = palette();
+    let bg_style = Style::default().bg(p.bg).fg(p.fg);
+    f.render_widget(Block::default().style(bg_style), f.area());
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(6),
+            Constraint::Min(0),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let header = Line::from(vec![
+        Span::styled(" aif v4 ", Style::default().fg(p.bg).bg(p.accent)),
+        Span::raw(format!("  {}  ", state.message)),
+    ]);
+    f.render_widget(Paragraph::new(header), chunks[0]);
+
+    let status = state.status.clone().unwrap_or(serde_json::json!({}));
+    let paused = status["paused"].as_bool().unwrap_or(false);
+    let stale = status["stale_source"].as_bool().unwrap_or(false);
+    let trusted = status["trusted"].as_bool().unwrap_or(false);
+    let revision = status["revision"].as_u64().unwrap_or(0);
+    let factory = status["factory_id"].as_str().unwrap_or("?");
+    let summary = vec![
+        Line::from(vec![
+            Span::styled(" factory ", Style::default().fg(p.dim)),
+            Span::raw(factory.to_owned()),
+        ]),
+        Line::from(vec![
+            Span::styled(" revision ", Style::default().fg(p.dim)),
+            Span::raw(format!("{revision}")),
+        ]),
+        Line::from(vec![
+            Span::styled(" state    ", Style::default().fg(p.dim)),
+            Span::styled(
+                if paused { "paused" } else { "running" },
+                Style::default().fg(if paused { p.warn } else { p.accent }),
+            ),
+            Span::raw(format!("  stale {stale}  trusted {trusted}")),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.dim))
+        .title(" daemon ");
+    f.render_widget(Paragraph::new(summary).block(block), chunks[1]);
+
+    if let Some(tasks) = status["tasks"].as_array() {
+        let rows: Vec<Line> = tasks
+            .iter()
+            .enumerate()
+            .map(|(idx, task)| {
+                let id = task["id"].as_str().unwrap_or("?");
+                let task_state = task["state"].as_str().unwrap_or("?");
+                let title = task["title"].as_str().unwrap_or("");
+                let selected = idx == state.selected;
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:<2} ", idx + 1),
+                        Style::default().fg(if selected { p.accent } else { p.dim }),
+                    ),
+                    Span::styled(
+                        format!("{id:<38}"),
+                        Style::default().fg(if selected { p.accent } else { p.fg }),
+                    ),
+                    Span::styled(
+                        format!(" {task_state:<16}"),
+                        Style::default().fg(task_state_color(task_state, p)),
+                    ),
+                    Span::raw(title.to_owned()),
+                ])
+            })
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.dim))
+            .title(" tasks ");
+        f.render_widget(Paragraph::new(rows).block(block), chunks[2]);
+    }
+
+    let recent: Vec<Line> = state
+        .records
+        .iter()
+        .rev()
+        .take(1)
+        .map(|r| Line::from(Span::styled(truncate_record(r), Style::default().fg(p.dim))))
+        .collect();
+    f.render_widget(Paragraph::new(recent), chunks[3]);
+
+    let footer = Line::from(vec![
+        Span::styled("1-9", Style::default().fg(p.accent)),
+        Span::raw(" select  "),
+        Span::styled("Enter", Style::default().fg(p.accent)),
+        Span::raw(" submit  "),
+        Span::styled("c", Style::default().fg(p.accent)),
+        Span::raw(" cancel  "),
+        Span::styled("r", Style::default().fg(p.accent)),
+        Span::raw(" retry  "),
+        Span::styled("C/f", Style::default().fg(p.accent)),
+        Span::raw(" complete/fail  "),
+        Span::styled("p/P", Style::default().fg(p.accent)),
+        Span::raw(" pause/resume  "),
+        Span::styled("q", Style::default().fg(p.accent)),
+        Span::raw(" quit"),
+    ]);
+    f.render_widget(Paragraph::new(footer), chunks[4]);
+}
+
+fn task_state_color(state: &str, p: &Palette) -> Color {
+    match state {
+        "queued" | "presenting" => p.dim,
+        "awaiting_user" | "reserved" => p.accent,
+        "accepted" | "running" => p.cyan,
+        "cancel_requested" | "uncertain" => p.warn,
+        "failed" => p.error,
+        _ => p.fg,
+    }
+}
+
+fn truncate_record(record: &str) -> String {
+    let chars: Vec<char> = record.chars().collect();
+    if chars.len() > 120 {
+        chars[..120].iter().collect()
+    } else {
+        record.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
