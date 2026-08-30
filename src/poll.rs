@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::exec::{Exec, RealExec};
@@ -22,10 +22,10 @@ use crate::gh::GhClient;
 use crate::model::RepoSnapshot;
 
 /// The normal wait between two poll passes of one repository.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The longest wait after repeated poll failures.
-pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// One inbound message of the daemon event loop.
 ///
@@ -57,7 +57,7 @@ pub enum DaemonMsg {
 /// The join handles and the wake senders of a set of spawned pollers.
 #[derive(Debug)]
 pub struct Pollers {
-    /// One join handle per spawned poller, in the config order.
+    /// One join handle per spawned poller, in repository alias order.
     pub handles: Vec<JoinHandle<()>>,
     /// The wake sender of each repository, keyed by alias. The daemon sends
     /// on a sender to force an early pass, and drops it to end that poller.
@@ -70,7 +70,7 @@ pub struct Pollers {
 /// [`POLL_INTERVAL`] on its wake channel. A failed pass sends
 /// [`DaemonMsg::PollFailed`] and doubles the wait, at most [`MAX_BACKOFF`].
 /// Each thread runs until the daemon drops its wake sender or the channel
-/// closes. The join handles follow the config order of the repositories.
+/// closes. The join handles follow repository alias order.
 pub fn spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Pollers {
     let exec_for = |_alias: &str| Arc::new(RealExec) as Arc<dyn Exec>;
     spawn_all(cfg, tx, &exec_for, POLL_INTERVAL, MAX_BACKOFF)
@@ -128,7 +128,8 @@ fn spawn_one(
     let thread_repo = repo.clone();
     let thread_tx = tx.clone();
     let spawned = thread::Builder::new().name(name).spawn(move || {
-        poller_loop(
+        let log_repo = thread_repo.clone();
+        if let Err(error) = poller_loop(
             thread_repo,
             owner_repo,
             exec,
@@ -136,21 +137,27 @@ fn spawn_one(
             wake_rx,
             interval,
             max_backoff,
-        )
+        ) {
+            eprintln!("poller {log_repo} stopped: {error:#}");
+        }
     });
     match spawned {
         Ok(handle) => Some(handle),
         Err(error) => {
-            let _ = tx.send(DaemonMsg::PollFailed {
+            let failed = DaemonMsg::PollFailed {
                 repo,
                 error: format!("cannot start the poller thread: {error}"),
-            });
+            };
+            if let Err(send_error) = tx.send(failed) {
+                eprintln!("cannot report the poller start failure: {send_error}");
+            }
             None
         }
     }
 }
 
 /// Run the poll loop of one repository until its wake channel disconnects.
+/// The loop returns an error when it cannot send a message to the daemon.
 fn poller_loop(
     repo: String,
     owner_repo: String,
@@ -159,7 +166,7 @@ fn poller_loop(
     wake_rx: Receiver<()>,
     interval: Duration,
     max_backoff: Duration,
-) {
+) -> Result<()> {
     let mut client = GhClient::new(exec.as_ref());
     let mut backoff = interval;
     loop {
@@ -170,9 +177,8 @@ fn poller_loop(
                     repo: repo.clone(),
                     snapshot,
                 };
-                if tx.send(polled).is_err() {
-                    return;
-                }
+                tx.send(polled)
+                    .context("cannot send poll result to daemon")?;
                 false
             }
             Err(error) => {
@@ -180,16 +186,15 @@ fn poller_loop(
                     repo: repo.clone(),
                     error: format!("{error:#}"),
                 };
-                if tx.send(failed).is_err() {
-                    return;
-                }
+                tx.send(failed)
+                    .context("cannot send poll failure to daemon")?;
                 true
             }
         };
         match wake_rx.recv_timeout(backoff) {
             Ok(()) | Err(RecvTimeoutError::Timeout) => {}
             // The daemon dropped the wake sender; the poller stops.
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
         if failed {
             backoff = next_backoff(backoff, max_backoff);
@@ -223,6 +228,8 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Mutex, PoisonError};
     use std::time::Instant;
 
     use super::*;
@@ -233,6 +240,37 @@ mod tests {
     const OWNER_REPO: &str = "acme/borsuk";
     const ISSUES_URL: &str = "repos/acme/borsuk/issues?state=open&per_page=100&page=1";
     const PULLS_URL: &str = "repos/acme/borsuk/pulls?state=open&per_page=100&page=1";
+
+    struct TimedExec {
+        inner: ScriptExec,
+        starts: Mutex<Vec<Instant>>,
+    }
+
+    impl TimedExec {
+        fn new(inner: ScriptExec) -> Self {
+            Self {
+                inner,
+                starts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn starts(&self) -> Vec<Instant> {
+            self.starts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Exec for TimedExec {
+        fn run(&self, program: &str, args: &[&str], cwd: Option<&Path>) -> Result<CmdOut> {
+            self.starts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Instant::now());
+            self.inner.run(program, args, cwd)
+        }
+    }
 
     /// A matcher for one exact `gh` argument vector.
     fn gh(argv: &[&str]) -> impl Fn(&Call) -> bool + Send + Sync {
@@ -304,19 +342,6 @@ mod tests {
     fn next_msg(rx: &Receiver<DaemonMsg>, what: &str) -> DaemonMsg {
         rx.recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|error| panic!("timed out waiting for {what}: {error}"))
-    }
-
-    /// Every message that arrives within `window`.
-    fn drain(rx: &Receiver<DaemonMsg>, window: Duration) -> Vec<DaemonMsg> {
-        let deadline = Instant::now() + window;
-        let mut messages = Vec::new();
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(left) {
-                Ok(msg) => messages.push(msg),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        messages
     }
 
     /// The issues and the pulls steps of one full pass of [`REPO`].
@@ -472,7 +497,7 @@ mod tests {
         let base = ScriptExec::new()
             .expect(gh(&["api", "-i", "-X", "GET", ISSUES_URL]), broken.clone())
             .expect(gh(&["api", "-i", "-X", "GET", ISSUES_URL]), broken);
-        let exec = Arc::new(pass_steps(
+        let exec = Arc::new(TimedExec::new(pass_steps(
             base,
             (
                 vec!["api", "-i", "-X", "GET", ISSUES_URL],
@@ -490,17 +515,17 @@ mod tests {
                     &format!("[{}]", pr_json(2, "aaa")),
                 )),
             ),
-        ));
+        )));
         let (tx, rx) = mpsc::channel();
         let (wake, wake_rx) = mpsc::channel();
         let handle = spawn_one(
             REPO.to_string(),
             OWNER_REPO.to_string(),
-            exec,
+            exec.clone(),
             tx,
             wake_rx,
-            Duration::from_millis(20),
-            Duration::from_millis(40),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
         )
         .unwrap();
 
@@ -529,6 +554,55 @@ mod tests {
 
         drop(wake);
         handle.join().unwrap();
+
+        let starts = exec.starts();
+        assert_eq!(starts.len(), 4);
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(40));
+        assert!(starts[2].duration_since(starts[1]) >= Duration::from_millis(90));
+    }
+
+    #[test]
+    fn a_closed_daemon_channel_returns_the_send_error() {
+        let exec = Arc::new(pass_steps(
+            ScriptExec::new(),
+            (
+                vec!["api", "-i", "-X", "GET", ISSUES_URL],
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"i1\""],
+                    &format!("[{}]", issue_json(1)),
+                )),
+            ),
+            (
+                vec!["api", "-i", "-X", "GET", PULLS_URL],
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"p1\""],
+                    &format!("[{}]", pr_json(2, "aaa")),
+                )),
+            ),
+        ));
+        let (tx, rx) = mpsc::channel();
+        let (_wake, wake_rx) = mpsc::channel();
+        drop(rx);
+
+        let error = poller_loop(
+            REPO.to_string(),
+            OWNER_REPO.to_string(),
+            exec,
+            tx,
+            wake_rx,
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot send poll result to daemon"),
+            "error was: {error:#}"
+        );
     }
 
     #[test]
@@ -682,8 +756,8 @@ path = "/repos/b"
             &config,
             tx,
             &exec_for,
-            Duration::from_millis(30),
-            Duration::from_millis(60),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
         );
         assert_eq!(pollers.handles.len(), 2);
 
@@ -706,30 +780,22 @@ path = "/repos/b"
         );
 
         pollers.wake["a"].send(()).unwrap();
-        let mut saw_a_update = false;
-        while !saw_a_update {
-            match next_msg(&rx, "the woken poll of a") {
-                DaemonMsg::Polled {
-                    repo,
-                    snapshot: snap,
-                } if repo == "a" => {
-                    assert_eq!(
-                        snap,
-                        snapshot(vec![model_issue(7)], vec![model_pr(2, "aaa")])
-                    );
-                    saw_a_update = true;
-                }
-                _ => {}
+        match next_msg(&rx, "the woken poll of a") {
+            DaemonMsg::Polled {
+                repo,
+                snapshot: snap,
+            } if repo == "a" => {
+                assert_eq!(
+                    snap,
+                    snapshot(vec![model_issue(7)], vec![model_pr(2, "aaa")])
+                );
             }
+            other => panic!("the wake for a reached another repository: {other:?}"),
         }
 
-        // Repository b must never run a second successful pass: its script
-        // holds one pass, so every later pass of b fails. A second Polled
-        // from b would mean the wake of a reached b.
-        for msg in drain(&rx, Duration::from_millis(300)) {
-            if let DaemonMsg::Polled { repo, .. } = msg {
-                assert_ne!(repo, "b", "the wake of a reached b");
-            }
+        // The ten-second interval cannot produce another message here.
+        if let Ok(other) = rx.recv_timeout(Duration::from_millis(200)) {
+            panic!("the wake for a produced an extra message: {other:?}");
         }
 
         drop(pollers.wake);
