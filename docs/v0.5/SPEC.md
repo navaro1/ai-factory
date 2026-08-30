@@ -1125,6 +1125,26 @@ loop {
 
 ---
 
+## Contracts the daemon imposes on the TUI chunks
+
+Reported by the author of chunk 15 after building the loop. These bind
+chunks 18 to 21.
+
+- `Limits::from_config` seeds the map with the config defaults, so a key being
+  PRESENT does not mean it was overridden at run time. To show that a limit
+  differs from the config file, compare the effective value against the
+  configured one; do not test for map presence.
+- A release gate row refreshes only on the poll AFTER a stack label call, because
+  stacking is recorded on GitHub. So the trains view must not assume a stack
+  edit is visible immediately; show the optimistic local change and let the next
+  push correct it.
+- `Decisions::push` preserves `opened_ms` for a row that already exists. The
+  inbox age column depends on that, so an existing row's age must not reset when
+  the daemon re-pushes it.
+- `write_marker` appends a newline. Trim marker values when you display them.
+- clippy 1.92 under `-D warnings` now demands `is_none_or` and vec literals.
+  Expect it and write to it rather than fighting the gate.
+
 ## Task 18 — TUI shell and pipeline view
 
 **Goal.** Connect, hold the pushed state, and draw the home view.
