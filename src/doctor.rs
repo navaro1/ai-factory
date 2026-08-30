@@ -48,18 +48,30 @@ pub struct Version {
     pub patch: u64,
 }
 
+/// The leading run of digits and dots of `word`.
+///
+/// A git-describe word such as `2.74.0-19-gea8fc856e` keeps its head
+/// `2.74.0`. The caller trims surrounding punctuation first, so a word
+/// such as `v2.1.3` also starts inside its run.
+fn leading_digits_and_dots(word: &str) -> &str {
+    match word.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        Some(end) => &word[..end],
+        None => word,
+    }
+}
+
 impl Version {
     /// Parse the first version-like word of `text`.
     ///
     /// A version-like word is `major.minor` or `major.minor.patch` after the
-    /// surrounding punctuation is gone. Later words that merely carry numbers,
-    /// such as a release date, never win.
+    /// surrounding punctuation is gone. Only the leading digits-and-dots run
+    /// of a word counts, so `2.74.0-19-gea8fc856e` yields `2.74.0`. A date
+    /// word such as `2025-06-09` keeps only `2025`, has no minor component,
+    /// and is skipped. The first version-like word wins.
     pub fn parse(text: &str) -> Option<Version> {
         for word in text.split_whitespace() {
             let word = word.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.'));
-            if !word.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                continue;
-            }
+            let word = leading_digits_and_dots(word);
             let mut parts = word.split('.');
             let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
                 continue;
@@ -1240,7 +1252,10 @@ mod tests {
             ("gh version 2.63.0 (2024-12-13)", Some((2, 63, 0))),
             ("opencode 1.18.25", Some((1, 18, 25))),
             ("v2.1.3", Some((2, 1, 3))),
+            ("2.74.0-19-gea8fc856e", Some((2, 74, 0))),
+            ("v2.1.3-rc1", Some((2, 1, 3))),
             ("release 1.2.3.4", None),
+            ("1.2.3.4-rc1", None),
             ("release 1.18446744073709551616.3", None),
             ("no version here", None),
             ("", None),
@@ -1253,6 +1268,87 @@ mod tests {
                 "input {text:?}"
             );
         }
+    }
+
+    /// The version lines of this machine, captured on 2026-08-30 by running
+    /// each tool. Tests never run a tool; these lines are hard-coded.
+    #[test]
+    fn version_parse_reads_the_real_version_lines_of_this_machine() {
+        let cases = [
+            (
+                "gh version 2.74.0-19-gea8fc856e (2025-06-09)",
+                Some((2, 74, 0)),
+            ),
+            ("git version 2.34.1", Some((2, 34, 1))),
+            ("2.1.251 (Claude Code)", Some((2, 1, 251))),
+            ("1.18.25", Some((1, 18, 25))),
+        ];
+        for (line, want) in cases {
+            let parsed = Version::parse(line);
+            assert_eq!(
+                parsed.map(|v| (v.major, v.minor, v.patch)),
+                want,
+                "input {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_word_and_a_fourth_component_stay_rejected() {
+        // A release date keeps only its year prefix `2025`. That prefix has
+        // no minor component, so the date never becomes a version.
+        assert_eq!(Version::parse("(2025-06-09)"), None);
+        assert_eq!(Version::parse("2025-06-09"), None);
+        // More than three numeric components stay rejected, with and without
+        // a suffix.
+        assert_eq!(Version::parse("release 1.2.3.4"), None);
+        assert_eq!(Version::parse("1.2.3.4-rc1"), None);
+        // The first version-like word wins, so a trailing date cannot
+        // override a real version.
+        assert_eq!(
+            Version::parse("gh version 2.74.0-19-gea8fc856e (2025-06-09)")
+                .map(|v| (v.major, v.minor, v.patch)),
+            Some((2, 74, 0))
+        );
+    }
+
+    #[test]
+    fn the_real_gh_describe_output_passes_tool_check() {
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "gh" && call.args == ["--version"],
+            CmdOut::ok(
+                "gh version 2.74.0-19-gea8fc856e (2025-06-09)\n\
+                 https://github.com/cli/cli/releases/latest\n",
+            ),
+        );
+
+        let check = tool_check(&exec, "gh");
+
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.detail, "gh 2.74.0");
+    }
+
+    /// Whether any check failed, which decides the `aif doctor` exit code.
+    #[test]
+    fn has_failures_decides_the_doctor_exit_code() {
+        let one = |status| {
+            vec![Check {
+                label: "check".to_string(),
+                status,
+                detail: "detail".to_string(),
+            }]
+        };
+        // No fail status reports no failure. An empty report does the same.
+        assert!(!has_failures(&one(Status::Pass)));
+        assert!(!has_failures(&one(Status::Info)));
+        assert!(!has_failures(&one(Status::Warn)));
+        assert!(!has_failures(&[]));
+        // One fail anywhere decides the exit code.
+        assert!(has_failures(&one(Status::Fail)));
+        let mut mixed = one(Status::Pass);
+        mixed.extend(one(Status::Warn));
+        mixed.extend(one(Status::Fail));
+        assert!(has_failures(&mixed));
     }
 
     #[test]
