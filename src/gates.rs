@@ -65,10 +65,14 @@ fn has_label(labels: &[String], wanted: &str) -> bool {
 
 /// Collect the issue numbers that a body names as blockers.
 ///
-/// The recognised phrasings are `blocked by #12`, `blocked-by #12`, and
-/// `depends on #12`, in any letter case. A number without one of the
-/// phrasings in front of it does not match, so a bare `#12` is not a
-/// blocker. The result is sorted and has no duplicates.
+/// The recognised phrasings are `blocked by`, `blocked-by`, and
+/// `depends on`, in any letter case. Each phrase introduces a list: the
+/// parser collects every `#N` after it, separated by commas, the word
+/// `and`, or plain spaces. The list stops at the first token that is not
+/// a separator or a `#N`, so `blocked by #1 then ship #9` reports only
+/// `1`. A body may carry several phrases. A number without a phrasing in
+/// front of it does not match, so a bare `#12` is not a blocker. The
+/// result is sorted and has no duplicates.
 pub fn parse_blocked_by(body: &str) -> Vec<u64> {
     const NEEDLES: [&str; 3] = ["blocked by", "blocked-by", "depends on"];
     let lower = body.to_lowercase();
@@ -87,21 +91,70 @@ pub fn parse_blocked_by(body: &str) -> Vec<u64> {
             if glued_to_word {
                 continue;
             }
-            let Some(rest) = lower[search_from..].trim_start().strip_prefix('#') else {
-                continue;
-            };
-            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 {
-                continue;
-            }
-            if let Ok(number) = rest[..digits].parse::<u64>() {
-                found.push(number);
-            }
+            take_blocker_list(&lower, search_from, &mut found);
         }
     }
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// Collect the `#N` list that follows one phrasing.
+///
+/// `pos` points just past the phrasing. Separators between numbers are
+/// plain spaces, tabs, commas, and the standalone word `and`. The list
+/// ends at the first other token or at the end of the text. Found
+/// numbers are appended to `found`.
+fn take_blocker_list(lower: &str, mut pos: usize, found: &mut Vec<u64>) {
+    loop {
+        loop {
+            let rest = &lower[pos..];
+            let trimmed = rest.trim_start_matches([' ', '\t']);
+            pos += rest.len() - trimmed.len();
+            let rest = &lower[pos..];
+            if rest.starts_with(',') {
+                pos += 1;
+                continue;
+            }
+            if standalone_and_at(lower, pos) {
+                pos += "and".len();
+                continue;
+            }
+            break;
+        }
+        let Some(rest) = lower[pos..].strip_prefix('#') else {
+            return;
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return;
+        }
+        let Ok(number) = rest[..digits].parse::<u64>() else {
+            return;
+        };
+        found.push(number);
+        pos += 1 + digits;
+    }
+}
+
+/// True when the standalone word `and` sits at `pos`.
+///
+/// The word counts only with a separator in front of it and whitespace
+/// behind it, so the tail of `android` is not the word `and`.
+fn standalone_and_at(lower: &str, pos: usize) -> bool {
+    if !lower[pos..].starts_with("and") {
+        return false;
+    }
+    let before_ok = pos > 0
+        && matches!(
+            lower[..pos].chars().next_back(),
+            Some(' ') | Some('\t') | Some(',')
+        );
+    let after_ok = matches!(
+        lower[pos + "and".len()..].chars().next(),
+        Some(' ') | Some('\t')
+    );
+    before_ok && after_ok
 }
 
 /// The tracker's memory of one item in one stage.
@@ -310,6 +363,30 @@ mod tests {
         assert!(parse_blocked_by("unblocked by #12").is_empty());
         assert!(parse_blocked_by("blocked by the weather").is_empty());
         assert!(parse_blocked_by("").is_empty());
+    }
+
+    #[test]
+    fn a_phrase_takes_a_list_of_numbers() {
+        assert_eq!(parse_blocked_by("blocked by #1, #2 and #3"), vec![1, 2, 3]);
+        assert_eq!(parse_blocked_by("blocked by #1, #2, and #3"), vec![1, 2, 3]);
+        assert_eq!(parse_blocked_by("blocked by #1 #2"), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_list_stops_at_the_first_foreign_token() {
+        assert_eq!(parse_blocked_by("blocked by #1 then ship #9"), vec![1]);
+        assert_eq!(parse_blocked_by("blocked by #1 and then #2"), vec![1]);
+        // The tail of a longer word is not the word "and".
+        assert_eq!(parse_blocked_by("blocked by #1 android #2"), vec![1]);
+    }
+
+    #[test]
+    fn two_phrases_each_take_their_own_list() {
+        assert_eq!(parse_blocked_by("depends on #4\nblocked-by #7"), vec![4, 7]);
+        assert_eq!(
+            parse_blocked_by("blocked by #1 and #2, depends on #3"),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
