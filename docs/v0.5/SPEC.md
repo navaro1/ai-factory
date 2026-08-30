@@ -845,6 +845,15 @@ pub enum Response { Allow, Deny { message: String },
   `human:<repo>:<kind><number>`, `gate:<repo>`.
 - `validate(&Decision, &Response) -> Result<()>` refuses a mismatched pair, for
   example `Go` against a `Permission`.
+- A `Question` answer's `updated_input` has the shape
+  `{"answers": {header: label}}`, matching the runner fixture. The daemon must
+  pass it through to the runner VERBATIM; reshaping it breaks AskUserQuestion.
+- Deferred, not a defect: the inbox has no "allow always". `Response::Allow`
+  carries no field for the request's `permission_suggestions`, so applying a
+  suggestion would need a wire change through sock.rs, decisions.rs and the
+  daemon. With yolo on by default, ordinary tool asks are auto-allowed anyway,
+  so the value is low. The inbox therefore offers only allow and deny, rather
+  than offering a key that silently does not do what it says.
 - `NeedsHuman` accepts only `Text` and `Cancel`. `Text` posts the text as a
   comment on the item and removes the `needs-human` label; `Cancel` removes the
   label without comment. It must NOT accept `Retry`: a `needs-human` label can
