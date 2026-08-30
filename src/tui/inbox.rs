@@ -1,9 +1,9 @@
 //! Draws the decisions inbox and handles its keys.
 //!
 //! The inbox is the one place where everything that needs a human waits.
-//! It lists every open decision across the repositories, and each key of
-//! the selected row sends exactly one [`Action::Answer`] whose response
-//! fits the kind of the row. The key map per kind:
+//! It lists every open decision across the repositories. Each answer key
+//! sends one [`Action::Answer`] for the selected row. The response fits the
+//! row kind. The key map follows:
 //!
 //! | Kind | Keys |
 //! |---|---|
@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -35,14 +36,13 @@ use ratatui::Frame;
 
 use crate::decisions::{Decision, DecisionKind, Response};
 use crate::model::ItemKind;
-use crate::sock::{Action, StateView};
+use crate::sock::{Action, Client, StateView};
 
 /// The local UI state of the inbox view.
 ///
-/// The state holds only what the pushed state does not carry: which row
-/// the human selected, the picks and checkboxes of the expanded rows, and
-/// a text input in progress. Every field survives a re-push, because the
-/// keys name decision ids and not list positions.
+/// The state holds data that the pushed state does not carry. This data
+/// includes the selected row, option picks, checkboxes, and typed text.
+/// Each key uses a decision id. Thus, each field survives a new push.
 #[derive(Debug, Default)]
 pub struct Inbox {
     /// The id of the selected decision, if any.
@@ -62,6 +62,8 @@ pub struct Inbox {
 /// What the human is typing, and the response it will produce.
 #[derive(Debug)]
 struct TextInput {
+    /// The decision that opened this input.
+    decision_id: String,
     /// The text typed so far.
     buffer: String,
     /// The label shown in front of the buffer.
@@ -77,6 +79,20 @@ enum InputKind {
     DenyReason,
     /// A free `Text` answer for a `Question` or `NeedsHuman` row.
     FreeText,
+}
+
+impl InputKind {
+    /// Check that this input can answer the current decision kind.
+    fn accepts(self, decision: &DecisionKind) -> bool {
+        matches!(
+            (self, decision),
+            (InputKind::DenyReason, DecisionKind::Permission { .. })
+                | (
+                    InputKind::FreeText,
+                    DecisionKind::Question { .. } | DecisionKind::NeedsHuman { .. }
+                )
+        )
+    }
 }
 
 /// What a key did beyond the local inbox state.
@@ -96,16 +112,18 @@ pub trait ActionSink {
     fn send_action(&mut self, action: Action);
 }
 
-impl ActionSink for Vec<Action> {
-    fn send_action(&mut self, action: Action) {
-        self.push(action);
-    }
-}
-
 impl ActionSink for Sender<Action> {
     fn send_action(&mut self, action: Action) {
         if let Err(error) = self.send(action) {
             eprintln!("inbox: the action receiver is gone: {error}");
+        }
+    }
+}
+
+impl ActionSink for Client {
+    fn send_action(&mut self, action: Action) {
+        if let Err(error) = self.send(&action) {
+            eprintln!("inbox: cannot send the action to the daemon: {error}");
         }
     }
 }
@@ -127,6 +145,15 @@ impl Inbox {
             .retain(|id, _| state.decisions.iter().any(|d| d.id == *id));
         self.checks
             .retain(|id, _| state.decisions.iter().any(|d| d.id == *id));
+        if self.input.as_ref().is_some_and(|input| {
+            state
+                .decisions
+                .iter()
+                .find(|decision| decision.id == input.decision_id)
+                .is_none_or(|decision| !input.kind.accepts(&decision.kind))
+        }) {
+            self.input = None;
+        }
         let selected_is_gone = self
             .selected_id
             .as_deref()
@@ -150,19 +177,14 @@ impl Inbox {
     /// The oldest row is the one with the smallest `opened_ms`; a tie
     /// keeps the earlier push order.
     pub fn select_oldest(&mut self, state: &StateView) {
-        let oldest = state
-            .decisions
-            .iter()
-            .enumerate()
-            .min_by_key(|(position, decision)| (decision.opened_ms, *position));
-        self.selected_id = oldest.map(|(_, decision)| decision.id.clone());
+        self.selected_id = oldest_decision(state).map(|decision| decision.id.clone());
     }
 
     /// Handle one key while the inbox view is open.
     ///
     /// The call sends at most one action to `sink` and returns what the
     /// shell must do beyond the inbox. A key that the kind of the
-    /// selected row does not accept changes nothing, so the UI can never
+    /// selected row does not accept changes nothing. Thus, the UI cannot
     /// produce a response that the decision refuses.
     pub fn handle_key(
         &mut self,
@@ -241,7 +263,7 @@ impl Inbox {
                 InboxOutcome::None
             }
             (DecisionKind::Permission { .. }, KeyCode::Char('n')) => {
-                self.open_input("reason", InputKind::DenyReason);
+                self.open_input(&decision, "reason", InputKind::DenyReason);
                 InboxOutcome::None
             }
             (DecisionKind::Permission { task, .. }, KeyCode::Enter) => {
@@ -252,7 +274,7 @@ impl Inbox {
                 InboxOutcome::None
             }
             (DecisionKind::Question { .. }, KeyCode::Char('i')) => {
-                self.open_input("answer", InputKind::FreeText);
+                self.open_input(&decision, "answer", InputKind::FreeText);
                 InboxOutcome::None
             }
             (DecisionKind::Question { .. }, KeyCode::Enter) => {
@@ -271,7 +293,7 @@ impl Inbox {
                 InboxOutcome::OpenSession(task.clone())
             }
             (DecisionKind::NeedsHuman { .. }, KeyCode::Char('t')) => {
-                self.open_input("comment", InputKind::FreeText);
+                self.open_input(&decision, "comment", InputKind::FreeText);
                 InboxOutcome::None
             }
             (DecisionKind::NeedsHuman { .. }, KeyCode::Char('c')) => {
@@ -301,12 +323,25 @@ impl Inbox {
         key: KeyEvent,
         sink: &mut impl ActionSink,
     ) -> InboxOutcome {
-        let Some(index) = self.selected_index(state) else {
+        let Some((decision_id, input_kind)) = self
+            .input
+            .as_ref()
+            .map(|input| (input.decision_id.as_str(), input.kind))
+        else {
             return InboxOutcome::None;
         };
-        let Some(decision) = state.decisions.get(index) else {
+        let Some(decision) = state
+            .decisions
+            .iter()
+            .find(|decision| decision.id == decision_id)
+        else {
+            self.input = None;
             return InboxOutcome::None;
         };
+        if !input_kind.accepts(&decision.kind) {
+            self.input = None;
+            return InboxOutcome::None;
+        }
         let decision = decision.clone();
         if key
             .modifiers
@@ -345,8 +380,9 @@ impl Inbox {
     }
 
     /// Start a text input.
-    fn open_input(&mut self, label: &'static str, kind: InputKind) {
+    fn open_input(&mut self, decision: &Decision, label: &'static str, kind: InputKind) {
         self.input = Some(TextInput {
+            decision_id: decision.id.clone(),
             buffer: String::new(),
             label,
             kind,
@@ -355,7 +391,7 @@ impl Inbox {
 
     /// Finish the text input and send its response.
     fn submit_text(&mut self, decision: &Decision, sink: &mut impl ActionSink) -> InboxOutcome {
-        let Some(input) = self.input.take() else {
+        let Some(input) = self.input.as_ref() else {
             return InboxOutcome::None;
         };
         let text = input.buffer.trim().to_string();
@@ -367,6 +403,7 @@ impl Inbox {
             InputKind::DenyReason => Response::Deny { message: text },
             InputKind::FreeText => Response::Text { text },
         };
+        self.input = None;
         self.answer(&decision.id, response, sink);
         InboxOutcome::None
     }
@@ -530,9 +567,9 @@ struct QuestionView {
 
 /// Parse the `questions` array of a `Question` decision.
 ///
-/// Entries that miss both a question text and a header, or that name no
-/// readable option labels, still parse with what they carry; a value
-/// that is no array parses as no questions at all.
+/// An entry can omit a question text, a header, or readable option labels.
+/// The parser uses the data that the entry contains. A value that is not an
+/// array produces no questions.
 fn parse_questions(value: &serde_json::Value) -> Vec<QuestionView> {
     let Some(entries) = value.as_array() else {
         return Vec::new();
@@ -587,9 +624,8 @@ fn parse_question(value: &serde_json::Value) -> Option<QuestionView> {
 
 /// Map one digit to its flattened option: question index and option index.
 ///
-/// The numbering runs across every option of every question, so a
-/// question with one option and a question with two options use the
-/// digits `1`, `2`, and `3`.
+/// The numbering continues across all questions. One option in the first
+/// question and two options in the second question use digits 1 through 3.
 fn flattened_option(questions: &[QuestionView], digit: char) -> Option<(usize, usize)> {
     let index = match digit.to_digit(10) {
         Some(index @ 1..=9) => index as usize - 1,
@@ -617,7 +653,7 @@ pub fn open_count(state: &StateView) -> usize {
 /// The shell renders this text in every view. The `!` in the badge names
 /// the key that jumps to the oldest decision.
 pub fn badge(state: &StateView) -> String {
-    format!("! {} open", state.decisions.len())
+    format!("! {} open", open_count(state))
 }
 
 /// The oldest open decision, if any.
@@ -630,12 +666,18 @@ pub fn oldest_decision(state: &StateView) -> Option<&Decision> {
         .map(|(_, decision)| decision)
 }
 
-/// The current time in milliseconds since the Unix epoch.
-pub fn now_ms() -> u64 {
-    SystemTime::now()
+/// Get the current time in milliseconds since the Unix epoch.
+pub fn now_ms() -> Result<u64> {
+    millis_since_epoch(SystemTime::now())
+}
+
+/// Convert one system time to milliseconds since the Unix epoch.
+fn millis_since_epoch(now: SystemTime) -> Result<u64> {
+    let millis = now
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+        .context("the system clock is before the Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("the system time in milliseconds does not fit in u64")
 }
 
 /// The age of one row as a short text.
@@ -657,7 +699,7 @@ pub fn age_text(opened_ms: u64, now_ms: u64) -> String {
 
 /// The one-line summary of a decision.
 fn summary(decision: &Decision) -> String {
-    match &decision.kind {
+    let text = match &decision.kind {
         DecisionKind::Permission { tool, input, .. } => {
             format!("{tool} {}", input_summary(input))
         }
@@ -671,7 +713,8 @@ fn summary(decision: &Decision) -> String {
         DecisionKind::ReleaseGate { prs } => {
             format!("release {} pull requests: {}", prs.len(), pr_list(prs))
         }
-    }
+    };
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The short summary of one tool input.
@@ -849,14 +892,14 @@ fn option_picked(inbox: &Inbox, id: &str, question_index: usize, option_index: u
 
 /// Build the footer line: the key map, a hint, or the text input.
 fn footer_text(state: &StateView, inbox: &Inbox) -> String {
+    if let Some(hint) = inbox.hint {
+        return hint.to_string();
+    }
     if let Some(input) = &inbox.input {
         return format!(
             "{}: {}_  (enter sends, esc cancels)",
             input.label, input.buffer
         );
-    }
-    if let Some(hint) = inbox.hint {
-        return hint.to_string();
     }
     let Some(index) = inbox.selected_index(state) else {
         return "j k move · ! oldest".to_string();
@@ -883,8 +926,12 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
@@ -995,6 +1042,30 @@ mod tests {
         mpsc::channel()
     }
 
+    #[test]
+    fn the_socket_client_sends_an_inbox_action() {
+        let socket = std::env::temp_dir().join(format!("aif-inbox-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut client = crate::sock::Client::connect(&socket).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let state = full_state();
+        let mut inbox = selected(&state, 0);
+        let expected = Action::Answer {
+            decision_id: "perm:borsuk/implement-i142:req-1".to_string(),
+            response: Response::Allow,
+        };
+
+        let outcome = inbox.handle_key(&state, press('y'), &mut client);
+
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        assert_eq!(outcome, InboxOutcome::None);
+        assert_eq!(serde_json::from_str::<Action>(&line).unwrap(), expected);
+        drop(client);
+        drop(listener);
+        fs::remove_file(socket).unwrap();
+    }
+
     /// Render the inbox and return the whole screen as text.
     fn render(state: &StateView, inbox: &Inbox, now_ms: u64) -> String {
         let backend = TestBackend::new(100, 20);
@@ -1062,6 +1133,22 @@ mod tests {
     }
 
     #[test]
+    fn a_row_summary_replaces_line_breaks_with_spaces() {
+        let decision = Decision::stuck(&worker(), "line one\nline two", OPENED);
+        let state = state_with(vec![decision]);
+        let inbox = Inbox::new();
+
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("line one line two")),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
     fn an_empty_state_renders_a_placeholder_and_no_rows() {
         let state = state_with(Vec::new());
         let inbox = Inbox::new();
@@ -1091,6 +1178,15 @@ mod tests {
         let repushed = full_state();
         let second = render(&repushed, &inbox, OPENED + 3_900_000);
         assert!(second.contains("  1h"), "screen: {second}");
+    }
+
+    #[test]
+    fn a_time_before_the_unix_epoch_returns_an_error() {
+        let before_epoch = UNIX_EPOCH - Duration::from_millis(1);
+
+        let error = millis_since_epoch(before_epoch).unwrap_err();
+
+        assert!(error.to_string().contains("before the Unix epoch"));
     }
 
     #[test]
@@ -1435,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn no_key_ever_produces_a_response_the_kind_refuses() {
+    fn each_kind_has_an_exact_immediate_answer_key_map() {
         let state = full_state();
         let mut alphabet: Vec<KeyCode> = "ynarcgti !123456789".chars().map(KeyCode::Char).collect();
         alphabet.extend([
@@ -1454,19 +1550,28 @@ mod tests {
                 let mut inbox = selected(&state, index);
                 let (mut tx, rx) = fake_sink();
                 inbox.handle_key(&state, press_code(code), &mut tx);
-                while let Ok(action) = rx.try_recv() {
-                    let Action::Answer {
-                        decision_id,
+                let expected = match (&decision.kind, code) {
+                    (DecisionKind::Permission { .. }, KeyCode::Char('y')) => Some(Response::Allow),
+                    (DecisionKind::Stuck { .. }, KeyCode::Char('r')) => Some(Response::Retry),
+                    (DecisionKind::Stuck { .. }, KeyCode::Char('c'))
+                    | (DecisionKind::NeedsHuman { .. }, KeyCode::Char('c')) => {
+                        Some(Response::Cancel)
+                    }
+                    (DecisionKind::ReleaseGate { prs }, KeyCode::Char('g')) => {
+                        Some(Response::Go { prs: prs.clone() })
+                    }
+                    _ => None,
+                };
+                let expected: Vec<Action> = expected
+                    .map(|response| Action::Answer {
+                        decision_id: decision.id.clone(),
                         response,
-                    } = action
-                    else {
-                        panic!("the inbox sent a non-answer action: {action:?}");
-                    };
-                    assert_eq!(decision_id, decision.id);
-                    crate::decisions::validate(&decision, &response).unwrap_or_else(|error| {
-                        panic!("key {code:?} produced a response the kind refuses: {error}")
-                    });
-                }
+                    })
+                    .into_iter()
+                    .collect();
+                let actual: Vec<Action> = rx.try_iter().collect();
+
+                assert_eq!(actual, expected, "row {index}, key {code:?}");
             }
         }
     }
@@ -1503,6 +1608,63 @@ mod tests {
         assert!(rx.try_recv().is_err());
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("type the text first"), "hint: {screen}");
+
+        type_text(&mut inbox, &state, "later", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "perm:borsuk/implement-i142:req-1".to_string(),
+                response: Response::Deny {
+                    message: "later".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_push_that_closes_the_input_row_cancels_that_input() {
+        let state = full_state();
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        inbox.handle_key(&state, press('n'), &mut tx);
+        let next_state = state_with(every_decision()[1..].to_vec());
+        inbox.observe(&next_state);
+
+        assert!(inbox.input.is_none(), "the closed row kept its input");
+        assert!(
+            rx.try_recv().is_err(),
+            "closing an input row must not send an answer"
+        );
+    }
+
+    #[test]
+    fn a_push_that_changes_the_input_row_kind_cancels_that_input() {
+        let state = full_state();
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        inbox.handle_key(&state, press('n'), &mut tx);
+        let question = Decision::question(
+            &worker(),
+            "req-1",
+            serde_json::json!([{
+                "question": "Continue?",
+                "header": "Choice",
+                "options": [{"label": "yes", "description": ""}],
+                "multiSelect": false,
+            }]),
+            OPENED,
+        );
+        let next_state = state_with(vec![question]);
+        inbox.observe(&next_state);
+
+        assert!(inbox.input.is_none(), "the changed row kept its input");
+        assert!(
+            rx.try_recv().is_err(),
+            "changing an input row must not send an answer"
+        );
     }
 
     #[test]
