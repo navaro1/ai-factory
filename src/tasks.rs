@@ -196,12 +196,14 @@ impl TaskTable {
 
     /// Move a task to the state `to`.
     ///
-    /// The legal transitions are: `Queued` to `Running`; `Running` to
-    /// `AwaitingUser`, `Done`, or `Failed`; `AwaitingUser` to `Running`,
-    /// `Done`, or `Failed`; and `Failed` to `Queued` while the attempt count
-    /// is below [`MAX_ATTEMPTS`]. A retry past the limit is refused. Every
-    /// other transition is an error that names both states. A successful
-    /// transition stamps `updated_ms` with `now_ms`.
+    /// The legal transitions are: `Queued` to `Running` or `Failed`;
+    /// `Running` to `AwaitingUser`, `Done`, or `Failed`; `AwaitingUser` to
+    /// `Running`, `Done`, or `Failed`; and `Failed` to `Queued` while the
+    /// attempt count is below [`MAX_ATTEMPTS`]. `Queued` to `Failed` exists
+    /// so a task can be cancelled or dropped before it ever starts. A retry
+    /// past the limit is refused. Every other transition is an error that
+    /// names both states. A successful transition stamps `updated_ms` with
+    /// `now_ms`.
     pub fn transition(&mut self, id: &str, to: TaskState, now_ms: u64) -> Result<()> {
         let task = self
             .by_id
@@ -211,6 +213,7 @@ impl TaskTable {
         let plain = matches!(
             (&from, &to),
             (TaskState::Queued, TaskState::Running)
+                | (TaskState::Queued, TaskState::Failed(_))
                 | (TaskState::Running, TaskState::AwaitingUser)
                 | (TaskState::Running, TaskState::Done)
                 | (TaskState::Running, TaskState::Failed(_))
@@ -243,8 +246,8 @@ impl TaskTable {
 
     /// Cancel a task: the state becomes `Failed("cancelled")`.
     ///
-    /// Cancelling follows the transition rules. A running or awaiting task
-    /// can be cancelled; a queued task cannot.
+    /// Cancelling follows the transition rules. A queued, running, or
+    /// awaiting task can be cancelled.
     pub fn cancel(&mut self, id: &str, now_ms: u64) -> Result<()> {
         self.transition(id, TaskState::Failed("cancelled".to_string()), now_ms)
     }
@@ -480,6 +483,7 @@ mod tests {
         // failed -> queued is legal here.
         let legal: Vec<(usize, usize)> = vec![
             (0, 1), // queued -> running
+            (0, 4), // queued -> failed, for a cancel or a dropped trigger
             (1, 2), // running -> awaiting user
             (1, 3), // running -> done
             (1, 4), // running -> failed
@@ -539,7 +543,11 @@ mod tests {
 
     #[test]
     fn cancelling_records_the_cancelled_reason() {
-        for state in [TaskState::Running, TaskState::AwaitingUser] {
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::AwaitingUser,
+        ] {
             let (mut table, id) = table_in_state(state);
             table.cancel(&id, LATER).unwrap();
             assert_eq!(
@@ -547,6 +555,30 @@ mod tests {
                 TaskState::Failed("cancelled".to_string())
             );
         }
+    }
+
+    #[test]
+    fn cancelling_a_queued_task_frees_the_stage_limit() {
+        let mut table = TaskTable::new();
+        let id = queued(&mut table, "borsuk", Stage::Refine, ItemKind::Issue, 1);
+        assert_eq!(table.counts_by_stage()[&Stage::Refine], 1);
+        assert_eq!(
+            table.counts_by_stage_repo()[&("borsuk".to_string(), Stage::Refine)],
+            1
+        );
+
+        table.cancel(&id, LATER).unwrap();
+
+        assert_eq!(
+            table.by_id[&id].state,
+            TaskState::Failed("cancelled".to_string())
+        );
+        assert!(table.active().is_empty(), "a cancelled task is terminal");
+        assert_eq!(table.counts_by_stage()[&Stage::Refine], 0);
+        assert_eq!(
+            table.counts_by_stage_repo()[&("borsuk".to_string(), Stage::Refine)],
+            0
+        );
     }
 
     #[test]
