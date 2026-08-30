@@ -253,3 +253,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    #[test]
+    fn fifty_thousand_records_replay_in_bounds() {
+        let dir = std::env::temp_dir().join(format!("aif-jperf-{}", crate::ids::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            for i in 0..50_000u64 {
+                let record = Record {
+                    seq: i + 1,
+                    ts: "2026-08-30T00:00:00Z".into(),
+                    v: SCHEMA_VERSION,
+                    rec: Rec::TaskTransition {
+                        id: format!("t{i}"),
+                        from: "queued".into(),
+                        to: "reserved".into(),
+                        detail: String::new(),
+                    },
+                };
+                writeln!(file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+            }
+        }
+        let start = std::time::Instant::now();
+        let records = Journal::replay(&path).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(records.len(), 50_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "replay took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -1290,6 +1290,11 @@ pub fn run(paths: FactoryPaths, graph: Graph, supervise_process: bool) -> Result
         let _ = adapter.check();
     }
     event_loop(&mut daemon, msg_rx);
+    for adapter in daemon.adapters.values_mut() {
+        adapter.shutdown();
+    }
+    std::fs::remove_file(paths.socket()).ok();
+    println!("aif: daemon stopped at revision {}", daemon.revision());
     Ok(())
 }
 

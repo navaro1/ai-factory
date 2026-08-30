@@ -2,40 +2,43 @@
 
 A zellij workspace that turns a git repository into an AI agent factory.
 
-Run one command inside a repository. You get two tabs with five agents.
-Each factory pane starts with its prompt already typed in. You check the
-text, then press Enter to send it.
+v4 is event-driven: one per-repository daemon reacts to GitHub changes and
+harness events immediately; a slow forced fetch repairs missed state every
+ten minutes. Codex and opencode tasks run inside one lazy resident server
+per factory. Claude stays supervised. Zellij becomes the control UI.
+
+Run one command inside a repository. v4 gives you a cockpit tab plus one
+tab per supervised agent. Automatic agents run with no TUI at all.
 
 ## What you get
 
-Tab 1 — `Planner - <repo>`
+Tab 1 — `Cockpit`
 
-| Pane | Command | Model |
+| Pane | Command |
+|---|---|
+| Cockpit | `aif tui` (daemon-driven task view) |
+
+One tab per supervised node:
+
+| Node | Command | Model |
 |---|---|---|
 | Planner | `clauded` (Claude Code) | `claude-fable-5[1m]` |
-
-Tab 2 — `AI factory - <repo>`
-
-| Pane | Command | Model |
-|---|---|---|
-| Refiner | `opencoded` (opencode, auto) | `openai/gpt-5.6-sol` |
-| Reviewer | `opencoded` (opencode, auto) | `openai/gpt-5.6-sol` |
-| Implementer | `opencoded` (opencode, auto) | `zai-coding-plan/glm-5.3-flash` |
 | Releaser | `clauded` (Claude Code) | `claude-opus-5[1m]` |
 
-The factory panes run loop prompts. The Refiner refines tickets labelled
-`to-refine`. The Reviewer works through draft PRs. The Implementer picks up
-tickets labelled `refined`. The Releaser merges and deploys. Edit the prompt
-files to change this flow. See [Configure](#configure).
+The Refiner, Implementer, and Reviewer run as automatic tasks through the
+resident `codex app-server` and `opencode serve` processes. They appear as
+cockpit cards, not panes.
 
-The session name is `<repo>-factory`. Start the command again to re-attach.
+The session name is `aif-<factory-id>-factory`. Start the command again to
+re-attach. The daemon keeps running when the session closes.
 
 ## Requirements
 
 - zellij (tested on 0.45.1)
 - Claude Code CLI (`claude`), logged in
-- opencode CLI (tested on 1.18.25), with your providers configured
-- GitHub CLI (`gh`), logged in — the graph engine queries it
+- opencode CLI (supported `>=1.18.25,<1.20.0`)
+- Codex CLI (supported `>=0.150.1,<0.152.0`)
+- GitHub CLI (`gh`), logged in
 - git, bash; the `aif` binary ships from this repo (cargo builds it)
 
 ## Install
@@ -52,126 +55,115 @@ and builds the `aif` binary when cargo is available:
 - `~/.config/zellij/themes/retro-future.kdl`
 - `~/.config/zellij/layouts/ai-factory.kdl`
 - `~/.config/zellij/prompts/*.md`
-- `~/.local/bin/aif`, `ai-factory` (shim), `clauded`, `opencoded`
-
-It also sets `theme "retro-future"` in your zellij config. The theme applies
-to all your zellij sessions. Remove the line if you do not want that.
+- `~/.local/bin/aif`, `ai-factory` (shim), `clauded`, `codexd`, `opencoded`
 
 ## Configure
 
-**Models.** Open `zellij/layouts/ai-factory.kdl`. Each pane has a
-`--model` argument. Change it to any model your tools support. Then run
-`./install.sh` again.
+**Graph.** `.aif/graph.kdl` declares the workflow:
 
-**Prompts.** Open the files in `zellij/prompts/`:
+```kdl
+graph version=4 {
+    limit 3
 
-| File | Pane |
-|---|---|
-| `refiner.md` | Refiner |
-| `reviewer.md` | Reviewer |
-| `implementer.md` | Implementer |
-| `releaser.md` | Releaser |
-
-The prompt text is plain Markdown. The workspace types it into the pane at
-start. The Planner pane has no prompt file — it starts empty.
-
-The default prompts use the `/loop every 30m` command and `gh` queries.
-Make sure your agent tool supports them, or adapt the text.
-
-**Colors.** Open `zellij/themes/retro-future.kdl` and edit the palette.
-
-**Reasoning effort (optional).** To run the OpenAI and Z.AI models at
-maximum effort, add this to your opencode config
-(`~/.config/opencode/opencode.jsonc`):
-
-```jsonc
-{
-  "provider": {
-    "openai": {
-      "options": {
-        "reasoningEffort": "max"
-      }
-    },
-    "zai-coding-plan": {
-      "options": {
-        "reasoningEffort": "max"
-      }
+    node "refiner" limit=1 {
+        agent "codex"
+        model "gpt-5.6-sol"
+        exec "auto"
+        when "issue has label 'to-refine'"
+        prompt ".aif/prompts/refiner.md"
     }
-  }
 }
 ```
 
-**Concurrency.** Every loop prompt caps the work at 3 subagents at the
-same time. Edit the `Dispatch at most 3 subagents` line in a prompt file
-to change this.
+Rules: `limit` caps concurrent reserved work globally; node `limit`
+(default 1) caps one node; `retrigger "head-sha"` starts a new Reviewer
+task when the PR head changes; `exec "auto"` is rejected for claude.
+Edges stay documentation-only. Local timing uses environment variables,
+not the graph: `AIF_GITHUB_POLL` (default 60s), `AIF_RECONCILE`
+(default 600s), `AIF_SERVER_IDLE` (default 600s).
+
+**Prompts.** Repo-local one-item prompts live in `.aif/prompts/`. The
+factory fills `{github_issue_no}` or `{gh_ticket_no}` with one item id.
+The daemon creates one isolated worktree per automatic task; prompts must
+not create worktrees themselves.
+
+**Trust.** Automatic full-access execution needs one explicit approval:
+
+```sh
+aif trust
+```
+
+Polling cannot verify who changed a label. Any collaborator who can set a
+matching label can trigger automatic work. `AIF_CODEX_YOLO=0` keeps the
+restricted codex sandbox; `AIF_ALLOW_UNTESTED_HARNESS=1` bypasses the
+version gates.
 
 ## Use
 
 ```sh
-aif start                       # start the factory session (ai-factory is a shim)
-aif                             # open the cockpit TUI
-aif status [--json]            # one-shot pane map
-aif start --skip planner       # factory tab only
-aif start --skip refiner,reviewer
+aif start                  # ensure the daemon, then open the lean UI
+aif                        # cockpit (tasks, nodes, events)
+aif status [--json]        # one-shot daemon state
+aif pause [node]           # stop new dispatches
+aif resume [node]
+aif task submit <id>       # send supervised work into its pane
+aif task cancel <id>
+aif task retry <id>        # next attempt for a terminal task
+aif task resolve <id> failed|succeeded|cancelled
+aif task complete <id>     # supervised work finished
+aif task fail <id>
+aif stop [--force]         # stop the daemon
+aif restart
+aif events --follow        # journal tail and live follow
+aif logs <task>            # bounded task log
+aif cleanup                # remove clean worktrees of terminal tasks
+aif doctor                 # binaries, protocols, graph, daemon
+aif list                   # local factories
 ```
 
-zellij keys: `Ctrl t` tabs, `Ctrl p` panes, `Alt hjkl` move focus,
-`Ctrl q` leave the session. The session keeps running in the background.
+Cockpit keys: `1-9` select, `Enter` submit, `c` cancel, `r` retry,
+`C`/`f` complete/fail, `p`/`P` pause/resume, `q` quit.
 
-Cockpit keys: `1-5` select, `Enter` submit a waiting draft, `r` press
-enter in the pane, `s` next pane, `l` scrollback, `q` quit.
+Task states: `queued`, `presenting`, `awaiting_user`, `reserved`,
+`accepted`, `running`, `cancel_requested`, `uncertain`, `succeeded`,
+`failed`, `cancelled`, `superseded`. Reserved, active, cancelling, and
+uncertain tasks all consume capacity. Uncertain tasks never retry
+automatically; an operator resolves them.
 
-## Graph mode
-
-A repo can carry `.aif/graph.kdl`. It declares the agent graph: nodes with
-agents, models, and `when` conditions over GitHub state; edges for
-documentation. See this repo's own `.aif/graph.kdl` as the example.
+## Migration
 
 ```sh
-aif graph validate             # parse and check the graph
-aif graph dot                  # Graphviz export
-aif run --once --dry-run       # show what would dispatch
-aif run --once                 # dispatch ready tasks into idle panes
-aif run                        # loop on the graph tick
-aif events                     # the JSONL dispatch log
+aif graph migrate                      # preview
+aif graph migrate --write              # apply with a v3 backup
+aif graph migrate --write --auto-workers
 ```
 
-When the graph file exists, the static pane drafts stand down. The
-scheduler owns the prompts: it fills the ticket number into
-`{github_issue_no}` or `{gh_ticket_no}` and pastes the prompt into an
-idle pane. You press Enter in the pane to send it.
+Migration never changes a supervised node to automatic by itself;
+`--auto-workers` performs that explicit step for codex and opencode nodes
+and adds head-sha retrigger to draft-review nodes. A live legacy session
+blocks the write. Rollback: restore `.aif/graph.kdl.v3.bak` and start v3.
 
-Rules: one task per pane, `limit` concurrent dispatches, one dispatch per
-ticket per cycle. Dependencies come from "blocked by #N" in the issue
-body; a ticket with open blockers never reaches the Implementer.
+## v3 compatibility
 
-## How the typed prompts work
+A graph without `version=4` keeps the whole v3 runtime: five panes, the
+tick loop, `aif run --once`, and the ledger. Nothing migrates by itself.
 
-Each pane command accepts `--draft-file <path>`. A background job in the
-pane waits until the TUI is ready, then asks the zellij server to write the
-text into the pane as a bracketed paste. Nothing is sent. You press Enter.
+## Memory
 
-This is why the drafts appear a few seconds after the panes start.
+| Lever | Effect |
+|---|---|
+| Resident harness servers | One lazy `codex app-server` and one lazy `opencode serve` per factory; both stop after `AIF_SERVER_IDLE` with zero active tasks. No agent TUIs. |
+| Scope isolation | The daemon runs inside the factory slice; `AIF_MEMORY_HIGH` still caps it. |
+| `aif top` | Per-process RSS from `/proc` plus scope totals. |
 
-## Versioning and development
+## Development
 
-The repo uses git tags for versions (`v0.1.0` is the first release). To
-work on it, edit the files here, run `./install.sh`, and test inside a
-scratch git repository. Send a pull request with a short description of
-the change.
+The Rust console lives in `ui/console`. Run `./check.sh` before pushing;
+it runs fmt, clippy, tests, and the tokens drift check. Tests never touch
+the network or real harness binaries; protocol behavior uses scripted
+transports.
 
-**Console (`aif`).** The Rust console and graph engine live in
-`ui/console`. The color source of truth is `ui/tokens/tokens.json`; the
-zellij theme is generated from it:
-
-```sh
-cargo run --manifest-path ui/console/Cargo.toml -- tokens zellij
-```
-
-CI does not exist in this repo on purpose. Run `./check.sh` before you
-push; it runs fmt, clippy, tests, and the tokens drift check.
-
-To release a new version:
+To release:
 
 ```sh
 git tag v0.x.0
