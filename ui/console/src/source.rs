@@ -42,6 +42,8 @@ impl GhRunner for RealGh {
 }
 
 pub fn parse_gh_output(code: i32, stdout: &str, stderr: &str) -> std::io::Result<GhOut> {
+    let stdout = stdout.replace("\r\n", "\n");
+    let stdout = stdout.as_str();
     let (head, body) = match stdout.find("\n\n") {
         Some(idx) => (&stdout[..idx], stdout[idx + 2..].to_owned()),
         None => match stdout.find('\n') {
@@ -402,6 +404,16 @@ mod tests {
         assert_eq!(out.status, 304);
         assert_eq!(out.headers.get("etag").map(|s| s.as_str()), Some("\"abc\""));
         assert_eq!(out.body, "");
+    }
+
+    #[test]
+    fn parses_crlf_headers_like_real_gh() {
+        let crlf =
+            "HTTP/2.0 200 OK\r\nEtag: \"e1\"\r\nLink: <next>; rel=\"next\"\r\n\r\n[{\"id\":1}]";
+        let out = parse_gh_output(0, crlf, "").unwrap();
+        assert_eq!(out.status, 200);
+        assert_eq!(out.headers.get("etag").map(|s| s.as_str()), Some("\"e1\""));
+        assert_eq!(out.body, "[{\"id\":1}]");
     }
 
     #[test]
