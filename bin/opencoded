@@ -5,7 +5,7 @@ set -euo pipefail
 
 register_role() {
     if [[ -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" ]]; then
-        local reg="${XDG_RUNTIME_DIR:-/tmp}/aif-registry/${ZELLIJ_SESSION_NAME}"
+        local reg="${XDG_STATE_HOME:-$HOME/.local/state}/aif/registry/${ZELLIJ_SESSION_NAME}"
         mkdir -p "$reg"
         printf '%s' "$1" >"${reg}/${ZELLIJ_PANE_ID}"
     fi
@@ -46,16 +46,19 @@ if [[ -n "$draft" && -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" &
         for _attempt in 1 2 3 4 5 6 7 8 9 10; do
             for _ in $(seq 1 20); do
                 out="$(screen)"
-                [[ "$out" == *"ctrl+p commands"* ]] && break
+                [[ "$out" == *"ctrl+p"* ]] && break
                 sleep 1
             done
             zj action write-chars -p "$ZELLIJ_PANE_ID" "$payload"
             sleep 2
             out="$(screen)"
-            [[ "$out" == *"[Pasted ~"* ]] && exit 0
+            [[ "$out" == *"[Pasted ~"* || "$out" == *"$draft"* ]] && exit 0
             sleep 2
         done
     ) >/dev/null 2>&1 &
 fi
 
+if [[ "${AIF_OPENCODE_MINI:-1}" != "0" ]]; then
+    exec opencode --auto --mini "${args[@]}"
+fi
 exec opencode --auto "${args[@]}"

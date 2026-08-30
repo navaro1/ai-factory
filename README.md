@@ -178,6 +178,24 @@ git tag v0.x.0
 git push --tags
 ```
 
+## Memory
+
+Five agent TUIs are heavy. The workspace attacks this on four fronts:
+
+| Lever | Effect |
+|---|---|
+| Codex for the gpt-5.6-sol panes | A painted codex TUI idles at ~200 MiB against opencode's ~850 MiB. `codexd` execs the native binary directly, skipping the node launcher. Effort is pinned with `model_reasoning_effort=max` (`AIF_CODEX_EFFORT`). |
+| opencode `--mini` for the rest | Roughly halves an idle opencode pane (~445 MiB). Disable with `AIF_OPENCODE_MINI=0`. |
+| Scope isolation + throttle | `aif start` runs the session in `aif-<repo>-factory.scope` with `MemoryHigh` (default 3 GiB, `AIF_MEMORY_HIGH` to change, `0` disables). The factory throttles itself before the user slice reaches systemd-oomd pressure. |
+| `aif top` | Per-process RSS from `/proc` plus scope totals, in the style of t3 Code's native resource monitor. |
+
+Measured: a full factory dropped from ~3.2 GiB to ~1.4 GiB. Graph-mode
+`exec auto` (v0.4.0) will remove idle TUIs entirely: agents spawn per task
+and exit, which is how t3 Code keeps five agents cheap.
+
+Codex panes do not support the `/loop` line; `codexd` and the scheduler
+strip it automatically.
+
 ## Known limits
 
 - Claude shows a folder-trust dialog on first use in a new repository.

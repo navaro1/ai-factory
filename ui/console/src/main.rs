@@ -57,6 +57,8 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         last: usize,
     },
+    /// Show factory memory usage per process and scope
+    Top,
 }
 
 #[derive(Subcommand)]
@@ -129,6 +131,11 @@ fn run() -> Result<()> {
         Some(Command::Events { last }) => {
             let root = status::repo_root()?;
             runner::print_events(&root, last)
+        }
+        Some(Command::Top) => {
+            let root = status::repo_root()?;
+            print!("{}", aif::mem::top(&root)?);
+            Ok(())
         }
         Some(Command::Graph { command }) => match command {
             GraphCommand::Validate { path } => {
@@ -213,10 +220,13 @@ fn start_factory(skip: Option<&str>) -> Result<()> {
     let rendered =
         aif::layout::render(&template, &root, &repo, &zdir.join("prompts"), &skip_items)?;
 
-    let runtime_base = std::env::var("XDG_RUNTIME_DIR")
+    let state_base = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let registry = runtime_base.join("aif-registry").join(&session);
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".local").join("state")
+        });
+    let registry = state_base.join("aif").join("registry").join(&session);
     let _ = std::fs::remove_dir_all(&registry);
 
     let layout_file =
@@ -230,18 +240,22 @@ fn start_factory(skip: Option<&str>) -> Result<()> {
         .map(|out| out.status.success())
         .unwrap_or(false);
     let err = if isolated {
+        let memory_high = std::env::var("AIF_MEMORY_HIGH").unwrap_or_else(|_| "3G".into());
         eprintln!("aif: starting {session} in its own user scope aif-{session}");
-        std::process::Command::new("systemd-run")
-            .args(["--user", "--scope"])
-            .arg(format!("--unit=aif-{session}"))
-            .args([
-                "zellij",
-                "--new-session-with-layout",
-                &layout_arg,
-                "--session",
-                &session,
-            ])
-            .exec()
+        let mut cmd = std::process::Command::new("systemd-run");
+        cmd.args(["--user", "--scope"])
+            .arg(format!("--unit=aif-{session}"));
+        if memory_high != "0" && !memory_high.eq_ignore_ascii_case("off") {
+            cmd.arg(format!("--property=MemoryHigh={memory_high}"));
+        }
+        cmd.args([
+            "zellij",
+            "--new-session-with-layout",
+            &layout_arg,
+            "--session",
+            &session,
+        ]);
+        cmd.exec()
     } else {
         std::process::Command::new("zellij")
             .arg("--new-session-with-layout")

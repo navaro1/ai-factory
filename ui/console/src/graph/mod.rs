@@ -9,6 +9,7 @@ use crate::graph::conditions::Condition;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Opencode,
+    Codex,
     Claude,
 }
 
@@ -16,14 +17,18 @@ impl Agent {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "opencode" => Ok(Agent::Opencode),
+            "codex" => Ok(Agent::Codex),
             "claude" => Ok(Agent::Claude),
-            other => bail!("unknown agent {other:?}; expected \"opencode\" or \"claude\""),
+            other => {
+                bail!("unknown agent {other:?}; expected \"opencode\", \"codex\" or \"claude\"")
+            }
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Agent::Opencode => "opencode",
+            Agent::Codex => "codex",
             Agent::Claude => "claude",
         }
     }
@@ -386,6 +391,19 @@ graph {
         let dot = graph.to_dot();
         assert!(dot.contains("\"refiner\" -> \"releaser\""));
         assert!(dot.contains("planner"));
+    }
+
+    #[test]
+    fn parses_codex_agent() {
+        let raw = r#"
+graph {
+    tick "1m"
+    node "reviewer" { agent "codex"; model "gpt-5.6-sol"; when "pr is draft"; prompt "p.md" }
+}
+"#;
+        let graph = Graph::parse(raw).unwrap();
+        assert_eq!(graph.node("reviewer").unwrap().agent, Agent::Codex);
+        graph.validate().unwrap();
     }
 
     #[test]

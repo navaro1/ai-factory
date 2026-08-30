@@ -9,7 +9,7 @@ CLAUDE_FLAGS=(
 
 register_role() {
     if [[ -n "${ZELLIJ_PANE_ID:-}" && -n "${ZELLIJ_SESSION_NAME:-}" ]]; then
-        local reg="${XDG_RUNTIME_DIR:-/tmp}/aif-registry/${ZELLIJ_SESSION_NAME}"
+        local reg="${XDG_STATE_HOME:-$HOME/.local/state}/aif/registry/${ZELLIJ_SESSION_NAME}"
         mkdir -p "$reg"
         printf '%s' "$1" >"${reg}/${ZELLIJ_PANE_ID}"
     fi

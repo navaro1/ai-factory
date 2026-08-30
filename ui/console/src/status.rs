@@ -50,8 +50,13 @@ pub fn session_name(root: &std::path::Path) -> String {
 }
 
 pub fn registry_dir(session: &str) -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(base).join("aif-registry").join(session)
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".local").join("state")
+        });
+    base.join("aif").join("registry").join(session)
 }
 
 pub fn registry_roles(session: &str) -> HashMap<String, String> {
@@ -120,14 +125,16 @@ fn probe_panes(session: &str, registry: &HashMap<String, String>) -> Vec<PaneSta
     }
     panes
 }
-
 pub fn resolve_role(registry_role: &str, class: &Classification) -> String {
+    let sol_worker =
+        matches!(class.agent.as_str(), "opencode" | "codex") && class.model.contains("gpt-5.6-sol");
     let trusted = match registry_role {
         "Planner" => class.agent == "claude" && class.model_marker().contains("Fable 5"),
         "Releaser" => class.agent == "claude" && class.model_marker().contains("Opus 5"),
-        "Refiner" | "Reviewer" => class.agent == "opencode" && class.model == "openai/gpt-5.6-sol",
+        "Refiner" | "Reviewer" => sol_worker,
         "Implementer" => {
-            class.agent == "opencode" && class.model == "zai-coding-plan/glm-5.3-flash"
+            class.agent == "opencode"
+                && (class.model == "zai-coding-plan/glm-5.3-flash" || class.model == "unknown")
         }
         _ => false,
     };
@@ -184,7 +191,34 @@ pub fn classify(content: &str) -> Classification {
             state: state.into(),
         };
     }
-    if content.contains("Build auto") || content.contains("Ask anything") {
+    let codex_like = content.contains("OpenAI Codex")
+        || content.contains("Ask Codex")
+        || (content.contains('›') && content.contains("gpt-5.6-sol"));
+    if codex_like {
+        let model = if content.contains("gpt-5.6-sol") {
+            "gpt-5.6-sol"
+        } else {
+            "unknown"
+        };
+        let state = if content.contains("interrupt") {
+            "working"
+        } else if has_typed_composer(content) {
+            "draft waiting"
+        } else {
+            "empty"
+        };
+        return Classification {
+            role: "unknown".into(),
+            agent: "codex".into(),
+            model: model.into(),
+            state: state.into(),
+        };
+    }
+    if content.contains("Build auto")
+        || content.contains("Ask anything")
+        || content.contains(" BUILD")
+    {
+        let mini = content.contains(" BUILD") && !content.contains("Build auto");
         let model = if content.contains("GPT-5.6 Sol") {
             "openai/gpt-5.6-sol"
         } else if content.contains("GLM-5.3-Flash") {
@@ -199,7 +233,7 @@ pub fn classify(content: &str) -> Classification {
         };
         let state = if content.contains("esc interrupt") {
             "working"
-        } else if content.contains("[Pasted ~") {
+        } else if content.contains("[Pasted ~") || (mini && !content.contains("Ask anything")) {
             "draft waiting"
         } else {
             "empty"
@@ -223,6 +257,15 @@ fn has_typed_draft(content: &str) -> bool {
     content.lines().any(|line| {
         let trimmed = line.trim_start();
         trimmed.starts_with('❯') && trimmed.chars().skip(1).any(|c| !c.is_whitespace())
+    })
+}
+
+fn has_typed_composer(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('›')
+            && trimmed.chars().skip(1).any(|c| !c.is_whitespace())
+            && !trimmed.contains("Ask Codex")
     })
 }
 
@@ -270,6 +313,10 @@ mod tests {
     const OC_IMPLEM: &str = "Build auto · GLM-5.3-Flash Z.AI Coding Plan\n[Pasted ~8 lines]\n";
     const OC_EMPTY: &str = "Ask anything... \"Fix a TODO\"\nBuild auto · GPT-5.6 Sol OpenAI\n";
     const OC_WORKING: &str = "Build auto · GPT-5.6 Sol\n⬝⬝⬝  esc interrupt\n";
+    const CODEX_EMPTY: &str =
+        "OpenAI Codex (v0.150.1)\nmodel: gpt-5.6-sol max\n› Ask Codex to do anything\n";
+    const CODEX_DRAFT: &str =
+        "OpenAI Codex (v0.150.1)\n› /loop every 30m get all PRs in draft state\n  gpt-5.6-sol max · /repo\n";
 
     fn class(text: &str) -> Classification {
         classify(text)
@@ -324,6 +371,24 @@ mod tests {
         let planner = class(CLAUDE_IDLE);
         assert_eq!(resolve_role("Planner", &planner), "Planner");
         assert_eq!(resolve_role("Releaser", &planner), "Planner");
+    }
+
+    #[test]
+    fn classifies_codex_panes() {
+        let empty = class(CODEX_EMPTY);
+        assert_eq!(
+            (
+                empty.agent.as_str(),
+                empty.model.as_str(),
+                empty.state.as_str()
+            ),
+            ("codex", "gpt-5.6-sol", "empty")
+        );
+        let draft = class(CODEX_DRAFT);
+        assert_eq!(draft.state, "draft waiting");
+        assert_eq!(resolve_role("Reviewer", &draft), "Reviewer");
+        assert_eq!(resolve_role("Refiner", &draft), "Refiner");
+        assert_eq!(resolve_role("Implementer", &draft), "unknown");
     }
 
     #[test]

@@ -234,6 +234,14 @@ pub fn render_prompt(node: &NodeSpec, root: &std::path::Path, task: &Task) -> Re
     let full = root.join(prompt_path);
     let raw = std::fs::read_to_string(&full)
         .with_context(|| format!("failed to read prompt {}", full.display()))?;
+    let raw = if node.agent == crate::graph::Agent::Codex {
+        raw.lines()
+            .filter(|line| !line.starts_with("/loop"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        raw
+    };
     Ok(raw
         .replace("{github_issue_no}", &task.number.to_string())
         .replace("{gh_ticket_no}", &task.number.to_string()))
@@ -419,6 +427,31 @@ mod tests {
         };
         let rendered = render_prompt(&spec, &dir, &task).unwrap();
         assert_eq!(rendered, "See ticket 42 or 42");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_prompts_lose_loop_lines() {
+        let mut spec = node("reviewer", Some("pr is draft"));
+        spec.agent = crate::graph::Agent::Codex;
+        spec.prompt = Some(PathBuf::from("prompts/x.md"));
+        let dir = std::env::temp_dir().join("aif-codex-prompt-test");
+        std::fs::create_dir_all(dir.join("prompts")).unwrap();
+        std::fs::write(
+            dir.join("prompts/x.md"),
+            "/loop every 30m do things\n0. Review the diff.\n",
+        )
+        .unwrap();
+        let task = Task {
+            node: "reviewer".into(),
+            kind: ItemKind::PullRequest,
+            number: 9,
+            title: String::new(),
+            url: String::new(),
+        };
+        let rendered = render_prompt(&spec, &dir, &task).unwrap();
+        assert!(!rendered.contains("/loop"));
+        assert!(rendered.contains("0. Review the diff."));
         let _ = std::fs::remove_dir_all(dir);
     }
 

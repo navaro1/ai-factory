@@ -20,11 +20,11 @@ layout {
     tab name="AI factory - {{REPO}}" {
         pane split_direction="vertical" {
             pane split_direction="horizontal" {
-                pane name="Refiner" command="opencoded" {
-                    args "--role" "Refiner" "--model" "openai/gpt-5.6-sol" "--draft-file" "{{PROMPTS}}/refiner.md"
+                pane name="Refiner" command="codexd" {
+                    args "--role" "Refiner" "--model" "gpt-5.6-sol" "--draft-file" "{{PROMPTS}}/refiner.md"
                 }
-                pane name="Reviewer" command="opencoded" {
-                    args "--role" "Reviewer" "--model" "openai/gpt-5.6-sol" "--draft-file" "{{PROMPTS}}/reviewer.md"
+                pane name="Reviewer" command="codexd" {
+                    args "--role" "Reviewer" "--model" "gpt-5.6-sol" "--draft-file" "{{PROMPTS}}/reviewer.md"
                 }
             }
             pane split_direction="horizontal" {

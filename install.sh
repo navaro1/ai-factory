@@ -11,7 +11,7 @@ mkdir -p "${zdir}/themes" "${zdir}/layouts" "${zdir}/prompts" "${bin_dir}"
 install -m 644 "${here}/zellij/themes/retro-future.kdl" "${zdir}/themes/"
 install -m 644 "${here}/zellij/layouts/ai-factory.kdl" "${zdir}/layouts/"
 install -m 644 "${here}"/zellij/prompts/*.md "${zdir}/prompts/"
-install -m 755 "${here}/bin/ai-factory" "${here}/bin/clauded" "${here}/bin/opencoded" "${bin_dir}/"
+install -m 755 "${here}/bin/ai-factory" "${here}/bin/clauded" "${here}/bin/codexd" "${here}/bin/opencoded" "${bin_dir}/"
 
 if command -v cargo >/dev/null 2>&1; then
     printf 'Building the aif binary...\n'
