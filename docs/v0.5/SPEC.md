@@ -125,6 +125,30 @@ Both provider routes are confirmed to work on this machine:
 `zai-coding-plan/glm-5.3-flash` and `openai/gpt-5.6-sol --variant xhigh`.
 Neither needs an API key; both use the subscription login.
 
+## Dependency waves
+
+Chunks in the same wave own disjoint files and may run in parallel. A wave
+starts only when every chunk of the previous wave has landed and been reviewed.
+
+| Wave | Chunks | Files each owns | Waits for |
+|---|---|---|---|
+| 0 | 1 | Cargo.toml, check.sh, lib.rs, bins, stubs | — |
+| 1 | 2 | model.rs, exec.rs, config.rs | 1 |
+| 2 | 3, 5, 6, 7, 9 | gh.rs · gates.rs · tasks.rs · worktree.rs · proc.rs | 2 |
+| 3 | 4, 8, 10, 13, 14 | poll.rs · sched.rs · runner/{mod,opencode}.rs · decisions.rs · trains.rs | its own inputs in wave 2 |
+| 4 | 11, 12 | runner/claude.rs | 10 |
+| 5 | 16 | sock.rs | 4, 8, 13, 14 |
+| 6 | 15, 17 | daemon.rs, state.rs · doctor.rs | 5 |
+| 7 | 18, 20, 21 | tui/{mod,theme,pipeline}.rs · tui/{session,transcript}.rs · tui/inbox.rs | 16 |
+| 8 | 19 | tui/pipeline.rs | 18 |
+| 9 | 22 | deletions, install.sh, README.md | all |
+
+Chunks 11 and 12 both own `runner/claude.rs` and stay sequential. Chunk 19
+extends chunk 18's file and stays after it.
+
+No chunk may edit a file another chunk owns. If you believe you need to, stop
+and report it instead of editing.
+
 ## Source layout
 
 ```
@@ -135,6 +159,7 @@ src/bin/aifd.rs     daemon binary
 src/bin/aif.rs      TUI and control binary
 src/model.rs        Stage, ItemKind, Issue, Pr, Snapshot, Task, TaskState
 src/config.rs       factory.toml
+src/exec.rs         the Exec indirection for every external command
 src/gh.rs           gh CLI wrapper, ETag cache, JSON to model
 src/poll.rs         one poller thread per repository
 src/gates.rs        the four stage predicates
@@ -212,13 +237,45 @@ quality gate.
 
 ---
 
-## Task 2 — Configuration
+## Task 2 — Foundation: domain types, command indirection, configuration
 
-**Goal.** Read and validate `factory.toml`, and resolve each repository's
-GitHub identity from its git remote.
+**Goal.** Every shared type the later chunks build on, in one place, so those
+chunks touch disjoint files and can run in parallel.
 
-**Files.** `src/config.rs`, `src/model.rs` (the `Stage` enum only),
-`docs/v0.5/factory.example.toml`.
+**Files.** `src/model.rs`, `src/exec.rs`, `src/config.rs`,
+`docs/v0.5/factory.example.toml`, and one line each in `src/lib.rs`.
+
+**Part A, `src/model.rs`.** Define the whole domain vocabulary now. No later
+chunk may edit this file.
+- `Stage { Refine, Implement, Review, Release }` with `as_str()`, `FromStr`,
+  `Display`, and `ALL: [Stage; 4]`. Serde uses the lowercase name.
+- `ItemKind { Issue, Pr }` with `as_str()` giving `i` and `p` for task ids.
+- `Issue { number, node_id, title, body, labels: Vec<String>, open: bool }`.
+- `Pr { number, node_id, title, body, labels, open: bool, draft: bool,
+  head_sha: String }`.
+- `RepoSnapshot { issues: BTreeMap<u64, Issue>, prs: BTreeMap<u64, Pr> }`.
+- `Snapshot { repos: BTreeMap<String, RepoSnapshot> }` with
+  `apply(&mut self, repo: &str, fresh: RepoSnapshot) -> Vec<Change>`. It
+  replaces only that repository's entry and returns what changed.
+- `Change { repo, kind, number, what: ChangeWhat }` with
+  `ChangeWhat { Added, Removed, Modified }`. Compare labels, open, draft, and
+  head_sha only. A title or body edit is stored but is not a `Modified`.
+- Every type derives `Debug`, `Clone`, `PartialEq`, and serde where it crosses
+  the socket.
+
+**Part B, `src/exec.rs`.** One indirection for every external command, so no
+test ever runs a real tool.
+- `trait Exec: Send + Sync { fn run(&self, program: &str, args: &[&str],
+  cwd: Option<&Path>) -> anyhow::Result<CmdOut>; }`
+- `CmdOut { status: i32, stdout: String, stderr: String }`.
+- `RealExec` runs the command with `std::process::Command`. It passes an
+  argument vector and never uses a shell.
+- `ScriptExec` is the test double: it is built from a list of
+  `(matcher, CmdOut)` pairs, returns them in order, records every call, and
+  fails the test when an unexpected command arrives. Expose `calls()` so tests
+  can assert the exact argument vectors.
+
+**Part C, `src/config.rs`.** As below.
 
 **Detail.**
 - `Stage` in `model.rs`: `enum Stage { Refine, Implement, Review, Release }`
@@ -280,6 +337,12 @@ release = { policy = "threshold", count = 3 }
 - Also expose `state_dir()`, `config_dir()`, and `socket_path()` helpers here.
 
 **Acceptance criteria.**
+- `Snapshot::apply` for one repository never removes or alters another
+  repository's entries. This gets its own test.
+- Label change, draft flip, head_sha change, add, and remove each produce the
+  right `Change`; a title-only edit produces none.
+- `ScriptExec` returns scripted output in order, records calls, and fails on an
+  unexpected command.
 - Unit tests parse the example config and assert every default and override.
 - `parse_owner_repo` tests cover `git@github.com:o/r.git`,
   `https://github.com/o/r.git`, `https://github.com/o/r`, and a rejected value.
@@ -294,13 +357,10 @@ release = { policy = "threshold", count = 3 }
 **Goal.** Fetch issues and pull requests through the `gh` CLI with conditional
 requests, and map the JSON into model types.
 
-**Files.** `src/gh.rs`, `src/model.rs` (item types).
+**Files.** `src/gh.rs` only. The model types already exist from chunk 2; do
+not edit `src/model.rs`.
 
 **Detail.**
-- Model types: `ItemKind { Issue, Pr }`; `Issue { number, node_id, title,
-  body, labels: Vec<String>, open: bool }`; `Pr { number, node_id, title, body,
-  labels, open: bool, draft: bool, head_sha: String }`;
-  `RepoSnapshot { issues: BTreeMap<u64, Issue>, prs: BTreeMap<u64, Pr> }`.
 - `GhClient` runs `gh api -i -X GET "repos/<owner_repo>/issues?state=open&per_page=100&page=<n>"`
   and the same for `pulls`. It sends `-H "If-None-Match: <etag>"` when it holds
   an ETag for that page. It parses the response head and body from the `-i`
@@ -309,10 +369,9 @@ requests, and map the JSON into model types.
   page returns fewer than 100 items or the `Link` header has no `rel="next"`.
 - The issues endpoint returns pull requests too. Drop any issue object that has
   a `pull_request` key.
-- Command execution goes through a small indirection so tests can substitute a
-  fake: `trait Exec { fn run(&self, args: &[&str]) -> anyhow::Result<Output>; }`
-  with a real implementation and a scripted one for tests. Do not shell out
-  through `sh -c`; pass an argument vector.
+- Command execution goes through the `Exec` trait from chunk 2's `src/exec.rs`.
+  Take it as `&dyn Exec` so tests pass `ScriptExec`. Do not define a second
+  indirection and do not shell out through `sh -c`.
 - Respect rate limits: if the status is 403 or 429 and the head carries
   `Retry-After`, return a typed error that names the wait in seconds. Do not
   sleep inside `GhClient`.
@@ -335,16 +394,10 @@ requests, and map the JSON into model types.
 **Goal.** One poller thread per repository, all feeding one channel, and a
 snapshot type that keeps repositories strictly separate.
 
-**Files.** `src/poll.rs`, `src/model.rs` (`Snapshot`).
+**Files.** `src/poll.rs` only. `Snapshot` and `Change` already exist from
+chunk 2; do not edit `src/model.rs`.
 
 **Detail.**
-- `Snapshot { repos: BTreeMap<String, RepoSnapshot> }` keyed by repository
-  alias. `Snapshot::apply(&mut self, repo: &str, fresh: RepoSnapshot) ->
-  Vec<Change>` replaces only that repository's entry and returns what changed.
-- `Change { repo: String, kind: ItemKind, number: u64, what: ChangeWhat }` where
-  `ChangeWhat` is `Added`, `Removed`, or `Modified`. Compare labels, open,
-  draft, and head_sha; ignore body and title churn for change purposes but do
-  store the new values.
 - `spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Vec<JoinHandle<()>>`.
   Each thread loops: fetch, send `DaemonMsg::Polled { repo, snapshot }`, then
   wait 60 s on a per-repo wake channel so `Reconcile` can force an early pass.
@@ -354,11 +407,8 @@ snapshot type that keeps repositories strictly separate.
   chunks add variants. Start with `Polled`, `PollFailed`, `Shutdown`.
 
 **Acceptance criteria.**
-- Applying a snapshot for `borsuk` never removes or alters `qubitsok` entries.
-  This has a dedicated test.
-- Label change, draft flip, head_sha change, add, and remove each produce the
-  right `Change`.
-- A title-only edit produces no `Modified` change.
+- A poller failure keeps the thread alive and backs off, capped at 5 minutes.
+- `Reconcile` through the wake channel forces an early pass.
 - Poller threads are tested with a fake `Exec`, a short interval injected for
   the test, and assertions on the messages received.
 
@@ -469,7 +519,7 @@ that carry state instead of a database.
   then deletes the branch. `Cleanable` has one variant, `MergedOrClosed`, so no
   code path can delete the worktree of a live issue by accident. There is no
   boolean force flag.
-- Git runs through the same `Exec` indirection as `gh`.
+- Git runs through the `Exec` trait from `src/exec.rs`. Take it as `&dyn Exec`.
 
 **Acceptance criteria.**
 - Tests build a real temporary git repository with an initial commit, then
@@ -542,10 +592,9 @@ task log, and report exit, all without blocking the event loop.
   events. A waiter thread sends `ProcEvent::Exit { code, ok }`.
 - `ProcHandle` exposes `write_line(&str)`, `close_stdin()`, `interrupt_hook`
   (a closure the runner can install to send its own protocol interrupt),
-  `terminate()`, and `kill()`. `terminate()` sends SIGTERM through
-  `libc`-free means: use `std::process::Child::kill` for SIGKILL and implement
-  SIGTERM by shelling out to `kill -TERM <pid>` through `Exec`, so no new
-  dependency is needed.
+  `terminate()`, and `kill()`. `terminate()` sends SIGTERM without a `libc`
+  dependency: use `std::process::Child::kill` for SIGKILL and run
+  `kill -TERM <pid>` through the `Exec` trait from `src/exec.rs` for SIGTERM.
 - `stop_gracefully(handle, protocol_interrupt: bool)` runs the escalation:
   optional protocol interrupt, wait 10 s, SIGTERM, wait 5 s, SIGKILL. It must
   not block the caller; run it on its own thread and report the outcome as a
