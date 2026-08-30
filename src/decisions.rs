@@ -1,16 +1,12 @@
-//! The one decision queue for every question that needs a human.
+//! This module holds one queue for each question that needs a human.
 //!
-//! A [`Decision`] is one condition that an agent or a pipeline stage cannot
-//! settle alone: a tool permission, a real question, a stuck task, an item
-//! with the `needs-human` label, or a release gate that waits for a human
-//! go. Every condition lands in one [`Decisions`] queue and gets one
-//! answer, a [`Response`]. The daemon wires the sources and routes each
-//! answer to its sink. This module owns the type, the queue, the id rules,
-//! and the validation.
+//! A [`Decision`] identifies one condition that requires a human response.
+//! The condition can be a permission, question, failed task, labeled item,
+//! or release approval. Each condition gets one [`Response`]. The daemon
+//! connects each source and handles each response.
 //!
-//! Decision ids are derived, never random. The same underlying condition
-//! always derives the same id, so a repeated push cannot open a second
-//! row.
+//! Each constructor derives a stable identifier (ID). The same condition
+//! always gets the same ID. Thus, a repeat push cannot open a second row.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -43,19 +39,18 @@ pub enum DecisionKind {
         /// The `questions` array of the request, as the CLI sent it.
         questions: serde_json::Value,
     },
-    /// A task used its last attempt and stopped.
+    /// A task failed on its last attempt.
     Stuck {
-        /// The task id of the task that gave up.
+        /// The ID of the failed task.
         task: String,
         /// Why the task gave up.
         reason: String,
     },
-    /// An item carries the `needs-human` label and waits for a human.
+    /// An item has the `needs-human` label and waits for a human.
     ///
-    /// The label can appear after the task ended, so this kind needs no
-    /// running task. The daemon routes the two answers: `Text` posts the
-    /// text as a comment on the item and removes the label. `Cancel`
-    /// removes the label without a comment.
+    /// This decision does not require a current task. The label can appear
+    /// after the task ends. `Text` adds a comment and removes the label.
+    /// `Cancel` removes the label without a comment.
     NeedsHuman {
         /// Whether the item is an issue or a pull request.
         kind: ItemKind,
@@ -64,7 +59,7 @@ pub enum DecisionKind {
         /// The item title.
         title: String,
     },
-    /// A release train waits for a human go.
+    /// A release train waits for human approval.
     ReleaseGate {
         /// The pull request numbers stacked at the gate.
         prs: Vec<u64>,
@@ -72,7 +67,7 @@ pub enum DecisionKind {
 }
 
 impl DecisionKind {
-    /// The lowercase name, for error messages.
+    /// Return the lowercase name for an error message.
     fn name(&self) -> &'static str {
         match self {
             DecisionKind::Permission { .. } => "permission",
@@ -83,7 +78,7 @@ impl DecisionKind {
         }
     }
 
-    /// The accepted response names, for error messages.
+    /// Return the accepted response names for an error message.
     fn accepted(&self) -> &'static str {
         match self {
             DecisionKind::Permission { .. } => "allow or deny",
@@ -95,96 +90,145 @@ impl DecisionKind {
     }
 }
 
-/// The stable id for a stuck condition, with the attempt number.
+/// Return the stable ID for one failed task attempt.
 fn stuck_id(task: &str, attempt: u32) -> String {
     format!("stuck:{task}:{attempt}")
 }
 
-/// One open question for a human, with its derived id.
+/// One open condition that requires a human response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
-    /// The stable, derived id. See [`Decision::new`] for the rules.
+    /// The stable ID that a constructor derives.
     pub id: String,
     /// The repository alias the decision belongs to.
     pub repo: String,
     /// The pipeline stage, when the decision belongs to one stage.
     pub stage: Option<Stage>,
-    /// The condition that waits for an answer.
+    /// The condition that waits for a response.
     pub kind: DecisionKind,
     /// Open time in milliseconds since the Unix epoch.
     pub opened_ms: u64,
 }
 
 impl Decision {
-    /// Build a decision and derive its stable id from `repo` and `kind`.
-    ///
-    /// The id rules:
-    ///
-    /// | Kind | Id |
-    /// |---|---|
-    /// | `Permission` | `perm:<task>:<request_id>` |
-    /// | `Question` | `perm:<task>:<request_id>` |
-    /// | `Stuck` | `stuck:<task>:<attempt>` |
-    /// | `NeedsHuman` | `human:<repo>:<kind><number>` |
-    /// | `ReleaseGate` | `gate:<repo>` |
-    ///
-    /// A `Question` shares the `Permission` shape. Both kinds arrive on the
-    /// same control channel of the claude CLI, and one request id never
-    /// names both a permission ask and a question.
-    ///
-    /// A `Stuck` decision built here gets the attempt number 1. Use
-    /// [`Decision::stuck`] for a task that gave up on a later attempt.
-    pub fn new(repo: &str, stage: Option<Stage>, kind: DecisionKind, opened_ms: u64) -> Self {
-        let id = match &kind {
-            DecisionKind::Permission {
-                task, request_id, ..
-            }
-            | DecisionKind::Question {
-                task, request_id, ..
-            } => {
-                format!("perm:{task}:{request_id}")
-            }
-            DecisionKind::Stuck { task, .. } => stuck_id(task, 1),
-            DecisionKind::NeedsHuman { kind, number, .. } => {
-                format!("human:{repo}:{}{number}", kind.as_str())
-            }
-            DecisionKind::ReleaseGate { .. } => format!("gate:{repo}"),
-        };
+    fn from_parts(
+        id: String,
+        repo: String,
+        stage: Option<Stage>,
+        kind: DecisionKind,
+        opened_ms: u64,
+    ) -> Self {
         Decision {
             id,
-            repo: repo.to_string(),
+            repo,
             stage,
             kind,
             opened_ms,
         }
     }
 
-    /// Build a `Stuck` decision from the task that gave up.
+    /// Build a tool permission decision for one task.
+    pub fn permission(
+        task: &Task,
+        request_id: &str,
+        tool: &str,
+        input: serde_json::Value,
+        opened_ms: u64,
+    ) -> Self {
+        Self::from_parts(
+            format!("perm:{}:{request_id}", task.id),
+            task.repo.clone(),
+            Some(task.stage),
+            DecisionKind::Permission {
+                task: task.id.clone(),
+                request_id: request_id.to_string(),
+                tool: tool.to_string(),
+                input,
+            },
+            opened_ms,
+        )
+    }
+
+    /// Build a question decision for one task.
     ///
-    /// The id records the attempt number of the task, so a second collapse
-    /// after a retry opens a row of its own.
+    /// The ID uses the `perm` prefix. One request can cause a question or a
+    /// permission. Thus, both variants use the same ID namespace.
+    pub fn question(
+        task: &Task,
+        request_id: &str,
+        questions: serde_json::Value,
+        opened_ms: u64,
+    ) -> Self {
+        Self::from_parts(
+            format!("perm:{}:{request_id}", task.id),
+            task.repo.clone(),
+            Some(task.stage),
+            DecisionKind::Question {
+                task: task.id.clone(),
+                request_id: request_id.to_string(),
+                questions,
+            },
+            opened_ms,
+        )
+    }
+
+    /// Build a `Stuck` decision from the failed task.
+    ///
+    /// The ID includes the current task attempt. A later attempt gets a
+    /// different ID.
     pub fn stuck(task: &Task, reason: &str, opened_ms: u64) -> Self {
-        let id = stuck_id(&task.id, task.attempt);
-        Decision {
-            id,
-            repo: task.repo.clone(),
-            stage: Some(task.stage),
-            kind: DecisionKind::Stuck {
+        Self::from_parts(
+            stuck_id(&task.id, task.attempt),
+            task.repo.clone(),
+            Some(task.stage),
+            DecisionKind::Stuck {
                 task: task.id.clone(),
                 reason: reason.to_string(),
             },
             opened_ms,
-        }
+        )
+    }
+
+    /// Build a decision for an item with the `needs-human` label.
+    pub fn needs_human(
+        repo: &str,
+        kind: ItemKind,
+        number: u64,
+        title: &str,
+        opened_ms: u64,
+    ) -> Self {
+        Self::from_parts(
+            format!("human:{repo}:{}{number}", kind.as_str()),
+            repo.to_string(),
+            None,
+            DecisionKind::NeedsHuman {
+                kind,
+                number,
+                title: title.to_string(),
+            },
+            opened_ms,
+        )
+    }
+
+    /// Build a manual release decision for one repository.
+    pub fn release_gate(repo: &str, prs: Vec<u64>, opened_ms: u64) -> Self {
+        Self::from_parts(
+            format!("gate:{repo}"),
+            repo.to_string(),
+            None,
+            DecisionKind::ReleaseGate { prs },
+            opened_ms,
+        )
     }
 }
 
-/// The one answer a human gives to a decision.
+/// One response from a human.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     /// Approve the tool use, with the input as stored.
     Allow,
-    /// Refuse the tool use, with a reason for the agent.
+    /// Refuse the tool use and give the agent a reason.
     Deny {
         /// The reason the answer carries to the agent.
         message: String,
@@ -194,18 +238,17 @@ pub enum Response {
         /// The tool input with the answers filled in.
         updated_input: serde_json::Value,
     },
-    /// A free-text answer or instruction.
+    /// A text answer or instruction.
     ///
-    /// On a `Question` the text folds into the answer for the agent. On a
-    /// `NeedsHuman` decision the daemon posts the text as a comment on the
-    /// item and removes the `needs-human` label.
+    /// For a `Question`, the daemon sends the text to the agent. For a
+    /// `NeedsHuman` decision, the daemon adds a comment and removes the label.
     Text {
         /// The text the human typed.
         text: String,
     },
-    /// Run the work again.
+    /// Start the work again.
     Retry,
-    /// Abandon the work the decision belongs to.
+    /// Stop the related work.
     Cancel,
     /// Release the stacked pull requests.
     Go {
@@ -215,7 +258,7 @@ pub enum Response {
 }
 
 impl Response {
-    /// The lowercase name, for error messages.
+    /// Return the lowercase name for an error message.
     fn name(&self) -> &'static str {
         match self {
             Response::Allow => "allow",
@@ -231,7 +274,7 @@ impl Response {
 
 /// Check that `response` fits the kind of `decision`.
 ///
-/// The legal pairings:
+/// The legal combinations are:
 ///
 /// | Kind | Responses |
 /// |---|---|
@@ -241,12 +284,11 @@ impl Response {
 /// | `NeedsHuman` | `Text`, `Cancel` |
 /// | `ReleaseGate` | `Go` |
 ///
-/// Every other pairing is an error.
+/// Every other combination is an error.
 ///
-/// The daemon routes the two `NeedsHuman` answers: `Text` posts the text
-/// as a comment on the item and removes the `needs-human` label. `Cancel`
-/// removes the label without a comment. `Retry` is refused: the label can
-/// outlive the task that raised it, so there may be nothing to retry.
+/// For `NeedsHuman`, `Text` adds a comment and removes the label. `Cancel`
+/// removes the label without a comment. The function refuses `Retry`. The
+/// label can remain after its task ends.
 pub fn validate(decision: &Decision, response: &Response) -> Result<()> {
     let legal = match response {
         Response::Allow => matches!(decision.kind, DecisionKind::Permission { .. }),
@@ -275,11 +317,10 @@ pub fn validate(decision: &Decision, response: &Response) -> Result<()> {
     }
 }
 
-/// Every decision that waits for a human, oldest first.
+/// All decisions that wait for a human.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Decisions {
-    /// The open decisions, oldest first.
-    pub open: Vec<Decision>,
+    open: Vec<Decision>,
 }
 
 impl Decisions {
@@ -288,18 +329,21 @@ impl Decisions {
         Decisions::default()
     }
 
-    /// The open decisions, oldest first.
+    /// Return the open decisions in push order.
     pub fn open(&self) -> &[Decision] {
         &self.open
     }
 
-    /// Open a decision, unless a row with the same id is already open.
+    /// Open a decision or refresh the row with the same id.
     ///
     /// The same underlying condition always derives the same id, so a
-    /// repeated push keeps one row. The call returns the id when it opened
-    /// the row, and `None` when an open row with that id already exists.
+    /// repeated push keeps one row. A refresh keeps the first open time.
+    /// The call returns the id only when it opens a new row.
     pub fn push(&mut self, decision: Decision) -> Option<String> {
-        if self.open.iter().any(|row| row.id == decision.id) {
+        if let Some(row) = self.open.iter_mut().find(|row| row.id == decision.id) {
+            let opened_ms = row.opened_ms;
+            *row = decision;
+            row.opened_ms = opened_ms;
             return None;
         }
         let id = decision.id.clone();
@@ -307,7 +351,7 @@ impl Decisions {
         Some(id)
     }
 
-    /// Remove the open decision with `id` and give the row back.
+    /// Remove the open decision with `id` and return it.
     ///
     /// The call returns `None` when no open row carries the id.
     pub fn take(&mut self, id: &str) -> Option<Decision> {
@@ -315,7 +359,7 @@ impl Decisions {
         Some(self.open.remove(position))
     }
 
-    /// Remove every open decision of one task and give the rows back.
+    /// Remove and return each open decision for one task.
     ///
     /// The call removes the `Permission`, `Question`, and `Stuck` rows of
     /// the task. `NeedsHuman` and `ReleaseGate` rows belong to no task, so
@@ -346,33 +390,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::tasks::{TaskState, TaskTable};
 
     const NOW: u64 = 1_000;
-
-    /// A permission ask for one tool use.
-    fn permission(task: &str, request_id: &str) -> DecisionKind {
-        DecisionKind::Permission {
-            task: task.to_string(),
-            request_id: request_id.to_string(),
-            tool: "Write".to_string(),
-            input: serde_json::json!({"file_path": "src/main.rs"}),
-        }
-    }
-
-    /// A real question from `AskUserQuestion`.
-    fn question(task: &str, request_id: &str) -> DecisionKind {
-        DecisionKind::Question {
-            task: task.to_string(),
-            request_id: request_id.to_string(),
-            questions: serde_json::json!([{
-                "question": "Which database?",
-                "header": "Storage",
-                "options": [{"label": "SQLite", "description": "embedded"}],
-                "multiSelect": false,
-            }]),
-        }
-    }
 
     /// A fresh task on attempt 1.
     fn task(repo: &str, stage: Stage, kind: ItemKind, number: u64) -> Task {
@@ -381,40 +400,29 @@ mod tests {
 
     /// One decision of every kind, in a fixed order.
     fn every_decision() -> Vec<Decision> {
+        let worker = task("borsuk", Stage::Implement, ItemKind::Issue, 142);
         vec![
-            Decision::new(
-                "borsuk",
-                Some(Stage::Implement),
-                permission("borsuk/implement-i142", "req-1"),
+            Decision::permission(
+                &worker,
+                "req-1",
+                "Write",
+                serde_json::json!({"file_path": "src/main.rs"}),
                 NOW,
             ),
-            Decision::new(
-                "borsuk",
-                Some(Stage::Implement),
-                question("borsuk/implement-i142", "req-2"),
+            Decision::question(
+                &worker,
+                "req-1",
+                serde_json::json!([{
+                    "question": "Which database?",
+                    "header": "Storage",
+                    "options": [{"label": "SQLite", "description": "embedded"}],
+                    "multiSelect": false,
+                }]),
                 NOW,
             ),
-            Decision::stuck(
-                &task("borsuk", Stage::Implement, ItemKind::Issue, 142),
-                "3 failures",
-                NOW,
-            ),
-            Decision::new(
-                "borsuk",
-                None,
-                DecisionKind::NeedsHuman {
-                    kind: ItemKind::Issue,
-                    number: 142,
-                    title: "Fix the flake".to_string(),
-                },
-                NOW,
-            ),
-            Decision::new(
-                "borsuk",
-                None,
-                DecisionKind::ReleaseGate { prs: vec![7, 9] },
-                NOW,
-            ),
+            Decision::stuck(&worker, "3 failures", NOW),
+            Decision::needs_human("borsuk", ItemKind::Issue, 142, "Fix the flake", NOW),
+            Decision::release_gate("borsuk", vec![7, 9], NOW),
         ]
     }
 
@@ -440,7 +448,7 @@ mod tests {
     #[test]
     fn permission_and_question_ids_derive_from_task_and_request() {
         assert_eq!(every_decision()[0].id, "perm:borsuk/implement-i142:req-1");
-        assert_eq!(every_decision()[1].id, "perm:borsuk/implement-i142:req-2");
+        assert_eq!(every_decision()[1].id, "perm:borsuk/implement-i142:req-1");
     }
 
     #[test]
@@ -457,39 +465,8 @@ mod tests {
             }
         );
 
-        // A new Decision built from the kind alone counts as attempt 1.
-        let plain = Decision::new(
-            "borsuk",
-            Some(Stage::Implement),
-            DecisionKind::Stuck {
-                task: "borsuk/implement-i142".to_string(),
-                reason: "3 failures".to_string(),
-            },
-            NOW,
-        );
-        assert_eq!(plain.id, "stuck:borsuk/implement-i142:1");
-
-        // After a retry the attempt rises, and the id follows it.
-        let mut table = TaskTable::new();
-        let id = table
-            .upsert_queued(
-                "borsuk",
-                Stage::Review,
-                ItemKind::Pr,
-                7,
-                PathBuf::from("l.jsonl"),
-                NOW,
-            )
-            .unwrap()
-            .id
-            .clone();
-        table.transition(&id, TaskState::Running, NOW).unwrap();
-        table
-            .transition(&id, TaskState::Failed("boom".to_string()), NOW)
-            .unwrap();
-        table.transition(&id, TaskState::Queued, NOW).unwrap();
-        let retried = table.by_id[&id].clone();
-        assert_eq!(retried.attempt, 2);
+        let mut retried = task("borsuk", Stage::Review, ItemKind::Pr, 7);
+        retried.attempt = 2;
         assert_eq!(
             Decision::stuck(&retried, "boom again", NOW).id,
             "stuck:borsuk/review-p7:2"
@@ -502,79 +479,63 @@ mod tests {
         assert_eq!(decisions[3].id, "human:borsuk:i142");
         assert_eq!(decisions[4].id, "gate:borsuk");
 
-        let pr = Decision::new(
-            "borsuk",
-            None,
-            DecisionKind::NeedsHuman {
-                kind: ItemKind::Pr,
-                number: 7,
-                title: "Tidy the changelog".to_string(),
-            },
-            NOW,
-        );
+        let pr = Decision::needs_human("borsuk", ItemKind::Pr, 7, "Tidy the changelog", NOW);
         assert_eq!(pr.id, "human:borsuk:p7");
     }
 
     #[test]
     fn pushing_one_condition_twice_keeps_one_row() {
-        for kind in [
-            permission("borsuk/implement-i142", "req-1"),
-            question("borsuk/implement-i142", "req-2"),
-            DecisionKind::NeedsHuman {
-                kind: ItemKind::Issue,
-                number: 142,
-                title: "Fix the flake".to_string(),
-            },
-            DecisionKind::ReleaseGate { prs: vec![7, 9] },
-        ] {
+        for decision in every_decision() {
             let mut queue = Decisions::new();
-            let first = Decision::new("borsuk", None, kind.clone(), NOW);
-            let id = first.id.clone();
-            assert_eq!(queue.push(first).as_deref(), Some(id.as_str()));
-            let again = Decision::new("borsuk", None, kind, NOW);
-            assert_eq!(queue.push(again), None);
+            let id = decision.id.clone();
+            assert_eq!(queue.push(decision.clone()).as_deref(), Some(id.as_str()));
+            assert_eq!(queue.push(decision), None);
             assert_eq!(queue.open().len(), 1);
         }
+    }
 
+    #[test]
+    fn pushing_one_condition_again_refreshes_its_data() {
         let mut queue = Decisions::new();
-        let worker = task("borsuk", Stage::Implement, ItemKind::Issue, 142);
-        let id = queue
-            .push(Decision::stuck(&worker, "3 failures", NOW))
+        queue
+            .push(Decision::release_gate("borsuk", vec![7], NOW))
             .unwrap();
-        assert_eq!(
-            queue.push(Decision::stuck(&worker, "3 failures", NOW)),
-            None
-        );
+
+        let result = queue.push(Decision::release_gate("borsuk", vec![7, 9], NOW + 1));
+
+        assert_eq!(result, None);
         assert_eq!(queue.open().len(), 1);
-        assert_eq!(id, "stuck:borsuk/implement-i142:1");
+        assert_eq!(queue.open()[0].opened_ms, NOW);
+        assert_eq!(
+            queue.open()[0].kind,
+            DecisionKind::ReleaseGate { prs: vec![7, 9] }
+        );
     }
 
     #[test]
     fn different_conditions_open_separate_rows() {
         let mut queue = Decisions::new();
+        let worker = task("borsuk", Stage::Implement, ItemKind::Issue, 142);
         queue
-            .push(Decision::new(
-                "borsuk",
-                None,
-                permission("borsuk/implement-i142", "req-1"),
+            .push(Decision::permission(
+                &worker,
+                "req-1",
+                "Write",
+                serde_json::json!({}),
                 NOW,
             ))
             .unwrap();
         queue
-            .push(Decision::new(
-                "borsuk",
-                None,
-                permission("borsuk/implement-i142", "req-2"),
+            .push(Decision::permission(
+                &worker,
+                "req-2",
+                "Write",
+                serde_json::json!({}),
                 NOW,
             ))
             .unwrap();
         queue
-            .push(Decision::new(
-                "qubitsok",
-                None,
-                DecisionKind::ReleaseGate { prs: vec![] },
-                NOW,
-            ))
+            .push(Decision::release_gate("qubitsok", vec![], NOW))
             .unwrap();
         assert_eq!(queue.open().len(), 3);
     }
@@ -582,12 +543,7 @@ mod tests {
     #[test]
     fn take_removes_the_row_and_a_repeat_push_reopens_it() {
         let mut queue = Decisions::new();
-        let decision = Decision::new(
-            "borsuk",
-            None,
-            DecisionKind::ReleaseGate { prs: vec![7, 9] },
-            NOW,
-        );
+        let decision = Decision::release_gate("borsuk", vec![7, 9], NOW);
         let id = decision.id.clone();
         queue.push(decision);
 
@@ -597,18 +553,13 @@ mod tests {
         assert!(queue.open().is_empty());
         assert!(queue.take(&id).is_none());
 
-        // The answered episode is closed, so the same gate opens again.
-        let fresh = Decision::new(
-            "borsuk",
-            None,
-            DecisionKind::ReleaseGate { prs: vec![7, 9] },
-            NOW,
-        );
+        // The first decision is closed. The same gate can open again.
+        let fresh = Decision::release_gate("borsuk", vec![7, 9], NOW);
         assert_eq!(queue.push(fresh).as_deref(), Some(id.as_str()));
     }
 
     #[test]
-    fn open_lists_rows_oldest_first() {
+    fn open_lists_rows_in_push_order() {
         let mut queue = Decisions::new();
         queue.push(every_decision()[3].clone()).unwrap();
         queue.push(every_decision()[4].clone()).unwrap();
@@ -668,26 +619,9 @@ mod tests {
         assert_eq!(accepted, legal.len());
     }
 
-    /// The needs-human row, for the routing tests below.
+    /// One needs-human decision.
     fn needs_human() -> Decision {
         every_decision()[3].clone()
-    }
-
-    #[test]
-    fn needs_human_text_posts_a_comment_and_removes_the_label() {
-        let decision = needs_human();
-        validate(
-            &decision,
-            &Response::Text {
-                text: "run the seed jobs first".to_string(),
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn needs_human_cancel_removes_the_label_without_a_comment() {
-        validate(&needs_human(), &Response::Cancel).unwrap();
     }
 
     #[test]
@@ -703,28 +637,34 @@ mod tests {
     #[test]
     fn drop_for_task_removes_only_that_tasks_rows() {
         let mut queue = Decisions::new();
-        let a = "borsuk/implement-i142";
-        let b = "borsuk/review-p7";
+        let a = task("borsuk", Stage::Implement, ItemKind::Issue, 142);
+        let b = task("borsuk", Stage::Review, ItemKind::Pr, 7);
         queue
-            .push(Decision::new("borsuk", None, permission(a, "req-1"), NOW))
-            .unwrap();
-        queue
-            .push(Decision::new("borsuk", None, question(a, "req-2"), NOW))
-            .unwrap();
-        queue
-            .push(Decision::stuck(
-                &task("borsuk", Stage::Implement, ItemKind::Issue, 142),
-                "3 failures",
+            .push(Decision::permission(
+                &a,
+                "req-1",
+                "Write",
+                serde_json::json!({}),
                 NOW,
             ))
             .unwrap();
         queue
-            .push(Decision::new("borsuk", None, permission(b, "req-3"), NOW))
+            .push(Decision::question(&a, "req-2", serde_json::json!([]), NOW))
+            .unwrap();
+        queue.push(Decision::stuck(&a, "3 failures", NOW)).unwrap();
+        queue
+            .push(Decision::permission(
+                &b,
+                "req-3",
+                "Write",
+                serde_json::json!({}),
+                NOW,
+            ))
             .unwrap();
         queue.push(every_decision()[3].clone()).unwrap();
         queue.push(every_decision()[4].clone()).unwrap();
 
-        let dropped = queue.drop_for_task(a);
+        let dropped = queue.drop_for_task(&a.id);
         let dropped_ids: Vec<&str> = dropped.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             dropped_ids,
@@ -755,14 +695,9 @@ mod tests {
         let decision = every_decision()[1].clone();
         let text = serde_json::to_string(&decision).unwrap();
         assert_eq!(serde_json::from_str::<Decision>(&text).unwrap(), decision);
-        assert!(text.contains("\"request_id\":\"req-2\""));
+        assert!(text.contains("\"request_id\":\"req-1\""));
 
-        let gate = Decision::new(
-            "borsuk",
-            None,
-            DecisionKind::ReleaseGate { prs: vec![7] },
-            NOW,
-        );
+        let gate = Decision::release_gate("borsuk", vec![7], NOW);
         let text = serde_json::to_string(&gate.kind).unwrap();
         assert!(text.contains("release_gate"));
 
