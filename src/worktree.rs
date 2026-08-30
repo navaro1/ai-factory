@@ -92,14 +92,23 @@ impl WorktreeManager {
     /// on, so callers can use it to choose between create and reuse. It is
     /// not a dispatch blocker: after a restart the gates legitimately re-open
     /// work whose worktree already exists, and that work resumes in place.
-    /// A git failure reports `false`; [`WorktreeManager::ensure_issue`]
-    /// remains the authority.
+    /// A git failure writes an error to standard error and reports `false`.
+    /// [`WorktreeManager::ensure_issue`] remains the authority.
     pub fn exists_issue(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> bool {
         let path = self.issue_path(repo, number);
         if !path.exists() {
             return false;
         }
-        self.registered(exec, &repo.path, &path).unwrap_or(false)
+        match self.registered(exec, &repo.path, &path) {
+            Ok(registered) => registered,
+            Err(error) => {
+                eprintln!(
+                    "cannot check the issue worktree {}: {error:#}",
+                    path.display()
+                );
+                false
+            }
+        }
     }
 
     /// Return the worktree for one issue, and create it when missing.
@@ -272,25 +281,33 @@ impl WorktreeManager {
             repo_path,
             &["rev-parse", "--verify", "--quiet", reference.as_str()],
         )?;
-        Ok(out.status == 0)
+        if out.status == 0 {
+            return Ok(true);
+        }
+        if out.status == 1 {
+            return Ok(false);
+        }
+        require_zero(out, "git rev-parse --verify").map(|_| false)
     }
 
     /// Resolve the base commitish: `origin/HEAD` when git knows it, else the
-    /// repository's own `HEAD`. A non-zero `symbolic-ref` is the designed
-    /// fallback, not a swallowed error.
+    /// repository's own `HEAD`. Status 1 means that the reference is absent.
+    /// Other failures propagate.
     fn default_base(&self, exec: &dyn Exec, repo_path: &Path) -> Result<String> {
         let out = git(
             exec,
             repo_path,
-            &["symbolic-ref", "refs/remotes/origin/HEAD"],
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
         )?;
-        if out.status == 0 {
-            let resolved = out.stdout.trim();
-            if !resolved.is_empty() {
-                return Ok(resolved.to_string());
-            }
+        if out.status == 1 {
+            return Ok("HEAD".to_string());
         }
-        Ok("HEAD".to_string())
+        let out = require_zero(out, "git symbolic-ref")?;
+        let resolved = out.stdout.trim();
+        if resolved.is_empty() {
+            bail!("git symbolic-ref returned an empty reference");
+        }
+        Ok(resolved.to_string())
     }
 
     /// Reset the worktree hard to `base`.
@@ -378,23 +395,40 @@ fn read_marker(worktree: &Path, name: &str) -> Result<Option<String>> {
 ///
 /// A crash can therefore never leave a half-written marker under the final
 /// name, and no `.tmp` file survives a completed call. On a failed write or
-/// rename the temporary file is removed on a best-effort basis, and the
-/// original error is the one that propagates.
+/// rename, the helper removes the temporary path. The error includes a
+/// cleanup failure when removal also fails.
 fn write_marker(worktree: &Path, name: &str, value: &str) -> Result<()> {
     let dir = worktree.join(AIF_DIR);
     fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let target = dir.join(name);
     let temp = dir.join(format!("{name}.tmp"));
     if let Err(e) = fs::write(&temp, format!("{value}\n")) {
-        let _ = fs::remove_file(&temp);
-        return Err(anyhow::Error::new(e).context(format!("cannot write {}", temp.display())));
+        let error = anyhow::Error::new(e).context(format!("cannot write {}", temp.display()));
+        return Err(clean_marker_temp(&temp, error));
     }
     if let Err(e) = fs::rename(&temp, &target) {
-        let _ = fs::remove_file(&temp);
-        return Err(anyhow::Error::new(e)
-            .context(format!("cannot move the marker to {}", target.display())));
+        let error = anyhow::Error::new(e)
+            .context(format!("cannot move the marker to {}", target.display()));
+        return Err(clean_marker_temp(&temp, error));
     }
     Ok(())
+}
+
+/// Remove a failed marker write and keep a cleanup error in the error chain.
+fn clean_marker_temp(temp: &Path, error: anyhow::Error) -> anyhow::Error {
+    let cleanup = match fs::remove_file(temp) {
+        Ok(()) => return error,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return error,
+        Err(e) if e.kind() == io::ErrorKind::IsADirectory => fs::remove_dir(temp),
+        Err(e) => Err(e),
+    };
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => error.context(format!(
+            "cannot clean the temporary marker {}: {cleanup_error}",
+            temp.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +752,126 @@ mod tests {
         fs::remove_dir_all(&root).expect("the temp dir must be removable");
     }
 
+    #[test]
+    fn marker_write_failure_preserves_the_marker_and_removes_the_temporary_path() {
+        let root = temp_root("marker-failure");
+        let worktree = root.join("wt");
+        let marker_dir = worktree.join(AIF_DIR);
+        fs::create_dir_all(&marker_dir).expect("the marker dir must be creatable");
+        let manager = WorktreeManager::new(root.clone());
+        manager.write_session(&worktree, "session-old").unwrap();
+
+        let temp = marker_dir.join(format!("{SESSION_MARKER}.tmp"));
+        fs::create_dir(&temp).expect("the temporary dir must be creatable");
+
+        let error = manager
+            .write_session(&worktree, "session-new")
+            .expect_err("the temporary dir must cause a write failure");
+
+        assert!(error.to_string().contains("cannot write"));
+        assert_eq!(
+            manager.read_session(&worktree).unwrap().as_deref(),
+            Some("session-old")
+        );
+        assert!(!temp.exists(), "the helper must remove the temporary path");
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn marker_write_reports_a_temporary_cleanup_failure() {
+        let root = temp_root("marker-cleanup-failure");
+        let worktree = root.join("wt");
+        let temp = worktree.join(AIF_DIR).join(format!("{SESSION_MARKER}.tmp"));
+        fs::create_dir_all(&temp).expect("the temporary dir must be creatable");
+        fs::write(temp.join("blocker"), "x").expect("the blocker write must succeed");
+        let manager = WorktreeManager::new(root.clone());
+
+        let error = manager
+            .write_session(&worktree, "session-new")
+            .expect_err("the nonempty temporary dir must cause a failure");
+        let error_chain = format!("{error:#}");
+
+        assert!(error_chain.contains("cannot write"));
+        assert!(error_chain.contains("cannot clean"));
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn branch_lookup_propagates_an_unexpected_git_failure() {
+        let root = temp_root("branch-error");
+        let repo_path = root.join("repo");
+        let repo_text = repo_path.to_string_lossy().into_owned();
+        let exec = ScriptExec::new().expect(
+            move |call| {
+                call.program == "git"
+                    && call.argv()
+                        == [
+                            "-C",
+                            repo_text.as_str(),
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            "refs/heads/aif/demo/issue-7",
+                        ]
+            },
+            CmdOut {
+                status: 128,
+                stdout: String::new(),
+                stderr: "fatal: repository is unavailable\n".to_string(),
+            },
+        );
+        let manager = WorktreeManager::new(root.clone());
+
+        let error = manager
+            .branch_exists(&exec, &repo_path, "aif/demo/issue-7")
+            .expect_err("an unexpected git status must be an error");
+
+        assert!(error.to_string().contains("git rev-parse --verify failed"));
+        assert!(error.to_string().contains("repository is unavailable"));
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn default_base_propagates_an_unexpected_git_failure() {
+        let root = temp_root("base-error");
+        let repo_path = root.join("repo");
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "git" && call.args.iter().any(|arg| arg == "symbolic-ref"),
+            CmdOut {
+                status: 128,
+                stdout: String::new(),
+                stderr: "fatal: repository is unavailable\n".to_string(),
+            },
+        );
+        let manager = WorktreeManager::new(root.clone());
+
+        let error = manager
+            .default_base(&exec, &repo_path)
+            .expect_err("an unexpected git status must be an error");
+
+        assert!(error.to_string().contains("git symbolic-ref failed"));
+        assert!(error.to_string().contains("repository is unavailable"));
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn default_base_rejects_an_empty_reference() {
+        let root = temp_root("base-empty");
+        let repo_path = root.join("repo");
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "git" && call.args.iter().any(|arg| arg == "symbolic-ref"),
+            CmdOut::ok("\n"),
+        );
+        let manager = WorktreeManager::new(root.clone());
+
+        let error = manager
+            .default_base(&exec, &repo_path)
+            .expect_err("an empty reference must be an error");
+
+        assert!(error.to_string().contains("empty reference"));
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
     // --- Argument construction, through ScriptExec. ---
 
     #[test]
@@ -763,6 +917,7 @@ mod tests {
                                 "-C",
                                 symref_repo.as_str(),
                                 "symbolic-ref",
+                                "--quiet",
                                 "refs/remotes/origin/HEAD",
                             ]
                 },
@@ -909,6 +1064,7 @@ mod tests {
                                 "-C",
                                 repo_text.as_str(),
                                 "symbolic-ref",
+                                "--quiet",
                                 "refs/remotes/origin/HEAD",
                             ]
                 },
