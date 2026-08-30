@@ -538,10 +538,16 @@ impl Daemon {
             if !self.transition(&id, TaskState::Reserved, "") {
                 return;
             }
-            let worktree = {
-                let task = &self.tasks[&id];
-                (self.worktrees.make)(task, &self.paths)
-            };
+            let worktree = self.tasks[&id]
+                .worktree
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    let task = &self.tasks[&id];
+                    (self.worktrees.make)(task, &self.paths)
+                });
             match worktree {
                 Ok(path) => {
                     if let Some(task) = self.tasks.get_mut(&id) {
@@ -1182,7 +1188,7 @@ impl Daemon {
 
 pub fn run(paths: FactoryPaths, graph: Graph, supervise_process: bool) -> Result<()> {
     paths.ensure()?;
-    let (mut journal, records) = Journal::open(&paths.journal())?;
+    let (mut journal, mut records) = Journal::open(&paths.journal())?;
     let (events_tx, events_rx) = channel::<AdapterEvent>();
     let adapters: Vec<(&'static str, Box<dyn HarnessAdapter>)> = vec![
         ("codex", Box::new(CodexAdapter::new(events_tx.clone()))),
@@ -1193,10 +1199,15 @@ pub fn run(paths: FactoryPaths, graph: Graph, supervise_process: bool) -> Result
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".into());
-    let _ = journal.append(Rec::FactoryMeta {
-        root: paths.root.display().to_string(),
-        repo: repo.clone(),
-    });
+    if !records
+        .iter()
+        .any(|record| matches!(record.rec, Rec::FactoryMeta { .. }))
+    {
+        records.push(journal.append(Rec::FactoryMeta {
+            root: paths.root.display().to_string(),
+            repo: repo.clone(),
+        })?);
+    }
     paths.write_meta(&repo)?;
 
     let session = format!("aif-{}-factory", paths.short_id());
@@ -1646,6 +1657,16 @@ mod tests {
         let mut rig = rig();
         paths_setup(&rig.daemon);
         rig.daemon.paths.write_trust(true).unwrap();
+        let worktree_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = worktree_calls.clone();
+        rig.daemon.worktrees = WorktreeMaker {
+            make: Box::new(move |task, paths| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let dir = paths.worktrees_dir().join(&task.id);
+                std::fs::create_dir_all(&dir)?;
+                Ok(dir)
+            }),
+        };
         for _ in 0..6 {
             rig.codex.script_next(vec![AdapterEvent::DispatchFailed {
                 task: "refiner-issue1-r1000003a1".into(),
@@ -1661,6 +1682,11 @@ mod tests {
         drain(&mut rig.daemon, &rig.events_rx);
         let status = rig.daemon.status_json();
         assert_eq!(status["tasks"][0]["state"], "failed");
+        assert_eq!(
+            worktree_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "automatic dispatch retries must reuse the worktree"
+        );
     }
 
     #[test]

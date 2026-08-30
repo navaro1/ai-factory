@@ -317,7 +317,7 @@ fn dispatch_job(
         "model": { "providerID": provider_id, "modelID": model_id },
         "agent": "build",
         "parts": [{ "type": "text", "text": job.prompt }],
-        "messageID": format!("aif-{}-a{}", job.task, job.attempt),
+        "messageID": message_id(&job.task, job.attempt),
     });
     match shared
         .agent
@@ -342,11 +342,17 @@ fn dispatch_job(
                 },
             });
         }
-        Err(ureq::Error::Status(code, _)) => {
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            let suffix = if body.is_empty() {
+                String::new()
+            } else {
+                format!(": {body}")
+            };
             let _ = events.send(AdapterEvent::DispatchFailed {
                 task: job.task.clone(),
                 definitive: true,
-                detail: format!("prompt_async returned {code}"),
+                detail: format!("prompt_async returned {code}{suffix}"),
             });
         }
         Err(err) => {
@@ -631,6 +637,10 @@ pub fn session_title(task: &str, attempt: u32) -> String {
     format!("aif:{task}:a{attempt}")
 }
 
+fn message_id(task: &str, attempt: u32) -> String {
+    format!("msg_aif-{task}-a{attempt}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +655,11 @@ mod tests {
     #[test]
     fn title_is_deterministic() {
         assert_eq!(session_title("t", 2), "aif:t:a2");
+    }
+
+    #[test]
+    fn message_id_has_required_prefix() {
+        assert_eq!(message_id("task-1", 2), "msg_aif-task-1-a2");
     }
 
     #[test]
