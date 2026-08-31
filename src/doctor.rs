@@ -179,6 +179,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             let facts = repo_facts(env.exec, &config);
             checks.extend(repo_checks(&config, &facts));
             checks.extend(tool_checks(env.exec));
+            checks.push(gh_auth_check(env.exec));
             checks.push(daemon_check(env.socket));
             checks.extend(scheduler_checks(&config));
             checks.extend(worktree_checks(env, &config, &facts));
@@ -190,6 +191,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
                 detail: format!("{error:#}"),
             });
             checks.extend(tool_checks(env.exec));
+            checks.push(gh_auth_check(env.exec));
             checks.push(daemon_check(env.socket));
         }
     }
@@ -698,6 +700,62 @@ fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
 /// Check the versions of every tool the factory runs.
 fn tool_checks(exec: &dyn Exec) -> Vec<Check> {
     TOOLS.iter().map(|tool| tool_check(exec, tool)).collect()
+}
+
+/// Check that `gh` is authenticated.
+///
+/// The whole factory reads GitHub through `gh`, so an unauthenticated
+/// `gh` stops every repository poll in silence. The check runs
+/// `gh auth status` and names the fix, because a user who reads the
+/// line must know what to do next.
+fn gh_auth_check(exec: &dyn Exec) -> Check {
+    let label = "gh auth".to_string();
+    let out = match exec.run("gh", &["auth", "status"], None) {
+        Ok(out) => out,
+        Err(error) => {
+            return Check {
+                label,
+                status: Status::Fail,
+                detail: format!("cannot run gh: {error:#}"),
+            };
+        }
+    };
+    // Some `gh` versions print the status on stdout and others on stderr,
+    // so the check reads both streams. The exit code alone does not
+    // decide: the account line must be present too.
+    let combined = format!("{}{}", out.stdout, out.stderr);
+    match (out.status, extract_gh_account(&combined)) {
+        (0, Some(account)) => Check {
+            label,
+            status: Status::Pass,
+            detail: format!("logged in to github.com as {account}"),
+        },
+        _ => Check {
+            label,
+            status: Status::Fail,
+            detail: "not logged in; run: gh auth login".to_string(),
+        },
+    }
+}
+
+/// Extract the account name from the
+/// `✓ Logged in to <host> account <name> (...)` line of
+/// `gh auth status`.
+fn extract_gh_account(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let Some(start) = line.find(" account ") else {
+            continue;
+        };
+        let rest = &line[start + " account ".len()..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Check whether the daemon answers on the socket.
@@ -1328,6 +1386,91 @@ mod tests {
         assert_eq!(check.detail, "gh 2.74.0");
     }
 
+    // --- gh authentication. ---
+
+    /// The real stdout of `gh auth status` when logged in, captured by
+    /// hand on gh 2.74.0.
+    const GH_AUTH_LOGGED_IN: &str = concat!(
+        "github.com\n",
+        "  ✓ Logged in to github.com account navaro1 \
+         (/home/navaro/snap/gh/640/.config/gh/hosts.yml)\n",
+        "  - Active account: true\n",
+        "  - Git operations protocol: ssh\n",
+        "  - Token: gho_************************************\n",
+        "  - Token scopes: 'admin:org', 'gist', 'project', 'repo'\n",
+    );
+
+    /// The real stderr of `gh auth status` with no configured host,
+    /// captured by hand on gh 2.74.0. The exit status is 1.
+    const GH_AUTH_LOGGED_OUT: &str =
+        "You are not logged into any GitHub hosts. To log in, run: gh auth login\n";
+
+    /// A scripted executor that answers one `gh auth status` call.
+    fn gh_auth_exec(out: CmdOut) -> ScriptExec {
+        ScriptExec::new().expect(
+            |call| call.program == "gh" && call.args == ["auth", "status"],
+            out,
+        )
+    }
+
+    #[test]
+    fn a_logged_in_gh_auth_status_passes_with_the_account() {
+        // The real answer of gh 2.74.0 when logged in: the status text
+        // arrives on stdout and the exit status is 0.
+        let exec = gh_auth_exec(CmdOut::ok(GH_AUTH_LOGGED_IN));
+
+        let check = gh_auth_check(&exec);
+
+        assert_eq!(check.label, "gh auth");
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.detail, "logged in to github.com as navaro1");
+    }
+
+    #[test]
+    fn a_logged_out_gh_auth_status_fails_and_names_the_fix() {
+        // The real answer of gh 2.74.0 with no configured host: the
+        // message arrives on stderr and the exit status is 1.
+        let exec = gh_auth_exec(CmdOut {
+            status: 1,
+            stdout: String::new(),
+            stderr: GH_AUTH_LOGGED_OUT.to_string(),
+        });
+
+        let check = gh_auth_check(&exec);
+
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.detail, "not logged in; run: gh auth login");
+        assert!(has_failures(&[check]));
+    }
+
+    #[test]
+    fn a_logged_in_answer_on_stderr_still_passes() {
+        // Some gh versions print the logged-in status on stderr, so the
+        // check reads both streams.
+        let exec = gh_auth_exec(CmdOut {
+            status: 0,
+            stdout: String::new(),
+            stderr: GH_AUTH_LOGGED_IN.to_string(),
+        });
+
+        let check = gh_auth_check(&exec);
+
+        assert_eq!(check.status, Status::Pass);
+        assert_eq!(check.detail, "logged in to github.com as navaro1");
+    }
+
+    #[test]
+    fn a_zero_exit_without_an_account_line_still_fails() {
+        // The exit code alone does not decide; the account line must be
+        // present too.
+        let exec = gh_auth_exec(CmdOut::ok("warning: nothing useful\n"));
+
+        let check = gh_auth_check(&exec);
+
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.detail, "not logged in; run: gh auth login");
+    }
+
     /// Whether any check failed, which decides the `aif doctor` exit code.
     #[test]
     fn has_failures_decides_the_doctor_exit_code() {
@@ -1487,6 +1630,10 @@ mod tests {
             .expect(
                 |call| call.program == "opencode",
                 CmdOut::ok("opencode 1.18.25\n"),
+            )
+            .expect(
+                |call| call.program == "gh" && call.args == ["auth", "status"],
+                CmdOut::ok(GH_AUTH_LOGGED_IN),
             );
         let env = DoctorEnv {
             config_path: &config_path,
@@ -1546,6 +1693,16 @@ mod tests {
                 check.detail
             );
         }
+        let gh_auth = checks
+            .iter()
+            .find(|check| check.label == "gh auth")
+            .expect("the gh auth check must exist");
+        assert_eq!(gh_auth.status, Status::Fail);
+        assert!(
+            gh_auth.detail.contains("cannot run"),
+            "gh auth: {}",
+            gh_auth.detail
+        );
         let daemon = checks
             .iter()
             .find(|check| check.label == "daemon")
@@ -1590,6 +1747,10 @@ mod tests {
                 CmdOut::ok("opencode 1.18.25\n"),
             )
             .expect(
+                |call| call.program == "gh" && call.args == ["auth", "status"],
+                CmdOut::ok(GH_AUTH_LOGGED_IN),
+            )
+            .expect(
                 gh_get("repos/acme/borsuk/issues/7"),
                 issue_answer(7, "open"),
             )
@@ -1623,6 +1784,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("the {tool} check must exist"));
             assert_eq!(check.status, Status::Pass, "{tool}: {}", check.detail);
         }
+        let gh_auth = checks
+            .iter()
+            .find(|check| check.label == "gh auth")
+            .expect("the gh auth check must exist");
+        assert_eq!(gh_auth.status, Status::Pass);
+        assert_eq!(gh_auth.detail, "logged in to github.com as navaro1");
         let daemon = checks
             .iter()
             .find(|check| check.label == "daemon")
@@ -1657,7 +1824,7 @@ mod tests {
             summary.detail
         );
         assert!(!has_failures(&checks));
-        assert_eq!(exec.calls().len(), 8, "calls: {:?}", exec.calls());
+        assert_eq!(exec.calls().len(), 9, "calls: {:?}", exec.calls());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
