@@ -1423,11 +1423,18 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         assert!(text.contains("keys"));
+        let open_session_row = text
+            .lines()
+            .find(|line| line.contains("open the selected task session"))
+            .expect("the help misses the open-session row");
+        assert!(
+            open_session_row.contains("enter"),
+            "the open-session row has the wrong key: {open_session_row}"
+        );
         for entry in [
             "switch view",
             "oldest decision",
             "ctrl-q",
-            "open the selected task session",
             "send the chat message",
             "PageUp PageDown",
             "PageDown",
