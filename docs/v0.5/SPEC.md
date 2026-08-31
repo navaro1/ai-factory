@@ -1585,3 +1585,46 @@ carried it. This task carries it.
   pause forbids.
 - The sibling guard still refuses a follow-up after an abort when another task
   holds the same worktree.
+
+## Task 28 — A running task with no session yet takes no message
+
+**Goal.** Close the one window where the wire still promises what the daemon
+refuses.
+
+**Files.** `src/daemon.rs`.
+
+**Why this task exists.** A live end-to-end run found it; no unit test did.
+`Daemon::input_mode` returns `InputMode::NextTurn` for ANY opencode task in
+`Running`:
+
+```rust
+} else if task.state == TaskState::Running {
+    return InputMode::NextTurn;
+```
+
+It never checks that a session exists. `Daemon::chat` does check, and refuses
+with "no session id and no session marker; there is no agent session to
+continue". An opencode run records its session id only when it prints its first
+NDJSON line, one to three seconds after it starts. In that window the session
+view shows `enter queue · lands after this turn · ctrl-x sends it now`, the
+human types, and the daemon drops the message while the UI reports success.
+
+`closed_reason` already carries the correct sentence for this state,
+`"Wait until the task records a session."`. Nothing routes to it today.
+
+**Detail.**
+
+- `input_mode` returns `NextTurn` only when the task is `Running` AND a session
+  id or marker exists. Otherwise it falls through to the `Closed` arm, which
+  already builds the right sentence.
+- Do not change `chat`. The daemon's refusal is correct; the wire is what lies.
+- Do not widen `chat` to accept a message with no session. A run that dies
+  before it records a session would strand that message.
+
+**Acceptance criteria.**
+- A `Running` opencode task with no session id and no marker returns `Closed`,
+  and the reason tells the human to wait until the task records a session.
+- A `Running` opencode task WITH a session id still returns `NextTurn`.
+- A `Running` opencode task with a session marker but no in-memory id still
+  returns `NextTurn`.
+- The existing input-mode tests still pass unchanged.
