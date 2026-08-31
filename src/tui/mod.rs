@@ -1924,6 +1924,8 @@ mod tests {
             state: TaskState::Running,
             attempt: 1,
             log_path: PathBuf::from("borsuk-refine-i140.jsonl"),
+            input: crate::sock::InputMode::Live,
+            queued_messages: 0,
         });
         run_messages(
             &mut surface,
@@ -2006,6 +2008,8 @@ mod tests {
             state: TaskState::Running,
             attempt: 1,
             log_path: PathBuf::from("ryba-refine-i0.jsonl"),
+            input: crate::sock::InputMode::Live,
+            queued_messages: 0,
         });
         run_messages(
             &mut surface,
