@@ -180,8 +180,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             checks.extend(repo_checks(&config, &facts));
             checks.extend(tool_checks(env.exec));
             checks.push(gh_auth_check(env.exec));
-            checks.push(daemon_check(env.socket));
-            checks.extend(paused_check(env.socket));
+            checks.extend(daemon_checks(env.socket));
             checks.extend(scheduler_checks(&config));
             checks.extend(worktree_checks(env, &config, &facts));
         }
@@ -193,8 +192,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             });
             checks.extend(tool_checks(env.exec));
             checks.push(gh_auth_check(env.exec));
-            checks.push(daemon_check(env.socket));
-            checks.extend(paused_check(env.socket));
+            checks.extend(daemon_checks(env.socket));
         }
     }
     checks
@@ -534,6 +532,15 @@ mod path_watch {
     }
 }
 
+/// The result of one detached daemon start request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// This call started a daemon and observed its socket.
+    Started,
+    /// A daemon answered before this call started one.
+    AlreadyRunning,
+}
+
 /// Start the daemon detached and wait for its socket.
 ///
 /// The start goes through
@@ -542,7 +549,7 @@ mod path_watch {
 /// factory paused. When `systemd-run` is missing, `spawn_detached` starts
 /// the fallback. Other `systemd-run` errors propagate. The helper then waits
 /// for `socket`. The wait ends when the socket answers or when `timeout`
-/// passes.
+/// passes. The result identifies an existing daemon without hiding it.
 pub fn start_detached(
     socket: &Path,
     daemon_program: &Path,
@@ -550,9 +557,9 @@ pub fn start_detached(
     timeout: Duration,
     paused: bool,
     spawn_detached: &mut dyn FnMut(&Path, bool) -> Result<()>,
-) -> Result<()> {
+) -> Result<StartOutcome> {
     if socket_answers(socket) {
-        return Ok(());
+        return Ok(StartOutcome::AlreadyRunning);
     }
     let program_text = daemon_program.to_string_lossy().into_owned();
     let mut args = vec![
@@ -580,7 +587,7 @@ pub fn start_detached(
         Err(error) => return Err(error).context("cannot run systemd-run"),
     }
     if wait_for_socket(socket, timeout) {
-        Ok(())
+        Ok(StartOutcome::Started)
     } else {
         bail!(
             "the daemon did not open {} within {} s; check the aif-daemon unit \
@@ -775,55 +782,53 @@ fn extract_gh_account(output: &str) -> Option<String> {
     None
 }
 
-/// Check whether the daemon answers on the socket.
-fn daemon_check(socket: &Path) -> Check {
+/// Report the daemon connection and its current paused state.
+fn daemon_checks(socket: &Path) -> Vec<Check> {
     match Client::connect(socket) {
-        Ok(_) => Check {
-            label: "daemon".to_string(),
-            status: Status::Pass,
-            detail: format!("running and answering on {}", socket.display()),
-        },
+        Ok(client) => vec![
+            Check {
+                label: "daemon".to_string(),
+                status: Status::Pass,
+                detail: format!("running and answering on {}", socket.display()),
+            },
+            paused_check(&client),
+        ],
         Err(error)
             if error_has_io_kind(
                 &error,
                 &[io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused],
             ) =>
         {
-            Check {
+            vec![Check {
                 label: "daemon".to_string(),
                 status: Status::Info,
                 detail: format!("not running at {}", socket.display()),
-            }
+            }]
         }
-        Err(error) => Check {
+        Err(error) => vec![Check {
             label: "daemon".to_string(),
             status: Status::Fail,
             detail: format!("cannot check {}: {error:#}", socket.display()),
-        },
+        }],
     }
 }
 
 /// Report the paused state of a running daemon.
 ///
-/// The call connects and reads the first state push. A daemon that does not
-/// answer yields no check, because the daemon check already reports that.
-fn paused_check(socket: &Path) -> Vec<Check> {
-    let Ok(client) = Client::connect(socket) else {
-        return Vec::new();
-    };
+/// The call reads the first state push from the connection that proved the
+/// daemon is available.
+fn paused_check(client: &Client) -> Check {
     if let Err(error) = client.set_read_timeout(PUSH_READ_TIMEOUT) {
-        return vec![no_state_check(error)];
+        return no_state_check(error);
     }
     let mut pushes = match client.pushes() {
         Ok(pushes) => pushes,
-        Err(error) => return vec![no_state_check(error)],
+        Err(error) => return no_state_check(error),
     };
     match pushes.next() {
-        Some(Ok(Push::State(view))) => vec![paused_check_from_view(&view.paused)],
-        Some(Err(error)) => vec![no_state_check(error)],
-        None => vec![no_state_check(anyhow!(
-            "the daemon closed the stream without a state push"
-        ))],
+        Some(Ok(Push::State(view))) => paused_check_from_view(&view.paused),
+        Some(Err(error)) => no_state_check(error),
+        None => no_state_check(anyhow!("the daemon closed the stream without a state push")),
     }
 }
 
@@ -1203,7 +1208,7 @@ mod tests {
     use super::*;
     use aif::exec::{CmdOut, ScriptExec};
     use aif::model::Stage;
-    use aif::sock::Action;
+    use aif::sock::{Action, Server, StateView};
     use std::cell::{Cell, RefCell};
     use std::fs::Permissions;
     use std::io::{BufRead, BufReader};
@@ -1805,8 +1810,11 @@ mod tests {
     fn a_daemon_socket_access_error_is_a_failure() {
         let socket = PathBuf::from(format!("/tmp/{}", "x".repeat(1024)));
 
-        let check = daemon_check(&socket);
+        let checks = daemon_checks(&socket);
 
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        let check = &checks[0];
+        assert_eq!(check.label, "daemon");
         assert_eq!(check.status, Status::Fail);
         assert!(
             check.detail.contains("cannot check"),
@@ -2452,10 +2460,10 @@ mod tests {
         let dir = temp_dir("no-systemd");
         let socket = dir.join("daemon.sock");
         let exec = IoErrorExec(std::io::ErrorKind::NotFound);
-        let spawned: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let spawned: RefCell<Vec<(PathBuf, bool)>> = RefCell::new(Vec::new());
         let spawn_socket = socket.clone();
-        let mut spawn = |program: &Path, _paused: bool| {
-            spawned.borrow_mut().push(program.to_path_buf());
+        let mut spawn = |program: &Path, paused: bool| {
+            spawned.borrow_mut().push((program.to_path_buf(), paused));
             fake_daemon(spawn_socket.clone(), 30);
             Ok(())
         };
@@ -2465,14 +2473,44 @@ mod tests {
             Path::new("/opt/aif/bin/aifd"),
             &exec,
             Duration::from_secs(5),
-            false,
+            true,
             &mut spawn,
         )
         .expect("the start must succeed");
 
         let spawned = spawned.borrow();
         assert_eq!(spawned.len(), 1);
-        assert_eq!(spawned[0].as_os_str(), "/opt/aif/bin/aifd");
+        assert_eq!(spawned[0].0.as_os_str(), "/opt/aif/bin/aifd");
+        assert!(spawned[0].1, "the fallback must receive the paused flag");
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn start_detached_reports_an_existing_daemon_without_starting_one() {
+        let dir = temp_dir("already-running");
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("the fake daemon must bind the socket");
+        let exec = ScriptExec::new();
+        let spawned = Cell::new(false);
+        let mut spawn = |_program: &Path, _paused: bool| {
+            spawned.set(true);
+            Ok(())
+        };
+
+        let outcome = start_detached(
+            &socket,
+            Path::new("/opt/aif/bin/aifd"),
+            &exec,
+            Duration::from_secs(5),
+            true,
+            &mut spawn,
+        )
+        .expect("the existing daemon check must succeed");
+
+        assert_eq!(outcome, StartOutcome::AlreadyRunning);
+        assert!(exec.calls().is_empty());
+        assert!(!spawned.get());
+        drop(listener);
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 
@@ -2577,19 +2615,22 @@ mod tests {
     }
 
     #[test]
-    fn spawn_detached_runs_a_real_child() {
+    fn spawn_detached_passes_the_paused_flag_to_a_fake_child() {
         let dir = temp_dir("real-spawn");
         let marker = dir.join("marker");
         let script = dir.join("fake-aifd");
         fs::write(
             &script,
-            format!("#!/bin/sh\ntouch '{}'\nsleep 1\n", marker.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nsleep 1\n",
+                marker.display()
+            ),
         )
         .expect("the script write must succeed");
         fs::set_permissions(&script, Permissions::from_mode(0o755))
             .expect("the script must be chmodable");
 
-        spawn_detached(&script, false).expect("the detached spawn must succeed");
+        spawn_detached(&script, true).expect("the detached spawn must succeed");
 
         let mut found = false;
         for _ in 0..100 {
@@ -2600,6 +2641,10 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(found, "the detached child never ran");
+        assert_eq!(
+            fs::read_to_string(&marker).expect("the fake child arguments must be readable"),
+            "run --paused"
+        );
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 
@@ -2657,6 +2702,49 @@ mod tests {
     }
 
     #[test]
+    fn the_report_reads_the_paused_state_from_the_daemon_socket() {
+        let dir = temp_dir("paused-socket");
+        let socket = dir.join("daemon.sock");
+        let (server, _actions) = Server::bind(&socket).expect("the fake daemon must bind");
+        server.publish(StateView {
+            repos: Vec::new(),
+            stages: Vec::new(),
+            lanes: Vec::new(),
+            tasks: Vec::new(),
+            decisions: Vec::new(),
+            trains: Vec::new(),
+            paused: PausedView {
+                global: true,
+                stages: Vec::new(),
+                repos: Vec::new(),
+            },
+        });
+        let missing_config = dir.join("factory.toml");
+        let exec = ScriptExec::new();
+        let env = DoctorEnv {
+            config_path: &missing_config,
+            state_dir: &dir,
+            socket: &socket,
+            exec: &exec,
+        };
+
+        let checks = report(&env);
+
+        let paused = checks
+            .iter()
+            .find(|check| check.label == "paused")
+            .expect("the paused check must exist");
+        assert_eq!(paused.status, Status::Info);
+        assert!(
+            paused.detail.contains("the whole factory is paused"),
+            "detail: {}",
+            paused.detail
+        );
+        drop(server);
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
     fn the_paused_check_reports_a_running_daemon_and_partial_pauses() {
         let check = paused_check_from_view(&PausedView {
             global: false,
@@ -2688,7 +2776,10 @@ mod tests {
     #[test]
     fn the_paused_check_reports_nothing_when_no_daemon_listens() {
         let dir = temp_dir("paused-down");
-        assert!(paused_check(&dir.join("absent.sock")).is_empty());
+        let checks = daemon_checks(&dir.join("absent.sock"));
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].label, "daemon");
+        assert_eq!(checks[0].status, Status::Info);
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 

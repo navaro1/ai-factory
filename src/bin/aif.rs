@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 
 use aif::config;
 use aif::exec::RealExec;
@@ -26,7 +26,12 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Command line for `aif`.
 #[derive(Parser)]
-#[command(name = "aif", about = "AI Factory terminal UI and control", version)]
+#[command(
+    name = "aif",
+    about = "AI Factory terminal UI and control",
+    version,
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     /// Start a new daemon with the whole factory paused: it polls and
     /// reports, but dispatches nothing until the operator resumes with `P`
@@ -34,7 +39,7 @@ struct Cli {
     /// without dispatching anything. The flag cannot apply when a daemon
     /// already runs; pause that daemon with `P`, or stop it with `aif stop`
     /// first.
-    #[arg(long, global = true)]
+    #[arg(long)]
     paused: bool,
     #[command(subcommand)]
     command: Option<Command>,
@@ -44,7 +49,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the terminal UI. This is the default when no subcommand is given.
-    Tui,
+    Tui {
+        /// Start a new daemon with the whole factory paused.
+        #[arg(long)]
+        paused: bool,
+    },
     /// Stop the daemon.
     Stop,
     /// Report on the installation.
@@ -66,7 +75,8 @@ fn main() {
     let code = match cli.command {
         Some(Command::Stop) => stop(),
         Some(Command::Doctor { config, clean, yes }) => doctor_main(config, clean, yes),
-        Some(Command::Tui) | None => tui(cli.paused),
+        Some(Command::Tui { paused }) => tui(paused),
+        None => tui(cli.paused),
     };
     if code != 0 {
         exit(code);
@@ -98,25 +108,24 @@ fn tui(paused: bool) -> i32 {
 /// daemon to open the socket.
 fn ensure_daemon(paused: bool) -> anyhow::Result<()> {
     let socket = config::socket_path();
-    if doctor::socket_answers(&socket) {
-        if paused {
-            eprintln!(
-                "aif: a daemon already runs on {}; --paused does not apply. \
-                 Pause it with P in the UI, or run `aif stop` first and start again.",
-                socket.display()
-            );
-        }
-        return Ok(());
-    }
     let program = doctor::daemon_program();
-    doctor::start_detached(
+    let outcome = doctor::start_detached(
         &socket,
         &program,
         &RealExec,
         DAEMON_START_TIMEOUT,
         paused,
         &mut doctor::spawn_detached,
-    )
+    )?;
+    match outcome {
+        doctor::StartOutcome::Started => Ok(()),
+        doctor::StartOutcome::AlreadyRunning if paused => bail!(
+            "a daemon already runs on {}; --paused cannot apply. \
+             Pause it with P in the UI, or run `aif stop` first and start again.",
+            socket.display()
+        ),
+        doctor::StartOutcome::AlreadyRunning => Ok(()),
+    }
 }
 
 /// Send the stop action to the daemon and wait for the socket to disappear.
@@ -200,22 +209,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_cli_parses_the_paused_flag_before_and_after_the_subcommand() {
+    fn the_cli_parses_both_required_paused_forms() {
         let parsed = Cli::try_parse_from(["aif", "--paused"]).expect("the arguments must parse");
         assert!(parsed.paused);
         assert!(parsed.command.is_none());
 
         let parsed =
             Cli::try_parse_from(["aif", "tui", "--paused"]).expect("the arguments must parse");
-        assert!(parsed.paused);
+        assert!(!parsed.paused);
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Tui { paused: true })
+        ));
 
         let parsed = Cli::try_parse_from(["aif"]).expect("the arguments must parse");
         assert!(!parsed.paused);
 
         let parsed = Cli::try_parse_from(["aif", "tui"]).expect("the arguments must parse");
         assert!(!parsed.paused);
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Tui { paused: false })
+        ));
 
         let parsed = Cli::try_parse_from(["aif", "stop"]).expect("the arguments must parse");
         assert!(!parsed.paused);
+
+        assert!(Cli::try_parse_from(["aif", "--paused", "stop"]).is_err());
+        assert!(Cli::try_parse_from(["aif", "--paused", "doctor"]).is_err());
     }
 }
