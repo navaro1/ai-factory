@@ -70,7 +70,11 @@ fn tui() -> i32 {
         eprintln!("aif: {error:#}");
         return 1;
     }
-    println!("aif tui: not implemented yet");
+    let socket = config::socket_path();
+    if let Err(error) = aif::tui::run(&socket) {
+        eprintln!("aif: {error:#}");
+        return 1;
+    }
     0
 }
 
