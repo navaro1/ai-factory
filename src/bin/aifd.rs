@@ -1,6 +1,16 @@
-//! The daemon binary. Chunk 15 fills in the real daemon.
+//! The daemon binary: `aifd run` starts the factory event loop.
 
+use std::path::{Path, PathBuf};
+use std::process::exit;
+use std::sync::mpsc;
+
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+
+use aif::config::{self, Config};
+use aif::daemon::Daemon;
+use aif::poll;
+use aif::sock;
 
 /// Command line for `aifd`.
 #[derive(Parser)]
@@ -17,12 +27,93 @@ enum Command {
     Run {
         /// Path to the config file. Defaults to the config directory.
         #[arg(long)]
-        config: Option<std::path::PathBuf>,
+        config: Option<PathBuf>,
     },
 }
 
 fn main() {
-    match Cli::parse().command {
-        Command::Run { .. } => println!("aifd: not implemented yet"),
+    let code = match Cli::parse().command {
+        Command::Run { config } => exit_code(run(config.as_deref(), &config::socket_path())),
+    };
+    if code != 0 {
+        exit(code);
+    }
+}
+
+/// Map the outcome of a daemon run to a process exit code.
+///
+/// A failure prints its whole error chain on stderr and maps to 1.
+fn exit_code(result: anyhow::Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("aifd: {error:#}");
+            1
+        }
+    }
+}
+
+/// Load the config, bind the control socket, spawn the pollers, and run the
+/// daemon until the operator stops it.
+///
+/// The call drops the server before it returns, so every connected client
+/// sees its stream close and the socket file disappears. Dropping the daemon
+/// inside `run` ends the pollers, because the daemon owns their wake
+/// senders.
+fn run(config_path: Option<&Path>, socket_path: &Path) -> anyhow::Result<()> {
+    let config = Config::load(config_path).context("cannot load the factory config")?;
+    let (server, action_rx) = sock::Server::bind(socket_path)?;
+    eprintln!("aifd: listening on {}", socket_path.display());
+    let (poll_tx, poll_rx) = mpsc::channel();
+    let pollers = poll::spawn_pollers(&config, poll_tx);
+    let daemon = Daemon::new(config, poll_rx, pollers.wake, action_rx);
+    let result = daemon.run();
+    drop(server);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A unique temporary directory for one test.
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aifd-wire-{label}-{}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).expect("the old temp dir must be removable");
+        }
+        fs::create_dir_all(&dir).expect("the temp dir must be creatable");
+        dir
+    }
+
+    #[test]
+    fn a_missing_config_file_fails_and_names_the_file() {
+        let dir = temp_dir("missing-config");
+        let config_path = dir.join("factory.toml");
+        let error = run(Some(&config_path), &dir.join("daemon.sock")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot load the factory config"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains(&config_path.to_string_lossy().into_owned()),
+            "message: {message}"
+        );
+        assert_eq!(exit_code(Err(error)), 1);
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn the_cli_parses_the_config_option() {
+        let parsed = Cli::try_parse_from(["aifd", "run", "--config", "/tmp/factory.toml"])
+            .expect("the arguments must parse");
+        let Command::Run { config } = parsed.command;
+        assert_eq!(config.as_deref(), Some(Path::new("/tmp/factory.toml")));
+
+        let parsed = Cli::try_parse_from(["aifd", "run"]).expect("the arguments must parse");
+        let Command::Run { config } = parsed.command;
+        assert_eq!(config, None);
     }
 }

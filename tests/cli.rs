@@ -96,12 +96,16 @@ fn aifd_run_help_lists_the_config_option() {
 }
 
 #[test]
-fn aifd_run_accepts_a_config_path() {
+fn aifd_run_with_a_missing_config_fails_and_names_the_file() {
     let output = run(
         env!("CARGO_BIN_EXE_aifd"),
         &["run", "--config", "/test/factory.toml"],
     );
 
-    assert!(output.status.success());
-    assert_eq!(stdout(&output), "aifd: not implemented yet\n");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("no config file at /test/factory.toml"),
+        "stderr: {}",
+        stderr(&output)
+    );
 }
