@@ -1253,6 +1253,10 @@ mod tests {
             marked.iter().filter(|line| line.contains(" of ")).count(),
             4
         );
+        assert!(text.contains("i142 paused"));
+        assert!(text.contains("i7 paused"));
+        assert!(!text.contains("i142 queued"));
+        assert!(!text.contains("i7 queued"));
 
         // A stage pause marks only that stage header and its queued ticket.
         let state = StateView {
@@ -1301,6 +1305,11 @@ mod tests {
             .filter(|line| line.contains("borsuk") && line.contains("paused"))
             .count();
         assert_eq!(marked, 4);
+        let train = text
+            .lines()
+            .find(|line| line.contains("train") && line.contains("queue 7,9"))
+            .expect("the borsuk train row must be visible");
+        assert!(!train.contains("paused"), "marked train row: {train}");
         assert!(text.contains("i142 paused"));
         assert!(!text.contains("i142 queued"));
         // A running ticket of the paused repository keeps its true state.
