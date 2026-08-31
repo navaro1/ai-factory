@@ -1093,6 +1093,7 @@ mod tests {
     use crate::tui::pipeline::render_to_string;
     use std::cell::Cell;
     use std::fs;
+    use std::io::Write as _;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1267,7 +1268,11 @@ mod tests {
             "an unchanged log must not cause a periodic draw"
         );
 
-        fs::write(&log, "first\nsecond\n").unwrap();
+        // Append the new line the way a real agent does. A rewrite would
+        // truncate the file first; a poll that observes the truncated
+        // file reports a log restart and clears the transcript.
+        let mut log_file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        log_file.write_all(b"second\n").unwrap();
         let second = draw_rx.recv_timeout(session::POLL_INTERVAL * 3).ok();
 
         let ctrl_q = Msg::Key(KeyEvent::new(
