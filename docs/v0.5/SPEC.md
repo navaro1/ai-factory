@@ -1628,3 +1628,48 @@ human types, and the daemon drops the message while the UI reports success.
 - A `Running` opencode task with a session marker but no in-memory id still
   returns `NextTurn`.
 - The existing input-mode tests still pass unchanged.
+
+## Task 29 — Close stdin for the one-shot runner
+
+**Goal.** Let the daemon hear an opencode agent. Today it hears nothing.
+
+**Files.** `src/runner/opencode.rs`.
+
+**Why this task exists.** This is a v0.5 defect, not a v0.5.1 one. A live run
+found it; no unit test could.
+
+`proc::spawn` pipes stdin and holds it open, because the claude runner steers a
+session by writing lines to it. `opencode run` writes NOTHING to stdout while its
+stdin is an open pipe that never delivers and never closes. Measured on this
+machine on 2026-08-31, same command and same worktree each time:
+
+| stdin | opencode output |
+|---|---|
+| inherited | NDJSON at once, `sessionID` on the first line |
+| pipe, held open, no data | nothing at all in 100 seconds |
+| pipe, closed at once | NDJSON at once, `sessionID` on the first line |
+
+Every daemon child gets the middle case. So the daemon never receives a
+`sessionID`, never writes a transcript line, never sees a `TurnEnd`, and learns
+of the task only from the process exit. The agent still does its work; the
+daemon is deaf to it. Every runner test feeds the parser from a recorded
+fixture, so the parser is right and the process plumbing was never exercised.
+
+**Detail.**
+
+- `OpenCodeRunner::start` calls `handle.close_stdin()` directly after
+  `proc::spawn` returns, and before it returns the session.
+- `proc::ProcHandle::close_stdin` already exists at `src/proc.rs:378`.
+- Do NOT change the claude runner. It needs stdin open: the prompt goes in as
+  the first line and steering uses the same channel.
+- Do NOT change `proc.rs`. The shared spawn keeps piping stdin; the one-shot
+  runner is what knows it has no steering channel.
+
+**Acceptance criteria.**
+- `OpenCodeRunner::start` closes the child's stdin.
+- An offline test proves it. Use a fake program that reads its stdin to the end
+  and only then prints one NDJSON line. With stdin left open the test would
+  block; with stdin closed the runner reports the line. Give the test a bounded
+  wait so a regression fails instead of hanging the suite.
+- The claude runner still writes its prompt on stdin, and its existing tests
+  pass unchanged.
