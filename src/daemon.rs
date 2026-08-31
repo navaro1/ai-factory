@@ -1761,8 +1761,9 @@ impl Daemon {
     /// The sibling guard decides first: a blocked task is closed whatever
     /// else is true. A live Claude session takes a steering message at
     /// once. A parked Claude task relaunches its session on the next
-    /// message. A running OpenCode task turns the message into its next
-    /// turn. A terminal OpenCode task queues a follow-up turn. Every other
+    /// message. A running OpenCode task with a recorded session turns the
+    /// message into its next turn. A terminal OpenCode task queues a
+    /// follow-up turn. Every other
     /// task takes no message. The close reason says why.
     fn input_mode(&self, task: &Task) -> InputMode {
         if let Some(reason) = self.sibling_refusal(task) {
@@ -1789,7 +1790,7 @@ impl Daemon {
             if task.state == TaskState::AwaitingUser && session.is_some() {
                 return InputMode::Resume;
             }
-        } else if task.state == TaskState::Running {
+        } else if task.state == TaskState::Running && session.is_some() {
             return InputMode::NextTurn;
         } else if task.state.is_terminal() && session.is_some() {
             return InputMode::Follow;
@@ -5663,6 +5664,43 @@ mod tests {
                     .to_string()
             }
         );
+    }
+
+    #[test]
+    fn the_input_mode_closes_a_running_task_that_has_no_session_yet() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        // The run is live, but opencode prints its first NDJSON line only
+        // one to three seconds after the start. No session id and no
+        // marker exist yet, so the input stays closed.
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.session_id, None);
+        assert_eq!(
+            rig.daemon.input_mode(&task),
+            InputMode::Closed {
+                reason: "The task \"borsuk/implement-i142\" has no session to continue. \
+                         Wait until the task records a session."
+                    .to_string()
+            }
+        );
+
+        // The run records its session id, and the input opens.
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(rig.daemon.input_mode(&task), InputMode::NextTurn);
+
+        // A restart loses the in-memory id, but the worktree marker keeps
+        // the next-turn path open while the run continues.
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/implement-i142")
+            .unwrap()
+            .session_id = None;
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(rig.daemon.input_mode(&task), InputMode::NextTurn);
     }
 
     #[test]
