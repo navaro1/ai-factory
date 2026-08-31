@@ -41,7 +41,7 @@ use crate::runner::claude::ClaudeRunner;
 use crate::runner::opencode::OpenCodeRunner;
 use crate::runner::{Answer, Job, RunEvent, Runner, Session};
 use crate::sched::{self, Limits, Paused, Verdict};
-use crate::sock::{Action, PauseScope};
+use crate::sock::{Action, PauseScope, StateInput, StateView};
 use crate::state::DaemonState;
 use crate::tasks::{self, Task, TaskState, TaskTable};
 use crate::trains::{Train, STACKED_LABEL};
@@ -147,9 +147,10 @@ pub struct Daemon {
     /// The serialized state of the last write, so an unchanged drive writes
     /// nothing.
     saved: Option<String>,
-    /// Reserved for the socket module: it attaches its push subscribers here.
-    /// The list stays empty until that chunk lands.
-    pub subscribers: Vec<()>,
+    /// The pusher that receives the state views. The binary wires it to
+    /// `Server::publish`, and tests wire it to a channel. None until
+    /// `set_pusher` runs, so an early view goes nowhere.
+    pusher: Option<Box<dyn Fn(StateView) + Send>>,
 
     /// The inbound end of the poller channel.
     poll_rx: Receiver<DaemonMsg>,
@@ -283,10 +284,12 @@ impl Daemon {
             now_ms: 0,
             idle_reap_ms: DEFAULT_IDLE_REAP_MS,
             changed: false,
-            dirty: false,
+            // The first drive publishes the initial state, so a UI that
+            // connects right after the start sees the state at once.
+            dirty: true,
             shutdown: false,
             saved: None,
-            subscribers: Vec::new(),
+            pusher: None,
             poll_rx,
             run_tx,
             run_rx,
@@ -379,6 +382,7 @@ impl Daemon {
         self.resume_pending_chats();
         self.dispatch_queued();
         self.save_state();
+        self.push_state();
     }
 
     /// The moment the loop must wake next, as a duration from now.
@@ -423,10 +427,52 @@ impl Daemon {
         self.shutdown
     }
 
-    /// Read and clear the dirty flag. The socket pusher calls this after it
-    /// published a state view.
+    /// Read and clear the dirty flag. The end of every drive pass calls
+    /// this before it builds and pushes the state view.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// Attach the pusher that receives the state views.
+    ///
+    /// The binary wires the pusher to [`crate::sock::Server::publish`].
+    /// The pusher never blocks and coalesces pushes itself, so the daemon
+    /// hands it a view whenever the dirty flag asks and adds no throttling
+    /// of its own.
+    pub fn set_pusher(&mut self, pusher: Box<dyn Fn(StateView) + Send>) {
+        self.pusher = Some(pusher);
+    }
+
+    /// Build the state view from the live state and hand it to the pusher.
+    ///
+    /// The call runs at the end of every drive pass and pushes only when
+    /// the pass changed something. Every field of [`StateInput`] reads one
+    /// field of the daemon, so the view can only show what the loop truly
+    /// holds.
+    fn push_state(&mut self) {
+        if !self.take_dirty() {
+            return;
+        }
+        let input = StateInput {
+            config: &self.config,
+            limits: &self.limits,
+            paused: &self.paused,
+            table: &self.table,
+            decisions: &self.decisions,
+            trains: &self.trains,
+            policies: &self.policies,
+            now_ms: self.now_ms,
+        };
+        let view = match input.build() {
+            Ok(view) => view,
+            Err(error) => {
+                eprintln!("cannot build the state view: {error:#}");
+                return;
+            }
+        };
+        if let Some(pusher) = self.pusher.as_ref() {
+            pusher(view);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -4078,5 +4124,145 @@ mod tests {
 
     fn rig_gitdir(dir: &Path) -> PathBuf {
         dir.join("git-common")
+    }
+
+    // ------------------------------------------------------------------
+    // State push
+    // ------------------------------------------------------------------
+
+    /// A rig whose state views land on a channel.
+    fn pushed_rig(steps: Vec<Step>) -> (Rig, Receiver<StateView>) {
+        let mut rig = Rig::make(steps);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| tx.send(view).unwrap()));
+        (rig, rx)
+    }
+
+    fn stage_view(view: &StateView, stage: Stage) -> &crate::sock::StageView {
+        view.stages
+            .iter()
+            .find(|one| one.stage == stage)
+            .unwrap_or_else(|| panic!("the view must carry the {stage:?} stage"))
+    }
+
+    #[test]
+    fn the_first_drive_publishes_the_state_a_new_subscriber_needs() {
+        let (mut rig, rx) = pushed_rig(vec![]);
+        rig.drive();
+        let view = rx.try_recv().expect("the first drive must publish a view");
+        assert_eq!(view.repos.len(), 1);
+        assert_eq!(view.repos[0].alias, "borsuk");
+        assert_eq!(view.repos[0].owner_repo, "acme/borsuk");
+        assert_eq!(view.stages.len(), Stage::ALL.len());
+        // The config seeds every limit, so a fresh daemon shows no override.
+        assert!(view.stages.iter().all(|stage| !stage.overridden));
+        let refine = stage_view(&view, Stage::Refine);
+        assert_eq!(refine.limit, 2);
+        assert_eq!(refine.running, 0);
+        assert_eq!(refine.queued, 0);
+        assert!(view.tasks.is_empty());
+        assert!(view.lanes.is_empty());
+        assert!(view.decisions.is_empty());
+        assert!(!view.paused.global);
+        assert!(view.paused.stages.is_empty());
+        assert!(view.paused.repos.is_empty());
+        assert_eq!(view.trains.len(), 1);
+        assert_eq!(view.trains[0].repo, "borsuk");
+        assert_eq!(view.trains[0].queue, Vec::<u64>::new());
+        assert_eq!(view.trains[0].stacked, Vec::<u64>::new());
+        assert_eq!(view.trains[0].policy, ReleasePolicy::Manual);
+        assert_eq!(view.trains[0].next_fire_ms, None);
+        assert_eq!(view.trains[0].in_flight, None);
+
+        // A quiet second drive publishes nothing.
+        rig.drive();
+        assert!(rx.try_recv().is_err(), "an unchanged drive must not push");
+    }
+
+    #[test]
+    fn a_change_publishes_a_view_with_the_real_task_and_train_values() {
+        let (mut rig, rx) = pushed_rig(vec![]);
+        rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
+        let view = rx.try_recv().expect("the poll must publish a view");
+        // The stacked pull request reaches the train queue and the gate row.
+        assert_eq!(view.trains[0].queue, vec![2]);
+        assert_eq!(view.trains[0].stacked, vec![2]);
+        assert_eq!(view.decisions.len(), 1);
+        assert_eq!(view.decisions[0].id, "gate:borsuk");
+
+        rig.poll(
+            vec![issue(142, &["to-refine"])],
+            vec![pr(2, false, &["release-stacked"])],
+        );
+        let view = rx.try_recv().expect("the second poll must publish a view");
+        assert_eq!(view.tasks.len(), 1);
+        let task = &view.tasks[0];
+        assert_eq!(task.id, "borsuk/refine-i142");
+        assert_eq!(task.repo, "borsuk");
+        assert_eq!(task.stage, Stage::Refine);
+        assert_eq!(task.kind, ItemKind::Issue);
+        assert_eq!(task.number, 142);
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.attempt, 1);
+        assert!(task.log_path.ends_with("borsuk__refine-i142.jsonl"));
+        let refine = stage_view(&view, Stage::Refine);
+        assert_eq!(refine.running, 1);
+        assert_eq!(refine.queued, 0);
+        assert_eq!(refine.limit, 2);
+    }
+
+    #[test]
+    fn a_view_marks_only_the_limits_that_differ_from_the_config() {
+        let (mut rig, rx) = pushed_rig(vec![]);
+        rig.act(Action::Limit {
+            stage: Stage::Review,
+            limit: 5,
+        });
+        let view = rx.try_recv().expect("the limit change must publish a view");
+        let review = stage_view(&view, Stage::Review);
+        assert_eq!(review.limit, 5);
+        assert!(review.overridden);
+        // Limits::from_config seeded every stage key, so a present key is
+        // not an override: the untouched stage keeps the config value and
+        // reports no override.
+        let refine = stage_view(&view, Stage::Refine);
+        assert_eq!(refine.limit, 2);
+        assert!(!refine.overridden);
+
+        rig.act(Action::Lane {
+            stage: Stage::Implement,
+            repo: "borsuk".to_string(),
+            slots: 1,
+        });
+        let view = rx.try_recv().expect("the lane change must publish a view");
+        assert_eq!(view.lanes.len(), 1);
+        assert_eq!(view.lanes[0].stage, Stage::Implement);
+        assert_eq!(view.lanes[0].repo, "borsuk");
+        assert_eq!(view.lanes[0].slots, 1);
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Global,
+            paused: true,
+        });
+        let view = rx.try_recv().expect("the pause change must publish a view");
+        assert!(view.paused.global);
+        assert!(view.paused.stages.is_empty());
+        assert!(view.paused.repos.is_empty());
+
+        rig.act(Action::Policy {
+            repo: "borsuk".to_string(),
+            policy: ReleasePolicy::Interval { minutes: 5 },
+        });
+        let view = rx
+            .try_recv()
+            .expect("the policy change must publish a view");
+        assert_eq!(
+            view.trains[0].policy,
+            ReleasePolicy::Interval { minutes: 5 }
+        );
+        // The real train state: an interval policy over an empty queue
+        // gives no fire time.
+        assert_eq!(view.trains[0].next_fire_ms, None);
     }
 }
