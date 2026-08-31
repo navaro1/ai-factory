@@ -74,9 +74,9 @@ pub struct StateView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum InputMode {
-    /// A live claude session receives the message at once.
+    /// A live Claude session receives the message at once.
     Live,
-    /// The next message relaunches the parked claude session.
+    /// The next message relaunches the parked Claude session.
     Resume,
     /// The next message waits for the running turn and starts the next one.
     NextTurn,
@@ -98,9 +98,8 @@ pub enum InputMode {
 /// entry overrides the config file value; a missing entry falls back to
 /// the config. A repository without an entry in `trains` gets an empty
 /// train view. A stage limit counts as overridden when the runtime limit
-/// differs from the config file value. A task without an entry in
-/// `input_modes` gets [`InputMode::Closed`], and a task without an entry
-/// in `queued_chats` gets a count of zero.
+/// differs from the config file value. Each task must have an entry in
+/// `input_modes`. The daemon adds queued message counts after this build.
 #[derive(Debug, Clone, Copy)]
 pub struct StateInput<'a> {
     /// The loaded configuration file.
@@ -120,8 +119,6 @@ pub struct StateInput<'a> {
     /// The input mode of each task, keyed by task id. The daemon decides
     /// every mode; this module only serializes it.
     pub input_modes: &'a BTreeMap<String, InputMode>,
-    /// The count of queued chat messages of each task, keyed by task id.
-    pub queued_chats: &'a BTreeMap<String, usize>,
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -138,7 +135,6 @@ impl StateInput<'_> {
             trains,
             policies,
             input_modes,
-            queued_chats,
             now_ms,
         } = *self;
         let repos = config
@@ -196,13 +192,8 @@ impl StateInput<'_> {
                     input: input_modes
                         .get(id)
                         .cloned()
-                        .unwrap_or_else(|| InputMode::Closed {
-                            reason: format!(
-                                "The daemon holds no input mode for the task \"{id}\". \
-                                 The input stays closed."
-                            ),
-                        }),
-                    queued_messages: queued_chats.get(id).copied().unwrap_or(0),
+                        .ok_or_else(|| anyhow!("task \"{id}\" has no input mode"))?,
+                    queued_messages: 0,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1167,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_build_falls_back_to_a_closed_mode_without_a_map_entry() {
+    fn the_view_build_rejects_a_missing_input_mode() {
         let config = Config::parse(&config_text()).unwrap();
         let limits = Limits::from_config(&config);
         let paused = Paused::default();
@@ -1186,9 +1177,8 @@ mod tests {
         let trains = BTreeMap::new();
         let policies = BTreeMap::new();
         let input_modes = BTreeMap::new();
-        let queued_chats = BTreeMap::new();
 
-        let view = StateInput {
+        let error = StateInput {
             config: &config,
             limits: &limits,
             paused: &paused,
@@ -1197,18 +1187,16 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
-            queued_chats: &queued_chats,
             now_ms: 0,
         }
         .build()
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(view.tasks.len(), 1);
-        let InputMode::Closed { reason } = &view.tasks[0].input else {
-            panic!("a task without a map entry must fall back to Closed");
-        };
-        assert!(reason.contains("refine-i142"), "reason: {reason}");
-        assert_eq!(view.tasks[0].queued_messages, 0);
+        assert!(
+            error.to_string().contains("refine-i142"),
+            "message: {error}"
+        );
+        assert!(error.to_string().contains("input mode"), "message: {error}");
     }
 
     #[test]
@@ -1615,7 +1603,6 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
-            queued_chats: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -1694,9 +1681,6 @@ mod tests {
                 reason: "no session".to_string(),
             },
         );
-        let mut queued_chats = BTreeMap::new();
-        queued_chats.insert("borsuk/implement-i142".to_string(), 2usize);
-
         let view = StateInput {
             config: &config,
             limits: &limits,
@@ -1706,7 +1690,6 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
-            queued_chats: &queued_chats,
             now_ms: 120_000,
         }
         .build()
@@ -1765,9 +1748,10 @@ mod tests {
         assert_eq!(view.tasks[1].id, "qubitsok/refine-i7");
         assert_eq!(view.tasks[1].state, TaskState::Queued);
 
-        // Each task view carries its input mode and its queued count.
+        // Each task view carries its input mode. The daemon fills the
+        // queued count from its pending chat queue after this build.
         assert_eq!(view.tasks[0].input, InputMode::Live);
-        assert_eq!(view.tasks[0].queued_messages, 2);
+        assert_eq!(view.tasks[0].queued_messages, 0);
         assert_eq!(
             view.tasks[1].input,
             InputMode::Closed {

@@ -480,11 +480,6 @@ impl Daemon {
             .values()
             .map(|task| (task.id.clone(), self.input_mode(task)))
             .collect();
-        let queued_chats: BTreeMap<String, usize> = self
-            .pending_chats
-            .iter()
-            .map(|(id, messages)| (id.clone(), messages.len()))
-            .collect();
         let input = StateInput {
             config: &self.config,
             limits: &self.limits,
@@ -494,16 +489,18 @@ impl Daemon {
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
-            queued_chats: &queued_chats,
             now_ms: self.now_ms,
         };
-        let view = match input.build() {
+        let mut view = match input.build() {
             Ok(view) => view,
             Err(error) => {
                 eprintln!("cannot build the state view: {error:#}");
                 return;
             }
         };
+        for task in &mut view.tasks {
+            task.queued_messages = self.pending_chats.get(&task.id).map_or(0, Vec::len);
+        }
         if let Some(pusher) = self.pusher.as_ref() {
             pusher(view);
         }
@@ -1747,7 +1744,7 @@ impl Daemon {
     /// The session id that a follow-up turn continues.
     ///
     /// The id comes from the task, and else from the session marker in the
-    /// task's workspace. The marker lets a human converse with an opencode
+    /// task's workspace. The marker lets a human converse with an OpenCode
     /// task after a daemon restart. `None` means no session exists.
     fn followup_session_id(&self, task: &Task) -> Result<Option<String>> {
         if let Some(session_id) = task.session_id.as_deref() {
@@ -1762,36 +1759,39 @@ impl Daemon {
     /// Decide what the session view's input bar does for one task.
     ///
     /// The sibling guard decides first: a blocked task is closed whatever
-    /// else is true. A live claude session takes a steering message at
-    /// once. A parked claude task relaunches its session on the next
-    /// message. A running opencode task turns the message into its next
-    /// turn. A finished or requeued opencode task queues a follow-up turn
-    /// that continues its session. Every other task takes no message, and
-    /// the close reason says why.
+    /// else is true. A live Claude session takes a steering message at
+    /// once. A parked Claude task relaunches its session on the next
+    /// message. A running OpenCode task turns the message into its next
+    /// turn. A terminal OpenCode task queues a follow-up turn. Every other
+    /// task takes no message. The close reason says why.
     fn input_mode(&self, task: &Task) -> InputMode {
         if let Some(reason) = self.sibling_refusal(task) {
             return InputMode::Closed { reason };
         }
-        if self.sessions.contains_key(&task.id) && self.task_uses_claude(task) {
+        let uses_claude = self.task_uses_claude(task);
+        if self.sessions.contains_key(&task.id) && uses_claude {
             return InputMode::Live;
         }
         let session = match self.followup_session_id(task) {
             Ok(session) => session,
             Err(error) => {
                 eprintln!("the input mode of {}: {error:#}", task.id);
-                None
+                return InputMode::Closed {
+                    reason: format!(
+                        "The daemon cannot read the session for task \"{}\". \
+                         Check its session marker and try again.",
+                        task.id
+                    ),
+                };
             }
         };
-        if self.task_uses_claude(task) {
+        if uses_claude {
             if task.state == TaskState::AwaitingUser && session.is_some() {
                 return InputMode::Resume;
             }
         } else if task.state == TaskState::Running {
             return InputMode::NextTurn;
-        } else if session.is_some() {
-            // A finished task reopens on a message, and a requeued task
-            // holds its messages for the relaunch. Both continue the old
-            // session, so the input queues a follow-up turn.
+        } else if task.state.is_terminal() && session.is_some() {
             return InputMode::Follow;
         }
         InputMode::Closed {
@@ -1801,28 +1801,33 @@ impl Daemon {
 
     /// Build the sentence that says why one task takes no message.
     ///
-    /// A task with no session id and no session marker needs its first
-    /// run. A task that holds a spent session is in a state whose message
-    /// path the daemon does not serve, so the reason names the state.
+    /// A task with no session id and no marker needs a new session. A task
+    /// with a spent session needs an action that fits its current state.
     fn closed_reason(&self, task: &Task, has_session: bool) -> String {
         if !has_session {
+            let action = match task.state {
+                TaskState::Queued => "Send a message after the task runs once.",
+                TaskState::Running => "Wait until the task records a session.",
+                TaskState::AwaitingUser | TaskState::Done => {
+                    "Start a new task before you send another message."
+                }
+                TaskState::Failed(_) => "Retry the task before you send a message.",
+            };
             return format!(
-                "The task \"{}\" has no session to continue. \
-                 Send a message after the task runs once.",
-                task.id
+                "The task \"{}\" has no session to continue. {action}",
+                task.id,
             );
         }
-        let state = match task.state {
-            TaskState::Queued => "queued",
-            TaskState::Running => "running",
-            TaskState::AwaitingUser => "awaiting the user",
-            TaskState::Done => "done",
-            TaskState::Failed(_) => "failed",
+        let (state, action) = match task.state {
+            TaskState::Queued => ("queued", "Wait for it to start."),
+            TaskState::Running => ("running", "Wait for its session to start."),
+            TaskState::AwaitingUser => {
+                ("awaiting the user", "Send a message to resume its session.")
+            }
+            TaskState::Done => ("done", "Start a new task before you send another message."),
+            TaskState::Failed(_) => ("failed", "Retry the task before you send a message."),
         };
-        format!(
-            "The task \"{}\" is {}. The input takes no message in this state.",
-            task.id, state
-        )
+        format!("The task \"{}\" is {state}. {action}", task.id)
     }
 
     /// Reopen a terminal task whose chat messages still wait.
@@ -4304,6 +4309,12 @@ mod tests {
         assert_eq!(jobs[0].task, "borsuk/refine-i0");
         assert!(jobs[0].prompt.contains("gh issue create"));
         drop(jobs);
+        let task = rig.task("borsuk/refine-i0");
+        assert_eq!(
+            rig.daemon.input_mode(&task),
+            InputMode::Live,
+            "a ticket task uses Claude despite the raw stage runner"
+        );
 
         rig.event(turn_ended("borsuk/refine-i0"));
 
@@ -5368,8 +5379,17 @@ mod tests {
         let task = rig.task("borsuk/implement-i142");
         assert_eq!(rig.daemon.input_mode(&task), InputMode::Follow);
 
-        // A requeued task with a session, as a chat leaves it, also queues
-        // a follow-up turn.
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/implement-i142")
+            .unwrap()
+            .state = TaskState::Failed("the turn failed".to_string());
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(rig.daemon.input_mode(&task), InputMode::Follow);
+
+        // A queued retry is not a terminal follow-up. It starts a fresh
+        // attempt, so the input stays closed while it waits.
         rig.daemon
             .table
             .by_id
@@ -5377,7 +5397,33 @@ mod tests {
             .unwrap()
             .state = TaskState::Queued;
         let task = rig.task("borsuk/implement-i142");
-        assert_eq!(rig.daemon.input_mode(&task), InputMode::Follow);
+        assert_eq!(
+            rig.daemon.input_mode(&task),
+            InputMode::Closed {
+                reason: "The task \"borsuk/implement-i142\" is queued. Wait for it to start."
+                    .to_string()
+            }
+        );
+
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/implement-i142")
+            .unwrap()
+            .state = TaskState::Done;
+        rig.daemon
+            .worktrees
+            .remove_task_session(&issue_wt(&dir, 142), "borsuk/implement-i142")
+            .unwrap();
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(
+            rig.daemon.input_mode(&task),
+            InputMode::Closed {
+                reason: "The task \"borsuk/implement-i142\" has no session to continue. \
+                         Start a new task before you send another message."
+                    .to_string()
+            }
+        );
     }
 
     #[test]
@@ -5416,7 +5462,35 @@ mod tests {
             rig.daemon.input_mode(&task),
             InputMode::Closed {
                 reason: "The task \"borsuk/refine-i142\" is done. \
-                         The input takes no message in this state."
+                         Start a new task before you send another message."
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_session_marker_read_error_closes_the_input_with_an_action() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/implement-i142")
+            .unwrap()
+            .session_id = None;
+
+        let marker_dir = issue_wt(&dir, 142).join(".aif");
+        fs::remove_dir_all(&marker_dir).unwrap();
+        fs::write(&marker_dir, "not a directory").unwrap();
+
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(
+            rig.daemon.input_mode(&task),
+            InputMode::Closed {
+                reason: "The daemon cannot read the session for task \
+                         \"borsuk/implement-i142\". Check its session marker and try again."
                     .to_string()
             }
         );
