@@ -758,11 +758,13 @@ fn repo_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
     spans
 }
 
-/// The spans of one ticket row: item, state, and attempt.
+/// The spans of one ticket row: item, state, attempt, and queued messages.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
 /// state, because it cannot start. A task in any other state keeps its true
-/// state: a pause blocks starts, it does not stop running tasks.
+/// state: a pause blocks starts, it does not stop running tasks. A count
+/// above zero of queued messages adds a badge, so a waiting message stays
+/// visible from the board.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::raw("    "),
@@ -780,6 +782,12 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     if task.attempt > 1 {
         spans.push(Span::styled(
             format!("  attempt {}", task.attempt),
+            THEME.dim(),
+        ));
+    }
+    if task.queued_messages > 0 {
+        spans.push(Span::styled(
+            format!("  {} queued", task.queued_messages),
             THEME.dim(),
         ));
     }
@@ -1355,6 +1363,23 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         assert!(!text.contains("paused"));
+    }
+
+    #[test]
+    fn a_ticket_with_queued_messages_shows_the_badge_on_the_board() {
+        let mut state = sample_view();
+        state.tasks[1].queued_messages = 2;
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("i143 running  2 queued"), "board: {text}");
+
+        // A ticket without queued messages shows no badge.
+        let line = text.lines().find(|line| line.contains("i142")).unwrap();
+        assert_eq!(line.trim_end(), "      i142 queued");
     }
 
     #[test]
