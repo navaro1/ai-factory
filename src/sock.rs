@@ -1247,10 +1247,13 @@ mod tests {
         // Dropping a listener closes it without removing its socket path.
         let listener = UnixListener::bind(&path).unwrap();
         drop(listener);
-        assert!(
-            UnixStream::connect(&path).is_err(),
-            "the leftover socket must be dead"
-        );
+        // A parallel child can briefly inherit the listener before it
+        // starts its program. Wait for this bounded test race to end.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while UnixStream::connect(&path).is_ok() {
+            assert!(Instant::now() < deadline, "the leftover socket stayed live");
+            thread::sleep(Duration::from_millis(1));
+        }
 
         let (server, _rx) = Server::bind(&path).unwrap();
         server.publish(sample_view(1));

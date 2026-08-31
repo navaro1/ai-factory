@@ -940,6 +940,11 @@ impl Daemon {
                 eprintln!("the pending chat for {id}: no session id to resume");
                 continue;
             };
+            // Scheduler capacity counts running tasks. The separate live
+            // process limit also counts parked Claude sessions.
+            if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
+                continue;
+            }
             if !matches!(
                 sched::can_start(
                     &self.limits,
@@ -1437,9 +1442,6 @@ impl Daemon {
         } else {
             self.fail_run(&task, detail);
         }
-        // The terminal state is set. A queued message asks for one more
-        // turn, so the task goes back to the queue.
-        self.reopen_for_pending_chat(id);
     }
 
     /// Complete one task and apply its stage-specific success action.
@@ -1460,18 +1462,18 @@ impl Daemon {
             return;
         }
         self.changed = true;
-        // A claude task loses its restart data at `Done`. An opencode task
-        // keeps the session marker, so a human can converse with it after a
-        // daemon restart, and its queued messages wait for the reopen.
-        if self.task_uses_claude(task) {
+        // A Claude task without a saved message loses its restart data at
+        // `Done`. A saved message keeps the marker until its next turn.
+        // An OpenCode task always keeps the marker for later follow-ups.
+        if self.task_uses_claude(task) && !self.pending_chats.contains_key(&task.id) {
             self.remove_task_session_marker(task);
-            self.pending_chats.remove(&task.id);
         }
         self.decisions.drop_for_task(&task.id);
         match task.stage {
             Stage::Release => self.finish_train(&task.repo, true),
             Stage::Refine | Stage::Implement | Stage::Review => {}
         }
+        self.reopen_for_pending_chat(&task.id);
     }
 
     /// Fail one run and return a final release batch to its train.
@@ -1480,6 +1482,7 @@ impl Daemon {
             self.finish_train(&task.repo, false);
         }
         self.fail_task(&task.id, reason);
+        self.reopen_for_pending_chat(&task.id);
     }
 
     /// Write the `.aif/reviewed-sha` marker of a finished review.
@@ -1629,14 +1632,19 @@ impl Daemon {
     /// A live claude session receives the message at once. Every other case
     /// queues the message as the next turn: the daemon reopens a terminal
     /// task, and `resume_pending_chats` starts a run whose prompt is the
-    /// message and whose session continues the old one. The call refuses a
-    /// follow-up while another task of the same worktree item is active,
-    /// and a task with no session id and no session marker.
+    /// message and whose session continues the old one. A failed live send
+    /// also keeps the message for a resumed turn. The call refuses any
+    /// message while another task of the same worktree item is active. It
+    /// also refuses a task with no session id and no session marker.
     fn chat(&mut self, id: &str, text: &str) {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             eprintln!("the chat message for {id}: no such task");
             return;
         };
+        if let Some(refusal) = self.sibling_refusal(&task) {
+            eprintln!("{refusal}");
+            return;
+        }
         // Never steer an opencode session: the one-shot runner has no
         // steering channel, so only a claude task may receive a live send.
         if self.task_uses_claude(&task) {
@@ -1654,14 +1662,22 @@ impl Daemon {
                             }
                         }
                     }
-                    Err(error) => eprintln!("the chat message for {id}: {error:#}"),
+                    Err(error) => {
+                        eprintln!("the chat message for {id}: {error:#}");
+                        // The process can exit before its event reaches the
+                        // daemon. Keep the message for the resumed turn.
+                        self.pending_chats
+                            .entry(id.to_string())
+                            .or_default()
+                            .push(text.to_string());
+                        self.changed = true;
+                        if task.state.is_terminal() {
+                            self.reopen_for_pending_chat(id);
+                        }
+                    }
                 }
                 return;
             }
-        }
-        if let Some(refusal) = self.sibling_refusal(&task) {
-            eprintln!("{refusal}");
-            return;
         }
         let session_id = match self.followup_session_id(&task) {
             Ok(session_id) => session_id,
@@ -1675,6 +1691,12 @@ impl Daemon {
                 "the chat message for {id}: no session id and no session marker; \
                  there is no agent session to continue"
             );
+            return;
+        }
+        // The wire and the daemon use the same policy. A saved session does
+        // not make an unsupported task state accept a message.
+        if let InputMode::Closed { reason } = self.input_mode(&task) {
+            eprintln!("the chat message for {id}: {reason}");
             return;
         }
         self.pending_chats
@@ -3705,6 +3727,56 @@ mod tests {
     }
 
     #[test]
+    fn a_reaped_chat_waits_while_a_parked_session_holds_the_live_process_slot() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
+        });
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        rig.event(turn_ended("borsuk/refine-i142"));
+
+        rig.set_now(T0 + 31 * 60_000);
+        rig.drive();
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the reaped process exited",
+        ));
+        rig.event(started("borsuk/refine-i143", "sid-143"));
+        rig.event(turn_ended("borsuk/refine-i143"));
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "resume after the parked session".to_string(),
+        });
+
+        assert_eq!(rig.job_count(), 2, "the parked process keeps the slot");
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/refine-i142")
+                .map(Vec::as_slice),
+            Some(&["resume after the parked session".to_string()][..])
+        );
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+
+        rig.event(exited(
+            "borsuk/refine-i143",
+            true,
+            "the parked process exited",
+        ));
+
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).prompt, "resume after the parked session");
+        assert_eq!(rig.job(2).resume.as_deref(), Some("sid-142"));
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
+
+    #[test]
     fn a_restart_restores_trains_decisions_and_worktrees() {
         let dir = temp_root();
         let snapshot_issues = vec![issue(142, &["refined"]), issue(7, &["needs-human"])];
@@ -4197,9 +4269,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_chat_does_not_extend_the_idle_deadline() {
+    fn a_failed_live_chat_waits_for_resume_without_extending_the_idle_deadline() {
         let mut rig = Rig::make(vec![]);
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
         rig.event(turn_ended("borsuk/refine-i142"));
         let session = rig.session(0);
         session.fail_send.store(true, Ordering::SeqCst);
@@ -4214,6 +4287,147 @@ mod tests {
             rig.daemon.last_event_ms["borsuk/refine-i142"], T0,
             "a rejected message is not session activity"
         );
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/refine-i142")
+                .map(Vec::as_slice),
+            Some(&["hello".to_string()][..]),
+            "a failed live send must not lose the message"
+        );
+
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the live session closed its input",
+        ));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).prompt, "hello");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("sid-142"));
+    }
+
+    #[test]
+    fn a_failed_live_chat_on_a_terminal_task_reopens_for_resume() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        let session = rig.session(0);
+        session.fail_send.store(true, Ordering::SeqCst);
+        let task = rig.task("borsuk/refine-i142");
+        rig.daemon.complete_task(&task);
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "continue after this process exits".to_string(),
+        });
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/refine-i142")
+                .map(Vec::as_slice),
+            Some(&["continue after this process exits".to_string()][..])
+        );
+
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the completed process closed its input",
+        ));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).prompt, "continue after this process exits");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("sid-142"));
+    }
+
+    #[test]
+    fn a_completed_claude_turn_keeps_a_message_that_the_live_send_refused() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = issue_wt(&dir, 142);
+        let gitdir = rig_gitdir(&dir);
+        let steps: Vec<Step> = fresh_issue_steps(&repo, &worktree, 142, &gitdir)
+            .into_iter()
+            .chain(reuse_issue_steps(&repo, &worktree, &gitdir))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.stages.get_mut(&Stage::Implement).unwrap().runner = "claude".to_string();
+        });
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "sid-142"));
+        let session = rig.session(0);
+        session.fail_send.store(true, Ordering::SeqCst);
+
+        rig.act(Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "carry this message into the next turn".to_string(),
+        });
+        rig.event(turn_finished("borsuk/implement-i142", true, "done"));
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["carry this message into the next turn".to_string()][..])
+        );
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).prompt, "carry this message into the next turn");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("sid-142"));
+    }
+
+    #[test]
+    fn a_poll_completion_keeps_the_message_of_a_parked_claude_task() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.set_now(T0 + 31 * 60_000);
+        rig.drive();
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the reaped process exited",
+        ));
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Refine,
+            },
+            paused: true,
+        });
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "keep this accepted message".to_string(),
+        });
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/refine-i142")
+                .map(Vec::as_slice),
+            Some(&["keep this accepted message".to_string()][..])
+        );
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Refine,
+            },
+            paused: false,
+        });
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).prompt, "keep this accepted message");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("sid-142"));
     }
 
     #[test]
@@ -5246,6 +5460,43 @@ mod tests {
     }
 
     #[test]
+    fn a_sibling_closure_blocks_a_live_claude_send() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        let session = rig.session(0);
+        let log = rig
+            .daemon
+            .log_path("borsuk", Stage::Implement, ItemKind::Issue, 142);
+        rig.daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                log,
+                rig.daemon.now_ms,
+            )
+            .unwrap();
+
+        let task = rig.task("borsuk/refine-i142");
+        assert!(matches!(
+            rig.daemon.input_mode(&task),
+            InputMode::Closed { .. }
+        ));
+
+        rig.daemon
+            .chat("borsuk/refine-i142", "do not steer this task");
+
+        assert!(
+            session.sends.lock().unwrap().is_empty(),
+            "the daemon must enforce the sibling closure on live sends"
+        );
+        assert!(rig.daemon.pending_chats.is_empty());
+    }
+
+    #[test]
     fn the_session_marker_survives_a_done_opencode_task() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 0);
@@ -5726,6 +5977,15 @@ mod tests {
                          Start a new task before you send another message."
                     .to_string()
             }
+        );
+
+        rig.daemon
+            .chat("borsuk/refine-i142", "do not accept this message");
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert!(
+            !rig.daemon.pending_chats.contains_key("borsuk/refine-i142"),
+            "the daemon must refuse the same task that the wire closes"
         );
     }
 
