@@ -26,9 +26,10 @@ const SUMMARY_CHARS: usize = 120;
 /// Build the exact argument vector for one factory task.
 ///
 /// The shape is the verified invocation: `run --format json --auto --agent
-/// build -m <model> [--variant <v>] --dir <cwd> <prompt>`. `--auto` is always
-/// present, because yolo is the factory policy and the run is one-shot.
-/// `job.resume` plays no part: a one-shot opencode run never resumes.
+/// build -m <model> [--variant <v>] [--session <id>] --dir <cwd> <prompt>`.
+/// `--auto` is always present, because yolo is the factory policy and the
+/// run is one-shot. A `Some` `job.resume` adds `--session <id>`, so the
+/// child continues that opencode conversation. `None` starts a fresh one.
 fn build_args(job: &Job) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -43,6 +44,10 @@ fn build_args(job: &Job) -> Vec<String> {
     if let Some(variant) = &job.variant {
         args.push("--variant".to_string());
         args.push(variant.clone());
+    }
+    if let Some(session) = &job.resume {
+        args.push("--session".to_string());
+        args.push(session.clone());
     }
     args.push("--dir".to_string());
     args.push(job.cwd.display().to_string());
@@ -480,6 +485,34 @@ not json at all
                 "xhigh",
                 "--dir",
                 "/state/worktrees/borsuk/train",
+                "Fix issue 142.",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_argument_vector_carries_the_session_of_a_resume() {
+        let dir = Path::new("/state/worktrees/borsuk/issue-142");
+        let fresh = build_args(&job(dir, None));
+        assert!(!fresh.contains(&"--session".to_string()));
+
+        let mut resumed = job(dir, None);
+        resumed.resume = Some("ses_fix01".to_string());
+        assert_eq!(
+            build_args(&resumed),
+            vec![
+                "run",
+                "--format",
+                "json",
+                "--auto",
+                "--agent",
+                "build",
+                "-m",
+                "zai-coding-plan/glm-5.3-flash",
+                "--session",
+                "ses_fix01",
+                "--dir",
+                "/state/worktrees/borsuk/issue-142",
                 "Fix issue 142.",
             ]
         );

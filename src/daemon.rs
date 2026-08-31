@@ -889,7 +889,16 @@ impl Daemon {
         }
     }
 
-    /// Resume parked chats when their old process exited and capacity exists.
+    /// Start the follow-up turns of the tasks that hold chat messages.
+    ///
+    /// The call owns every task with entries in `pending_chats`, and the
+    /// dispatcher skips such a task. A task in `Running` keeps its messages
+    /// and waits for the exit; the exit reopens the task when messages
+    /// remain. A task in `Queued` or `AwaitingUser` gets one run: the first
+    /// message is the prompt, and the session id continues the old
+    /// conversation. The scheduler decides whether the run may start, so
+    /// stage limits, lane reservations, and pauses all apply to a follow-up
+    /// turn.
     fn resume_pending_chats(&mut self) {
         let ids: Vec<String> = self.pending_chats.keys().cloned().collect();
         for id in ids {
@@ -901,22 +910,43 @@ impl Daemon {
                 eprintln!("the pending chat for {id}: no such task");
                 continue;
             };
-            if task.state != TaskState::AwaitingUser {
+            if task.state == TaskState::Running {
+                continue;
+            }
+            if task.state.is_terminal() {
                 self.pending_chats.remove(&id);
-                eprintln!(
-                    "the pending chat for {id}: the task is {}, not awaiting a user",
-                    task.state
-                );
+                eprintln!("the pending chat for {id}: the task is {}", task.state);
                 continue;
             }
-            if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
+            // Another task still owns the worktree item. Keep the messages
+            // and wait, as the dispatcher waits for a queued task.
+            if self.sibling_blocker(&task).is_some() {
                 continue;
             }
-            let Some(session_id) = task.session_id.clone() else {
+            let session_id = match self.followup_session_id(&task) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    eprintln!("the pending chat for {id}: {error:#}");
+                    continue;
+                }
+            };
+            let Some(session_id) = session_id else {
                 self.pending_chats.remove(&id);
                 eprintln!("the pending chat for {id}: no session id to resume");
                 continue;
             };
+            if !matches!(
+                sched::can_start(
+                    &self.limits,
+                    &self.paused,
+                    &self.table,
+                    task.stage,
+                    &task.repo
+                ),
+                Verdict::Yes
+            ) {
+                continue;
+            }
             let Some(messages) = self.pending_chats.remove(&id) else {
                 continue;
             };
@@ -928,15 +958,26 @@ impl Daemon {
                 self.pending_chats.insert(id, messages);
                 continue;
             }
-            for text in messages.into_iter().skip(1) {
+            let mut delivered = 1;
+            while delivered < messages.len() {
                 let result = self
                     .sessions
                     .get_mut(&id)
                     .ok_or_else(|| anyhow!("the resumed session vanished"))
-                    .and_then(|session| session.send_user(&text));
-                if let Err(error) = result {
-                    eprintln!("the pending chat for {id}: {error:#}");
-                    break;
+                    .and_then(|session| session.send_user(&messages[delivered]));
+                match result {
+                    Ok(()) => delivered += 1,
+                    Err(error) => {
+                        eprintln!("the pending chat for {id}: {error:#}");
+                        // The session refuses the rest of the turn. Keep the
+                        // undelivered messages; the next turn carries them.
+                        let leftover: Vec<String> = messages[delivered..].to_vec();
+                        self.pending_chats
+                            .entry(id.clone())
+                            .or_default()
+                            .extend(leftover);
+                        delivered = messages.len();
+                    }
                 }
             }
         }
@@ -969,7 +1010,9 @@ impl Daemon {
     ///
     /// This mirrors [`sched::next_dispatch`] with one daemon-side exception:
     /// a stage whose live-process slots are full yields to the later tasks of
-    /// other stages until the reaper or an exit frees a slot.
+    /// other stages until the reaper or an exit frees a slot. A task that
+    /// holds queued chat messages is not eligible either;
+    /// `resume_pending_chats` owns it.
     fn next_eligible(
         &self,
         saturated: &BTreeSet<Stage>,
@@ -984,6 +1027,7 @@ impl Daemon {
                 || failed.contains(&task.id)
                 || self.stopping_sessions.contains(&task.id)
                 || self.sessions.contains_key(&task.id)
+                || self.pending_chats.contains_key(&task.id)
                 || self.prior_stage_active(task)
             {
                 continue;
@@ -1041,14 +1085,20 @@ impl Daemon {
     /// Start one queued task: ensure the worktree, render the prompt, start
     /// the runner, move the task to `Running`.
     ///
-    /// `Ok(true)` means the task started. `Ok(false)` means the stage's live
-    /// processes are at their limit; the caller tries the next stage. An
-    /// error means the dispatch failed, the task is handled, and the caller
-    /// must stop this round.
+    /// `Ok(true)` means the task started, or that it holds queued chat
+    /// messages and `resume_pending_chats` owns it. `Ok(false)` means the
+    /// stage's live processes are at their limit; the caller tries the next
+    /// stage. An error means the dispatch failed, the task is handled, and
+    /// the caller must stop this round.
     fn dispatch_one(&mut self, id: &str) -> Result<bool> {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return Ok(true);
         };
+        // One owner per queued task: a task with queued chat messages
+        // belongs to `resume_pending_chats`, whatever the drive order is.
+        if self.pending_chats.contains_key(id) {
+            return Ok(true);
+        }
         // The second limit: live processes, not scheduler slots. A parked
         // chat holds a process between turns, and that process is the real
         // memory cost the stage limit exists to bound.
@@ -1343,6 +1393,8 @@ impl Daemon {
     /// A terminal task ignores the exit. A parked task stays resumable.
     /// An opencode exit supplies the task result.
     /// A claude exit without a prior result fails the active task.
+    /// After the terminal state is set, a queued chat message reopens the
+    /// task for its follow-up turn.
     fn on_exit_event(&mut self, id: &str, ok: bool, detail: &str) {
         self.last_event_ms.remove(id);
         if self.stopping_sessions.remove(id) {
@@ -1373,6 +1425,9 @@ impl Daemon {
         } else {
             self.fail_run(&task, detail);
         }
+        // The terminal state is set. A queued message asks for one more
+        // turn, so the task goes back to the queue.
+        self.reopen_for_pending_chat(id);
     }
 
     /// Complete one task and apply its stage-specific success action.
@@ -1393,8 +1448,13 @@ impl Daemon {
             return;
         }
         self.changed = true;
-        self.remove_task_session_marker(task);
-        self.pending_chats.remove(&task.id);
+        // A claude task loses its restart data at `Done`. An opencode task
+        // keeps the session marker, so a human can converse with it after a
+        // daemon restart, and its queued messages wait for the reopen.
+        if self.task_uses_claude(task) {
+            self.remove_task_session_marker(task);
+            self.pending_chats.remove(&task.id);
+        }
         self.decisions.drop_for_task(&task.id);
         match task.stage {
             Stage::Release => self.finish_train(&task.repo, true),
@@ -1552,54 +1612,150 @@ impl Daemon {
         }
     }
 
-    /// Send a chat message to a live session, or resume a parked task.
+    /// Send a chat message to one task.
+    ///
+    /// A live claude session receives the message at once. Every other case
+    /// queues the message as the next turn: the daemon reopens a terminal
+    /// task, and `resume_pending_chats` starts a run whose prompt is the
+    /// message and whose session continues the old one. The call refuses a
+    /// follow-up while another task of the same worktree item is active,
+    /// and a task with no session id and no session marker.
     fn chat(&mut self, id: &str, text: &str) {
-        let task = self.table.by_id.get(id).cloned();
-        if task.as_ref().is_some_and(|task| task.state.is_terminal()) {
-            eprintln!("the chat message for {id}: the task is terminal");
-            return;
-        }
-        if let Some(session) = self.sessions.get_mut(id) {
-            match session.send_user(text) {
-                Ok(()) => {
-                    self.last_event_ms.insert(id.to_string(), self.now_ms);
-                    if task
-                        .as_ref()
-                        .is_some_and(|task| task.state == TaskState::AwaitingUser)
-                    {
-                        if let Err(error) =
-                            self.table.transition(id, TaskState::Running, self.now_ms)
-                        {
-                            eprintln!("the chat message for {id}: {error:#}");
-                        } else {
-                            self.changed = true;
-                        }
-                    }
-                }
-                Err(error) => eprintln!("the chat message for {id}: {error:#}"),
-            }
-            return;
-        }
-        let Some(task) = task else {
+        let Some(task) = self.table.by_id.get(id).cloned() else {
             eprintln!("the chat message for {id}: no such task");
             return;
         };
-        if task.state != TaskState::AwaitingUser {
+        // Never steer an opencode session: the one-shot runner has no
+        // steering channel, so only a claude task may receive a live send.
+        if self.task_uses_claude(&task) {
+            if let Some(session) = self.sessions.get_mut(id) {
+                match session.send_user(text) {
+                    Ok(()) => {
+                        self.last_event_ms.insert(id.to_string(), self.now_ms);
+                        if task.state == TaskState::AwaitingUser {
+                            if let Err(error) =
+                                self.table.transition(id, TaskState::Running, self.now_ms)
+                            {
+                                eprintln!("the chat message for {id}: {error:#}");
+                            } else {
+                                self.changed = true;
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("the chat message for {id}: {error:#}"),
+                }
+                return;
+            }
+        }
+        if let Some(blocker) = self.sibling_blocker(&task) {
             eprintln!(
-                "the chat message for {id}: the task is {}, not awaiting a user",
-                task.state
+                "the chat message for {id}: task \"{blocker}\" is still active on the \
+                 same worktree item; a follow-up waits until it is terminal"
             );
             return;
         }
-        let Some(session_id) = task.session_id.clone() else {
-            eprintln!("the chat message for {id}: no session id to resume");
-            return;
+        let session_id = match self.followup_session_id(&task) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                eprintln!("the chat message for {id}: {error:#}");
+                return;
+            }
         };
-        let _ = session_id;
+        if session_id.is_none() {
+            eprintln!(
+                "the chat message for {id}: no session id and no session marker; \
+                 there is no agent session to continue"
+            );
+            return;
+        }
         self.pending_chats
             .entry(id.to_string())
             .or_default()
             .push(text.to_string());
+        if task.state.is_terminal() {
+            if let Err(error) = self.table.reopen(id, self.now_ms) {
+                eprintln!("the chat message for {id}: {error:#}");
+                return;
+            }
+            self.changed = true;
+            self.decisions.drop_for_task(id);
+        }
+    }
+
+    /// The item whose workspace the task runs in.
+    ///
+    /// A review task carries the pull request number, but it runs in the
+    /// worktree of its source issue. The comparison of two tasks uses this
+    /// item, so two agents never share one worktree.
+    fn worktree_item(&self, task: &Task) -> (ItemKind, u64) {
+        match task.stage {
+            Stage::Review => (
+                ItemKind::Issue,
+                self.review_issue_numbers
+                    .get(&task.id)
+                    .copied()
+                    .unwrap_or(task.number),
+            ),
+            _ => (task.kind, task.number),
+        }
+    }
+
+    /// The active task that blocks a follow-up to `task`, if one exists.
+    ///
+    /// Two agents must never run in one worktree. A follow-up waits while
+    /// another task of the same repository and worktree item is active.
+    fn sibling_blocker(&self, task: &Task) -> Option<String> {
+        let item = self.worktree_item(task);
+        self.table
+            .by_id
+            .values()
+            .find(|other| {
+                other.id != task.id
+                    && other.repo == task.repo
+                    && !other.state.is_terminal()
+                    && self.worktree_item(other) == item
+            })
+            .map(|other| other.id.clone())
+    }
+
+    /// The session id that a follow-up turn continues.
+    ///
+    /// The id comes from the task, and else from the session marker in the
+    /// task's workspace. The marker lets a human converse with an opencode
+    /// task after a daemon restart. `None` means no session exists.
+    fn followup_session_id(&self, task: &Task) -> Result<Option<String>> {
+        if let Some(session_id) = task.session_id.as_deref() {
+            return Ok(Some(session_id.to_string()));
+        }
+        let Some(cwd) = self.task_cwd(&task.id) else {
+            return Ok(None);
+        };
+        self.worktrees.read_task_session(&cwd, &task.id)
+    }
+
+    /// Reopen a terminal task whose chat messages still wait.
+    ///
+    /// complete_task and fail_run set the terminal state first. A queued
+    /// message asks for one more turn, so the task goes back to `Queued`,
+    /// and `resume_pending_chats` starts it. The reopen ignores the attempt
+    /// limit and never raises the attempt count, and it drops the stuck row
+    /// of the finished run.
+    fn reopen_for_pending_chat(&mut self, id: &str) {
+        if !self.pending_chats.contains_key(id) {
+            return;
+        }
+        let Some(task) = self.table.by_id.get(id) else {
+            return;
+        };
+        if !task.state.is_terminal() {
+            return;
+        }
+        if let Err(error) = self.table.reopen(id, self.now_ms) {
+            eprintln!("the pending chat for {id}: {error:#}");
+            return;
+        }
+        self.changed = true;
+        self.decisions.drop_for_task(id);
     }
 
     /// Route one answered decision to its sink.
@@ -4678,6 +4834,264 @@ mod tests {
 
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+    }
+
+    // ------------------------------------------------------------------
+    // The opencode follow-up turn
+    // ------------------------------------------------------------------
+
+    /// A rig whose implement stage runs on the one-shot opencode runner.
+    ///
+    /// `reuses` adds that many reuse-step rounds for later launches of the
+    /// same issue worktree.
+    fn opencode_rig(dir: &Path, reuses: usize) -> Rig {
+        let repo = rig_repo(dir);
+        let worktree = issue_wt(dir, 142);
+        let gitdir = rig_gitdir(dir);
+        let mut steps = fresh_issue_steps(&repo, &worktree, 142, &gitdir);
+        for _ in 0..reuses {
+            steps.extend(reuse_issue_steps(&repo, &worktree, &gitdir));
+        }
+        Rig::make_in(dir.to_path_buf(), steps, |config| {
+            config.stages.get_mut(&Stage::Implement).unwrap().runner = "opencode".to_string();
+        })
+    }
+
+    #[test]
+    fn a_chat_on_a_done_opencode_task_queues_the_text_and_reopens_the_task() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        // A daemon restart loses the session id in the table. The marker in
+        // the worktree keeps it.
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/implement-i142")
+            .unwrap()
+            .session_id = None;
+
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["add a regression test".to_string()][..])
+        );
+        assert_eq!(rig.job_count(), 1, "the chat alone starts no run");
+    }
+
+    #[test]
+    fn the_follow_up_relaunch_continues_the_session_with_the_typed_prompt() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/implement-i142")
+            .unwrap()
+            .session_id = None;
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        rig.drive();
+
+        assert_eq!(rig.job_count(), 2);
+        let job = rig.job(1);
+        assert_eq!(job.task, "borsuk/implement-i142");
+        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(job.prompt, "add a regression test");
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_chat_on_a_running_opencode_task_waits_for_the_exit() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        assert_eq!(rig.job_count(), 1, "the relaunch waits for the exit");
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(rig.job_count(), 2, "the exit event frees the follow-up");
+        let job = rig.job(1);
+        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(job.prompt, "add a regression test");
+    }
+
+    #[test]
+    fn a_chat_on_a_live_opencode_session_never_steers_it() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        // The fake session records every send. The empty record proves the
+        // daemon never calls send_user on an opencode session, so the
+        // unsupported-steering error can never appear.
+        assert!(rig.session(0).sends.lock().unwrap().is_empty());
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["add a regression test".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_queued_task_with_a_pending_chat_gets_exactly_one_launch() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 3);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed("boom".to_string())
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
+        assert_eq!(rig.job_count(), 3);
+        let stuck = rig.decision("stuck:borsuk/implement-i142:3");
+        assert!(stuck.is_some(), "the finished run left a stuck row");
+
+        rig.daemon
+            .chat("borsuk/implement-i142", "try one more typed turn");
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
+        assert!(rig.decision("stuck:borsuk/implement-i142:3").is_none());
+
+        // The dispatcher must leave the task to resume_pending_chats,
+        // whatever the order of the drive steps is.
+        rig.daemon.dispatch_queued();
+        assert_eq!(rig.job_count(), 3, "the dispatcher does not own the task");
+
+        rig.drive();
+        assert_eq!(rig.job_count(), 4, "the follow-up turn starts once");
+        let job = rig.job(3);
+        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(job.prompt, "try one more typed turn");
+        rig.drive();
+        assert_eq!(rig.job_count(), 4, "no second launch");
+    }
+
+    #[test]
+    fn an_opencode_retry_starts_fresh_without_a_session() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job(0).resume, None);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 2);
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).resume, None, "a retry never resumes");
+        assert!(
+            rig.job(1).prompt.contains("142"),
+            "the retry reruns the stage prompt, not a chat message"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_refuses_while_another_task_of_the_item_is_active() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job_count(), 2, "the implement gate opened");
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.daemon
+            .chat("borsuk/refine-i142", "adjust the specification");
+
+        assert!(
+            rig.daemon.pending_chats.is_empty(),
+            "the sibling guard refuses the follow-up"
+        );
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 2);
+    }
+
+    #[test]
+    fn the_session_marker_survives_a_done_opencode_task() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+
+        let marker = rig
+            .daemon
+            .worktrees
+            .read_task_session(&issue_wt(&dir, 142), "borsuk/implement-i142")
+            .unwrap();
+
+        assert_eq!(marker.as_deref(), Some("ses-142"));
+    }
+
+    #[test]
+    fn a_paused_stage_holds_a_queued_follow_up() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: true,
+        });
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+
+        rig.drive();
+        assert_eq!(rig.job_count(), 1, "the pause holds the follow-up");
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["add a regression test".to_string()][..])
+        );
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: false,
+        });
+        assert_eq!(rig.job_count(), 2, "the lift starts the follow-up");
+        assert_eq!(rig.job(1).prompt, "add a regression test");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
     }
 
     // ------------------------------------------------------------------
