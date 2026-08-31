@@ -165,6 +165,7 @@ countdown to the next fire.
 | Key | Action |
 |---|---|
 | `j` / `k` | Move the selection. |
+| `enter` | Open the session of the selected ticket. Every stage. Every state. |
 | `+` / `-` | Change the limit of the selected stage. On a repository row, change its lane reservation. |
 | `p` | Pause or resume the selected stage or repository. `P` pauses or resumes everything. |
 | `r` | Refine the selected ticket in the session view. |
@@ -178,13 +179,30 @@ countdown to the next fire.
 ### Session, view 2
 
 The session view follows the log of one task. You see the agent output and
-you steer it.
+you converse with the agent. Press `enter` on a ticket in the pipeline to
+open its session.
 
-- Type a message and press Enter. The UI sends it to the agent.
-- Press `ctrl-x` to abort the task.
+The input bar states what your message does. The daemon decides this per
+task, and the bar never promises what the daemon refuses:
+
+| Bar hint | What happens |
+|---|---|
+| `enter send` | A live claude chat takes the message at once. |
+| `resumes the parked chat` | The message restarts a parked claude session. |
+| `lands after this turn` | An opencode turn runs. The message becomes the next turn. |
+| `starts a follow-up turn` | The task finished. The message continues the same session. |
+| a reason, and a dim bar | The task takes no message. The reason says why. |
+
+- Press `ctrl-x` to abort. On a running opencode task that holds a queued
+  message, the abort makes that message start at once.
 - Press `PageUp` and `PageDown` to scroll. Press `End` to follow the live
   output again.
 - A pending question of the agent appears inline, with its options.
+
+The implement and review agents run one turn per process. A turn that already
+runs can not change course. So a message waits for the turn to end, and then
+starts the next turn in the same agent session. The agent keeps the context of
+its earlier work.
 
 ### Decisions inbox, view 3
 
@@ -231,6 +249,8 @@ would break trust.
   there.
 - A permission answer is valid for one request only. You answer the same
   tool again next time.
+- An implement or review turn that already runs can not change course. A
+  message waits for the next turn.
 - A release gate row refreshes at the poll after you stack a pull request.
 
 ## Development
