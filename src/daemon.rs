@@ -586,7 +586,7 @@ impl Daemon {
             .map(|task| task.id.clone())
             .collect();
         for id in ids {
-            self.cancel_task(&id);
+            self.cancel_task(&id, false);
         }
     }
 
@@ -619,7 +619,7 @@ impl Daemon {
             .map(|task| task.id.clone())
             .collect();
         for id in ids {
-            self.cancel_task(&id);
+            self.cancel_task(&id, false);
         }
     }
 
@@ -729,7 +729,7 @@ impl Daemon {
                     })
                     .map(|task| task.id.clone());
                 if let Some(id) = superseded {
-                    self.cancel_task(&id);
+                    self.cancel_task(&id, false);
                 }
             }
             let log = self.log_path(&work.repo, work.stage, work.kind, work.number);
@@ -1525,7 +1525,7 @@ impl Daemon {
                 decision_id,
                 response,
             } => self.answer_decision(&decision_id, response),
-            Action::Abort { task } => self.cancel_task(&task),
+            Action::Abort { task } => self.cancel_task(&task, true),
             Action::Retry { task } => self.retry_task(&task),
             Action::Stack { repo, pr, on } => {
                 let Some(repo_cfg) = self.config.repos.get(&repo).cloned() else {
@@ -1832,11 +1832,12 @@ impl Daemon {
 
     /// Reopen a terminal task whose chat messages still wait.
     ///
-    /// complete_task and fail_run set the terminal state first. A queued
-    /// message asks for one more turn, so the task goes back to `Queued`,
-    /// and `resume_pending_chats` starts it. The reopen ignores the attempt
-    /// limit and never raises the attempt count, and it drops the stuck row
-    /// of the finished run.
+    /// complete_task and fail_run set the terminal state first. A human
+    /// abort can also call this after `table.cancel`. A queued message asks
+    /// for one more turn, so the task goes back to `Queued`, and
+    /// `resume_pending_chats` starts it. The reopen ignores the attempt
+    /// limit and never raises the attempt count. It drops the stuck row of
+    /// the finished run.
     fn reopen_for_pending_chat(&mut self, id: &str) {
         if !self.pending_chats.contains_key(id) {
             return;
@@ -1933,7 +1934,7 @@ impl Daemon {
                 }
             }
             (DecisionKind::Stuck { task, .. }, Response::Retry) => self.retry_task(task),
-            (DecisionKind::Stuck { task, .. }, Response::Cancel) => self.cancel_task(task),
+            (DecisionKind::Stuck { task, .. }, Response::Cancel) => self.cancel_task(task, false),
             (DecisionKind::NeedsHuman { .. }, Response::Text { text }) => {
                 self.resolve_needs_human(decision, Some(text))
             }
@@ -2085,11 +2086,19 @@ impl Daemon {
         }
     }
 
-    /// Abort one task: stop its process, cancel it, and drop its decisions.
-    fn cancel_task(&mut self, id: &str) {
+    /// Cancel one task: stop its process, cancel it, and drop its decisions.
+    ///
+    /// Only a human abort can deliver a queued chat after the cancel. Every
+    /// gate cancel and a stuck-task cancel drop queued chats and restart data.
+    /// A human abort with queued chat keeps the messages and session marker.
+    /// It returns the task to `Queued` for `resume_pending_chats`.
+    fn cancel_task(&mut self, id: &str, deliver_pending_chat: bool) {
         let task = self.table.by_id.get(id).cloned();
         self.stop_session(id, "cannot stop the session during the abort");
-        self.pending_chats.remove(id);
+        let carries_chat = deliver_pending_chat && self.pending_chats.contains_key(id);
+        if !carries_chat {
+            self.pending_chats.remove(id);
+        }
         let active = self
             .table
             .by_id
@@ -2105,7 +2114,11 @@ impl Daemon {
             self.changed = true;
         }
         if let Some(task) = task.as_ref() {
-            self.remove_task_session_marker(task);
+            if carries_chat {
+                self.reopen_for_pending_chat(id);
+            } else {
+                self.remove_task_session_marker(task);
+            }
         }
     }
 
@@ -5285,6 +5298,216 @@ mod tests {
         assert_eq!(rig.job_count(), 2, "the lift starts the follow-up");
         assert_eq!(rig.job(1).prompt, "add a regression test");
         assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
+    }
+
+    // ------------------------------------------------------------------
+    // The abort delivers the queued message
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_abort_of_a_task_without_chats_keeps_the_old_behaviour() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        assert!(
+            rig.daemon
+                .worktrees
+                .read_task_session(&issue_wt(&dir, 142), "borsuk/implement-i142")
+                .unwrap()
+                .is_some(),
+            "the run wrote the session marker"
+        );
+        rig.event(RunEvent::Ask {
+            task: "borsuk/implement-i142".to_string(),
+            request_id: "req-1".to_string(),
+            tool: "Bash".to_string(),
+            input: json!({"command": "cargo test"}),
+            suggestions: serde_json::Value::Null,
+            needs_human: false,
+        });
+        assert!(rig.decision("perm:borsuk/implement-i142:req-1").is_some());
+
+        rig.act(Action::Abort {
+            task: "borsuk/implement-i142".to_string(),
+        });
+
+        assert!(rig.session(0).stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed("cancelled".to_string())
+        );
+        assert!(
+            rig.daemon
+                .worktrees
+                .read_task_session(&issue_wt(&dir, 142), "borsuk/implement-i142")
+                .unwrap()
+                .is_none(),
+            "the abort removes the restart data"
+        );
+        assert!(rig.daemon.pending_chats.is_empty());
+        assert!(rig.decision("perm:borsuk/implement-i142:req-1").is_none());
+        assert_eq!(rig.job_count(), 1);
+    }
+
+    #[test]
+    fn an_abort_keeps_the_queued_message_and_reopens_the_task() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        rig.act(Action::Abort {
+            task: "borsuk/implement-i142".to_string(),
+        });
+
+        assert!(rig.session(0).stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["add a regression test".to_string()][..])
+        );
+        let marker = rig
+            .daemon
+            .worktrees
+            .read_task_session(&issue_wt(&dir, 142), "borsuk/implement-i142")
+            .unwrap();
+        assert_eq!(marker.as_deref(), Some("ses-142"));
+        assert_eq!(rig.job_count(), 1, "the abort alone starts no run");
+    }
+
+    #[test]
+    fn the_turn_after_an_abort_carries_the_message_and_the_session() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+        rig.act(Action::Abort {
+            task: "borsuk/implement-i142".to_string(),
+        });
+
+        // The stopped process reports its exit and clears the stop gate.
+        // The exit frees the follow-up, and the daemon launches it at once.
+        rig.event(exited("borsuk/implement-i142", false, "killed"));
+
+        assert_eq!(rig.job_count(), 2);
+        let job = rig.job(1);
+        assert_eq!(job.task, "borsuk/implement-i142");
+        assert_eq!(job.prompt, "add a regression test");
+        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_closed_gate_drops_a_queued_message_and_does_not_relaunch() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        rig.poll(vec![issue(142, &[])], vec![]);
+
+        assert!(rig.session(0).stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed("cancelled".to_string())
+        );
+        assert!(!rig
+            .daemon
+            .pending_chats
+            .contains_key("borsuk/implement-i142"));
+        assert!(rig
+            .daemon
+            .worktrees
+            .read_task_session(&issue_wt(&dir, 142), "borsuk/implement-i142")
+            .unwrap()
+            .is_none());
+
+        rig.event(exited("borsuk/implement-i142", false, "killed"));
+
+        assert_eq!(rig.job_count(), 1, "the closed gate starts no new run");
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed("cancelled".to_string())
+        );
+    }
+
+    #[test]
+    fn a_paused_stage_holds_the_task_an_abort_reopened() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: true,
+        });
+        rig.act(Action::Abort {
+            task: "borsuk/implement-i142".to_string(),
+        });
+        rig.event(exited("borsuk/implement-i142", false, "killed"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+
+        rig.drive();
+        assert_eq!(rig.job_count(), 1, "the pause holds the reopened task");
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["add a regression test".to_string()][..])
+        );
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: false,
+        });
+        assert_eq!(rig.job_count(), 2, "the lift starts the follow-up");
+        assert_eq!(rig.job(1).prompt, "add a regression test");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
+    }
+
+    #[test]
+    fn a_follow_up_still_refuses_after_an_abort_of_the_sibling() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job_count(), 2, "the implement gate opened");
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+        rig.act(Action::Abort {
+            task: "borsuk/implement-i142".to_string(),
+        });
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+
+        let task = rig.task("borsuk/refine-i142");
+        assert!(rig.daemon.sibling_refusal(&task).is_some());
+        rig.daemon
+            .chat("borsuk/refine-i142", "adjust the specification");
+
+        assert!(
+            !rig.daemon.pending_chats.contains_key("borsuk/refine-i142"),
+            "the sibling guard refuses the follow-up after the abort"
+        );
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
     }
 
     // ------------------------------------------------------------------
