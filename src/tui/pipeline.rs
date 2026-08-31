@@ -5,7 +5,8 @@
 //! and queued counts against the limit and marks a limit that differs from
 //! the config file with a star. The release stage shows one train row per
 //! repository with the queue, the stacked set, the policy, and the
-//! countdown.
+//! countdown. A pause marks the paused stage header, the repository group
+//! row, and the queued tickets that cannot start.
 //!
 //! Chunk 19 adds the interaction keys to this file. The `Row` model and
 //! the selection movement exist so those keys can resolve their target.
@@ -99,6 +100,14 @@ fn stage_is_empty(state: &StateView, stage: Stage) -> bool {
 /// True when the operator paused the whole factory or this stage.
 fn stage_is_paused(state: &StateView, stage: Stage) -> bool {
     state.paused.global || state.paused.stages.contains(&stage)
+}
+
+/// True when a pause blocks the start of this task: the factory, its
+/// stage, or its repository.
+fn task_is_paused(state: &StateView, task: &TaskView) -> bool {
+    state.paused.global
+        || state.paused.stages.contains(&task.stage)
+        || state.paused.repos.iter().any(|repo| repo == &task.repo)
 }
 
 /// Move the selection of the app by `delta` rows in the pipeline view.
@@ -660,9 +669,9 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
 fn row_spans(state: &StateView, row: &Row, now_ms: u64) -> Vec<Span<'static>> {
     match row {
         Row::Stage { stage } => stage_spans(state, *stage),
-        Row::Repo { repo, .. } => repo_spans(repo),
+        Row::Repo { repo, .. } => repo_spans(state, repo),
         Row::Ticket { index } => match state.tasks.get(*index) {
-            Some(task) => ticket_spans(task),
+            Some(task) => ticket_spans(state, task),
             None => vec![Span::raw("    (missing task)")],
         },
         Row::Train { repo } => train_spans(state, repo, now_ms),
@@ -699,24 +708,37 @@ fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
         ));
     }
     if stage_is_paused(state, stage) {
-        spans.push(Span::styled(
-            "  paused",
-            Style::default().fg(THEME.warn).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(paused_span());
     }
     spans
 }
 
+/// The bold warn span that marks a paused scope.
+fn paused_span() -> Span<'static> {
+    Span::styled(
+        "  paused",
+        Style::default().fg(THEME.warn).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The spans of one repository group header row.
-fn repo_spans(repo: &str) -> Vec<Span<'static>> {
-    vec![
+fn repo_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled(repo.to_string(), THEME.dim().add_modifier(Modifier::BOLD)),
-    ]
+    ];
+    if state.paused.repos.iter().any(|entry| entry == repo) {
+        spans.push(paused_span());
+    }
+    spans
 }
 
 /// The spans of one ticket row: item, state, and attempt.
-fn ticket_spans(task: &TaskView) -> Vec<Span<'static>> {
+///
+/// A queued task that a pause blocks shows the pause instead of the queue
+/// state, because it cannot start. A task in any other state keeps its true
+/// state: a pause blocks starts, it does not stop running tasks.
+fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::raw("    "),
         Span::styled(
@@ -725,7 +747,11 @@ fn ticket_spans(task: &TaskView) -> Vec<Span<'static>> {
         ),
         Span::raw(" "),
     ];
-    spans.push(state_span(&task.state));
+    if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
+        spans.push(Span::styled("paused", Style::default().fg(THEME.warn)));
+    } else {
+        spans.push(state_span(&task.state));
+    }
     if task.attempt > 1 {
         spans.push(Span::styled(
             format!("  attempt {}", task.attempt),
@@ -1216,11 +1242,23 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        // A global pause marks the header and all four stage headers.
-        let marked = text.lines().filter(|line| line.contains("paused")).count();
-        assert_eq!(marked, 5);
+        // A global pause marks the four stage headers, the status bar, and
+        // the two queued tickets.
+        let marked: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("paused"))
+            .collect();
+        assert_eq!(marked.len(), 7);
+        assert_eq!(
+            marked.iter().filter(|line| line.contains(" of ")).count(),
+            4
+        );
+        assert!(text.contains("i142 paused"));
+        assert!(text.contains("i7 paused"));
+        assert!(!text.contains("i142 queued"));
+        assert!(!text.contains("i7 queued"));
 
-        // A stage pause marks only that stage header.
+        // A stage pause marks only that stage header and its queued ticket.
         let state = StateView {
             paused: PausedView {
                 global: false,
@@ -1239,8 +1277,57 @@ mod tests {
             .lines()
             .filter(|line| line.contains("paused"))
             .collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("refine"));
+        assert!(lines[1].contains("i142"));
+    }
+
+    #[test]
+    fn a_paused_repository_marks_its_group_rows_and_queued_tickets() {
+        let state = StateView {
+            paused: PausedView {
+                global: false,
+                stages: Vec::new(),
+                repos: vec!["borsuk".to_string()],
+            },
+            ..sample_view()
+        };
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        // Every group row of borsuk carries the mark. The train row stays
+        // unmarked: the daemon fires trains regardless of a pause.
+        let marked = text
+            .lines()
+            .filter(|line| line.contains("borsuk") && line.contains("paused"))
+            .count();
+        assert_eq!(marked, 4);
+        let train = text
+            .lines()
+            .find(|line| line.contains("train") && line.contains("queue 7,9"))
+            .expect("the borsuk train row must be visible");
+        assert!(!train.contains("paused"), "marked train row: {train}");
+        assert!(text.contains("i142 paused"));
+        assert!(!text.contains("i142 queued"));
+        // A running ticket of the paused repository keeps its true state.
+        assert!(text.contains("i140 running"));
+        // The unpaused repository keeps its queued state.
+        assert!(text.contains("i7 queued"));
+        assert!(!text.contains("i7 paused"));
+    }
+
+    #[test]
+    fn an_unpaused_repository_shows_no_pause_mark() {
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(!text.contains("paused"));
     }
 
     #[test]

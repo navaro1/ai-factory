@@ -145,7 +145,9 @@ write code, and open pull requests before you see the UI. The flag cannot
 apply when a daemon already runs. `aif` prints a message instead. Pause
 that daemon with `P`, or stop it with `aif stop` and start again.
 `aif doctor` reports the paused state. The UI shows a bold `paused` badge
-in the header and marks every stage row.
+in the header and marks every stage row. A paused repository marks its
+group row the same way. A queued ticket that a pause blocks shows `paused`
+instead of `queued`.
 
 ## The three views
 

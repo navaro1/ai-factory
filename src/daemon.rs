@@ -3584,6 +3584,34 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_repository_fires_its_train_but_cannot_start_the_release() {
+        let mut rig = Rig::make(vec![]);
+        rig.act(Action::Policy {
+            repo: "borsuk".to_string(),
+            policy: ReleasePolicy::Interval { minutes: 60 },
+        });
+        rig.act(Action::Pause {
+            scope: PauseScope::Repo {
+                repo: "borsuk".to_string(),
+            },
+            paused: true,
+        });
+
+        rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
+
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release-p2")
+        );
+        assert_eq!(rig.task("borsuk/release-p2").state, TaskState::Queued);
+        assert_eq!(rig.job_count(), 0);
+        assert!(
+            rig.exec.calls().is_empty(),
+            "firing a paused train must not call GitHub or prepare a worktree"
+        );
+    }
+
+    #[test]
     fn next_deadline_picks_the_earliest_and_none_when_idle() {
         let mut rig = Rig::make(vec![]);
         assert_eq!(
