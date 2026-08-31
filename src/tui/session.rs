@@ -7,6 +7,11 @@
 //! [`crate::tui::transcript`] and keeps the last [`RING_CAP`] items in a
 //! ring buffer.
 //!
+//! The input bar states what a typed message will do. The daemon says the
+//! mode with [`TaskView::input`]; the bar renders a hint for that mode. A
+//! closed input takes no message: the bar shows the daemon's reason, and
+//! [`SessionView::handle_key`] sends nothing.
+//!
 //! The shell in `mod.rs` hosts this view. The contract is:
 //!
 //! 1. Create one [`SessionView::new`] at startup.
@@ -36,8 +41,9 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use serde_json::Value;
 
+use super::theme::THEME;
 use crate::decisions::{Decision, DecisionKind};
-use crate::sock::{Action, TaskView};
+use crate::sock::{Action, InputMode, TaskView};
 use crate::tui::transcript::{self, Entry};
 
 /// How many parsed items the transcript ring buffer keeps.
@@ -270,6 +276,22 @@ fn ask_questions(value: &Value) -> Vec<AskQuestion> {
         .collect()
 }
 
+/// The bottom hint of the input bar for one input mode.
+///
+/// A closed input shows the reason sentence from the daemon instead of a
+/// key hint. The bar renders that sentence as is.
+fn input_hint(mode: &InputMode) -> String {
+    match mode {
+        InputMode::Live => "enter send · ctrl-x abort · end tail".to_string(),
+        InputMode::Resume => "enter send · resumes the parked chat".to_string(),
+        InputMode::NextTurn => {
+            "enter queue · lands after this turn · ctrl-x sends it now".to_string()
+        }
+        InputMode::Follow => "enter send · starts a follow-up turn".to_string(),
+        InputMode::Closed { reason } => reason.clone(),
+    }
+}
+
 /// The session view: the transcript, the input bar, and the pending asks.
 #[derive(Debug)]
 pub struct SessionView {
@@ -389,6 +411,16 @@ impl SessionView {
         self.scroll_up == 0
     }
 
+    /// True when the shown task accepts no chat message.
+    ///
+    /// A closed input swallows typing and Enter, so the shell never sends
+    /// the daemon a message it would drop.
+    fn input_is_closed(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(|task| matches!(task.input, InputMode::Closed { .. }))
+    }
+
     /// Handle one key press. Returns the action to send to the daemon.
     ///
     /// `page` is the visible transcript height in rows; the shell passes
@@ -396,17 +428,21 @@ impl SessionView {
     /// step. Typing feeds the input bar. Enter sends one [`Action::Chat`]
     /// with the typed text, `ctrl-x` sends [`Action::Abort`], PageUp and
     /// PageDown scroll, and End returns to following the tail.
+    ///
+    /// A closed input swallows typing and Enter and returns none, whatever
+    /// the bar holds. `ctrl-x` and the scroll keys stay alive.
     pub fn handle_key(&mut self, key: KeyEvent, page: u16) -> Option<Action> {
         if key.kind != KeyEventKind::Press {
             return None;
         }
         let page = usize::from(page.max(1));
+        let closed = self.input_is_closed();
         match (key.code, key.modifiers) {
             (KeyCode::Char('x'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 let task = self.task.as_ref()?.id.clone();
                 Some(Action::Abort { task })
             }
-            (KeyCode::Enter, _) => {
+            (KeyCode::Enter, _) if !closed => {
                 let task = self.task.as_ref()?.id.clone();
                 let text = std::mem::take(&mut self.input);
                 if text.trim().is_empty() {
@@ -415,12 +451,12 @@ impl SessionView {
                 Some(Action::Chat { task, text })
             }
             (KeyCode::Char(letter), modifiers)
-                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !closed && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.input.push(letter);
                 None
             }
-            (KeyCode::Backspace, _) => {
+            (KeyCode::Backspace, _) if !closed => {
                 self.input.pop();
                 None
             }
@@ -521,7 +557,9 @@ impl SessionView {
     ///
     /// The layout, from the top: a one-row task header, the transcript,
     /// the inline ask block when a decision of this task waits, and the
-    /// input bar at the bottom.
+    /// input bar at the bottom. The header shows the queued message count
+    /// when one waits. The input bar hint comes from the task's input
+    /// mode, and a closed bar renders dim.
     pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, decisions: &[Decision]) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -551,10 +589,14 @@ impl SessionView {
 
         if header_rows > 0 {
             let header = match &self.task {
-                Some(task) => Line::styled(
-                    format!("{} · {} · attempt {}", task.id, task.state, task.attempt),
-                    transcript::dim_style(),
-                ),
+                Some(task) => {
+                    let mut text =
+                        format!("{} · {} · attempt {}", task.id, task.state, task.attempt);
+                    if task.queued_messages > 0 {
+                        text.push_str(&format!(" · {} queued", task.queued_messages));
+                    }
+                    Line::styled(text, transcript::dim_style())
+                }
                 None => Line::styled("no task selected".to_string(), transcript::dim_style()),
             };
             frame.render_widget(Paragraph::new(header), header_rect);
@@ -574,15 +616,30 @@ impl SessionView {
             frame.render_widget(Paragraph::new(ask), ask_rect);
         }
 
-        let hint = "enter send · ctrl-x abort · end tail";
-        let block = Block::default()
+        // The hint states what Enter will do for this task. A closed bar
+        // shows the daemon's reason and renders dim.
+        let (hint, closed) = match &self.task {
+            Some(task) => (
+                input_hint(&task.input),
+                matches!(task.input, InputMode::Closed { .. }),
+            ),
+            None => ("enter send · ctrl-x abort · end tail".to_string(), false),
+        };
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .title(" chat ")
             .title_bottom(Line::styled(hint, transcript::dim_style()).centered());
         let mut content = String::with_capacity(self.input.len() + 2);
         content.push_str(&self.input);
         content.push('▏');
-        frame.render_widget(Paragraph::new(Line::from(content)).block(block), input_rect);
+        let mut line = Line::from(content);
+        if closed {
+            block = block
+                .border_style(THEME.dim())
+                .title_style(transcript::dim_style());
+            line = line.style(transcript::dim_style());
+        }
+        frame.render_widget(Paragraph::new(line).block(block), input_rect);
     }
 }
 
@@ -593,6 +650,7 @@ mod tests {
     use crate::tasks::TaskState;
     use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
     use std::fs;
     use std::io::Write;
@@ -644,6 +702,15 @@ mod tests {
             log_path: path.to_path_buf(),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+        }
+    }
+
+    /// The sample task with another input mode and queued count.
+    fn task_with_mode(path: &Path, mode: InputMode, queued: usize) -> TaskView {
+        TaskView {
+            input: mode,
+            queued_messages: queued,
+            ..sample_task(path)
         }
     }
 
@@ -1085,5 +1152,153 @@ mod tests {
         // A wrapped object and a wrong shape both yield nothing.
         assert!(ask_questions(&serde_json::json!(null)).is_empty());
         assert!(ask_questions(&serde_json::json!("no")).is_empty());
+    }
+
+    /// Render the view at 80 by 12 and return the visible text.
+    fn drawn_screen(view: &SessionView) -> String {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 12);
+        terminal.draw(|frame| view.draw(frame, area, &[])).unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// Render the view and return the style of the input bar top border.
+    ///
+    /// The input bar fills the bottom three rows, so its top border row is
+    /// three rows above the bottom edge.
+    fn drawn_border_style(view: &SessionView) -> ratatui::style::Style {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 12);
+        terminal.draw(|frame| view.draw(frame, area, &[])).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer[(0, 9)].style()
+    }
+
+    #[test]
+    fn the_frame_shows_a_hint_for_each_of_the_five_input_modes() {
+        let dir = TempDir::new("modes");
+        let log = dir.path().join("task.jsonl");
+        let cases = [
+            (InputMode::Live, "enter send · ctrl-x abort · end tail"),
+            (InputMode::Resume, "enter send · resumes the parked chat"),
+            (
+                InputMode::NextTurn,
+                "enter queue · lands after this turn · ctrl-x sends it now",
+            ),
+            (InputMode::Follow, "enter send · starts a follow-up turn"),
+            (
+                InputMode::Closed {
+                    reason: "the session is parked".to_string(),
+                },
+                "the session is parked",
+            ),
+        ];
+        for (mode, hint) in cases {
+            let mut view = SessionView::new();
+            view.show(&task_with_mode(&log, mode.clone(), 0));
+            let screen = drawn_screen(&view);
+            assert!(screen.contains(hint), "mode {mode:?}: {screen}");
+        }
+    }
+
+    #[test]
+    fn the_closed_bar_renders_dim_and_the_live_bar_does_not() {
+        let dir = TempDir::new("dim");
+        let log = dir.path().join("task.jsonl");
+
+        let mut view = SessionView::new();
+        view.show(&task_with_mode(&log, InputMode::Live, 0));
+        assert_ne!(
+            drawn_border_style(&view).fg,
+            Some(Color::DarkGray),
+            "a live bar keeps its normal border"
+        );
+
+        let closed = InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        let mut view = SessionView::new();
+        view.show(&task_with_mode(&log, closed, 0));
+        assert_eq!(
+            drawn_border_style(&view).fg,
+            Some(Color::DarkGray),
+            "a closed bar renders a dim border"
+        );
+    }
+
+    #[test]
+    fn a_closed_input_swallows_typing_and_enter_but_keeps_abort_and_scroll() {
+        let dir = TempDir::new("closed");
+        let log = dir.path().join("task.jsonl");
+        let closed = InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        let mut view = SessionView::new();
+        view.show(&task_with_mode(&log, closed, 0));
+
+        for press in [letter('h'), letter('i'), key(KeyCode::Backspace)] {
+            assert_eq!(view.handle_key(press, 10), None);
+        }
+        assert!(view.input.is_empty(), "a closed input swallows the letters");
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter), 10),
+            None,
+            "a closed input sends nothing on Enter"
+        );
+
+        // Scrolling still works in a closed session.
+        view.handle_key(key(KeyCode::PageUp), 10);
+        assert!(!view.following());
+        view.handle_key(key(KeyCode::End), 10);
+        assert!(view.following());
+
+        // ctrl-x still aborts the shown task.
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(
+            view.handle_key(ctrl_x, 10),
+            Some(Action::Abort {
+                task: "borsuk/implement-i142".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn enter_in_next_turn_mode_sends_the_chat() {
+        let dir = TempDir::new("next-turn");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&task_with_mode(&log, InputMode::NextTurn, 1));
+
+        for press in [letter('h'), letter('i')] {
+            assert_eq!(view.handle_key(press, 10), None);
+        }
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter), 10),
+            Some(Action::Chat {
+                task: "borsuk/implement-i142".to_string(),
+                text: "hi".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn the_header_shows_the_queued_count_when_it_is_above_zero() {
+        let dir = TempDir::new("queued");
+        let log = dir.path().join("task.jsonl");
+
+        let mut view = SessionView::new();
+        view.show(&task_with_mode(&log, InputMode::NextTurn, 2));
+        let screen = drawn_screen(&view);
+        assert!(
+            screen.contains("borsuk/implement-i142 · running · attempt 1 · 2 queued"),
+            "header: {screen}"
+        );
+
+        let mut view = SessionView::new();
+        view.show(&task_with_mode(&log, InputMode::Live, 0));
+        let screen = drawn_screen(&view);
+        assert!(!screen.contains("queued"), "header: {screen}");
     }
 }
