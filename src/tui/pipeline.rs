@@ -201,8 +201,33 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
         KeyCode::Char(' ') => stack_head(app, sink),
         KeyCode::Char('g') => ask_release(app),
         KeyCode::Char('s') => cycle_policy(app, sink),
+        KeyCode::Enter => open_selected_task(app),
         _ => {}
     }
+}
+
+/// Open the session of the selected ticket.
+///
+/// A ticket in any state opens its session: a done or failed task keeps
+/// its log file, so its transcript stays readable. A stage, repository,
+/// or train row opens nothing.
+fn open_selected_task(app: &mut App) {
+    let task = {
+        let Some(state) = app.state.as_ref() else {
+            return;
+        };
+        let Some(Row::Ticket { index }) = selected_row(app) else {
+            return;
+        };
+        let Some(task) = state.tasks.get(index) else {
+            return;
+        };
+        task.id.clone()
+    };
+    app.session_task = Some(task);
+    app.wanted = None;
+    app.view = View::Session;
+    app.show_session_task();
 }
 
 /// The row the operator selected, cloned out of the row list.
@@ -1371,6 +1396,11 @@ mod tests {
         )
     }
 
+    /// A plain press of the Enter key.
+    fn pressed_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
     /// The sample app with one selected row.
     fn app_with_selection(index: usize) -> App {
         App {
@@ -1662,6 +1692,69 @@ mod tests {
         );
         assert_eq!(app.view, View::Session);
         assert_eq!(app.session_task.as_deref(), Some("ryba/refine-i0"));
+    }
+
+    #[test]
+    fn enter_opens_the_session_of_the_selected_ticket() {
+        let mut app = app_with_selection(2);
+        app.wanted = Some(Wanted::Create {
+            repo: "borsuk".to_string(),
+        });
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert!(sink.0.is_empty(), "enter must not send an action");
+        assert_eq!(app.view, View::Session);
+        assert_eq!(app.session_task.as_deref(), Some("borsuk/refine-i142"));
+        assert!(app.wanted.is_none());
+        assert!(app.session.is_showing("borsuk/refine-i142"));
+    }
+
+    #[test]
+    fn enter_opens_done_and_failed_tickets() {
+        let mut state = sample_view();
+        state.tasks[1].state = TaskState::Done;
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            selection: Selection::Row(3),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Session);
+        assert!(app.session.is_showing("borsuk/refine-i143"));
+
+        let mut app = app_with_selection(5);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Session);
+        assert!(app.session.is_showing("ryba/refine-i9"));
+    }
+
+    #[test]
+    fn enter_on_a_header_or_train_row_changes_nothing() {
+        // Row 0 is the refine stage header, row 1 the borsuk repository
+        // header, rows 18 and 20 the two train rows.
+        for index in [0_usize, 1, 18, 20] {
+            let mut app = app_with_selection(index);
+            let mut sink = FakeSink::default();
+            handle_key(&mut app, pressed_enter(), &mut sink);
+            assert!(sink.0.is_empty(), "selection {index}");
+            assert_eq!(app.view, View::Pipeline, "selection {index}");
+            assert!(app.session_task.is_none(), "selection {index}");
+            assert!(app.toast.is_none(), "selection {index}");
+        }
+
+        // A pipeline with no selection also ignores Enter.
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Pipeline);
+        assert!(app.session_task.is_none());
     }
 
     #[test]
