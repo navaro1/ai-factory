@@ -1327,8 +1327,13 @@ those files. Say in the report which of them you touched and why. No other file.
   moving it breaks the chunk briefs.
 
 **Acceptance criteria.**
-- `rg -i zellij` finds nothing outside `.git` and the changelog.
-- `rg "ui/console"` finds nothing.
+- `rg -i zellij` and `rg "ui/console"` find nothing outside `.git` and
+  `docs/v0.5/`. The spec and the chunk reviews under `docs/v0.5/reviews/`
+  are the HISTORICAL RECORD of how this was built and legitimately name the
+  old tree. Never edit a review document to satisfy this check: those files
+  are other reviewers' accounts of their own work, and rewriting them
+  falsifies the record. Exclude the path instead:
+      rg -i zellij --glob '!docs/v0.5/**'
 - `./check.sh` passes.
 - `install.sh` runs in a temporary `HOME` and produces both binaries and a
   config directory, asserted by a test script.
