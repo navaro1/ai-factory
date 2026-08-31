@@ -1035,9 +1035,9 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 19, area);
+    let panel = centered(44, 20, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 17] = [
+    let rows: [(&str, &str); 18] = [
         ("1 2 3", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
@@ -1049,6 +1049,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("r n", "refine / new ticket"),
         ("x R", "abort / retry"),
         ("space g s", "stack / release / policy"),
+        ("enter", "open the selected task session"),
         ("enter", "send the chat message"),
         ("ctrl-x", "abort the shown task"),
         ("PageUp PageDown", "scroll the transcript"),
@@ -1422,10 +1423,19 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         assert!(text.contains("keys"));
+        let open_session_row = text
+            .lines()
+            .find(|line| line.contains("open the selected task session"))
+            .expect("the help misses the open-session row");
+        assert!(
+            open_session_row.contains("enter"),
+            "the open-session row has the wrong key: {open_session_row}"
+        );
         for entry in [
             "switch view",
             "oldest decision",
             "ctrl-q",
+            "send the chat message",
             "PageUp PageDown",
             "PageDown",
             "End",
@@ -1614,6 +1624,44 @@ mod tests {
         assert_eq!(app.view, View::Session);
         assert_eq!(app.session_task.as_deref(), Some("borsuk/implement-i140"));
         assert!(app.session.is_showing("borsuk/implement-i140"));
+    }
+
+    #[test]
+    fn enter_on_a_pipeline_ticket_opens_its_session() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        // Three `j` presses walk from no selection to the first ticket:
+        // stage header, repository header, ticket.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('j'),
+                key('j'),
+                key('j'),
+                key_code(KeyCode::Enter),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session);
+        assert_eq!(app.session_task.as_deref(), Some("borsuk/refine-i142"));
+        assert!(app.session.is_showing("borsuk/refine-i142"));
+        assert!(sink.0.is_empty(), "enter must not send an action");
+
+        // Escape returns to the pipeline view.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Pipeline);
+        assert_eq!(app.session_task.as_deref(), Some("borsuk/refine-i142"));
     }
 
     #[test]
@@ -1840,6 +1888,47 @@ mod tests {
     }
 
     #[test]
+    fn enter_in_a_closed_session_sends_no_action_and_shows_no_toast() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].input = crate::sock::InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('h'), key('i'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty(), "a closed input must send nothing");
+        assert!(app.visible_toast().is_none(), "no send means no toast");
+        let screen = render_to_string(&mut app);
+        assert!(
+            !screen.contains("hi▏"),
+            "a closed input swallows the letters: {screen}"
+        );
+        assert!(
+            screen.contains("the session is parked"),
+            "the bar shows the reason: {screen}"
+        );
+    }
+
+    #[test]
     fn r_follows_the_new_refine_task_on_the_next_push() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App {
@@ -1876,6 +1965,8 @@ mod tests {
             state: TaskState::Running,
             attempt: 1,
             log_path: PathBuf::from("borsuk-refine-i140.jsonl"),
+            input: crate::sock::InputMode::Live,
+            queued_messages: 0,
         });
         run_messages(
             &mut surface,
@@ -1958,6 +2049,8 @@ mod tests {
             state: TaskState::Running,
             attempt: 1,
             log_path: PathBuf::from("ryba-refine-i0.jsonl"),
+            input: crate::sock::InputMode::Live,
+            queued_messages: 0,
         });
         run_messages(
             &mut surface,

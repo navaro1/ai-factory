@@ -201,8 +201,33 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
         KeyCode::Char(' ') => stack_head(app, sink),
         KeyCode::Char('g') => ask_release(app),
         KeyCode::Char('s') => cycle_policy(app, sink),
+        KeyCode::Enter => open_selected_task(app),
         _ => {}
     }
+}
+
+/// Open the session of the selected ticket.
+///
+/// A ticket in any state opens its session: a done or failed task keeps
+/// its log file, so its transcript stays readable. A stage, repository,
+/// or train row opens nothing.
+fn open_selected_task(app: &mut App) {
+    let task = {
+        let Some(state) = app.state.as_ref() else {
+            return;
+        };
+        let Some(Row::Ticket { index }) = selected_row(app) else {
+            return;
+        };
+        let Some(task) = state.tasks.get(index) else {
+            return;
+        };
+        task.id.clone()
+    };
+    app.session_task = Some(task);
+    app.wanted = None;
+    app.view = View::Session;
+    app.show_session_task();
 }
 
 /// The row the operator selected, cloned out of the row list.
@@ -733,11 +758,13 @@ fn repo_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
     spans
 }
 
-/// The spans of one ticket row: item, state, and attempt.
+/// The spans of one ticket row: item, state, attempt, and queued messages.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
 /// state, because it cannot start. A task in any other state keeps its true
-/// state: a pause blocks starts, it does not stop running tasks.
+/// state: a pause blocks starts, it does not stop running tasks. A count
+/// above zero of queued messages adds a badge, so a waiting message stays
+/// visible from the board.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::raw("    "),
@@ -755,6 +782,12 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     if task.attempt > 1 {
         spans.push(Span::styled(
             format!("  attempt {}", task.attempt),
+            THEME.dim(),
+        ));
+    }
+    if task.queued_messages > 0 {
+        spans.push(Span::styled(
+            format!("  {} queued", task.queued_messages),
             THEME.dim(),
         ));
     }
@@ -856,6 +889,8 @@ fn task(
         state,
         attempt,
         log_path: std::env::temp_dir().join(format!("{repo}-{stage}-{number}.jsonl")),
+        input: crate::sock::InputMode::Live,
+        queued_messages: 0,
     }
 }
 
@@ -1331,6 +1366,23 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_with_queued_messages_shows_the_badge_on_the_board() {
+        let mut state = sample_view();
+        state.tasks[1].queued_messages = 2;
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("i143 running  2 queued"), "board: {text}");
+
+        // A ticket without queued messages shows no badge.
+        let line = text.lines().find(|line| line.contains("i142")).unwrap();
+        assert_eq!(line.trim_end(), "      i142 queued");
+    }
+
+    #[test]
     fn policy_label_covers_every_policy() {
         assert_eq!(policy_label(&ReleasePolicy::Manual), "manual");
         assert_eq!(
@@ -1369,6 +1421,11 @@ mod tests {
             KeyCode::Char(character),
             crossterm::event::KeyModifiers::empty(),
         )
+    }
+
+    /// A plain press of the Enter key.
+    fn pressed_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
     }
 
     /// The sample app with one selected row.
@@ -1662,6 +1719,69 @@ mod tests {
         );
         assert_eq!(app.view, View::Session);
         assert_eq!(app.session_task.as_deref(), Some("ryba/refine-i0"));
+    }
+
+    #[test]
+    fn enter_opens_the_session_of_the_selected_ticket() {
+        let mut app = app_with_selection(2);
+        app.wanted = Some(Wanted::Create {
+            repo: "borsuk".to_string(),
+        });
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert!(sink.0.is_empty(), "enter must not send an action");
+        assert_eq!(app.view, View::Session);
+        assert_eq!(app.session_task.as_deref(), Some("borsuk/refine-i142"));
+        assert!(app.wanted.is_none());
+        assert!(app.session.is_showing("borsuk/refine-i142"));
+    }
+
+    #[test]
+    fn enter_opens_done_and_failed_tickets() {
+        let mut state = sample_view();
+        state.tasks[1].state = TaskState::Done;
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            selection: Selection::Row(3),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Session);
+        assert!(app.session.is_showing("borsuk/refine-i143"));
+
+        let mut app = app_with_selection(5);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Session);
+        assert!(app.session.is_showing("ryba/refine-i9"));
+    }
+
+    #[test]
+    fn enter_on_a_header_or_train_row_changes_nothing() {
+        // Row 0 is the refine stage header, row 1 the borsuk repository
+        // header, rows 18 and 20 the two train rows.
+        for index in [0_usize, 1, 18, 20] {
+            let mut app = app_with_selection(index);
+            let mut sink = FakeSink::default();
+            handle_key(&mut app, pressed_enter(), &mut sink);
+            assert!(sink.0.is_empty(), "selection {index}");
+            assert_eq!(app.view, View::Pipeline, "selection {index}");
+            assert!(app.session_task.is_none(), "selection {index}");
+            assert!(app.toast.is_none(), "selection {index}");
+        }
+
+        // A pipeline with no selection also ignores Enter.
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Pipeline);
+        assert!(app.session_task.is_none());
     }
 
     #[test]

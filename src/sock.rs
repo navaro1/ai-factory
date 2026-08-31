@@ -70,6 +70,25 @@ pub struct StateView {
     pub paused: PausedView,
 }
 
+/// What the session view's input bar does for one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum InputMode {
+    /// A live Claude session receives the message at once.
+    Live,
+    /// The next message relaunches the parked Claude session.
+    Resume,
+    /// The next message waits for the running turn and starts the next one.
+    NextTurn,
+    /// The next message queues a follow-up turn that continues the session.
+    Follow,
+    /// The task takes no message, and the reason tells the human why.
+    Closed {
+        /// The sentence that tells the human why the input is closed.
+        reason: String,
+    },
+}
+
 /// The daemon state one state view is built from.
 ///
 /// Every field borrows one piece of the state the daemon event loop owns.
@@ -79,7 +98,8 @@ pub struct StateView {
 /// entry overrides the config file value; a missing entry falls back to
 /// the config. A repository without an entry in `trains` gets an empty
 /// train view. A stage limit counts as overridden when the runtime limit
-/// differs from the config file value.
+/// differs from the config file value. Each task must have an entry in
+/// `input_modes`. The daemon adds queued message counts after this build.
 #[derive(Debug, Clone, Copy)]
 pub struct StateInput<'a> {
     /// The loaded configuration file.
@@ -96,6 +116,9 @@ pub struct StateInput<'a> {
     pub trains: &'a BTreeMap<String, Train>,
     /// The active release policies, keyed by repository alias.
     pub policies: &'a BTreeMap<String, ReleasePolicy>,
+    /// The input mode of each task, keyed by task id. The daemon decides
+    /// every mode; this module only serializes it.
+    pub input_modes: &'a BTreeMap<String, InputMode>,
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -111,6 +134,7 @@ impl StateInput<'_> {
             decisions,
             trains,
             policies,
+            input_modes,
             now_ms,
         } = *self;
         let repos = config
@@ -165,6 +189,11 @@ impl StateInput<'_> {
                     state: task.state.clone(),
                     attempt: task.attempt,
                     log_path: task.log_path.clone(),
+                    input: input_modes
+                        .get(id)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("task \"{id}\" has no input mode"))?,
+                    queued_messages: 0,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -268,6 +297,10 @@ pub struct TaskView {
     pub attempt: u32,
     /// The JSON lines log of the task. The UI tails this file itself.
     pub log_path: PathBuf,
+    /// What the session view's input bar does for this task.
+    pub input: InputMode,
+    /// How many chat messages wait to run for this task.
+    pub queued_messages: usize,
 }
 
 /// One release train in the state view.
@@ -1066,6 +1099,106 @@ mod tests {
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 
+    /// One input mode of every variant.
+    fn every_input_mode() -> Vec<InputMode> {
+        vec![
+            InputMode::Live,
+            InputMode::Resume,
+            InputMode::NextTurn,
+            InputMode::Follow,
+            InputMode::Closed {
+                reason: "The task holds no session to continue.".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_input_mode_round_trips_through_json_with_the_documented_tags() {
+        for mode in every_input_mode() {
+            let text = serde_json::to_string(&mode).unwrap();
+            assert!(text.contains("\"mode\":"), "line: {text}");
+            assert_eq!(serde_json::from_str::<InputMode>(&text).unwrap(), mode);
+        }
+        assert_eq!(
+            serde_json::to_string(&InputMode::NextTurn).unwrap(),
+            "{\"mode\":\"next_turn\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&InputMode::Closed {
+                reason: "no session".to_string()
+            })
+            .unwrap(),
+            "{\"mode\":\"closed\",\"reason\":\"no session\"}"
+        );
+    }
+
+    #[test]
+    fn a_task_view_keeps_the_input_and_the_queued_count_through_json() {
+        let mut view = sample_view(1);
+        view.tasks.push(TaskView {
+            id: "borsuk/implement-i142".to_string(),
+            repo: "borsuk".to_string(),
+            stage: Stage::Implement,
+            kind: ItemKind::Issue,
+            number: 142,
+            state: TaskState::Running,
+            attempt: 1,
+            log_path: PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
+            input: InputMode::NextTurn,
+            queued_messages: 2,
+        });
+        let text = serde_json::to_string(&Push::State(view.clone())).unwrap();
+        assert!(
+            text.contains("\"input\":{\"mode\":\"next_turn\"}"),
+            "line: {text}"
+        );
+        assert!(text.contains("\"queued_messages\":2"), "line: {text}");
+        let push = serde_json::from_str::<Push>(&text).unwrap();
+        assert_eq!(push, Push::State(view));
+    }
+
+    #[test]
+    fn the_view_build_rejects_a_missing_input_mode() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let mut table = TaskTable::new();
+        table
+            .upsert_queued(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                PathBuf::from("/state/logs/borsuk__refine-i142.jsonl"),
+                1_000,
+            )
+            .unwrap();
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let input_modes = BTreeMap::new();
+
+        let error = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            trains: &trains,
+            policies: &policies,
+            input_modes: &input_modes,
+            now_ms: 0,
+        }
+        .build()
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("refine-i142"),
+            "message: {error}"
+        );
+        assert!(error.to_string().contains("input mode"), "message: {error}");
+    }
+
     #[test]
     fn broadcast_skips_the_initial_push_that_a_subscriber_already_received() {
         let (stream, _peer) = UnixStream::pair().unwrap();
@@ -1114,10 +1247,13 @@ mod tests {
         // Dropping a listener closes it without removing its socket path.
         let listener = UnixListener::bind(&path).unwrap();
         drop(listener);
-        assert!(
-            UnixStream::connect(&path).is_err(),
-            "the leftover socket must be dead"
-        );
+        // A parallel child can briefly inherit the listener before it
+        // starts its program. Wait for this bounded test race to end.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while UnixStream::connect(&path).is_ok() {
+            assert!(Instant::now() < deadline, "the leftover socket stayed live");
+            thread::sleep(Duration::from_millis(1));
+        }
 
         let (server, _rx) = Server::bind(&path).unwrap();
         server.publish(sample_view(1));
@@ -1219,6 +1355,8 @@ mod tests {
             state: TaskState::Queued,
             attempt: 1,
             log_path: PathBuf::from("/state/logs/borsuk__refine-i142.jsonl"),
+            input: InputMode::NextTurn,
+            queued_messages: 1,
         });
         server.publish(second.clone());
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(second.clone()));
@@ -1467,6 +1605,7 @@ mod tests {
             decisions: &decisions,
             trains: &trains,
             policies: &policies,
+            input_modes: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -1535,6 +1674,16 @@ mod tests {
             repos: ["qubitsok".to_string()].into_iter().collect(),
         };
 
+        // The daemon decides the input mode of each task. The build only
+        // looks the entries up.
+        let mut input_modes = BTreeMap::new();
+        input_modes.insert("borsuk/implement-i142".to_string(), InputMode::Live);
+        input_modes.insert(
+            "qubitsok/refine-i7".to_string(),
+            InputMode::Closed {
+                reason: "no session".to_string(),
+            },
+        );
         let view = StateInput {
             config: &config,
             limits: &limits,
@@ -1543,6 +1692,7 @@ mod tests {
             decisions: &decisions,
             trains: &trains,
             policies: &policies,
+            input_modes: &input_modes,
             now_ms: 120_000,
         }
         .build()
@@ -1600,6 +1750,18 @@ mod tests {
         );
         assert_eq!(view.tasks[1].id, "qubitsok/refine-i7");
         assert_eq!(view.tasks[1].state, TaskState::Queued);
+
+        // Each task view carries its input mode. The daemon fills the
+        // queued count from its pending chat queue after this build.
+        assert_eq!(view.tasks[0].input, InputMode::Live);
+        assert_eq!(view.tasks[0].queued_messages, 0);
+        assert_eq!(
+            view.tasks[1].input,
+            InputMode::Closed {
+                reason: "no session".to_string()
+            }
+        );
+        assert_eq!(view.tasks[1].queued_messages, 0);
 
         // The open decisions ride along unchanged.
         assert_eq!(view.decisions.len(), 1);

@@ -26,9 +26,10 @@ const SUMMARY_CHARS: usize = 120;
 /// Build the exact argument vector for one factory task.
 ///
 /// The shape is the verified invocation: `run --format json --auto --agent
-/// build -m <model> [--variant <v>] --dir <cwd> <prompt>`. `--auto` is always
-/// present, because yolo is the factory policy and the run is one-shot.
-/// `job.resume` plays no part: a one-shot opencode run never resumes.
+/// build -m <model> [--variant <v>] [--session <id>] --dir <cwd> <prompt>`.
+/// `--auto` is always present, because yolo is the factory policy and the
+/// run is one-shot. A `Some` `job.resume` adds `--session <id>`, so the
+/// child continues that opencode conversation. `None` starts a fresh one.
 fn build_args(job: &Job) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -43,6 +44,10 @@ fn build_args(job: &Job) -> Vec<String> {
     if let Some(variant) = &job.variant {
         args.push("--variant".to_string());
         args.push(variant.clone());
+    }
+    if let Some(session) = &job.resume {
+        args.push("--session".to_string());
+        args.push(session.clone());
     }
     args.push("--dir".to_string());
     args.push(job.cwd.display().to_string());
@@ -82,6 +87,9 @@ impl Runner for OpenCodeRunner {
         };
         let (proc_tx, proc_rx) = channel::<ProcEvent>();
         let handle = proc::spawn(spec, proc_tx)?;
+        // opencode prints only once its stdin reaches end of file, and this
+        // runner has no steering channel, so close the pipe at once.
+        handle.close_stdin();
         let task = job.task.clone();
         thread::spawn(move || forward_events(task, proc_rx, tx));
         Ok(Box::new(OpenCodeSession {
@@ -486,6 +494,34 @@ not json at all
     }
 
     #[test]
+    fn the_argument_vector_carries_the_session_of_a_resume() {
+        let dir = Path::new("/state/worktrees/borsuk/issue-142");
+        let fresh = build_args(&job(dir, None));
+        assert!(!fresh.contains(&"--session".to_string()));
+
+        let mut resumed = job(dir, None);
+        resumed.resume = Some("ses_fix01".to_string());
+        assert_eq!(
+            build_args(&resumed),
+            vec![
+                "run",
+                "--format",
+                "json",
+                "--auto",
+                "--agent",
+                "build",
+                "-m",
+                "zai-coding-plan/glm-5.3-flash",
+                "--session",
+                "ses_fix01",
+                "--dir",
+                "/state/worktrees/borsuk/issue-142",
+                "Fix issue 142.",
+            ]
+        );
+    }
+
+    #[test]
     fn fixture_replay_produces_the_expected_run_events() {
         let dir = temp_dir("fixture-replay");
         let fixture = dir.join("recorded.ndjson");
@@ -763,6 +799,41 @@ not json at all
 
         // Every raw line, the malformed one included, reached the log.
         assert_eq!(fs::read_to_string(job.log).unwrap(), FIXTURE);
+        drop(path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The child prints its first line only after its stdin reaches end of
+    /// file. The real `opencode run` has the same contract: it stays silent
+    /// while its stdin pipe stays open. So `cat` drains stdin to end of file
+    /// before the fake prints. This test fails in a bounded time when the
+    /// runner leaves the pipe open, because then the child never prints.
+    #[test]
+    fn start_closes_the_child_stdin() {
+        let dir = temp_dir("stdin-close");
+        script(
+            &dir,
+            PROGRAM,
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"ses_eof1\",\"part\":{\"type\":\"step-start\"}}'\n",
+        );
+        let job = job(&dir, None);
+        let path = PathGuard::prepend(&dir);
+        let mut runner = OpenCodeRunner::new();
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let deadline = Instant::now() + std::time::Duration::from_secs(TEST_TIMEOUT);
+        let left = deadline.saturating_duration_since(Instant::now());
+        let event = rx
+            .recv_timeout(left)
+            .expect("the child printed nothing; the runner left its stdin open");
+        assert_eq!(
+            event,
+            RunEvent::Started {
+                task: TASK.to_string(),
+                session_id: Some("ses_eof1".to_string()),
+            }
+        );
+        session.stop().unwrap();
         drop(path);
         fs::remove_dir_all(dir).unwrap();
     }

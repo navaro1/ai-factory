@@ -229,6 +229,29 @@ impl TaskTable {
         ))
     }
 
+    /// Reopen a terminal task for one more human-requested turn.
+    ///
+    /// The call accepts a task in `Done` or `Failed` and sets `Queued`. It
+    /// does not raise the attempt count and it ignores [`MAX_ATTEMPTS`]: a
+    /// human asked for the turn, so the automatic retry budget stays
+    /// untouched. The call refuses a task in `Queued`, `Running`, or
+    /// `AwaitingUser` with a clear error.
+    pub fn reopen(&mut self, id: &str, now_ms: u64) -> Result<()> {
+        let task = self
+            .by_id
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("no task \"{id}\" in the table"))?;
+        if !task.state.is_terminal() {
+            return Err(anyhow!(
+                "task \"{id}\" is {}, not terminal; reopen accepts only done or failed",
+                task.state
+            ));
+        }
+        task.state = TaskState::Queued;
+        task.updated_ms = now_ms;
+        Ok(())
+    }
+
     /// Cancel a task: the state becomes `Failed("cancelled")`.
     ///
     /// Cancelling follows the transition rules. A queued, running, or
@@ -520,6 +543,48 @@ mod tests {
             TaskState::Failed("boom".to_string())
         );
         assert_eq!(table.by_id[&id].attempt, MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn reopen_refuses_a_task_that_is_not_terminal() {
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::AwaitingUser,
+        ] {
+            let (mut table, id) = table_in_state(state);
+            let before = table.by_id[&id].clone();
+
+            let error = table.reopen(&id, LATER).unwrap_err().to_string();
+
+            assert!(error.contains(id.as_str()), "message: {error}");
+            assert!(error.contains("not terminal"), "message: {error}");
+            assert_eq!(table.by_id[&id], before, "reopen changed the task");
+        }
+    }
+
+    #[test]
+    fn reopen_queues_a_terminal_task_without_raising_the_attempt_count() {
+        for state in [TaskState::Done, TaskState::Failed("boom".to_string())] {
+            let (mut table, id) = table_in_state(state);
+            table.by_id.get_mut(&id).unwrap().attempt = MAX_ATTEMPTS;
+
+            table.reopen(&id, LATER).unwrap();
+
+            let task = &table.by_id[&id];
+            assert_eq!(task.state, TaskState::Queued);
+            assert_eq!(task.attempt, MAX_ATTEMPTS, "reopen keeps the count");
+            assert_eq!(task.updated_ms, LATER);
+        }
+    }
+
+    #[test]
+    fn reopen_refuses_an_unknown_task() {
+        let mut table = TaskTable::new();
+
+        let error = table.reopen("borsuk/implement-i142", LATER).unwrap_err();
+
+        assert!(error.to_string().contains("no task"));
     }
 
     #[test]
