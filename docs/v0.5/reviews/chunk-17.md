@@ -365,6 +365,6 @@ all checks passed
 - I left `src/bin/aifd.rs` unchanged. Its `run` command already exists. Chunk 15 owns the daemon loop.
 - I kept the CLI process test in `tests/cli.rs`. The stop criterion requires a real process exit code.
 - I did not change `src/model.rs` or `src/exec.rs`. Both files are frozen.
-- I did not change `ui/console/`, `zellij/`, or `bin/`.
+- I did not change the old v0.4 tree.
 
 Final verdict: PASS

@@ -12,4 +12,7 @@ cargo clippy --all-targets -- -D warnings
 printf '== test ==\n'
 cargo test
 
+printf '== install ==\n'
+tests/install.sh
+
 printf 'all checks passed\n'

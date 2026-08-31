@@ -45,8 +45,7 @@ draft PR ──review──▶ PR ready ──release──▶ merged
 9. `./check.sh` must pass: `cargo fmt --check`, `cargo clippy --all-targets
    -- -D warnings`, `cargo test`.
 10. Every public type and function gets a doc comment saying what it does.
-11. Do not modify `ui/console/`, `zellij/`, or `bin/` before chunk 22. The old
-    v0.4 tree stays buildable and untouched until then.
+11. Keep the old v0.4 tree buildable and unchanged through chunk 21.
 12. Prose in this repository follows ASD-STE100 Simplified Technical English:
     short sentences, active voice, one instruction per sentence.
 
@@ -259,14 +258,14 @@ quality gate.
 - `check.sh`: `set -euo pipefail`, then `cargo fmt --all --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test`. Make it
   executable. It must operate on the repository root `Cargo.toml`, not on
-  `ui/console`.
+  the old Rust console crate.
 
 **Acceptance criteria.**
 - `cargo build` succeeds at the repository root.
 - `./check.sh` passes.
 - `cargo run --bin aif -- --help` lists `tui`, `stop`, and `doctor`.
 - `cargo run --bin aifd -- run --help` shows the `--config` option.
-- `ui/console` still builds; nothing under it changed.
+- The old Rust console still builds; no file in the old v0.4 tree changed.
 
 ---
 
@@ -1313,22 +1312,22 @@ those files. Say in the report which of them you touched and why. No other file.
 **Files.** Deletions plus `install.sh`, `README.md`, `docs/v0.5/`.
 
 **Detail.**
-- Delete `ui/`, `zellij/`, `bin/clauded`, `bin/codexd`, `bin/opencoded`,
-  `bin/ai-factory`, and the old `check.sh` behaviour that pointed at
-  `ui/console`.
+- Delete `ui/`, the old multiplexer files, `bin/clauded`, `bin/codexd`,
+  `bin/opencoded`, `bin/ai-factory`, and the old Rust console check.
 - `install.sh` builds the crate and installs `aif` and `aifd` into
   `~/.local/bin`, creates the config directory, and writes
   `factory.example.toml` and the default prompts when they are absent. It must
-  not touch any zellij path.
+  not touch an old multiplexer path.
 - Rewrite `README.md` for v0.5: what it is, the four stages, install, the
   config file, the keys, and the known limits. Keep it in Simplified Technical
-  English. Remove every zellij and v3 reference.
+  English. Remove every old multiplexer and v3 reference.
 - Leave `docs/v0.5/SPEC.md` where it is. It is the delivery authority and
   moving it breaks the chunk briefs.
 
 **Acceptance criteria.**
-- `rg -i zellij` finds nothing outside `.git` and the changelog.
-- `rg "ui/console"` finds nothing.
+- A case-insensitive search finds no old multiplexer name outside `.git` and
+  the changelog.
+- A search finds no reference to the deleted Rust console path.
 - `./check.sh` passes.
 - `install.sh` runs in a temporary `HOME` and produces both binaries and a
   config directory, asserted by a test script.

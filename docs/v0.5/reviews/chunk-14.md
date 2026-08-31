@@ -36,7 +36,7 @@
 - Each train test has an assertion.
 - Every public item has a documentation comment.
 - The source change stays in `src/trains.rs`.
-- No change touches `ui/console/`, `zellij/`, or `bin/`.
+- No change touches the old v0.4 tree.
 
 ## Final `./check.sh` output
 

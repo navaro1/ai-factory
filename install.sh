@@ -21,14 +21,30 @@ install -m 755 "${here}/target/release/aifd" "${bin_dir}/aifd"
 
 mkdir -p "${config_dir}/prompts"
 
-# The example config is a reference copy. The live config starts as a copy of
-# it, so a new user has a working starting point. A file that exists stays.
+# Write a portable copy of the committed example.
+write_config() {
+    local destination="$1"
+    local temporary
+    temporary="$(mktemp "${config_dir}/.factory.XXXXXX")"
+    if ! sed 's|^path = "/home/[^/]*/Workplace/|path = "/home/you/Workplace/|' \
+        "${here}/docs/v0.5/factory.example.toml" >"${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    if ! install -m 644 "${temporary}" "${destination}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    rm -f -- "${temporary}"
+}
+
+# The live config starts as a copy of the example. A file that exists stays.
 if [[ ! -f "${config_dir}/factory.example.toml" ]]; then
-    install -m 644 "${here}/docs/v0.5/factory.example.toml" "${config_dir}/factory.example.toml"
+    write_config "${config_dir}/factory.example.toml"
     printf 'Wrote %s\n' "${config_dir}/factory.example.toml"
 fi
 if [[ ! -f "${config_dir}/factory.toml" ]]; then
-    install -m 644 "${here}/docs/v0.5/factory.example.toml" "${config_dir}/factory.toml"
+    write_config "${config_dir}/factory.toml"
     printf 'Wrote %s\n' "${config_dir}/factory.toml"
 fi
 
@@ -51,4 +67,3 @@ esac
 printf 'Installed.\n'
 printf 'Edit %s and set the path of every repository.\n' "${config_dir}/factory.toml"
 printf 'Run aif doctor to check the installation.\n'
-printf 'Run aif to start the daemon and open the terminal UI.\n'

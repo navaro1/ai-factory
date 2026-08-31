@@ -8,7 +8,7 @@
 | `./check.sh` passes. | Met | The final command exited with status 0. The exact output follows below. |
 | `cargo run --bin aif -- --help` lists `tui`, `stop`, and `doctor`. | Met | The command listed all three names. An offline integration test also checks them. |
 | `cargo run --bin aifd -- run --help` shows `--config`. | Met | The command showed `--config <CONFIG>`. An offline integration test also checks it. |
-| `ui/console` builds, and no file under it changed. | Met | Its `cargo build` command exited with status 0. The base diff contains no protected path. |
+| The old Rust console builds, and no file under it changed. | Met | Its `cargo build` command exited with status 0. The base diff contains no protected path. |
 
 ## Findings and fixes
 
@@ -80,6 +80,6 @@ all checks passed
 
 I left `Cargo.lock` unchanged. Cargo uses this file to keep dependency versions stable for this application.
 
-I left `ui/console/`, `zellij/`, and `bin/` unchanged. Global Constraint 11 forbids changes before Task 22.
+I left the old v0.4 tree unchanged. Global Constraint 11 forbids changes before Task 22.
 
 Final verdict: PASS

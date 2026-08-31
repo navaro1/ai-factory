@@ -42,7 +42,7 @@
 - The brief defines no multi-digit key sequence.
 - The free text path remains available.
 - I read `src/model.rs` and `src/exec.rs` only.
-- I did not edit `ui/console/`, `zellij/`, or `bin/`.
+- I did not edit the old v0.4 tree.
 
 ## Exact final `./check.sh` output
 

@@ -27,7 +27,7 @@
 
 I left `src/model.rs` and `src/exec.rs` unchanged. The task freezes these files.
 
-I left `ui/console/`, `zellij/`, and `bin/` unchanged. The specification protects these directories.
+I left the old v0.4 tree unchanged. The specification protects these files.
 
 I found no later chunk work in the tracked diff. I left all supplied review input files unchanged.
 

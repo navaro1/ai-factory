@@ -307,7 +307,7 @@ all checks passed
 ## Deliberate exclusions
 
 - I left src/model.rs and src/exec.rs unchanged because the worktree instructions freeze them.
-- I left ui/console/, zellij/, and bin/ unchanged because chunk 22 owns those paths.
+- I left the old v0.4 tree unchanged because chunk 22 owns those files.
 - I left the task 17 stop-wait behavior for chunk 17. Task 16 now sends the stop action only.
 - I found no unresolved defect in the owned scope.
 

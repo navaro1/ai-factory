@@ -149,7 +149,7 @@ The new tests use fake senders, local files, and an injected clock.
 Each new test has an assertion.
 Production code adds no `unwrap` or `expect`.
 
-The source changes do not touch `ui/console/`, `zellij/`, or `bin/`.
+The source changes do not touch the old v0.4 tree.
 
 ## Scope decisions
 
@@ -698,4 +698,3 @@ all checks passed
 ## Final verdict
 
 PASS
-

@@ -324,7 +324,7 @@ all checks passed
 
 - I read `src/model.rs` and `src/exec.rs`. I did not edit these frozen files.
 - I did not edit any file outside the owned source file and this review file.
-- I did not edit `ui/console/`, `zellij/`, or `bin/`.
+- I did not edit the old v0.4 tree.
 - I left no known chunk 11 defect.
 
 PASS

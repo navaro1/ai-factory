@@ -402,7 +402,7 @@ The same test passed alone, and the final unmodified gate passed.
 I did not change the frozen runner module.
 
 I did not change any other frozen module.
-I did not change `ui/console/`, `zellij/`, or `bin/`.
+I did not change the old v0.4 tree.
 
 ## Verdict
 

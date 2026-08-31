@@ -26,7 +26,7 @@
 - Tests use no network or external tool.
 - Every test contains an assertion on behavior or a checked result.
 - Every public type, field, constant, and function has a documentation comment.
-- The diff changes no file under `ui/console/`, `zellij/`, or `bin/`.
+- The diff changes no file in the old v0.4 tree.
 
 ## Deliberately left alone
 

@@ -65,7 +65,7 @@ These are the two files in the task brief.
 The review changed those files and this required review file.
 
 I did not edit `src/model.rs` or `src/exec.rs`.
-I did not edit `ui/console/`, `zellij/`, or `bin/`.
+I did not edit the old v0.4 tree.
 
 ## Deliberately left alone
 

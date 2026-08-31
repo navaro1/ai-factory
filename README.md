@@ -2,7 +2,8 @@
 
 AI Factory drives AI coding agents against GitHub issues in several
 repositories. A daemon (a background program that runs without a terminal)
-does the work. A terminal UI shows the work and takes your decisions.
+does the work. A terminal user interface (UI) shows the work and takes your
+decisions.
 GitHub is the source of truth. AI Factory keeps no journal and no database.
 
 ## The four stages
@@ -20,7 +21,8 @@ refine ──▶ implement ──▶ review ──▶ release
 | review | opencode, model gpt-5.6-sol | The agent fixes findings and marks the pull request ready. |
 | release | claude Opus | Release trains merge the ready pull requests. |
 
-A release train is one batch of several pull requests, merged in order.
+A release train is one batch of one or more pull requests. The factory merges
+the pull requests in order.
 
 Labels drive the flow: `to-refine`, `refined`, `needs-human`, and
 `release-stacked`. Add the label `to-refine` to an issue to start the work.
@@ -30,18 +32,20 @@ only for real events. The only periodic clock is the 60-second GitHub poll
 of each repository. The poll is conditional: an unchanged repository costs
 almost nothing.
 
-Each issue gets one git worktree (a second checkout of the repository).
-The factory creates the worktrees. The agents never create them.
+Each implementation issue gets one git worktree (a second repository
+checkout). The implementation and review agents use this worktree. The
+factory creates the worktree. The agents never create it.
 
 ## Install
 
 You need:
 
-- Rust, with `cargo` on your `PATH`
+- Rust and its `cargo` tool. Your command search path (`PATH`) must contain
+  `cargo`.
 - `git`
-- the GitHub CLI (`gh`), logged in
-- the Claude Code CLI (`claude`), version 2.1.223 or later, logged in
-- the opencode CLI (`opencode`), logged in
+- the GitHub command-line interface (`gh`), with an active login
+- the `claude` command-line interface for Claude Code, version 2.1.223 or later
+- the `opencode` command-line interface, with an active login
 
 Run:
 
@@ -58,7 +62,7 @@ do not exist:
 | File | Purpose |
 |---|---|
 | `factory.toml` | Your configuration, copied from the example. |
-| `factory.example.toml` | A fresh reference copy of the example. |
+| `factory.example.toml` | A portable reference copy of the example. |
 | `prompts/refine.md` and three more | The default prompt of each stage, for you to edit. |
 
 The installer never overwrites a file that exists. Edit
@@ -102,9 +106,13 @@ path = "/home/you/Workplace/qubitsok"
 release = { policy = "threshold", count = 3 }
 ```
 
+- `model` sets the model identifier that the runner receives.
+- `runner` selects the `claude` or `opencode` command.
+- `variant` sets the optional effort level for `opencode`.
 - `limit` caps the concurrent tasks of a stage.
 - `yolo` auto-approves the ordinary tool permissions of a stage. The default
   is `true`. A real question always reaches the inbox.
+- `path` sets the absolute path of one repository checkout.
 - `lanes` reserves stage slots for one repository.
 - `release.policy` is `manual`, `interval` with `minutes`, or `threshold`
   with `count`.
@@ -113,18 +121,12 @@ release = { policy = "threshold", count = 3 }
 channel, and then the agent can not ask you anything. AI Factory never
 passes it.
 
-## Start and stop
+## Commands
 
 | Command | Effect |
 |---|---|
-| `aif` | Starts the daemon when none runs, then opens the terminal UI. |
-| `aif stop` | Stops the daemon. |
 | `aif doctor` | Reports on the installation and the configuration. |
 | `aif doctor --clean` | Removes the worktrees of closed issues and merged pull requests. |
-| `aifd run --config <path>` | Runs the daemon in a terminal, for debugging. |
-
-The daemon start uses `systemd-run --user` with the unit `aif-daemon` when
-systemd is present. Without systemd, `aif` spawns the daemon detached.
 
 ## The three views
 
@@ -201,6 +203,9 @@ would break trust.
 
 ## Known limits
 
+- The `aifd run` command prints a placeholder message and exits. The `aif`
+  command cannot start the daemon. The terminal UI and `aif stop` are not
+  usable in this build.
 - A label change becomes visible at the next poll, at most 60 seconds later.
 - A restart kills the agent processes of the running tasks. The gates
   re-open that work at the next poll.

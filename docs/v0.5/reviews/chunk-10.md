@@ -292,7 +292,7 @@ The task marks both files as frozen.
 
 I did not edit `src/proc.rs` because this chunk does not own it.
 
-I did not edit `ui/console/`, `zellij/`, or `bin/`.
+I did not edit the old v0.4 tree.
 
 The recorded fixture bytes remain inside `src/runner/opencode.rs`.
 
