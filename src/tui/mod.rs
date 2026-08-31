@@ -5,18 +5,18 @@
 //! - The key reader thread turns crossterm events into `Msg` values.
 //! - The socket reader thread connects to the daemon, turns pushes into
 //!   `Msg` values, and reconnects with `backoff_delay`.
-//! - The main thread owns the `App`, blocks on the one channel, and draws
-//!   one frame per message. Nothing draws on a timer.
+//! - The main thread owns the `App` and blocks on the one channel. It draws
+//!   one frame per message. The session view also draws when its file poll
+//!   finds new log data.
 //!
 //! The shell draws the pipeline view itself and drives the session and
 //! inbox views through their contracts: `show`, `on_redraw`, `draw`, and
-//! `handle_key` for the session, and `observe`, `draw`, and `handle_key`
-//! for the inbox. The loop never wakes on a timer, so it does not call the
-//! session `poll`; the next message triggers the redraw instead.
+//! `poll`, and `handle_key` for the session, and `observe`, `draw`, and
+//! `handle_key` for the inbox.
 //!
-//! A view that holds the keyboard for text input eats every key first.
-//! Thus a typed `q` or `!` lands in the text and never reaches the global
-//! handler. The quit chords ctrl-q and ctrl-c work from anywhere.
+//! A view that holds the keyboard for text input keeps a typed `q` away
+//! from the quit handler. The `!` inbox key and the ctrl-q and ctrl-c quit
+//! chords work from every view.
 
 pub mod inbox;
 pub mod pipeline;
@@ -26,7 +26,7 @@ pub mod transcript;
 
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -313,12 +313,17 @@ impl App {
 
     /// Apply one key press. Returns false when the app wants to quit.
     ///
-    /// The quit chords work in every state. A view that holds the keyboard
-    /// for text input eats every other key first, so a typed `q` or `!`
-    /// never reaches the global handler.
+    /// The quit chords and the inbox key work in every state. A view that
+    /// holds text input keeps a typed `q` away from the quit handler.
     fn handle_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
         if quit_chord(key) {
             return false;
+        }
+        if inbox_key(key) {
+            self.confirm = None;
+            self.help = false;
+            self.open_inbox_oldest();
+            return true;
         }
         if self.confirm.is_some() {
             self.confirm_key(key, sink);
@@ -359,7 +364,6 @@ impl App {
                     KeyCode::Char('1') => self.view = View::Pipeline,
                     KeyCode::Char('2') => self.view = View::Session,
                     KeyCode::Char('3') => {}
-                    KeyCode::Char('!') => self.open_inbox_oldest(),
                     KeyCode::Char('?') => self.help = true,
                     KeyCode::Esc => self.view = View::Pipeline,
                     _ => {
@@ -371,7 +375,6 @@ impl App {
                 KeyCode::Char('1') => {}
                 KeyCode::Char('2') => self.view = View::Session,
                 KeyCode::Char('3') => self.view = View::Inbox,
-                KeyCode::Char('!') => self.open_inbox_oldest(),
                 KeyCode::Char('?') => self.help = true,
                 KeyCode::Char('j') => pipeline::move_selection(self, 1),
                 KeyCode::Char('k') => pipeline::move_selection(self, -1),
@@ -387,7 +390,7 @@ impl App {
     /// waits, so the prompt cannot be dismissed by accident.
     fn confirm_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) {
         match key.code {
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
                 if let Some(confirm) = self.confirm.take() {
                     confirm.send(self, sink);
                 }
@@ -454,6 +457,15 @@ fn quit_chord(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c'))
 }
 
+/// True when this key opens the inbox from any view.
+fn inbox_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('!')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 /// True when the key is one of the digit keys 1 through 9.
 fn digit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('1'..='9'))
@@ -512,10 +524,22 @@ struct RealTerminal {
 
 impl Surface for RealTerminal {
     fn draw(&mut self, app: &mut App) -> Result<()> {
-        self.terminal
-            .draw(|frame| render(frame, app))
-            .context("cannot draw a frame")?;
-        Ok(())
+        let mut render_result = Ok(());
+        let terminal_result = self
+            .terminal
+            .draw(|frame| render_result = render(frame, app))
+            .map(|_| ())
+            .context("cannot draw a frame");
+        finish_draw(terminal_result, render_result)
+    }
+}
+
+/// Combine the terminal and render results without hiding either error.
+fn finish_draw(terminal: Result<()>, render: Result<()>) -> Result<()> {
+    match (terminal, render) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(terminal), Err(render)) => Err(anyhow!("{terminal:#}; {render:#}")),
     }
 }
 
@@ -649,7 +673,7 @@ pub fn run(socket: &Path) -> Result<()> {
         socket: socket.to_path_buf(),
         client: None,
     };
-    run_loop(&mut surface, &mut app, rx.into_iter(), &mut link)
+    run_loop(&mut surface, &mut app, &rx, &mut link)
 }
 
 /// Read crossterm events until the channel dies.
@@ -723,34 +747,85 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
     });
 }
 
-/// Consume messages until the app quits or the channel dies.
+/// Consume messages and session file changes until the app quits.
 ///
-/// Every handled message leads to one draw. A quiet channel causes no
-/// draw. In the session view the call advances the log tail before the
-/// draw, so the transcript keeps up with the log file.
+/// Every handled message leads to one draw. The pipeline and inbox block
+/// without a deadline. The session adds one file poll deadline and draws
+/// only when that poll finds new visible log data.
 fn run_loop(
+    surface: &mut impl Surface,
+    app: &mut App,
+    rx: &Receiver<Msg>,
+    sink: &mut impl ActionSink,
+) -> Result<()> {
+    loop {
+        let msg = if app.view == View::Session {
+            match rx.recv_timeout(session::POLL_INTERVAL) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => {
+                    let now = Instant::now();
+                    if app.session.poll(now) {
+                        draw_app(surface, app, now)?;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => return Ok(()),
+            }
+        };
+        if !handle_message(app, msg, sink)? {
+            return Ok(());
+        }
+        draw_app(surface, app, Instant::now())?;
+    }
+}
+
+/// Apply one shell message. False requests a clean exit.
+fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result<bool> {
+    match msg {
+        Msg::Key(key) => Ok(app.handle_key(key, sink)),
+        Msg::State(view) => {
+            app.apply_state(view);
+            Ok(true)
+        }
+        Msg::Connected => {
+            app.connected = true;
+            Ok(true)
+        }
+        Msg::Disconnected(reason) => {
+            app.mark_disconnected(reason);
+            Ok(true)
+        }
+        Msg::Input(reason) => Err(anyhow!("terminal input stopped: {reason}")),
+        Msg::Resize => Ok(true),
+    }
+}
+
+/// Read the session log and draw one frame.
+fn draw_app(surface: &mut impl Surface, app: &mut App, now: Instant) -> Result<()> {
+    if app.view == View::Session {
+        app.session.on_redraw(now);
+    }
+    surface.draw(app)
+}
+
+/// Run a finite message list through the same handlers in a test.
+#[cfg(test)]
+fn run_messages(
     surface: &mut impl Surface,
     app: &mut App,
     msgs: impl Iterator<Item = Msg>,
     sink: &mut impl ActionSink,
 ) -> Result<()> {
     for msg in msgs {
-        match msg {
-            Msg::Key(key) => {
-                if !app.handle_key(key, sink) {
-                    return Ok(());
-                }
-            }
-            Msg::State(view) => app.apply_state(view),
-            Msg::Connected => app.connected = true,
-            Msg::Disconnected(reason) => app.mark_disconnected(reason),
-            Msg::Input(reason) => return Err(anyhow!("terminal input stopped: {reason}")),
-            Msg::Resize => {}
+        if !handle_message(app, msg, sink)? {
+            return Ok(());
         }
-        if app.view == View::Session {
-            app.session.on_redraw(Instant::now());
-        }
-        surface.draw(app)?;
+        draw_app(surface, app, Instant::now())?;
     }
     Ok(())
 }
@@ -759,7 +834,16 @@ fn run_loop(
 ///
 /// The call records the body rectangle on the app, so the next key press
 /// knows the visible transcript height of the session view.
-fn render(f: &mut Frame, app: &mut App) {
+fn render(f: &mut Frame, app: &mut App) -> Result<()> {
+    render_with_clock(f, app, inbox::now_ms)
+}
+
+/// Draw the shell with an injected inbox clock.
+fn render_with_clock(
+    f: &mut Frame,
+    app: &mut App,
+    clock: impl FnOnce() -> Result<u64>,
+) -> Result<()> {
     let area = f.area();
     let (header, body, footer) = if app.connected {
         let chunks = Layout::vertical([
@@ -783,7 +867,10 @@ fn render(f: &mut Frame, app: &mut App) {
     app.body = body;
     draw_header(f, app, header);
     match app.view {
-        View::Pipeline => pipeline::draw(f, app, body),
+        View::Pipeline => {
+            let now = clock().context("cannot read the system clock")?;
+            pipeline::draw(f, app, body, now);
+        }
         View::Session => {
             let decisions = app
                 .state
@@ -794,7 +881,7 @@ fn render(f: &mut Frame, app: &mut App) {
         }
         View::Inbox => {
             if let Some(state) = app.state.as_ref() {
-                let now = inbox::now_ms().unwrap_or(0);
+                let now = clock().context("cannot read the system clock")?;
                 inbox::draw(f, body, state, &app.inbox, now);
             }
         }
@@ -805,6 +892,7 @@ fn render(f: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(f, area);
     }
+    Ok(())
 }
 
 /// Draw the title row: app name, view tabs, pause flag, and socket state.
@@ -1004,6 +1092,7 @@ mod tests {
     use crate::tasks::{Task, TaskState};
     use crate::tui::pipeline::render_to_string;
     use std::cell::Cell;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1031,6 +1120,19 @@ mod tests {
             self.draws.fetch_add(1, Ordering::SeqCst);
             self.drew.send(()).context("cannot report a test draw")?;
             Ok(())
+        }
+    }
+
+    /// A surface that publishes the visible text of each frame.
+    struct FrameSurface {
+        drew: Sender<String>,
+    }
+
+    impl Surface for FrameSurface {
+        fn draw(&mut self, app: &mut App) -> Result<()> {
+            self.drew
+                .send(render_to_string(app))
+                .context("cannot report a test frame")
         }
     }
 
@@ -1116,7 +1218,7 @@ mod tests {
             };
             let mut app = App::default();
             let mut sink = FakeSink::default();
-            run_loop(&mut surface, &mut app, msg_rx.into_iter(), &mut sink)
+            run_loop(&mut surface, &mut app, &msg_rx, &mut sink)
         });
 
         msg_tx.send(Msg::Resize).unwrap();
@@ -1134,11 +1236,58 @@ mod tests {
     }
 
     #[test]
+    fn the_session_poll_draws_new_log_text_without_an_input_message() {
+        let dir = std::env::temp_dir().join(format!("aif-session-poll-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("task.jsonl");
+        fs::write(&log, "first\n").unwrap();
+
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].log_path = log.clone();
+        let mut app = App::default();
+        app.apply_state(state);
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        let (draw_tx, draw_rx) = channel();
+        let (msg_tx, msg_rx) = channel();
+        let handle = thread::spawn(move || {
+            let mut surface = FrameSurface { drew: draw_tx };
+            let mut sink = FakeSink::default();
+            run_loop(&mut surface, &mut app, &msg_rx, &mut sink)
+        });
+
+        msg_tx.send(Msg::Resize).unwrap();
+        let first = draw_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(first.contains("first"), "initial frame: {first}");
+        assert_eq!(
+            draw_rx.recv_timeout(session::POLL_INTERVAL * 2),
+            Err(RecvTimeoutError::Timeout),
+            "an unchanged log must not cause a periodic draw"
+        );
+
+        fs::write(&log, "first\nsecond\n").unwrap();
+        let second = draw_rx.recv_timeout(session::POLL_INTERVAL * 3).ok();
+
+        let ctrl_q = Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        msg_tx.send(ctrl_q).unwrap();
+        handle.join().unwrap().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        let second = second.expect("the file poll did not draw a new frame");
+        assert!(second.contains("second"), "polled frame: {second}");
+    }
+
+    #[test]
     fn the_loop_stops_on_q_without_a_last_draw() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view()), key('q')].into_iter(),
@@ -1153,7 +1302,7 @@ mod tests {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key('3'), key('?')].into_iter(),
@@ -1163,7 +1312,7 @@ mod tests {
         assert_eq!(app.view, View::Inbox);
         assert!(app.help);
         // While the overlay is open, the view keys do nothing.
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key('1')].into_iter(),
@@ -1172,7 +1321,7 @@ mod tests {
         .unwrap();
         assert_eq!(app.view, View::Inbox);
         // Escape closes the overlay, then the view keys work again.
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key_code(KeyCode::Esc)].into_iter(),
@@ -1180,7 +1329,7 @@ mod tests {
         )
         .unwrap();
         assert!(!app.help);
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key('1')].into_iter(),
@@ -1188,7 +1337,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.view, View::Pipeline);
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key('?')].into_iter(),
@@ -1206,7 +1355,7 @@ mod tests {
             ..App::default()
         };
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
@@ -1318,7 +1467,7 @@ mod tests {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
@@ -1332,14 +1481,15 @@ mod tests {
 
         // The loop keeps running: the next key still reaches the app, and
         // both letters land in the input buffer.
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key('q'), key('?')].into_iter(),
             &mut sink,
         )
         .unwrap();
-        assert_eq!(app.session.input_text(), "q?");
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("q?▏"), "session screen: {screen}");
         assert!(!app.help, "the question mark went into the buffer too");
     }
 
@@ -1352,7 +1502,7 @@ mod tests {
             KeyCode::Char('q'),
             crossterm::event::KeyModifiers::CONTROL,
         ));
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![ctrl_q, key('?')].into_iter(),
@@ -1369,7 +1519,7 @@ mod tests {
         let mut sink = FakeSink::default();
         let mut state = crate::tui::pipeline::sample_view();
         state.decisions = vec![permission_decision("req-1", 1_000)];
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(state), key('3'), key('n'), key('q'), key('?')].into_iter(),
@@ -1391,7 +1541,7 @@ mod tests {
             permission_decision("req-1", 9_000),
             permission_decision("req-2", 2_000),
         ];
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(state), key('!')].into_iter(),
@@ -1407,13 +1557,49 @@ mod tests {
     }
 
     #[test]
+    fn bang_enters_the_inbox_from_the_session_view() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Inbox);
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2")
+        );
+    }
+
+    #[test]
     fn enter_on_an_inbox_row_opens_the_task_session() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
         let mut sink = FakeSink::default();
         let mut state = crate::tui::pipeline::sample_view();
         state.decisions = vec![permission_decision("req-1", 1_000)];
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(state), key('3'), key_code(KeyCode::Enter)].into_iter(),
@@ -1442,6 +1628,64 @@ mod tests {
     }
 
     #[test]
+    fn an_inbox_clock_error_propagates_from_render() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Inbox,
+            ..App::default()
+        };
+        let mut render_result = Ok(());
+
+        terminal
+            .draw(|frame| {
+                render_result =
+                    render_with_clock(frame, &mut app, || Err(anyhow!("clock before epoch")));
+            })
+            .unwrap();
+
+        let error = render_result.unwrap_err();
+        assert!(format!("{error:#}").contains("cannot read the system clock: clock before epoch"));
+    }
+
+    #[test]
+    fn a_pipeline_clock_error_propagates_from_render() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Pipeline,
+            ..App::default()
+        };
+        let mut render_result = Ok(());
+
+        terminal
+            .draw(|frame| {
+                render_result =
+                    render_with_clock(frame, &mut app, || Err(anyhow!("clock before epoch")));
+            })
+            .unwrap();
+
+        let error = render_result.unwrap_err();
+        assert!(format!("{error:#}").contains("cannot read the system clock: clock before epoch"));
+    }
+
+    #[test]
+    fn a_frame_reports_both_terminal_and_render_errors() {
+        let error = finish_draw(
+            Err(anyhow!("terminal write failed")),
+            Err(anyhow!("clock read failed")),
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("terminal write failed"), "error: {text}");
+        assert!(text.contains("clock read failed"), "error: {text}");
+    }
+
+    #[test]
     fn y_confirms_the_aborting_of_the_selected_task() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App {
@@ -1449,7 +1693,7 @@ mod tests {
             ..App::default()
         };
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![
@@ -1481,7 +1725,7 @@ mod tests {
             ..App::default()
         };
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![
@@ -1499,6 +1743,36 @@ mod tests {
     }
 
     #[test]
+    fn a_modified_y_does_not_confirm_a_destructive_action() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(2),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        let ctrl_y = Msg::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('x'),
+                ctrl_y,
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
     fn y_confirms_the_release_of_the_stacked_batch() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App {
@@ -1506,7 +1780,7 @@ mod tests {
             ..App::default()
         };
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![
@@ -1534,7 +1808,7 @@ mod tests {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
@@ -1544,7 +1818,7 @@ mod tests {
         app.session_task = Some("borsuk/refine-i142".to_string());
         app.show_session_task();
         app.view = View::Session;
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![key('h'), key('i'), key_code(KeyCode::Enter)].into_iter(),
@@ -1568,7 +1842,7 @@ mod tests {
             ..App::default()
         };
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view()), key('r')].into_iter(),
@@ -1598,7 +1872,7 @@ mod tests {
             attempt: 1,
             log_path: PathBuf::from("borsuk-refine-i140.jsonl"),
         });
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(state)].into_iter(),
@@ -1611,6 +1885,41 @@ mod tests {
     }
 
     #[test]
+    fn r_cannot_send_chat_to_the_previous_session_while_it_waits() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.selection = Selection::Row(8);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('r'), key('h'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Refine {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 140
+            }]
+        );
+        assert_eq!(app.session.task_id(), None);
+    }
+
+    #[test]
     fn n_follows_the_ticket_create_task_on_the_next_push() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App {
@@ -1618,7 +1927,7 @@ mod tests {
             ..App::default()
         };
         let mut sink = FakeSink::default();
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view()), key('n')].into_iter(),
@@ -1645,7 +1954,7 @@ mod tests {
             attempt: 1,
             log_path: PathBuf::from("ryba-refine-i0.jsonl"),
         });
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(state)].into_iter(),
@@ -1654,6 +1963,39 @@ mod tests {
         .unwrap();
         assert!(app.wanted.is_none());
         assert!(app.session.is_showing("ryba/refine-i0"));
+    }
+
+    #[test]
+    fn n_cannot_send_chat_to_the_previous_session_while_it_waits() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.selection = Selection::Row(4);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('n'), key('h'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.0,
+            vec![Action::TicketCreate {
+                repo: "ryba".to_string()
+            }]
+        );
+        assert_eq!(app.session.task_id(), None);
     }
 
     #[test]

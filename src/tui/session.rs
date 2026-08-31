@@ -310,11 +310,14 @@ impl SessionView {
         self.task_id() == Some(task_id)
     }
 
-    /// The text in the input bar.
-    ///
-    /// The shell and the tests read it to check what a key press typed.
-    pub fn input_text(&self) -> &str {
-        &self.input
+    /// Clear the shown task and all local session data.
+    pub fn clear(&mut self) {
+        self.task = None;
+        self.tailer = None;
+        self.ring.clear();
+        self.input.clear();
+        self.scroll_up = 0;
+        self.last_poll = None;
     }
 
     /// Show `task` in the view.
@@ -329,10 +332,8 @@ impl SessionView {
             .as_ref()
             .is_some_and(|current| current.id == task.id && current.log_path == task.log_path);
         if !same {
+            self.clear();
             self.tailer = Some(LogTailer::new(task.log_path.clone()));
-            self.ring.clear();
-            self.scroll_up = 0;
-            self.input.clear();
         }
         self.task = Some(task.clone());
     }
@@ -346,35 +347,41 @@ impl SessionView {
     /// Read the new log bytes when the last read is [`POLL_INTERVAL`] old.
     ///
     /// The shell calls this on wakeups that carry no message, so a quiet
-    /// agent still streams into the view at most five times a second.
-    pub fn poll(&mut self, now: Instant) {
+    /// agent still streams into the view at most five times a second. The
+    /// return value is true when the visible transcript changed.
+    pub fn poll(&mut self, now: Instant) -> bool {
         if self
             .last_poll
             .is_none_or(|last| now.duration_since(last) >= POLL_INTERVAL)
         {
-            self.ingest();
+            let changed = self.ingest();
             self.last_poll = Some(now);
+            return changed;
         }
+        false
     }
 
     /// Read the tailer and push every parsed item into the ring.
     ///
     /// A restarted log clears the ring: the transcript restarts with the
     /// file, because the replaced history no longer exists.
-    fn ingest(&mut self) {
+    fn ingest(&mut self) -> bool {
         let mut lines = Vec::new();
         let restarted = self
             .tailer
             .as_mut()
             .is_some_and(|tailer| tailer.read_lines(&mut lines));
+        let mut changed = restarted && !self.ring.is_empty();
         if restarted {
             self.ring.clear();
         }
         for line in lines {
             for entry in transcript::parse(&line) {
                 self.ring.push(entry);
+                changed = true;
             }
         }
+        changed
     }
 
     /// True when the view follows the tail of the transcript.

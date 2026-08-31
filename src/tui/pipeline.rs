@@ -22,7 +22,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{emit, App, Confirm, Selection, View, Wanted};
 
@@ -55,16 +54,6 @@ pub(super) enum Row {
         /// The repository alias.
         repo: String,
     },
-}
-
-/// The current time in milliseconds since the Unix epoch.
-///
-/// The value is 0 before the epoch, which no real clock reports.
-fn epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// The selectable rows of the pipeline view, in draw order.
@@ -420,17 +409,15 @@ fn refine_ticket(app: &mut App, sink: &mut impl ActionSink) {
         },
         format!("sent refine {repo} {}{number}", kind.as_str()),
     );
-    app.wanted = Some(Wanted::Refine {
-        repo: repo.clone(),
-        kind,
-        number,
-    });
-    app.session_task = Some(format!(
-        "{repo}/{}-{}{number}",
-        Stage::Refine.as_str(),
-        kind.as_str()
-    ));
-    app.view = View::Session;
+    wait_for_task(
+        app,
+        format!(
+            "{repo}/{}-{}{number}",
+            Stage::Refine.as_str(),
+            kind.as_str()
+        ),
+        Wanted::Refine { repo, kind, number },
+    );
 }
 
 /// Send `Action::TicketCreate` for the selected repository and follow it.
@@ -444,8 +431,18 @@ fn create_ticket(app: &mut App, sink: &mut impl ActionSink) {
         Action::TicketCreate { repo: repo.clone() },
         format!("sent new ticket {repo}"),
     );
-    app.wanted = Some(Wanted::Create { repo: repo.clone() });
-    app.session_task = Some(format!("{repo}/{}-i0", Stage::Refine.as_str()));
+    wait_for_task(
+        app,
+        format!("{repo}/{}-i0", Stage::Refine.as_str()),
+        Wanted::Create { repo },
+    );
+}
+
+/// Show an empty session until the requested task reaches a state push.
+fn wait_for_task(app: &mut App, task: String, wanted: Wanted) {
+    app.session.clear();
+    app.wanted = Some(wanted);
+    app.session_task = Some(task);
     app.view = View::Session;
 }
 
@@ -609,8 +606,8 @@ fn next_policy(policy: &ReleasePolicy) -> ReleasePolicy {
     }
 }
 
-/// Draw the pipeline view into `area`.
-pub(super) fn draw(f: &mut Frame, app: &App, area: Rect) {
+/// Draw the pipeline view into `area` at the given Unix time.
+pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
     let Some(state) = app.state.as_ref() else {
         let hint = Line::from(Span::styled(
             " waiting for the first state push from the daemon",
@@ -638,7 +635,7 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("  ")
         };
         let mut spans = vec![marker];
-        spans.extend(row_spans(state, row));
+        spans.extend(row_spans(state, row, now_ms));
         let mut line = Line::from(spans);
         if is_selected {
             line = line.style(THEME.selected());
@@ -660,7 +657,7 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The spans of one row of the pipeline view.
-fn row_spans(state: &StateView, row: &Row) -> Vec<Span<'static>> {
+fn row_spans(state: &StateView, row: &Row, now_ms: u64) -> Vec<Span<'static>> {
     match row {
         Row::Stage { stage } => stage_spans(state, *stage),
         Row::Repo { repo, .. } => repo_spans(repo),
@@ -668,7 +665,7 @@ fn row_spans(state: &StateView, row: &Row) -> Vec<Span<'static>> {
             Some(task) => ticket_spans(task),
             None => vec![Span::raw("    (missing task)")],
         },
-        Row::Train { repo } => train_spans(state, repo),
+        Row::Train { repo } => train_spans(state, repo, now_ms),
     }
 }
 
@@ -753,7 +750,7 @@ fn state_span(state: &TaskState) -> Span<'static> {
 }
 
 /// The spans of one release train row.
-fn train_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
+fn train_spans(state: &StateView, repo: &str, now_ms: u64) -> Vec<Span<'static>> {
     let header = Style::default()
         .fg(THEME.accent)
         .add_modifier(Modifier::BOLD);
@@ -768,7 +765,7 @@ fn train_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
     spans.push(Span::styled("  policy ", THEME.dim()));
     spans.push(Span::raw(policy_label(&train.policy)));
     if let Some(fire) = train.next_fire_ms {
-        let remaining = fire.saturating_sub(epoch_ms());
+        let remaining = fire.saturating_sub(now_ms);
         spans.push(Span::styled("  fires in ", THEME.dim()));
         spans.push(Span::raw(format_countdown(remaining)));
     }
@@ -964,7 +961,7 @@ pub(crate) fn sample_view() -> StateView {
                 queue: Vec::new(),
                 stacked: Vec::new(),
                 policy: ReleasePolicy::Interval { minutes: 30 },
-                next_fire_ms: Some(epoch_ms() + 90_000),
+                next_fire_ms: Some(super::inbox::now_ms().unwrap() + 90_000),
                 in_flight: None,
             },
         ],
@@ -983,7 +980,9 @@ pub(crate) fn sample_view() -> StateView {
 pub(super) fn render_to_string(app: &mut App) -> String {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| super::render(frame, app)).unwrap();
+    terminal
+        .draw(|frame| super::render(frame, app).unwrap())
+        .unwrap();
     buffer_text(terminal.backend().buffer())
 }
 
@@ -1426,6 +1425,20 @@ mod tests {
             vec![Action::Pause {
                 scope: PauseScope::Stage {
                     stage: Stage::Refine
+                },
+                paused: true
+            }]
+        );
+
+        // A repository row pauses that repository.
+        let mut app = app_with_selection(1);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('p'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Pause {
+                scope: PauseScope::Repo {
+                    repo: "borsuk".to_string()
                 },
                 paused: true
             }]
