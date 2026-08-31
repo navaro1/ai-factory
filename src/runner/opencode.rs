@@ -87,6 +87,9 @@ impl Runner for OpenCodeRunner {
         };
         let (proc_tx, proc_rx) = channel::<ProcEvent>();
         let handle = proc::spawn(spec, proc_tx)?;
+        // opencode prints only once its stdin reaches end of file, and this
+        // runner has no steering channel, so close the pipe at once.
+        handle.close_stdin();
         let task = job.task.clone();
         thread::spawn(move || forward_events(task, proc_rx, tx));
         Ok(Box::new(OpenCodeSession {
@@ -796,6 +799,41 @@ not json at all
 
         // Every raw line, the malformed one included, reached the log.
         assert_eq!(fs::read_to_string(job.log).unwrap(), FIXTURE);
+        drop(path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The child prints its first line only after its stdin reaches end of
+    /// file. The real `opencode run` has the same contract: it stays silent
+    /// while its stdin pipe stays open. So `cat` drains stdin to end of file
+    /// before the fake prints. This test fails in a bounded time when the
+    /// runner leaves the pipe open, because then the child never prints.
+    #[test]
+    fn start_closes_the_child_stdin() {
+        let dir = temp_dir("stdin-close");
+        script(
+            &dir,
+            PROGRAM,
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"type\":\"step_start\",\"sessionID\":\"ses_eof1\",\"part\":{\"type\":\"step-start\"}}'\n",
+        );
+        let job = job(&dir, None);
+        let path = PathGuard::prepend(&dir);
+        let mut runner = OpenCodeRunner::new();
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let deadline = Instant::now() + std::time::Duration::from_secs(TEST_TIMEOUT);
+        let left = deadline.saturating_duration_since(Instant::now());
+        let event = rx
+            .recv_timeout(left)
+            .expect("the child printed nothing; the runner left its stdin open");
+        assert_eq!(
+            event,
+            RunEvent::Started {
+                task: TASK.to_string(),
+                session_id: Some("ses_eof1".to_string()),
+            }
+        );
+        session.stop().unwrap();
         drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
