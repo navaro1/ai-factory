@@ -881,6 +881,8 @@ fn task(
         state,
         attempt,
         log_path: std::env::temp_dir().join(format!("{repo}-{stage}-{number}.jsonl")),
+        input: crate::sock::InputMode::Live,
+        queued_messages: 0,
     }
 }
 

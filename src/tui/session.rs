@@ -642,6 +642,8 @@ mod tests {
             state: TaskState::Running,
             attempt: 1,
             log_path: path.to_path_buf(),
+            input: crate::sock::InputMode::Live,
+            queued_messages: 0,
         }
     }
 
