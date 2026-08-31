@@ -300,7 +300,7 @@ mod tests {
     /// One GitHub draft pull request object.
     fn pr_json(number: u64, sha: &str) -> String {
         format!(
-            r#"{{"number":{number},"node_id":"prnode-{number}","title":"pr {number}","body":"","state":"open","labels":[],"draft":true,"head":{{"sha":"{sha}"}}}}"#
+            r#"{{"number":{number},"node_id":"prnode-{number}","title":"pr {number}","body":"","state":"open","labels":[],"draft":true,"head":{{"sha":"{sha}","ref":"aif/borsuk/issue-{number}"}}}}"#
         )
     }
 
@@ -327,6 +327,7 @@ mod tests {
             open: true,
             draft: true,
             head_sha: sha.to_string(),
+            head_ref: format!("aif/borsuk/issue-{number}"),
         }
     }
 

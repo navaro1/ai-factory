@@ -67,7 +67,14 @@ fn run(config_path: Option<&Path>, socket_path: &Path) -> anyhow::Result<()> {
     eprintln!("aifd: listening on {}", socket_path.display());
     let (poll_tx, poll_rx) = mpsc::channel();
     let pollers = poll::spawn_pollers(&config, poll_tx);
-    let mut daemon = Daemon::new(config, poll_rx, pollers.wake, action_rx);
+    let mut daemon = Daemon::new(
+        config,
+        prompts_dir(config_path),
+        poll_rx,
+        pollers.wake,
+        action_rx,
+    )
+    .context("cannot initialize the factory daemon")?;
     // Every dirty drive of the loop hands its state view to the socket
     // server. The Arc clone in the pusher dies with the daemon inside
     // `run`, so this `drop` still stops the server last.
@@ -79,6 +86,18 @@ fn run(config_path: Option<&Path>, socket_path: &Path) -> anyhow::Result<()> {
     let result = daemon.run();
     drop(server);
     result
+}
+
+/// Select prompt files beside a custom config file.
+///
+/// The default config uses the standard config directory. A custom config
+/// carries its own prompt set, so test and alternate factory setups remain
+/// self-contained.
+fn prompts_dir(config_path: Option<&Path>) -> PathBuf {
+    config_path.and_then(Path::parent).map_or_else(
+        || config::config_dir().join("prompts"),
+        |dir| dir.join("prompts"),
+    )
 }
 
 #[cfg(test)]
@@ -124,5 +143,14 @@ mod tests {
         let parsed = Cli::try_parse_from(["aifd", "run"]).expect("the arguments must parse");
         let Command::Run { config } = parsed.command;
         assert_eq!(config, None);
+    }
+
+    #[test]
+    fn a_custom_config_uses_its_sibling_prompt_directory() {
+        assert_eq!(
+            prompts_dir(Some(Path::new("/tmp/factory/factory.toml"))),
+            PathBuf::from("/tmp/factory/prompts")
+        );
+        assert_eq!(prompts_dir(None), config::config_dir().join("prompts"));
     }
 }

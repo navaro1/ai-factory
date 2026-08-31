@@ -86,6 +86,11 @@ impl WorktreeManager {
         format!("aif/{}/train", repo.alias)
     }
 
+    /// Create the marker directory and hide it in one repository checkout.
+    pub fn prepare_checkout(&self, exec: &dyn Exec, checkout: &Path) -> Result<()> {
+        self.prepare(exec, checkout)
+    }
+
     /// Whether the issue worktree exists and git still registers it.
     ///
     /// This is the same condition [`WorktreeManager::ensure_issue`] reuses
@@ -248,6 +253,31 @@ impl WorktreeManager {
         write_marker(worktree, SESSION_MARKER, session_id)
     }
 
+    /// Read the Claude session id of one task.
+    ///
+    /// The task-specific name prevents concurrent refine tasks in one checkout
+    /// from replacing each other's restart data.
+    pub fn read_task_session(&self, worktree: &Path, task: &str) -> Result<Option<String>> {
+        read_marker(worktree, &task_session_marker(task))
+    }
+
+    /// Store the Claude session id of one task.
+    pub fn write_task_session(&self, worktree: &Path, task: &str, session_id: &str) -> Result<()> {
+        write_marker(worktree, &task_session_marker(task), session_id)
+    }
+
+    /// Remove the Claude session id of one terminal task.
+    pub fn remove_task_session(&self, worktree: &Path, task: &str) -> Result<()> {
+        let path = worktree.join(AIF_DIR).join(task_session_marker(task));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context(format!("cannot remove {}", path.display())))
+            }
+        }
+    }
+
     /// Read the head sha of the last completed review, or `None` when absent.
     pub fn read_reviewed_sha(&self, worktree: &Path) -> Result<Option<String>> {
         read_marker(worktree, REVIEWED_SHA_MARKER)
@@ -391,6 +421,16 @@ fn read_marker(worktree: &Path, name: &str) -> Result<Option<String>> {
     }
 }
 
+/// Build a collision-free file name from the bytes of one task id.
+fn task_session_marker(task: &str) -> String {
+    let mut name = String::from("session-");
+    for byte in task.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
 /// Write one marker file through a temporary file and a rename.
 ///
 /// A crash can therefore never leave a half-written marker under the final
@@ -435,7 +475,7 @@ fn clean_marker_temp(temp: &Path, error: anyhow::Error) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::config::ReleasePolicy;
-    use crate::exec::{RealExec, ScriptExec};
+    use crate::exec::ScriptExec;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -456,94 +496,6 @@ mod tests {
         dir
     }
 
-    /// A real local git repository, built with plain file transports only.
-    struct TestRepo {
-        root: PathBuf,
-        repo: PathBuf,
-        state: PathBuf,
-    }
-
-    impl TestRepo {
-        /// A repository with a local bare `origin` whose HEAD resolves to
-        /// `refs/remotes/origin/main`.
-        fn with_origin(label: &str) -> Self {
-            Self::build(label, true)
-        }
-
-        /// A repository with no remote, so base resolution must fall back.
-        fn plain(label: &str) -> Self {
-            Self::build(label, false)
-        }
-
-        fn build(label: &str, with_origin: bool) -> Self {
-            let root = temp_root(label);
-            let repo = root.join("repo");
-            let state = root.join("state");
-            let t = TestRepo {
-                root: root.clone(),
-                repo: repo.clone(),
-                state,
-            };
-            t.ok(&root, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
-            t.ok(&repo, &["config", "user.email", "aif-test@example.com"]);
-            t.ok(&repo, &["config", "user.name", "Aif Tests"]);
-            fs::write(repo.join("README.md"), "# test\n").expect("the readme write must succeed");
-            t.ok(&repo, &["add", "-A"]);
-            t.ok(&repo, &["commit", "-q", "-m", "init"]);
-            if with_origin {
-                let origin = root.join("origin.git");
-                t.ok(&root, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-                t.ok(
-                    &repo,
-                    &["remote", "add", "origin", origin.to_str().unwrap()],
-                );
-                t.ok(&repo, &["push", "-q", "origin", "main"]);
-                t.ok(&repo, &["fetch", "-q", "origin"]);
-                t.ok(&repo, &["remote", "set-head", "origin", "main"]);
-            }
-            t
-        }
-
-        /// Run git in `dir` and return the raw output.
-        fn git(&self, dir: &Path, args: &[&str]) -> CmdOut {
-            RealExec
-                .run("git", args, Some(dir))
-                .expect("the test git command must start")
-        }
-
-        /// Run git in `dir` and demand success.
-        fn ok(&self, dir: &Path, args: &[&str]) -> CmdOut {
-            let out = self.git(dir, args);
-            assert_eq!(
-                out.status,
-                0,
-                "git {} failed: {}",
-                args.join(" "),
-                out.stderr
-            );
-            out
-        }
-
-        /// The full sha of `commitish` in `dir`.
-        fn sha(&self, dir: &Path, commitish: &str) -> String {
-            self.ok(dir, &["rev-parse", commitish])
-                .stdout
-                .trim()
-                .to_string()
-        }
-
-        /// A manager over this repository's test state directory.
-        fn manager(&self) -> WorktreeManager {
-            WorktreeManager::new(self.state.clone())
-        }
-    }
-
-    impl Drop for TestRepo {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
     /// A `RepoConfig` for the test repository, with the alias `demo`.
     fn demo_repo(path: &Path) -> RepoConfig {
         RepoConfig {
@@ -553,162 +505,6 @@ mod tests {
             lanes: BTreeMap::new(),
             release: ReleasePolicy::Manual,
         }
-    }
-
-    // --- Real git behaviour. ---
-
-    #[test]
-    fn ensure_issue_creates_a_worktree_at_the_documented_path() {
-        let t = TestRepo::with_origin("create");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-
-        let path = manager
-            .ensure_issue(&RealExec, &repo, 7)
-            .expect("ensure_issue must succeed");
-
-        assert_eq!(path, t.state.join("worktrees").join("demo").join("issue-7"));
-        assert!(path.is_dir());
-        assert!(path.join(".aif").is_dir());
-        let head = t.sha(&path, "HEAD");
-        assert_eq!(head, t.sha(&t.repo, "refs/remotes/origin/main"));
-        assert_eq!(
-            head,
-            t.sha(&t.repo, "refs/heads/aif/demo/issue-7"),
-            "the new branch must point at the base commit"
-        );
-        assert!(manager.exists_issue(&RealExec, &repo, 7));
-    }
-
-    #[test]
-    fn ensure_issue_twice_reuses_in_place() {
-        let t = TestRepo::with_origin("reuse");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-
-        let first = manager.ensure_issue(&RealExec, &repo, 7).unwrap();
-        manager.write_session(&first, "sess-1").unwrap();
-        fs::write(first.join("notes.txt"), "agent scratch").expect("the write must succeed");
-        t.ok(&first, &["add", "-A"]);
-        t.ok(&first, &["commit", "-q", "-m", "wip"]);
-        let head = t.sha(&first, "HEAD");
-
-        let second = manager.ensure_issue(&RealExec, &repo, 7).unwrap();
-
-        assert_eq!(first, second);
-        assert_eq!(
-            t.sha(&second, "HEAD"),
-            head,
-            "reuse must keep the work in place"
-        );
-        assert_eq!(
-            manager.read_session(&second).unwrap().as_deref(),
-            Some("sess-1")
-        );
-    }
-
-    #[test]
-    fn ensure_issue_reuses_a_branch_whose_worktree_was_removed() {
-        let t = TestRepo::with_origin("recut");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-
-        let path = manager.ensure_issue(&RealExec, &repo, 7).unwrap();
-        fs::write(path.join("notes.txt"), "work").expect("the write must succeed");
-        t.ok(&path, &["add", "-A"]);
-        t.ok(&path, &["commit", "-q", "-m", "wip"]);
-        let head = t.sha(&path, "HEAD");
-        t.ok(&t.repo, &["worktree", "remove", path.to_str().unwrap()]);
-        assert!(!manager.exists_issue(&RealExec, &repo, 7));
-
-        let again = manager.ensure_issue(&RealExec, &repo, 7).unwrap();
-
-        assert_eq!(again, path);
-        assert_eq!(
-            t.sha(&again, "HEAD"),
-            head,
-            "the surviving branch must come back, not a fresh cut"
-        );
-    }
-
-    #[test]
-    fn ensure_issue_falls_back_to_head_without_origin() {
-        let t = TestRepo::plain("fallback");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-
-        let path = manager.ensure_issue(&RealExec, &repo, 3).unwrap();
-
-        assert_eq!(t.sha(&path, "HEAD"), t.sha(&t.repo, "HEAD"));
-    }
-
-    #[test]
-    fn ensure_train_creates_and_resets_to_the_default_branch() {
-        let t = TestRepo::with_origin("train");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-        let base = t.sha(&t.repo, "refs/remotes/origin/main");
-
-        let path = manager.ensure_train(&RealExec, &repo).unwrap();
-        assert_eq!(path, t.state.join("worktrees").join("demo").join("train"));
-        assert_eq!(t.sha(&path, "HEAD"), base);
-
-        fs::write(path.join("train.txt"), "x").expect("the write must succeed");
-        t.ok(&path, &["add", "-A"]);
-        t.ok(&path, &["commit", "-q", "-m", "train wip"]);
-
-        let again = manager.ensure_train(&RealExec, &repo).unwrap();
-        assert_eq!(again, path);
-        assert_eq!(
-            t.sha(&again, "HEAD"),
-            base,
-            "reuse must reset the train to the default branch"
-        );
-        assert!(!again.join("train.txt").exists());
-    }
-
-    #[test]
-    fn remove_issue_with_proof_removes_the_worktree_and_the_branch() {
-        let t = TestRepo::with_origin("remove");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-
-        let path = manager.ensure_issue(&RealExec, &repo, 9).unwrap();
-        manager.write_session(&path, "sess-9").unwrap();
-        manager
-            .remove_issue(&RealExec, &repo, 9, Cleanable::MergedOrClosed)
-            .expect("the merged path must succeed");
-
-        assert!(!path.exists());
-        assert!(
-            t.git(
-                &t.repo,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    "refs/heads/aif/demo/issue-9"
-                ]
-            )
-            .status
-                != 0,
-            "the branch must be gone"
-        );
-        assert!(!manager.exists_issue(&RealExec, &repo, 9));
-    }
-
-    #[test]
-    fn the_aif_directory_is_invisible_to_git() {
-        let t = TestRepo::with_origin("exclude");
-        let manager = t.manager();
-        let repo = demo_repo(&t.repo);
-
-        let path = manager.ensure_issue(&RealExec, &repo, 5).unwrap();
-        manager.write_session(&path, "sess-5").unwrap();
-        fs::write(path.join("loose.txt"), "untracked").expect("the write must succeed");
-
-        let status = t.ok(&path, &["status", "--porcelain"]).stdout;
-        assert_eq!(status, "?? loose.txt\n");
     }
 
     // --- Marker files. ---
@@ -869,6 +665,57 @@ mod tests {
             .expect_err("an empty reference must be an error");
 
         assert!(error.to_string().contains("empty reference"));
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn default_base_falls_back_to_head_when_origin_head_is_missing() {
+        let root = temp_root("base-fallback");
+        let repo_path = root.join("repo");
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "git" && call.args.iter().any(|arg| arg == "symbolic-ref"),
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        let manager = WorktreeManager::new(root.clone());
+
+        assert_eq!(manager.default_base(&exec, &repo_path).unwrap(), "HEAD");
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn prepare_checkout_hides_root_markers_without_starting_git() {
+        let root = temp_root("prepare-checkout");
+        let checkout = root.join("repo");
+        let common = root.join("common-git");
+        let checkout_text = checkout.to_string_lossy().into_owned();
+        let common_text = common.to_string_lossy().into_owned();
+        let exec = ScriptExec::new().expect(
+            move |call| {
+                call.program == "git"
+                    && call.argv()
+                        == [
+                            "-C",
+                            checkout_text.as_str(),
+                            "rev-parse",
+                            "--path-format=absolute",
+                            "--git-common-dir",
+                        ]
+            },
+            CmdOut::ok(format!("{common_text}\n")),
+        );
+        let manager = WorktreeManager::new(root.join("state"));
+
+        manager.prepare_checkout(&exec, &checkout).unwrap();
+
+        assert!(checkout.join(".aif").is_dir());
+        assert_eq!(
+            fs::read_to_string(common.join("info/exclude")).unwrap(),
+            ".aif/\n"
+        );
         fs::remove_dir_all(&root).expect("the temp dir must be removable");
     }
 

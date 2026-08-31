@@ -706,11 +706,15 @@ fn tool_checks(exec: &dyn Exec) -> Vec<Check> {
 ///
 /// The whole factory reads GitHub through `gh`, so an unauthenticated
 /// `gh` stops every repository poll in silence. The check runs
-/// `gh auth status` and names the fix, because a user who reads the
-/// line must know what to do next.
+/// `gh auth status` for the active github.com account. An unrelated host
+/// cannot make this check fail. The failure line names the required fix.
 fn gh_auth_check(exec: &dyn Exec) -> Check {
     let label = "gh auth".to_string();
-    let out = match exec.run("gh", &["auth", "status"], None) {
+    let out = match exec.run(
+        "gh",
+        &["auth", "status", "--hostname", "github.com", "--active"],
+        None,
+    ) {
         Ok(out) => out,
         Err(error) => {
             return Check {
@@ -1408,7 +1412,10 @@ mod tests {
     /// A scripted executor that answers one `gh auth status` call.
     fn gh_auth_exec(out: CmdOut) -> ScriptExec {
         ScriptExec::new().expect(
-            |call| call.program == "gh" && call.args == ["auth", "status"],
+            |call| {
+                call.program == "gh"
+                    && call.args == ["auth", "status", "--hostname", "github.com", "--active"]
+            },
             out,
         )
     }
@@ -1632,7 +1639,10 @@ mod tests {
                 CmdOut::ok("opencode 1.18.25\n"),
             )
             .expect(
-                |call| call.program == "gh" && call.args == ["auth", "status"],
+                |call| {
+                    call.program == "gh"
+                        && call.args == ["auth", "status", "--hostname", "github.com", "--active"]
+                },
                 CmdOut::ok(GH_AUTH_LOGGED_IN),
             );
         let env = DoctorEnv {
@@ -1747,7 +1757,10 @@ mod tests {
                 CmdOut::ok("opencode 1.18.25\n"),
             )
             .expect(
-                |call| call.program == "gh" && call.args == ["auth", "status"],
+                |call| {
+                    call.program == "gh"
+                        && call.args == ["auth", "status", "--hostname", "github.com", "--active"]
+                },
                 CmdOut::ok(GH_AUTH_LOGGED_IN),
             )
             .expect(

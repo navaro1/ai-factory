@@ -387,6 +387,11 @@ fn pr_from_value(value: &Value) -> Result<Pr> {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("GitHub object has no string field \"head.sha\""))?
             .to_string(),
+        head_ref: value
+            .pointer("/head/ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("GitHub object has no string field \"head.ref\""))?
+            .to_string(),
     })
 }
 
@@ -965,7 +970,7 @@ mod tests {
 
     #[test]
     fn fetch_pulls_maps_draft_and_head_sha() {
-        let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"open","labels":[{"name":"release-stacked"},{"name":"x"}],"draft":true,"head":{"sha":"abc123"}}"#;
+        let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"open","labels":[{"name":"release-stacked"},{"name":"x"}],"draft":true,"head":{"sha":"abc123","ref":"aif/borsuk/issue-142"}}"#;
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
@@ -986,6 +991,7 @@ mod tests {
         let pr = &fetched.items[&5];
         assert!(pr.draft);
         assert_eq!(pr.head_sha, "abc123");
+        assert_eq!(pr.head_ref, "aif/borsuk/issue-142");
         assert_eq!(
             pr.labels,
             vec!["release-stacked".to_string(), "x".to_string()]
@@ -1032,6 +1038,26 @@ mod tests {
         let error = client.fetch_pulls("acme/borsuk").unwrap_err();
 
         assert!(error.to_string().contains("head.sha"));
+    }
+
+    #[test]
+    fn a_pull_without_a_head_ref_is_rejected() {
+        let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"open","labels":[],"draft":false,"head":{"sha":"abc123"}}"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/pulls?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &[], &format!("[{pr_json}]"))),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_pulls("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("head.ref"));
     }
 
     #[test]

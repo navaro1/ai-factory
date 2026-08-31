@@ -14,5 +14,7 @@ something the body must record.
 When you need a human decision, add the `needs-human` label to the issue with
 `gh` and state the question in a comment. Stop after the label is on.
 
-When the specification is complete, end your turn and report one line that
-says the issue is refined.
+When the specification is complete, run
+`gh issue edit {number} --remove-label to-refine --add-label refined`.
+Run this command only after the issue body is complete. Then report one line
+that says the issue is refined.

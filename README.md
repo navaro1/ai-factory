@@ -18,7 +18,7 @@ refine ──▶ implement ──▶ review ──▶ release
 |---|---|---|
 | refine | claude Opus, one interactive chat | You shape the ticket. The issue gets the label `refined`. |
 | implement | opencode, model glm-5.3-flash | The agent writes the change and opens a draft pull request. |
-| review | opencode, model gpt-5.6-sol | The agent fixes findings and marks the pull request ready. |
+| review | opencode, model gpt-5.6-sol | The agent reviews the change and marks the pull request ready. |
 | release | claude Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
@@ -125,6 +125,8 @@ passes it.
 
 | Command | Effect |
 |---|---|
+| `aif` or `aif tui` | Starts the daemon when needed, then opens the terminal UI. |
+| `aif stop` | Stops the daemon. |
 | `aif doctor` | Reports on the installation and the configuration. |
 | `aif doctor --clean` | Removes the worktrees of closed issues and merged pull requests. |
 
@@ -203,9 +205,6 @@ would break trust.
 
 ## Known limits
 
-- The `aifd run` command prints a placeholder message and exits. The `aif`
-  command cannot start the daemon. The terminal UI and `aif stop` are not
-  usable in this build.
 - A label change becomes visible at the next poll, at most 60 seconds later.
 - A restart kills the agent processes of the running tasks. The gates
   re-open that work at the next poll.

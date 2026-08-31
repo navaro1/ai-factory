@@ -28,7 +28,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{self, Config, ReleasePolicy, RepoConfig};
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
@@ -121,6 +121,8 @@ pub struct Daemon {
     trains: BTreeMap<String, Train>,
     /// The pull request set of each release task, for prompt rendering.
     release_batches: BTreeMap<String, Vec<u64>>,
+    /// The source issue worktree of each review task.
+    review_issue_numbers: BTreeMap<String, u64>,
 
     /// One live session per running or parked task.
     sessions: BTreeMap<String, Box<dyn Session>>,
@@ -173,10 +175,11 @@ impl Daemon {
     /// the interactive claude runner.
     pub fn new(
         config: Config,
+        prompts_dir: PathBuf,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut runners: BTreeMap<Stage, Box<dyn Runner>> = BTreeMap::new();
         for stage in Stage::ALL {
             let runner: Box<dyn Runner> = if config.stage(stage).runner == "opencode" {
@@ -188,12 +191,18 @@ impl Daemon {
             runners.insert(stage, runner);
         }
         let state_dir = config::state_dir();
-        let prompts_dir = config::config_dir().join("prompts");
+        let exec: Arc<dyn Exec> = Arc::new(RealExec);
+        let worktrees = WorktreeManager::new(state_dir.clone());
+        for repo in config.repos.values() {
+            worktrees
+                .prepare_checkout(&*exec, &repo.path)
+                .with_context(|| format!("cannot prepare repository {}", repo.alias))?;
+        }
         let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_session_id: &str| {});
         let ticket_runner: Box<dyn Runner> = Box::new(ClaudeRunner::new(sink));
-        Self::with_runners(
+        Ok(Self::with_runners(
             config,
-            Arc::new(RealExec),
+            exec,
             state_dir,
             prompts_dir,
             poll_rx,
@@ -201,7 +210,7 @@ impl Daemon {
             action_rx,
             runners,
             ticket_runner,
-        )
+        ))
     }
 
     /// Build a daemon over injected runners and a scripted command runner.
@@ -276,6 +285,7 @@ impl Daemon {
             decisions: Decisions::new(),
             trains,
             release_batches: BTreeMap::new(),
+            review_issue_numbers: BTreeMap::new(),
             sessions: BTreeMap::new(),
             stopping_sessions: BTreeSet::new(),
             pending_chats: BTreeMap::new(),
@@ -325,11 +335,12 @@ impl Daemon {
             forwarder("aif-act", action_rx, in_tx, Inbound::Act)?,
         ];
 
+        self.now_ms = (self.clock)();
+        self.drive();
         loop {
             if self.shutdown {
                 break;
             }
-            self.now_ms = (self.clock)();
             let message = match self.next_deadline() {
                 Some(timeout) => match in_rx.recv_timeout(timeout) {
                     Ok(message) => Some(message),
@@ -502,6 +513,7 @@ impl Daemon {
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
         }
+        self.complete_parked_refines(repo, &fresh);
         if !unchanged {
             self.reconcile_unready(repo, &fresh);
         }
@@ -566,20 +578,51 @@ impl Daemon {
             .into_iter()
             .filter(|task| task.repo == repo)
             .filter(|task| match task.stage {
-                Stage::Implement => fresh
-                    .issues
-                    .get(&task.number)
-                    .is_none_or(|issue| !implement_ready(fresh, issue)),
-                Stage::Review => fresh
-                    .prs
-                    .get(&task.number)
-                    .is_none_or(|pr| !review_ready(pr)),
+                Stage::Implement => {
+                    fresh
+                        .issues
+                        .get(&task.number)
+                        .is_none_or(|issue| !implement_ready(fresh, issue))
+                        && !(task.state == TaskState::Running
+                            && implementation_transitioned(fresh, repo, task.number))
+                }
+                Stage::Review => {
+                    fresh
+                        .prs
+                        .get(&task.number)
+                        .is_none_or(|pr| !review_ready(pr))
+                        && !(task.state == TaskState::Running
+                            && review_transitioned(fresh, task.number))
+                }
                 Stage::Refine | Stage::Release => false,
             })
             .map(|task| task.id.clone())
             .collect();
         for id in ids {
             self.cancel_task(&id);
+        }
+    }
+
+    /// Complete parked refine tasks after GitHub reports their gate change.
+    ///
+    /// A poll can follow the turn end. In that order, GitHub confirms that the
+    /// parked task finished its requested transition.
+    fn complete_parked_refines(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let tasks: Vec<Task> = self
+            .table
+            .active()
+            .into_iter()
+            .filter(|task| task.repo == repo)
+            .filter(|task| {
+                task.stage == Stage::Refine
+                    && task.state == TaskState::AwaitingUser
+                    && refine_transitioned(fresh, task.number)
+            })
+            .cloned()
+            .collect();
+        for task in tasks {
+            self.stop_session(&task.id, "cannot stop the completed refine session");
+            self.complete_task(&task);
         }
     }
 
@@ -641,6 +684,15 @@ impl Daemon {
                 }
                 continue;
             }
+            let review_issue_number = (work.stage == Stage::Review)
+                .then(|| {
+                    self.snapshot
+                        .repos
+                        .get(&work.repo)
+                        .and_then(|snapshot| snapshot.prs.get(&work.number))
+                        .and_then(|pr| issue_number_from_head(&work.repo, &pr.head_ref))
+                })
+                .flatten();
             if work.stage == Stage::Review {
                 let superseded = self
                     .table
@@ -651,7 +703,9 @@ impl Daemon {
                             && task.stage == Stage::Review
                             && task.kind == work.kind
                             && task.number == work.number
-                            && task.head_sha != work.head_sha
+                            && (task.head_sha != work.head_sha
+                                || self.review_issue_numbers.get(&task.id).copied()
+                                    != review_issue_number)
                     })
                     .map(|task| task.id.clone());
                 if let Some(id) = superseded {
@@ -670,6 +724,11 @@ impl Daemon {
                 Ok(task) => {
                     if work.stage == Stage::Review {
                         task.head_sha = work.head_sha.clone();
+                        if let Some(number) = review_issue_number {
+                            self.review_issue_numbers.insert(task.id.clone(), number);
+                        } else {
+                            self.review_issue_numbers.remove(&task.id);
+                        }
                     }
                     self.changed = true;
                 }
@@ -915,6 +974,7 @@ impl Daemon {
                 || failed.contains(&task.id)
                 || self.stopping_sessions.contains(&task.id)
                 || self.sessions.contains_key(&task.id)
+                || self.prior_stage_active(task)
             {
                 continue;
             }
@@ -932,6 +992,40 @@ impl Daemon {
             }
         }
         None
+    }
+
+    /// True when the task before this one still owns the same work.
+    ///
+    /// An agent updates GitHub before its runner result arrives. The next gate
+    /// can therefore open first. This guard prevents two stages from using one
+    /// issue at the same time and prevents a release from beating its review.
+    fn prior_stage_active(&self, task: &Task) -> bool {
+        self.table.by_id.values().any(|prior| {
+            prior.state != TaskState::Done
+                && match task.stage {
+                    Stage::Refine => false,
+                    Stage::Implement => {
+                        prior.repo == task.repo
+                            && prior.stage == Stage::Refine
+                            && prior.kind == ItemKind::Issue
+                            && prior.number == task.number
+                    }
+                    Stage::Review => {
+                        prior.repo == task.repo
+                            && prior.stage == Stage::Implement
+                            && self.review_issue_numbers.get(&task.id).copied()
+                                == Some(prior.number)
+                    }
+                    Stage::Release => {
+                        prior.repo == task.repo
+                            && prior.stage == Stage::Review
+                            && self
+                                .release_batches
+                                .get(&task.id)
+                                .is_some_and(|prs| prs.contains(&prior.number))
+                    }
+                }
+        })
     }
 
     /// Start one queued task: ensure the worktree, render the prompt, start
@@ -958,9 +1052,23 @@ impl Daemon {
         };
         let cwd = match task.stage {
             Stage::Refine => Ok(repo_cfg.path.clone()),
-            Stage::Implement | Stage::Review => {
+            Stage::Implement => self
+                .worktrees
+                .ensure_issue(&*self.exec, &repo_cfg, task.number),
+            Stage::Review => {
+                let issue_number = self
+                    .review_issue_numbers
+                    .get(&task.id)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "pull request #{} does not use branch aif/{}/issue-<n>",
+                            task.number,
+                            task.repo
+                        )
+                    })?;
                 self.worktrees
-                    .ensure_issue(&*self.exec, &repo_cfg, task.number)
+                    .ensure_issue(&*self.exec, &repo_cfg, issue_number)
             }
             Stage::Release => self.worktrees.ensure_train(&*self.exec, &repo_cfg),
         };
@@ -980,7 +1088,22 @@ impl Daemon {
                 return Err(e);
             }
         };
-        if let Err(e) = self.launch_task(&task, prompt, None) {
+        let resume = if self.task_uses_claude(&task) {
+            match task.session_id.clone().map_or_else(
+                || self.worktrees.read_task_session(&cwd, &task.id),
+                |id| Ok(Some(id)),
+            ) {
+                Ok(resume) => resume,
+                Err(e) => {
+                    let reason = format!("cannot read the session marker: {e:#}");
+                    self.fail_run(&task, &reason);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(e) = self.launch_task(&task, prompt, resume) {
             let reason = format!("the runner could not start: {e:#}");
             self.fail_run(&task, &reason);
             return Err(e);
@@ -1114,7 +1237,11 @@ impl Daemon {
                 let marker = self
                     .task_cwd(&task_id)
                     .ok_or_else(|| anyhow!("the task has no worktree"))
-                    .and_then(|cwd| self.worktrees.write_session(&cwd, &session_id));
+                    .and_then(|cwd| {
+                        self.worktrees.write_session(&cwd, &session_id)?;
+                        self.worktrees
+                            .write_task_session(&cwd, &task_id, &session_id)
+                    });
                 if let Err(error) = marker {
                     let reason = format!("cannot write the session marker: {error:#}");
                     eprintln!("task {task_id}: {reason}");
@@ -1171,6 +1298,16 @@ impl Daemon {
             return;
         }
         if task.stage == Stage::Refine {
+            let transitioned = self
+                .snapshot
+                .repos
+                .get(&task.repo)
+                .is_some_and(|fresh| refine_transitioned(fresh, task.number));
+            if ok && transitioned {
+                self.stop_session(id, "cannot stop the completed refine session");
+                self.complete_task(&task);
+                return;
+            }
             if let Err(error) = self
                 .table
                 .transition(id, TaskState::AwaitingUser, self.now_ms)
@@ -1246,6 +1383,7 @@ impl Daemon {
             return;
         }
         self.changed = true;
+        self.remove_task_session_marker(task);
         self.pending_chats.remove(&task.id);
         self.decisions.drop_for_task(&task.id);
         match task.stage {
@@ -1686,6 +1824,7 @@ impl Daemon {
 
     /// Abort one task: stop its process, cancel it, and drop its decisions.
     fn cancel_task(&mut self, id: &str) {
+        let task = self.table.by_id.get(id).cloned();
         self.stop_session(id, "cannot stop the session during the abort");
         self.pending_chats.remove(id);
         let active = self
@@ -1701,6 +1840,9 @@ impl Daemon {
         let dropped = self.decisions.drop_for_task(id);
         if active || !dropped.is_empty() {
             self.changed = true;
+        }
+        if let Some(task) = task.as_ref() {
+            self.remove_task_session_marker(task);
         }
     }
 
@@ -1805,13 +1947,29 @@ impl Daemon {
         }
     }
 
+    /// Remove restart data after one task becomes terminal.
+    fn remove_task_session_marker(&self, task: &Task) {
+        let Some(cwd) = self.task_cwd(&task.id) else {
+            return;
+        };
+        if let Err(error) = self.worktrees.remove_task_session(&cwd, &task.id) {
+            eprintln!(
+                "task {}: cannot remove the session marker: {error:#}",
+                task.id
+            );
+        }
+    }
+
     /// The working directory of a task's run.
     fn task_cwd(&self, id: &str) -> Option<PathBuf> {
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
         Some(match task.stage {
             Stage::Refine => repo.path.clone(),
-            Stage::Implement | Stage::Review => self.worktrees.issue_path(repo, task.number),
+            Stage::Implement => self.worktrees.issue_path(repo, task.number),
+            Stage::Review => self
+                .worktrees
+                .issue_path(repo, *self.review_issue_numbers.get(id)?),
             Stage::Release => self.worktrees.train_path(repo),
         })
     }
@@ -2000,6 +2158,45 @@ fn event_task(event: &RunEvent) -> &str {
     }
 }
 
+/// Extract the issue number from one factory pull request branch.
+fn issue_number_from_head(repo: &str, head_ref: &str) -> Option<u64> {
+    let prefix = format!("aif/{repo}/issue-");
+    head_ref
+        .strip_prefix(&prefix)?
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+}
+
+/// True when GitHub shows the completed refine transition.
+fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
+    fresh.issues.get(&number).is_some_and(|issue| {
+        issue.open
+            && issue.labels.iter().any(|label| label == "refined")
+            && !issue.labels.iter().any(|label| label == "to-refine")
+    })
+}
+
+/// True when GitHub shows a pull request for the implemented issue.
+fn implementation_transitioned(fresh: &RepoSnapshot, repo: &str, number: u64) -> bool {
+    fresh.issues.get(&number).is_some_and(|issue| {
+        issue.open
+            && !issue.labels.iter().any(|label| label == "refined")
+            && !issue.labels.iter().any(|label| label == "to-refine")
+    }) && fresh
+        .prs
+        .values()
+        .any(|pr| pr.open && issue_number_from_head(repo, &pr.head_ref) == Some(number))
+}
+
+/// True when GitHub shows the completed review transition.
+fn review_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
+    fresh
+        .prs
+        .get(&number)
+        .is_some_and(|pr| pr.open && !pr.draft)
+}
+
 /// Fill a prompt template.
 fn fill_template(template: &str, values: &[(&str, String)]) -> Result<String> {
     for token in scan_placeholders(template) {
@@ -2115,8 +2312,10 @@ something the body must record.
 When you need a human decision, add the `needs-human` label to the issue with
 `gh` and state the question in a comment. Stop after the label is on.
 
-When the specification is complete, end your turn and report one line that
-says the issue is refined.
+When the specification is complete, run
+`gh issue edit {number} --remove-label to-refine --add-label refined`.
+Run this command only after the issue body is complete. Then report one line
+that says the issue is refined.
 "#;
 
 /// The built-in prompt of an implement run.
@@ -2130,8 +2329,9 @@ Issue #{number}: {title}
 
 Implement the issue on the current branch. Follow its acceptance criteria.
 Run the test suite and make it pass. Commit your work in small, complete
-commits. Open a pull request with `gh pr create` when the work is done, and
-mention `#{number}` in the body.
+commits. Open a draft pull request with `gh pr create --draft` when the work is
+done. Put `Closes #{number}` in the body. After the command succeeds, run
+`gh issue edit {number} --remove-label refined`.
 
 If the specification is incomplete, or you need a human decision, add the
 `needs-human` label to issue #{number} with `gh`, write the question into a
@@ -2151,8 +2351,9 @@ Pull request #{number}: {title}
 
 Read the diff of the pull request with `gh pr diff {number}`. Review it for
 correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`: approve it when it is correct, or
-request changes with concrete findings.
+review with `gh pr review {number}`. If it is correct, approve it and then run
+`gh pr ready {number}`. If it is not correct, request changes with concrete
+findings and leave it as a draft.
 
 If the change needs a human decision, add the `needs-human` label to the
 pull request with `gh`, write the question into a comment, and stop. Do not
@@ -2522,6 +2723,7 @@ mod tests {
             open: true,
             draft,
             head_sha: format!("sha{number}"),
+            head_ref: format!("aif/borsuk/issue-{number}"),
         }
     }
 
@@ -2837,6 +3039,25 @@ mod tests {
     }
 
     #[test]
+    fn a_review_uses_the_issue_worktree_named_by_the_pull_head() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        let mut pull = pr(5, true, &[]);
+        pull.head_ref = "aif/borsuk/issue-142".to_string();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).cwd, issue_wt(&dir, 142));
+    }
+
+    #[test]
     fn a_review_marker_error_requeues_the_review() {
         let dir = temp_root();
         let worktree = issue_wt(&dir, 5);
@@ -3020,6 +3241,83 @@ mod tests {
     }
 
     #[test]
+    fn a_refined_poll_completes_the_parked_refine_task() {
+        let mut rig = Rig::make(vec![]);
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: true,
+        });
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert!(
+            rig.session(0).stopped.load(Ordering::SeqCst),
+            "the completed task must release its live process"
+        );
+    }
+
+    #[test]
+    fn a_turn_end_completes_a_refine_when_the_poll_won_the_race() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert_eq!(rig.job_count(), 1, "implement waits for the refine result");
+        rig.event(turn_ended("borsuk/refine-i142"));
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert!(rig.session(0).stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/implement-i142");
+    }
+
+    #[test]
+    fn a_draft_pull_poll_keeps_the_implementation_until_runner_success() {
+        let dir = temp_root();
+        let steps: Vec<Step> = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        )
+        .into_iter()
+        .chain(reuse_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            &rig_gitdir(&dir),
+        ))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        let session = rig.session(0);
+        let mut pull = pr(5, true, &[]);
+        pull.head_ref = "aif/borsuk/issue-142".to_string();
+
+        rig.poll(vec![issue(142, &[])], vec![pull]);
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert!(!session.stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.job_count(), 1, "review waits for the implement result");
+        rig.event(turn_finished("borsuk/implement-i142", true, "done"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/review-p5");
+    }
+
+    #[test]
     fn a_live_chat_marks_the_parked_task_running() {
         let mut rig = Rig::make(vec![]);
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -3123,6 +3421,67 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_resumes_the_claude_session_of_the_same_task() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir));
+        let mut first = Rig::make_in(dir.clone(), steps, |_| {});
+        first.poll(vec![issue(142, &["refined"])], vec![]);
+        first.event(started("borsuk/implement-i142", "session-142"));
+        drop(first);
+
+        let steps = reuse_issue_steps(&rig_repo(&dir), &worktree, &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |_| {});
+        second.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert_eq!(second.job_count(), 1);
+        assert_eq!(second.job(0).resume.as_deref(), Some("session-142"));
+        second.event(turn_finished("borsuk/implement-i142", true, "done"));
+        assert_eq!(
+            second
+                .daemon
+                .worktrees
+                .read_task_session(&worktree, "borsuk/implement-i142")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn concurrent_refine_tasks_resume_their_own_sessions() {
+        let dir = temp_root();
+        let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+        first.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+        first.event(started("borsuk/refine-i142", "session-142"));
+        first.event(started("borsuk/refine-i143", "session-143"));
+        drop(first);
+
+        let mut second = Rig::make_in(dir, vec![], |_| {});
+        second.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+
+        let resumes: BTreeMap<String, Option<String>> = (0..second.job_count())
+            .map(|index| {
+                let job = second.job(index);
+                (job.task, job.resume)
+            })
+            .collect();
+        assert_eq!(
+            resumes["borsuk/refine-i142"].as_deref(),
+            Some("session-142")
+        );
+        assert_eq!(
+            resumes["borsuk/refine-i143"].as_deref(),
+            Some("session-143")
+        );
+    }
+
+    #[test]
     fn an_interval_fire_survives_a_restart() {
         let dir = temp_root();
         let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));
@@ -3214,6 +3573,9 @@ mod tests {
     #[test]
     fn an_idle_loop_waits_for_a_message_and_stop_returns() {
         let mut rig = Rig::make(vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
         let (action_tx, action_rx) = mpsc::channel();
         rig.daemon.action_rx = Some(action_rx);
         let (clock_tx, clock_rx) = mpsc::channel();
@@ -3230,6 +3592,11 @@ mod tests {
         clock_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("the loop reads the clock before it blocks");
+        let initial = push_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the loop must publish its initial state before it blocks");
+        assert_eq!(initial.repos.len(), 1);
+        assert!(initial.tasks.is_empty());
         assert_eq!(
             clock_rx.recv_timeout(Duration::from_millis(100)),
             Err(mpsc::RecvTimeoutError::Timeout),
@@ -3542,6 +3909,26 @@ mod tests {
     }
 
     #[test]
+    fn builtin_prompts_advance_the_github_gates() {
+        assert!(
+            REFINE_PROMPT.contains("--remove-label to-refine --add-label refined"),
+            "the refine prompt must open the implement gate"
+        );
+        assert!(
+            IMPLEMENT_PROMPT.contains("gh pr create --draft"),
+            "the implement prompt must leave the pull request in the review gate"
+        );
+        assert!(
+            IMPLEMENT_PROMPT.contains("--remove-label refined"),
+            "the implement prompt must close its issue gate"
+        );
+        assert!(
+            REVIEW_PROMPT.contains("gh pr ready {number}"),
+            "the review prompt must open the release gate after approval"
+        );
+    }
+
+    #[test]
     fn ticket_create_starts_one_ticket_session() {
         let mut rig = Rig::make(vec![]);
         rig.act(Action::TicketCreate {
@@ -3814,6 +4201,31 @@ mod tests {
     }
 
     #[test]
+    fn aborting_a_release_returns_its_batch_to_the_train() {
+        let dir = temp_root();
+        let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        assert_eq!(rig.job_count(), 1);
+
+        rig.act(Action::Abort {
+            task: "borsuk/release-p2".to_string(),
+        });
+
+        assert_eq!(
+            rig.task("borsuk/release-p2").state,
+            TaskState::Failed("cancelled".to_string())
+        );
+        assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
+        assert_eq!(rig.daemon.trains["borsuk"].queue, vec![2]);
+        assert!(!rig.daemon.release_batches.contains_key("borsuk/release-p2"));
+    }
+
+    #[test]
     fn overrides_persist_across_a_restart() {
         let dir = temp_root();
         let lane_config = |config: &mut Config| {
@@ -3973,20 +4385,87 @@ mod tests {
     }
 
     #[test]
-    fn making_a_pull_request_ready_cancels_its_draft_review() {
+    fn a_ready_pull_poll_keeps_the_review_until_runner_success() {
         let dir = temp_root();
         let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
-        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
         rig.poll(vec![], vec![pr(5, true, &[])]);
         let session = rig.session(0);
 
         rig.poll(vec![], vec![pr(5, false, &[])]);
 
-        assert!(session.stopped.load(Ordering::SeqCst));
+        assert!(!session.stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
+        rig.event(turn_finished("borsuk/review-p5", true, "approved"));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
         assert_eq!(
-            rig.task("borsuk/review-p5").state,
-            TaskState::Failed("cancelled".to_string())
+            fs::read_to_string(issue_wt(&dir, 5).join(".aif/reviewed-sha"))
+                .unwrap()
+                .trim(),
+            "sha5"
         );
+    }
+
+    #[test]
+    fn an_automatic_release_waits_for_the_running_review() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+
+        assert_eq!(rig.job_count(), 1, "release waits for the review result");
+        rig.event(turn_finished("borsuk/review-p5", true, "approved"));
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/release-p5");
+    }
+
+    #[test]
+    fn an_automatic_release_stays_blocked_after_a_failed_review() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+
+        rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+        rig.event(exited("borsuk/review-p5", false, "review failed"));
+        rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+        rig.event(exited("borsuk/review-p5", false, "review failed"));
+        rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+        rig.event(exited("borsuk/review-p5", false, "review failed"));
+
+        assert_eq!(rig.job_count(), 3, "only review attempts can run");
+        let release = rig.task("borsuk/release-p5");
+        assert_eq!(release.state, TaskState::Queued);
+        assert_eq!(release.attempt, 1, "the release never reached dispatch");
+        assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());
     }
 
     #[test]
@@ -4027,6 +4506,37 @@ mod tests {
             rig.task("borsuk/review-p5").head_sha.as_deref(),
             Some("new-sha")
         );
+    }
+
+    #[test]
+    fn a_new_head_branch_replaces_the_review_worktree() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_issue_steps(
+                    &rig_repo(&dir),
+                    &issue_wt(&dir, 142),
+                    142,
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        let first = rig.session(0);
+        let mut updated = pr(5, true, &[]);
+        updated.head_ref = "aif/borsuk/issue-142".to_string();
+
+        rig.poll(vec![], vec![updated]);
+
+        assert!(first.stopped.load(Ordering::SeqCst));
+        rig.event(exited(
+            "borsuk/review-p5",
+            false,
+            "the superseded process exited",
+        ));
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).cwd, issue_wt(&dir, 142));
     }
 
     #[test]

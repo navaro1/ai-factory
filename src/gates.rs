@@ -159,10 +159,9 @@ fn standalone_and_at(lower: &str, pos: usize) -> bool {
 /// The tracker's memory of one item in one stage.
 ///
 /// A key is present exactly when the gate for that item was open at the
-/// last poll of its repository. The review key carries the head sha, so a
-/// push forms a new key and opens the gate again, while an unchanged
-/// draft keeps its key and stays silent. The other stages carry no sha,
-/// so a push alone does not re-open their gates.
+/// last poll of its repository. The review key carries the head sha and
+/// branch. A push or branch change opens the gate again. An unchanged draft
+/// stays silent. The other stages carry no trigger.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GateKey {
     repo: String,
@@ -218,7 +217,8 @@ impl GateTracker {
                 (Stage::Release, release_ready(pr)),
             ] {
                 if open {
-                    let trigger = (stage == Stage::Review).then(|| pr.head_sha.clone());
+                    let trigger = (stage == Stage::Review)
+                        .then(|| format!("{}\0{}", pr.head_sha, pr.head_ref));
                     now_ready.insert(GateKey {
                         repo: repo.to_string(),
                         stage,
@@ -288,6 +288,7 @@ mod tests {
             open: true,
             draft,
             head_sha: head_sha.to_string(),
+            head_ref: format!("aif/demo/issue-{number}"),
         }
     }
 
@@ -440,6 +441,26 @@ mod tests {
         let again = tracker.observe("borsuk", &draft("bbb"));
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].head_sha.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn a_new_head_branch_retriggers_review_with_the_same_commit() {
+        let mut tracker = GateTracker::new();
+        let mut first = pr(5, true, "aaa");
+        first.head_ref = "aif/borsuk/issue-5".to_string();
+        let mut renamed = first.clone();
+        renamed.head_ref = "aif/borsuk/issue-142".to_string();
+
+        assert_eq!(
+            tracker.observe("borsuk", &repo(vec![], vec![first])).len(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .observe("borsuk", &repo(vec![], vec![renamed]))
+                .len(),
+            1
+        );
     }
 
     #[test]

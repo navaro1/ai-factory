@@ -115,6 +115,8 @@ pub struct Pr {
     pub draft: bool,
     /// The head commit sha at poll time.
     pub head_sha: String,
+    /// The source branch name at poll time.
+    pub head_ref: String,
 }
 
 /// The issues and pull requests of one repository.
@@ -205,7 +207,8 @@ impl Snapshot {
                             if new_item.labels != old_item.labels
                                 || new_item.open != old_item.open
                                 || new_item.draft != old_item.draft
-                                || new_item.head_sha != old_item.head_sha =>
+                                || new_item.head_sha != old_item.head_sha
+                                || new_item.head_ref != old_item.head_ref =>
                         {
                             changes.push(Change {
                                 repo: repo.to_string(),
@@ -285,6 +288,7 @@ mod tests {
             open: true,
             draft,
             head_sha: head_sha.to_string(),
+            head_ref: format!("aif/demo/issue-{number}"),
         }
     }
 
@@ -437,6 +441,7 @@ mod tests {
                     pr(3, true, "aaa", &[]),
                     pr(4, true, "bbb", &[]),
                     pr(5, true, "ccc", &[]),
+                    pr(6, true, "eee", &[]),
                 ],
             ),
         );
@@ -447,12 +452,14 @@ mod tests {
                 pr(3, false, "aaa", &[]),
                 pr(4, true, "ddd", &[]),
                 pr(5, true, "ccc", &[]),
+                pr(6, true, "eee", &[]),
             ],
         );
         fresh.issues.get_mut(&1).unwrap().labels =
             vec!["refined".to_string(), "to-refine".to_string()];
         fresh.issues.get_mut(&2).unwrap().title = "a new title".to_string();
         fresh.prs.get_mut(&5).unwrap().body = "body edit only".to_string();
+        fresh.prs.get_mut(&6).unwrap().head_ref = "aif/demo/issue-60".to_string();
 
         let mut changes = snap.apply("borsuk", fresh);
         changes.sort_by_key(|c| (c.kind, c.number));
@@ -475,6 +482,12 @@ mod tests {
                     repo: "borsuk".to_string(),
                     kind: ItemKind::Pr,
                     number: 4,
+                    what: ChangeWhat::Modified,
+                },
+                Change {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Pr,
+                    number: 6,
                     what: ChangeWhat::Modified,
                 },
             ]
