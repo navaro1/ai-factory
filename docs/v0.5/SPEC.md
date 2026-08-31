@@ -1338,3 +1338,207 @@ those files. Say in the report which of them you touched and why. No other file.
 - `install.sh` runs in a temporary `HOME` and produces both binaries and a
   config directory, asserted by a test script.
 - The README names no removed command.
+
+---
+
+# v0.5.1 — Open a task session and converse with the agent
+
+## Verified external protocol facts (v0.5.1 additions)
+
+### opencode multi-turn (CLI 1.18.25, probed 2026-08-31)
+
+`opencode run` accepts `-s, --session <id>` and `-c, --continue`. A second run
+that names the session id of the first continues that conversation with its full
+context.
+
+The probe: turn one was told a secret code and told to write no file. Turn two ran
+with `--session <id>` and asked for the code. It answered correctly. The code
+existed only in the conversation, never on disk. So the continuation is real.
+
+The session id arrives in the NDJSON stream as `sessionID`. The runner already
+captures it and the daemon already writes it to a marker file.
+
+**Mid-turn steering does not work.** The opencode server accepts a prompt with
+`delivery: "steer"` and records it. A run that is already in flight finishes its
+original task and never reads it. A steer needs a turn boundary. A one-shot run
+has none. So the factory never steers a running turn. It queues the message and
+sends it as the next turn.
+
+There is no `opencode serve` in this design. There is no HTTP client. Multi-turn
+uses the same one-shot child process shape as every other run.
+
+## Task 23 — The opencode follow-up turn
+
+**Goal.** Let a human send a message to an implement or review task. The message
+becomes a new turn in the same opencode session.
+
+**Files.** `src/runner/opencode.rs`, `src/daemon.rs`, `src/tasks.rs`.
+
+**Detail.**
+
+- `build_args` appends `--session <id>` when `job.resume` is `Some`. The doc
+  comment above `build_args` states the opposite today. Correct it.
+- `TaskTable::reopen(&mut self, id: &str, now_ms: u64) -> Result<()>`. It is a new
+  method, not a new edge in `transition`. It accepts a task in `Done` or
+  `Failed` only. It sets `Queued`. It does NOT raise the attempt count and it
+  ignores `MAX_ATTEMPTS`. A human asked for this turn, so the automatic retry
+  budget must stay untouched. It refuses `Queued`, `Running`, and `AwaitingUser`
+  with a clear error.
+- `Daemon::chat` changes. Today it refuses a terminal task, then calls
+  `send_user` on any live session, then queues for an `AwaitingUser` claude task.
+  The new order:
+  1. Find the task. No task is an error, as today.
+  2. If a live session exists AND `task_uses_claude(&task)`, call `send_user`.
+     This is the unchanged claude path.
+  3. Otherwise apply the sibling guard, then push the text into `pending_chats`.
+     If the task is terminal, also call `reopen`.
+  4. If the task has no session id and no session marker, refuse with a reason.
+- **Never call `send_user` on an opencode session.** Today `chat` calls it for any
+  live session and prints the resulting "does not support steering" error to
+  stderr. Use `task_uses_claude` at `daemon.rs:1992` to gate it, because that
+  helper also treats a ticket task as claude.
+- **The sibling guard.** Refuse a follow-up when another task for the same
+  repository, kind, and number is not terminal. Two agents must never run in one
+  worktree. The refusal names the blocking task.
+- **The session marker survives.** `remove_task_session_marker` runs when a task
+  reaches `Done`. Keep the marker for an opencode task, so a human can converse
+  after a daemon restart. The worktree cleanup still removes it.
+- `resume_pending_chats` changes. It accepts a task in `Queued` as well as
+  `AwaitingUser`. It skips a task in `Running` and waits for the exit. It calls
+  `sched::can_start` in place of the raw live-session limit check, so stage
+  limits, lane reservations, and pauses all apply to a follow-up turn.
+- **One owner per queued task.** A failed opencode task requeues itself, so a
+  `Queued` task can also hold a typed message. Two dispatchers would then race.
+  The rule: a task with entries in `pending_chats` belongs to
+  `resume_pending_chats`, and `dispatch_one` skips it. Do not depend on the order
+  of the calls inside `drive`.
+- **The reopen hook.** `on_exit_event` handles an opencode exit and calls
+  `complete_task` or `fail_run`. After that terminal state is set, check
+  `pending_chats`. When it holds a message for this task, call `reopen`.
+- **A retry still starts fresh.** `dispatch_one` computes `resume` only for a
+  claude task. Do not change that. Only `resume_pending_chats` passes a session
+  id for an opencode task.
+
+**Acceptance criteria.**
+- `build_args` emits `--session <id>` with a resume id, and omits the flag
+  without one.
+- A chat on a `Done` opencode task queues the text and reopens the task to
+  `Queued`.
+- The relaunch calls the runner with the captured session id and the typed
+  message as the prompt, not the stage prompt.
+- A chat on a `Running` opencode task queues the text, and the relaunch happens
+  after the exit event, never before it.
+- A chat on a live opencode session never reaches `send_user`. A test asserts
+  that the unsupported-steering error never appears.
+- A `Queued` task that holds a pending chat gets exactly one launch, and that
+  launch carries the typed message.
+- A retry after a failure passes `resume = None`.
+- `reopen` refuses a `Queued`, `Running`, or `AwaitingUser` task.
+- `reopen` succeeds on a task at `MAX_ATTEMPTS` and leaves the attempt count
+  unchanged.
+- The sibling guard refuses the follow-up and its message names the other task.
+- The task session marker still exists after an opencode task reaches `Done`.
+- A paused stage holds a queued follow-up, and the follow-up does not start.
+
+## Task 24 — Enter opens a task session
+
+**Goal.** Press `Enter` on a ticket row. The UI opens that task's session view.
+
+**Files.** `src/tui/pipeline.rs`, `src/tui/mod.rs`.
+
+**Detail.**
+
+- Bind `KeyCode::Enter` in `pipeline::handle_key`. On `Row::Ticket { index }`
+  resolve `state.tasks[index]`, then set `app.session_task` to the task id, set
+  `app.wanted` to `None`, set `app.view` to `View::Session`, and call
+  `app.show_session_task()`. This is the same path the inbox uses at
+  `mod.rs:444`.
+- `Row::Stage`, `Row::Repo`, and `Row::Train` do nothing on `Enter`.
+- `Enter` works for a task in any state. A `Done` or `Failed` task still has its
+  log file, so its transcript is readable.
+- Add the row `("enter", "open the selected task session")` to the help rows at
+  `mod.rs:1040`. Raise the array length annotation and the overlay height.
+- `Esc` already returns to the pipeline view. Do not change it.
+
+**Acceptance criteria.**
+- `Enter` on a ticket row sets `View::Session` and the correct task id.
+- `Enter` opens a `done` task and a `failed` task.
+- `Enter` on a stage, repository, or train row changes nothing.
+- A shell test drives the keys through `run_messages`.
+- The help overlay test asserts the new key row.
+
+## Task 25 — The input mode on the wire
+
+**Goal.** Tell the UI what the input bar will do for each task.
+
+**Files.** `src/sock.rs`, `src/daemon.rs`.
+
+**Detail.**
+
+```rust
+/// What the session view's input bar does for one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum InputMode {
+    Live,
+    Resume,
+    NextTurn,
+    Follow,
+    Closed { reason: String },
+}
+```
+
+- `TaskView` gains `input: InputMode` and `queued_messages: usize`.
+- `Daemon::input_mode(&Task) -> InputMode` is the one place that decides:
+  - a live session and a claude task: `Live`
+  - a claude task in `AwaitingUser` with a session id and no live process:
+    `Resume`
+  - an opencode task in `Running`: `NextTurn`
+  - an opencode task in a terminal state with a session id or marker: `Follow`
+  - any task blocked by the sibling guard: `Closed`, and the reason names the
+    other task
+  - any task with no session to continue: `Closed`, and the reason says so
+- Use `task_uses_claude`, not the raw config string, so a ticket task counts as
+  claude although it runs in the refine stage.
+- `StateInput` gains one field: a map from task id to `InputMode`. `push_state`
+  fills it. `sock.rs` stays a plain serializer and holds no policy.
+- `queued_messages` is the count of `pending_chats` entries for that task.
+
+**Acceptance criteria.**
+- Each of the six cases above returns the stated mode.
+- A `Closed` reason is a sentence a human can act on, not a code.
+- `queued_messages` rises after a chat and falls after the relaunch.
+- A `StateView` round trip through JSON keeps both new fields.
+
+## Task 26 — The input bar tells the truth
+
+**Goal.** The session view states what your message will do, and never claims to
+send a message it dropped.
+
+**Files.** `src/tui/session.rs`, `src/tui/pipeline.rs`, `src/tui/mod.rs`.
+
+**Detail.**
+
+- The input bar's bottom hint comes from `TaskView::input`:
+
+| Mode | Hint |
+|---|---|
+| `Live` | `enter send · ctrl-x abort · end tail` |
+| `Resume` | `enter send · resumes the parked chat` |
+| `NextTurn` | `enter queue · lands after this turn · ctrl-x sends it now` |
+| `Follow` | `enter send · starts a follow-up turn` |
+| `Closed` | the reason text, and the bar is dim |
+
+- In `Closed` mode `handle_key` swallows typed letters and returns `None` for
+  `Enter`. The shell must not show the `sent chat` toast for a message the daemon
+  will drop.
+- The session header shows the queued count when `queued_messages` is above zero.
+- A pipeline ticket row shows a short badge when `queued_messages` is above zero,
+  so a waiting message is visible from the board.
+
+**Acceptance criteria.**
+- A `TestBackend` frame test covers each of the five modes.
+- `Enter` in `Closed` mode emits no action and shows no toast.
+- `Enter` in `NextTurn` mode emits `Action::Chat`.
+- The session header shows the queued count.
+- The pipeline ticket row shows the badge.
