@@ -1,37 +1,61 @@
 #!/usr/bin/env bash
-# ai-factory installer. Copies the workspace files into place.
+# ai-factory installer. Builds the crate and installs the binaries and the
+# default configuration. Existing configuration files are never overwritten.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-zdir="${ZELLIJ_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zellij}"
+config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/aif"
 bin_dir="${HOME}/.local/bin"
 
-mkdir -p "${zdir}/themes" "${zdir}/layouts" "${zdir}/prompts" "${bin_dir}"
-
-install -m 644 "${here}/zellij/themes/retro-future.kdl" "${zdir}/themes/"
-install -m 644 "${here}/zellij/layouts/ai-factory.kdl" "${zdir}/layouts/"
-install -m 644 "${here}"/zellij/prompts/*.md "${zdir}/prompts/"
-install -m 755 "${here}/bin/ai-factory" "${here}/bin/clauded" "${here}/bin/codexd" "${here}/bin/opencoded" "${bin_dir}/"
-
-if command -v cargo >/dev/null 2>&1; then
-    printf 'Building the aif binary...\n'
-    (cd "${here}/ui/console" && cargo build --release -q)
-    install -m 755 "${here}/ui/console/target/release/aif" "${bin_dir}/"
-else
-    printf 'Warning: cargo not found; the aif binary was not built.\n' >&2
-    printf 'Session start (ai-factory, aif start) will not work without it.\n' >&2
+if ! command -v cargo >/dev/null 2>&1; then
+    printf 'Error: cargo is missing. Install Rust first, then run this script again.\n' >&2
+    exit 1
 fi
 
-config="${zdir}/config.kdl"
-if [[ ! -f "${config}" ]]; then
-    printf 'theme "retro-future"\n' >"${config}"
-elif grep -q '^[[:space:]]*theme[[:space:]]' "${config}"; then
-    if ! grep -q '^[[:space:]]*theme[[:space:]]*"retro-future"' "${config}"; then
-        sed -i 's/^\([[:space:]]*theme[[:space:]]*\)"[^"]*"/\1"retro-future"/' "${config}"
+printf 'Building aif and aifd...\n'
+(cd "${here}" && cargo build --release -q)
+
+mkdir -p "${bin_dir}"
+install -m 755 "${here}/target/release/aif" "${bin_dir}/aif"
+install -m 755 "${here}/target/release/aifd" "${bin_dir}/aifd"
+
+mkdir -p "${config_dir}/prompts"
+
+# Write a portable copy of the committed example.
+write_config() {
+    local destination="$1"
+    local temporary
+    temporary="$(mktemp "${config_dir}/.factory.XXXXXX")"
+    if ! sed 's|^path = "/home/[^/]*/Workplace/|path = "/home/you/Workplace/|' \
+        "${here}/docs/v0.5/factory.example.toml" >"${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
     fi
-else
-    printf '\ntheme "retro-future"\n' >>"${config}"
+    if ! install -m 644 "${temporary}" "${destination}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    rm -f -- "${temporary}"
+}
+
+# The live config starts as a copy of the example. A file that exists stays.
+if [[ ! -f "${config_dir}/factory.example.toml" ]]; then
+    write_config "${config_dir}/factory.example.toml"
+    printf 'Wrote %s\n' "${config_dir}/factory.example.toml"
 fi
+if [[ ! -f "${config_dir}/factory.toml" ]]; then
+    write_config "${config_dir}/factory.toml"
+    printf 'Wrote %s\n' "${config_dir}/factory.toml"
+fi
+
+# The default prompts. The daemon falls back to built-in prompts when these
+# files are absent, so they exist only to give you a starting point to edit.
+for stage in refine implement review release; do
+    if [[ ! -f "${config_dir}/prompts/${stage}.md" ]]; then
+        install -m 644 "${here}/docs/v0.5/prompts/${stage}.md" "${config_dir}/prompts/${stage}.md"
+        printf 'Wrote %s\n' "${config_dir}/prompts/${stage}.md"
+    fi
+done
 
 case ":${PATH}:" in
 *":${bin_dir}:"*) ;;
@@ -41,6 +65,5 @@ case ":${PATH}:" in
 esac
 
 printf 'Installed.\n'
-printf 'Requirements: zellij, claude, opencode, gh, git.\n'
-printf 'Start it inside a git repository with: aif start (or ai-factory).\n'
-printf 'Run aif --help for the full guide.\n'
+printf 'Edit %s and set the path of every repository.\n' "${config_dir}/factory.toml"
+printf 'Run aif doctor to check the installation.\n'
