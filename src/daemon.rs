@@ -918,11 +918,6 @@ impl Daemon {
                 eprintln!("the pending chat for {id}: the task is {}", task.state);
                 continue;
             }
-            // Another task still owns the worktree item. Keep the messages
-            // and wait, as the dispatcher waits for a queued task.
-            if self.sibling_blocker(&task).is_some() {
-                continue;
-            }
             let session_id = match self.followup_session_id(&task) {
                 Ok(session_id) => session_id,
                 Err(error) => {
@@ -956,6 +951,13 @@ impl Daemon {
             if let Err(error) = self.launch_task(&task, first, Some(session_id)) {
                 eprintln!("the pending chat for {id}: the runner could not resume: {error:#}");
                 self.pending_chats.insert(id, messages);
+                continue;
+            }
+            if !self.task_uses_claude(&task) {
+                let leftover: Vec<String> = messages.into_iter().skip(1).collect();
+                if !leftover.is_empty() {
+                    self.pending_chats.insert(id, leftover);
+                }
                 continue;
             }
             let mut delivered = 1;
@@ -1647,11 +1649,8 @@ impl Daemon {
                 return;
             }
         }
-        if let Some(blocker) = self.sibling_blocker(&task) {
-            eprintln!(
-                "the chat message for {id}: task \"{blocker}\" is still active on the \
-                 same worktree item; a follow-up waits until it is terminal"
-            );
+        if let Some(refusal) = self.sibling_refusal(&task) {
+            eprintln!("{refusal}");
             return;
         }
         let session_id = match self.followup_session_id(&task) {
@@ -1716,6 +1715,17 @@ impl Daemon {
                     && self.worktree_item(other) == item
             })
             .map(|other| other.id.clone())
+    }
+
+    /// The clear refusal for a follow-up whose sibling is not terminal.
+    fn sibling_refusal(&self, task: &Task) -> Option<String> {
+        self.sibling_blocker(task).map(|blocker| {
+            format!(
+                "the chat message for \"{}\" cannot start. Task \"{blocker}\" uses the same \
+                 worktree item. Wait until that task is terminal.",
+                task.id
+            )
+        })
     }
 
     /// The session id that a follow-up turn continues.
@@ -4960,6 +4970,38 @@ mod tests {
     }
 
     #[test]
+    fn queued_opencode_messages_each_start_a_turn_without_steering() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 2);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.daemon.chat("borsuk/implement-i142", "first follow-up");
+        rig.daemon.chat("borsuk/implement-i142", "second follow-up");
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).prompt, "first follow-up");
+        assert!(
+            rig.session(1).sends.lock().unwrap().is_empty(),
+            "an opencode turn never accepts a steering call"
+        );
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["second follow-up".to_string()][..])
+        );
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).prompt, "second follow-up");
+        assert_eq!(rig.job(2).resume.as_deref(), Some("ses-142"));
+    }
+
+    #[test]
     fn a_queued_task_with_a_pending_chat_gets_exactly_one_launch() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 3);
@@ -4999,6 +5041,55 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_later_stage_does_not_deadlock_a_pending_follow_up() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: true,
+        });
+        rig.act(Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "check the review feedback".to_string(),
+        });
+
+        let review_id = rig
+            .daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Pr,
+                7,
+                dir.join("review.jsonl"),
+                rig.daemon.now_ms,
+            )
+            .unwrap()
+            .id
+            .clone();
+        rig.daemon
+            .review_issue_numbers
+            .insert(review_id.clone(), 142);
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: false,
+        });
+
+        assert_eq!(rig.job_count(), 2, "the follow-up owns the queued task");
+        assert_eq!(rig.job(1).task, "borsuk/implement-i142");
+        assert_eq!(rig.job(1).prompt, "check the review feedback");
+        assert_eq!(rig.task(&review_id).state, TaskState::Queued);
+    }
+
+    #[test]
     fn an_opencode_retry_starts_fresh_without_a_session() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 1);
@@ -5027,6 +5118,15 @@ mod tests {
         assert_eq!(rig.job_count(), 2, "the implement gate opened");
         rig.event(started("borsuk/implement-i142", "ses-142"));
 
+        let task = rig.task("borsuk/refine-i142");
+        assert_eq!(
+            rig.daemon.sibling_refusal(&task).as_deref(),
+            Some(
+                "the chat message for \"borsuk/refine-i142\" cannot start. Task \
+                 \"borsuk/implement-i142\" uses the same worktree item. Wait until that task is \
+                 terminal."
+            )
+        );
         rig.daemon
             .chat("borsuk/refine-i142", "adjust the specification");
 
