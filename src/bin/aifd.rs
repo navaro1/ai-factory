@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -66,7 +67,15 @@ fn run(config_path: Option<&Path>, socket_path: &Path) -> anyhow::Result<()> {
     eprintln!("aifd: listening on {}", socket_path.display());
     let (poll_tx, poll_rx) = mpsc::channel();
     let pollers = poll::spawn_pollers(&config, poll_tx);
-    let daemon = Daemon::new(config, poll_rx, pollers.wake, action_rx);
+    let mut daemon = Daemon::new(config, poll_rx, pollers.wake, action_rx);
+    // Every dirty drive of the loop hands its state view to the socket
+    // server. The Arc clone in the pusher dies with the daemon inside
+    // `run`, so this `drop` still stops the server last.
+    let server = Arc::new(server);
+    daemon.set_pusher(Box::new({
+        let server = Arc::clone(&server);
+        move |view| server.publish(view)
+    }));
     let result = daemon.run();
     drop(server);
     result
