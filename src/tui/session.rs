@@ -411,14 +411,14 @@ impl SessionView {
         self.scroll_up == 0
     }
 
-    /// True when the shown task accepts no chat message.
+    /// True when the input bar accepts no chat message.
     ///
-    /// A closed input swallows typing and Enter, so the shell never sends
-    /// the daemon a message it would drop.
-    fn input_is_closed(&self) -> bool {
+    /// A missing task and a closed task disable the bar. The bar swallows
+    /// typing and Enter, so the shell sends no message it cannot deliver.
+    fn input_is_disabled(&self) -> bool {
         self.task
             .as_ref()
-            .is_some_and(|task| matches!(task.input, InputMode::Closed { .. }))
+            .is_none_or(|task| matches!(task.input, InputMode::Closed { .. }))
     }
 
     /// Handle one key press. Returns the action to send to the daemon.
@@ -436,13 +436,13 @@ impl SessionView {
             return None;
         }
         let page = usize::from(page.max(1));
-        let closed = self.input_is_closed();
+        let disabled = self.input_is_disabled();
         match (key.code, key.modifiers) {
             (KeyCode::Char('x'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 let task = self.task.as_ref()?.id.clone();
                 Some(Action::Abort { task })
             }
-            (KeyCode::Enter, _) if !closed => {
+            (KeyCode::Enter, _) if !disabled => {
                 let task = self.task.as_ref()?.id.clone();
                 let text = std::mem::take(&mut self.input);
                 if text.trim().is_empty() {
@@ -451,12 +451,13 @@ impl SessionView {
                 Some(Action::Chat { task, text })
             }
             (KeyCode::Char(letter), modifiers)
-                if !closed && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !disabled
+                    && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.input.push(letter);
                 None
             }
-            (KeyCode::Backspace, _) if !closed => {
+            (KeyCode::Backspace, _) if !disabled => {
                 self.input.pop();
                 None
             }
@@ -618,13 +619,11 @@ impl SessionView {
 
         // The hint states what Enter will do for this task. A closed bar
         // shows the daemon's reason and renders dim.
-        let (hint, closed) = match &self.task {
-            Some(task) => (
-                input_hint(&task.input),
-                matches!(task.input, InputMode::Closed { .. }),
-            ),
-            None => ("enter send · ctrl-x abort · end tail".to_string(), false),
+        let hint = match &self.task {
+            Some(task) => input_hint(&task.input),
+            None => "select a task to chat".to_string(),
         };
+        let disabled = self.input_is_disabled();
         let mut block = Block::default()
             .borders(Borders::ALL)
             .title(" chat ")
@@ -633,7 +632,7 @@ impl SessionView {
         content.push_str(&self.input);
         content.push('▏');
         let mut line = Line::from(content);
-        if closed {
+        if disabled {
             block = block
                 .border_style(THEME.dim())
                 .title_style(transcript::dim_style());
@@ -1122,15 +1121,15 @@ mod tests {
     fn the_draw_fits_into_a_one_row_area() {
         let view = SessionView::new();
 
-        let backend = TestBackend::new(20, 1);
+        let backend = TestBackend::new(30, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| view.draw(frame, Rect::new(0, 0, 20, 1), &[]))
+            .draw(|frame| view.draw(frame, Rect::new(0, 0, 30, 1), &[]))
             .unwrap();
 
         let screen = terminal.backend().to_string();
         assert!(
-            screen.contains("abort"),
+            screen.contains("select a task to chat"),
             "one row shows the input bar hint: {screen}"
         );
     }
@@ -1280,6 +1279,24 @@ mod tests {
                 task: "borsuk/implement-i142".to_string(),
                 text: "hi".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn no_selected_task_disables_the_input_bar() {
+        let mut view = SessionView::new();
+
+        assert_eq!(view.handle_key(letter('h'), 10), None);
+        assert!(view.input.is_empty(), "a disabled bar swallows text");
+        assert_eq!(view.handle_key(key(KeyCode::Enter), 10), None);
+
+        let screen = drawn_screen(&view);
+        assert!(screen.contains("select a task to chat"), "bar: {screen}");
+        assert!(!screen.contains("enter send"), "bar: {screen}");
+        assert_eq!(
+            drawn_border_style(&view).fg,
+            Some(Color::DarkGray),
+            "a disabled bar renders dim"
         );
     }
 
