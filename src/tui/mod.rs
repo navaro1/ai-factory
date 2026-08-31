@@ -5,11 +5,18 @@
 //! - The key reader thread turns crossterm events into `Msg` values.
 //! - The socket reader thread connects to the daemon, turns pushes into
 //!   `Msg` values, and reconnects with `backoff_delay`.
-//! - The main thread owns the `App`, blocks on the one channel, and draws
-//!   one frame per message. Nothing draws on a timer.
+//! - The main thread owns the `App` and blocks on the one channel. It draws
+//!   one frame per message. The session view also draws when its file poll
+//!   finds new log data.
 //!
-//! The shell draws the pipeline view itself. Later chunks replace the session
-//! and inbox placeholders.
+//! The shell draws the pipeline view itself and drives the session and
+//! inbox views through their contracts: `show`, `on_redraw`, `draw`, and
+//! `poll`, and `handle_key` for the session, and `observe`, `draw`, and
+//! `handle_key` for the inbox.
+//!
+//! A view that holds the keyboard for text input keeps a typed `q` away
+//! from the quit handler. The `!` inbox key and the ctrl-q and ctrl-c quit
+//! chords work from every view.
 
 pub mod inbox;
 pub mod pipeline;
@@ -19,12 +26,12 @@ pub mod transcript;
 
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -36,7 +43,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::sock::{Client, Push, StateView};
+use crate::decisions::DecisionKind;
+use crate::model::{ItemKind, Stage};
+use crate::sock::{Action, Client, Push, StateView, TaskView};
+use inbox::{ActionSink, Inbox};
+use session::SessionView;
 use theme::THEME;
 
 /// The view the shell shows.
@@ -81,6 +92,89 @@ enum Msg {
     Input(String),
 }
 
+/// The task the shell chose for the session view.
+///
+/// The daemon creates a refine task some time after an `r` or `n` key. The
+/// choice waits in the app until a state push carries the matching task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wanted {
+    /// A refine task of one item.
+    Refine {
+        /// The repository alias.
+        repo: String,
+        /// The item kind.
+        kind: ItemKind,
+        /// The item number.
+        number: u64,
+    },
+    /// The ticket-creation task of one repository.
+    Create {
+        /// The repository alias.
+        repo: String,
+    },
+}
+
+impl Wanted {
+    /// True when `task` is the task this choice waits for.
+    ///
+    /// A ticket creation turns into the refine task of item zero, which is
+    /// how the daemon names its ticket-creation session.
+    fn matches(&self, task: &TaskView) -> bool {
+        let refine = task.stage == Stage::Refine;
+        match self {
+            Wanted::Refine { repo, kind, number } => {
+                refine && task.repo == *repo && task.kind == *kind && task.number == *number
+            }
+            Wanted::Create { repo } => {
+                refine && task.repo == *repo && task.kind == ItemKind::Issue && task.number == 0
+            }
+        }
+    }
+}
+
+/// One action that waits for the operator to confirm it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Confirm {
+    /// Abort one task.
+    Abort {
+        /// The task id.
+        task: String,
+    },
+    /// Fire one release train with the stacked pull requests.
+    Go {
+        /// The repository alias.
+        repo: String,
+        /// The pull request numbers in the batch.
+        prs: Vec<u64>,
+    },
+}
+
+impl Confirm {
+    /// Send the confirmed action and toast what was sent.
+    fn send(self, app: &mut App, sink: &mut impl ActionSink) {
+        match self {
+            Confirm::Abort { task } => emit(
+                app,
+                sink,
+                Action::Abort { task: task.clone() },
+                format!("sent abort {task}"),
+            ),
+            Confirm::Go { repo, prs } => emit(
+                app,
+                sink,
+                Action::Go {
+                    repo: repo.clone(),
+                    prs: prs.clone(),
+                },
+                format!("sent release {repo} {}", pr_text(&prs)),
+            ),
+        }
+    }
+}
+
+/// How long a toast stays on screen.
+const TOAST_TIME: Duration = Duration::from_secs(3);
+
 /// The model the main loop owns.
 #[derive(Debug, Default)]
 struct App {
@@ -98,15 +192,42 @@ struct App {
     help: bool,
     /// The reason the daemon went away, for the banner.
     disconnect: Option<String>,
+    /// The session view with its transcript and input bar.
+    session: SessionView,
+    /// The decisions inbox.
+    inbox: Inbox,
+    /// The task id the session view follows.
+    session_task: Option<String>,
+    /// The task the shell still waits for, from `r` or `n`.
+    wanted: Option<Wanted>,
+    /// The action that waits for the operator to confirm it.
+    confirm: Option<Confirm>,
+    /// The body rectangle of the last drawn frame.
+    body: Rect,
 }
 
 impl App {
     /// Apply one state push.
     ///
     /// The push proves the connection, clamps the selection to the new row
-    /// count, and drops an expired toast.
+    /// count, and drops an expired toast. It feeds the inbox and follows
+    /// the session task, so both views stay in step with the daemon.
     fn apply_state(&mut self, view: StateView) {
         let count = pipeline::rows(&view).len();
+        self.inbox.observe(&view);
+        let wanted_task = self.wanted.as_ref().and_then(|wanted| {
+            view.tasks
+                .iter()
+                .rfind(|task| wanted.matches(task))
+                .cloned()
+        });
+        let shown_task = match &wanted_task {
+            Some(task) => Some(task.clone()),
+            None => self
+                .session_task
+                .as_deref()
+                .and_then(|id| view.tasks.iter().find(|task| task.id == id).cloned()),
+        };
         self.state = Some(view);
         self.connected = true;
         self.disconnect = None;
@@ -120,6 +241,13 @@ impl App {
             .is_some_and(|(_, until)| Instant::now() >= *until)
         {
             self.toast = None;
+        }
+        if let Some(task) = wanted_task {
+            self.session_task = Some(task.id.clone());
+            self.wanted = None;
+            self.session.show(&task);
+        } else if let Some(task) = shown_task {
+            self.session.show(&task);
         }
     }
 
@@ -135,21 +263,240 @@ impl App {
         (Instant::now() < *until).then_some(text.as_str())
     }
 
+    /// Toast `text` for one toast period.
+    fn show_toast(&mut self, text: &str) {
+        self.toast = Some((text.to_string(), Instant::now() + TOAST_TIME));
+    }
+
+    /// True while a view holds the keyboard for text input.
+    ///
+    /// The session view always owns its input bar. The inbox owns it while
+    /// a reason input is open.
+    fn text_focus(&self) -> bool {
+        match self.view {
+            View::Session => true,
+            View::Inbox => self.inbox.typing(),
+            View::Pipeline => false,
+        }
+    }
+
+    /// The visible transcript height of the session view.
+    ///
+    /// The session view draws a one-row task header and a three-row input
+    /// bar around the transcript. The last drawn frame supplies the height.
+    fn session_page(&self) -> u16 {
+        self.body.height.saturating_sub(4).max(1)
+    }
+
+    /// Show the session task from the current state, if it is still there.
+    fn show_session_task(&mut self) {
+        let Some(id) = self.session_task.clone() else {
+            return;
+        };
+        let Some(task) = self
+            .state
+            .as_ref()
+            .and_then(|state| state.tasks.iter().find(|task| task.id == id).cloned())
+        else {
+            return;
+        };
+        self.session.show(&task);
+    }
+
+    /// Enter the inbox view and select its oldest row, as `!` promises.
+    fn open_inbox_oldest(&mut self) {
+        self.view = View::Inbox;
+        if let Some(state) = self.state.as_ref() {
+            self.inbox.select_oldest(state);
+        }
+    }
+
     /// Apply one key press. Returns false when the app wants to quit.
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Char('q') => return false,
-            KeyCode::Char('?') => self.help = !self.help,
-            KeyCode::Esc if self.help => self.help = false,
-            _ if self.help => {}
-            KeyCode::Char('1') => self.view = View::Pipeline,
-            KeyCode::Char('2') => self.view = View::Session,
-            KeyCode::Char('3') => self.view = View::Inbox,
-            KeyCode::Char('j') if self.view == View::Pipeline => pipeline::move_selection(self, 1),
-            KeyCode::Char('k') if self.view == View::Pipeline => pipeline::move_selection(self, -1),
-            _ => {}
+    ///
+    /// The quit chords and the inbox key work in every state. A view that
+    /// holds text input keeps a typed `q` away from the quit handler.
+    fn handle_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
+        if quit_chord(key) {
+            return false;
+        }
+        if inbox_key(key) {
+            self.confirm = None;
+            self.help = false;
+            self.open_inbox_oldest();
+            return true;
+        }
+        if self.confirm.is_some() {
+            self.confirm_key(key, sink);
+            return true;
+        }
+        if self.help {
+            if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+                self.help = false;
+            }
+            return true;
+        }
+        if key.code == KeyCode::Char('q') && !self.text_focus() {
+            return false;
+        }
+        match self.view {
+            View::Session => {
+                if let Some(action) = self.session.handle_key(key, self.session_page()) {
+                    let text = match &action {
+                        Action::Chat { task, .. } => format!("sent chat {task}"),
+                        Action::Abort { task } => format!("sent abort {task}"),
+                        _ => "sent".to_string(),
+                    };
+                    emit(self, sink, action, text);
+                }
+                if key.code == KeyCode::Esc {
+                    self.view = View::Pipeline;
+                }
+            }
+            View::Inbox if self.inbox.typing() => {
+                self.inbox_dispatch(key, sink);
+            }
+            View::Inbox => {
+                if digit_key(key) && self.inbox_row_owns(key) {
+                    self.inbox_dispatch(key, sink);
+                    return true;
+                }
+                match key.code {
+                    KeyCode::Char('1') => self.view = View::Pipeline,
+                    KeyCode::Char('2') => self.view = View::Session,
+                    KeyCode::Char('3') => {}
+                    KeyCode::Char('?') => self.help = true,
+                    KeyCode::Esc => self.view = View::Pipeline,
+                    _ => {
+                        self.inbox_dispatch(key, sink);
+                    }
+                }
+            }
+            View::Pipeline => match key.code {
+                KeyCode::Char('1') => {}
+                KeyCode::Char('2') => self.view = View::Session,
+                KeyCode::Char('3') => self.view = View::Inbox,
+                KeyCode::Char('?') => self.help = true,
+                KeyCode::Char('j') => pipeline::move_selection(self, 1),
+                KeyCode::Char('k') => pipeline::move_selection(self, -1),
+                _ => pipeline::handle_key(self, key, sink),
+            },
         }
         true
+    }
+
+    /// Apply one key to the confirmation prompt.
+    ///
+    /// `y` sends the confirmed action. Escape cancels it. Every other key
+    /// waits, so the prompt cannot be dismissed by accident.
+    fn confirm_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) {
+        match key.code {
+            KeyCode::Char('y') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+                if let Some(confirm) = self.confirm.take() {
+                    confirm.send(self, sink);
+                }
+            }
+            KeyCode::Esc => self.confirm = None,
+            _ => {}
+        }
+    }
+
+    /// True when the kind of the selected inbox row consumes this key, so
+    /// it must not reach the global handler.
+    ///
+    /// A `Question` row numbers its options with the digits, and a
+    /// `ReleaseGate` row toggles pull requests with them.
+    fn inbox_row_owns(&self, key: KeyEvent) -> bool {
+        if !digit_key(key) {
+            return false;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
+        let Some(id) = self.inbox.selected_id() else {
+            return false;
+        };
+        let Some(decision) = state.decisions.iter().find(|decision| decision.id == id) else {
+            return false;
+        };
+        matches!(
+            decision.kind,
+            DecisionKind::Question { .. } | DecisionKind::ReleaseGate { .. }
+        )
+    }
+
+    /// Apply one key to the inbox and report whether an action crossed.
+    ///
+    /// A sent action toasts. An open-session outcome switches to the
+    /// session view of that task.
+    fn inbox_dispatch(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
+        let mut counted = CountingSink {
+            inner: sink,
+            sent: 0,
+        };
+        let outcome = self.inbox.handle_key(state, key, &mut counted);
+        let sent = counted.sent > 0;
+        if sent {
+            self.show_toast("sent");
+        }
+        if let inbox::InboxOutcome::OpenSession(task) = outcome {
+            self.session_task = Some(task);
+            self.wanted = None;
+            self.view = View::Session;
+            self.show_session_task();
+        }
+        sent
+    }
+}
+
+/// True when the key combination quits the UI from anywhere.
+fn quit_chord(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c'))
+}
+
+/// True when this key opens the inbox from any view.
+fn inbox_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('!')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+/// True when the key is one of the digit keys 1 through 9.
+fn digit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('1'..='9'))
+}
+
+/// Send one action to the sink and toast what was sent.
+fn emit(app: &mut App, sink: &mut impl ActionSink, action: Action, toast: String) {
+    sink.send_action(action);
+    app.show_toast(&toast);
+}
+
+/// The pull request numbers as `#3 #7`.
+fn pr_text(prs: &[u64]) -> String {
+    prs.iter()
+        .map(|pr| format!("#{pr}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An action sink that counts the actions that cross it.
+struct CountingSink<'a, S: ActionSink> {
+    /// The sink the actions go to.
+    inner: &'a mut S,
+    /// How many actions crossed.
+    sent: usize,
+}
+
+impl<S: ActionSink> ActionSink for CountingSink<'_, S> {
+    fn send_action(&mut self, action: Action) {
+        self.sent += 1;
+        self.inner.send_action(action);
     }
 }
 
@@ -167,7 +514,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// The trait exists so tests can count draws without a real terminal.
 trait Surface {
     /// Draw one frame of the app.
-    fn draw(&mut self, app: &App) -> Result<()>;
+    fn draw(&mut self, app: &mut App) -> Result<()>;
 }
 
 /// The drawing surface over the real terminal.
@@ -176,11 +523,68 @@ struct RealTerminal {
 }
 
 impl Surface for RealTerminal {
-    fn draw(&mut self, app: &App) -> Result<()> {
-        self.terminal
-            .draw(|frame| render(frame, app))
-            .context("cannot draw a frame")?;
-        Ok(())
+    fn draw(&mut self, app: &mut App) -> Result<()> {
+        let mut render_result = Ok(());
+        let terminal_result = self
+            .terminal
+            .draw(|frame| render_result = render(frame, app))
+            .map(|_| ())
+            .context("cannot draw a frame");
+        finish_draw(terminal_result, render_result)
+    }
+}
+
+/// Combine the terminal and render results without hiding either error.
+fn finish_draw(terminal: Result<()>, render: Result<()>) -> Result<()> {
+    match (terminal, render) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(terminal), Err(render)) => Err(anyhow!("{terminal:#}; {render:#}")),
+    }
+}
+
+/// The action sink over the daemon socket.
+///
+/// The link opens the socket on the first send and reopens it once when
+/// the daemon went away. A send that still fails is reported on stderr.
+struct DaemonLink {
+    /// The path of the daemon socket.
+    socket: PathBuf,
+    /// The open client, if any.
+    client: Option<Client>,
+}
+
+impl ActionSink for DaemonLink {
+    fn send_action(&mut self, action: Action) {
+        if self.client.is_none() {
+            self.client = self.connect();
+        }
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        if client.send(&action).is_ok() {
+            return;
+        }
+        // The daemon went away. One fresh connection gets one new try.
+        self.client = self.connect();
+        if let Some(client) = self.client.as_mut() {
+            if let Err(error) = client.send(&action) {
+                eprintln!("tui: cannot send the action to the daemon: {error:#}");
+            }
+        }
+    }
+}
+
+impl DaemonLink {
+    /// Open the daemon socket, and report a failure on stderr.
+    fn connect(&mut self) -> Option<Client> {
+        match Client::connect(&self.socket) {
+            Ok(client) => Some(client),
+            Err(error) => {
+                eprintln!("tui: cannot connect to the daemon: {error:#}");
+                None
+            }
+        }
     }
 }
 
@@ -265,7 +669,11 @@ pub fn run(socket: &Path) -> Result<()> {
     spawn_key_thread(tx.clone());
     spawn_socket_thread(tx, socket.to_path_buf());
     let mut app = App::default();
-    run_loop(&mut surface, &mut app, rx.into_iter())
+    let mut link = DaemonLink {
+        socket: socket.to_path_buf(),
+        client: None,
+    };
+    run_loop(&mut surface, &mut app, &rx, &mut link)
 }
 
 /// Read crossterm events until the channel dies.
@@ -339,36 +747,103 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
     });
 }
 
-/// Consume messages until the app quits or the channel dies.
+/// Consume messages and session file changes until the app quits.
 ///
-/// Every handled message leads to one draw. A quiet channel causes no draw.
+/// Every handled message leads to one draw. The pipeline and inbox block
+/// without a deadline. The session adds one file poll deadline and draws
+/// only when that poll finds new visible log data.
 fn run_loop(
     surface: &mut impl Surface,
     app: &mut App,
+    rx: &Receiver<Msg>,
+    sink: &mut impl ActionSink,
+) -> Result<()> {
+    loop {
+        let msg = if app.view == View::Session {
+            match rx.recv_timeout(session::POLL_INTERVAL) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => {
+                    let now = Instant::now();
+                    if app.session.poll(now) {
+                        draw_app(surface, app, now)?;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => return Ok(()),
+            }
+        };
+        if !handle_message(app, msg, sink)? {
+            return Ok(());
+        }
+        draw_app(surface, app, Instant::now())?;
+    }
+}
+
+/// Apply one shell message. False requests a clean exit.
+fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result<bool> {
+    match msg {
+        Msg::Key(key) => Ok(app.handle_key(key, sink)),
+        Msg::State(view) => {
+            app.apply_state(view);
+            Ok(true)
+        }
+        Msg::Connected => {
+            app.connected = true;
+            Ok(true)
+        }
+        Msg::Disconnected(reason) => {
+            app.mark_disconnected(reason);
+            Ok(true)
+        }
+        Msg::Input(reason) => Err(anyhow!("terminal input stopped: {reason}")),
+        Msg::Resize => Ok(true),
+    }
+}
+
+/// Read the session log and draw one frame.
+fn draw_app(surface: &mut impl Surface, app: &mut App, now: Instant) -> Result<()> {
+    if app.view == View::Session {
+        app.session.on_redraw(now);
+    }
+    surface.draw(app)
+}
+
+/// Run a finite message list through the same handlers in a test.
+#[cfg(test)]
+fn run_messages(
+    surface: &mut impl Surface,
+    app: &mut App,
     msgs: impl Iterator<Item = Msg>,
+    sink: &mut impl ActionSink,
 ) -> Result<()> {
     for msg in msgs {
-        match msg {
-            Msg::Key(key) => {
-                if !app.handle_key(key) {
-                    return Ok(());
-                }
-            }
-            Msg::State(view) => app.apply_state(view),
-            Msg::Connected => app.connected = true,
-            Msg::Disconnected(reason) => app.mark_disconnected(reason),
-            Msg::Input(reason) => return Err(anyhow!("terminal input stopped: {reason}")),
-            Msg::Resize => {}
+        if !handle_message(app, msg, sink)? {
+            return Ok(());
         }
-        surface.draw(app)?;
+        draw_app(surface, app, Instant::now())?;
     }
     Ok(())
 }
 
 /// Draw the whole shell into the frame.
 ///
-/// Later chunks replace the session and inbox placeholders.
-fn render(f: &mut Frame, app: &App) {
+/// The call records the body rectangle on the app, so the next key press
+/// knows the visible transcript height of the session view.
+fn render(f: &mut Frame, app: &mut App) -> Result<()> {
+    render_with_clock(f, app, inbox::now_ms)
+}
+
+/// Draw the shell with an injected inbox clock.
+fn render_with_clock(
+    f: &mut Frame,
+    app: &mut App,
+    clock: impl FnOnce() -> Result<u64>,
+) -> Result<()> {
     let area = f.area();
     let (header, body, footer) = if app.connected {
         let chunks = Layout::vertical([
@@ -389,17 +864,35 @@ fn render(f: &mut Frame, app: &App) {
         draw_banner(f, app, chunks[1]);
         (chunks[0], chunks[2], chunks[3])
     };
+    app.body = body;
     draw_header(f, app, header);
     match app.view {
-        View::Pipeline => pipeline::draw(f, app, body),
-        View::Session => draw_placeholder(f, "session", body),
-        View::Inbox => draw_placeholder(f, "inbox", body),
+        View::Pipeline => {
+            let now = clock().context("cannot read the system clock")?;
+            pipeline::draw(f, app, body, now);
+        }
+        View::Session => {
+            let decisions = app
+                .state
+                .as_ref()
+                .map(|state| state.decisions.as_slice())
+                .unwrap_or(&[]);
+            app.session.draw(f, body, decisions);
+        }
+        View::Inbox => {
+            if let Some(state) = app.state.as_ref() {
+                let now = clock().context("cannot read the system clock")?;
+                inbox::draw(f, body, state, &app.inbox, now);
+            }
+        }
     }
     draw_toast(f, app, body);
-    draw_footer(f, footer);
+    draw_footer(f, app, footer);
+    draw_confirm(f, app, area);
     if app.help {
         draw_help(f, area);
     }
+    Ok(())
 }
 
 /// Draw the title row: app name, view tabs, pause flag, and socket state.
@@ -469,16 +962,32 @@ fn banner_text(app: &App) -> String {
     }
 }
 
-/// Draw the key hints of this chunk.
-fn draw_footer(f: &mut Frame, area: Rect) {
-    let hints = Span::styled(" 1/2/3 views   j/k move   ? help   q quit ", THEME.dim());
-    f.render_widget(Paragraph::new(Line::from(hints)), area);
-}
-
-/// Draw a placeholder for a view that a later chunk wires in.
-fn draw_placeholder(f: &mut Frame, name: &str, area: Rect) {
-    let text = Span::styled(format!(" the {name} view is not wired yet "), THEME.dim());
-    f.render_widget(Paragraph::new(Line::from(text)), area);
+/// Draw the key hints and the inbox badge.
+///
+/// The badge renders in every view, so an open decision stays visible from
+/// anywhere.
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
+    let hints = Span::styled(
+        " 1/2/3 views   j/k move   ! inbox   ? help   ctrl-q quit ",
+        THEME.dim(),
+    );
+    f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
+    let Some(state) = app.state.as_ref() else {
+        return;
+    };
+    let style = if inbox::open_count(state) > 0 {
+        Style::default().fg(THEME.warn).add_modifier(Modifier::BOLD)
+    } else {
+        THEME.dim()
+    };
+    let badge = inbox::badge(state);
+    f.render_widget(
+        Paragraph::new(badge)
+            .style(style)
+            .alignment(Alignment::Right),
+        sides[1],
+    );
 }
 
 /// Draw the fresh toast at the lower right of the body.
@@ -500,18 +1009,52 @@ fn draw_toast(f: &mut Frame, app: &App, body: Rect) {
     f.render_widget(Paragraph::new(text).style(THEME.toast()), area);
 }
 
+/// Draw the confirmation prompt over the view.
+///
+/// The prompt names the action and lists the pull requests of a release.
+fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some(confirm) = app.confirm.as_ref() else {
+        return;
+    };
+    let question = match confirm {
+        Confirm::Abort { task } => format!("abort {task}?"),
+        Confirm::Go { repo, prs } => format!("release {repo}: {}", pr_text(prs)),
+    };
+    let hint = "y confirm - esc cancel";
+    let width = question.chars().count().max(hint.len()) as u16 + 6;
+    let panel = centered(width, 5, area);
+    f.render_widget(Clear, panel);
+    let lines = vec![
+        Line::from(Span::raw(question)),
+        Line::from(String::new()),
+        Line::from(Span::styled(hint, THEME.dim())),
+    ];
+    let block = Paragraph::new(lines).block(Block::bordered().title(" confirm "));
+    f.render_widget(block, panel);
+}
+
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(40, 9, area);
+    let panel = centered(44, 19, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 7] = [
-        ("1", "pipeline view"),
-        ("2", "session view"),
-        ("3", "inbox view"),
-        ("j", "move down"),
-        ("k", "move up"),
+    let rows: [(&str, &str); 17] = [
+        ("1 2 3", "switch view"),
+        ("esc", "home view"),
+        ("!", "inbox, oldest decision"),
+        ("j k", "move the selection"),
         ("?", "toggle this help"),
-        ("q", "quit"),
+        ("ctrl-q", "quit"),
+        ("+ -", "stage limit / repo lane"),
+        ("p P", "pause scope / all"),
+        ("r n", "refine / new ticket"),
+        ("x R", "abort / retry"),
+        ("space g s", "stack / release / policy"),
+        ("enter", "send the chat message"),
+        ("ctrl-x", "abort the shown task"),
+        ("PageUp PageDown", "scroll the transcript"),
+        ("End", "follow the tail"),
+        ("y n i t c", "inbox answers"),
+        ("g", "fire the release gate"),
     ];
     let lines: Vec<Line> = rows
         .iter()
@@ -544,9 +1087,13 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Stage;
+    use crate::decisions::Decision;
+    use crate::model::ItemKind;
+    use crate::tasks::{Task, TaskState};
     use crate::tui::pipeline::render_to_string;
     use std::cell::Cell;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -556,7 +1103,7 @@ mod tests {
     }
 
     impl Surface for CountingSurface {
-        fn draw(&mut self, _app: &App) -> Result<()> {
+        fn draw(&mut self, _app: &mut App) -> Result<()> {
             self.draws += 1;
             Ok(())
         }
@@ -569,10 +1116,33 @@ mod tests {
     }
 
     impl Surface for SharedCountingSurface {
-        fn draw(&mut self, _app: &App) -> Result<()> {
+        fn draw(&mut self, _app: &mut App) -> Result<()> {
             self.draws.fetch_add(1, Ordering::SeqCst);
             self.drew.send(()).context("cannot report a test draw")?;
             Ok(())
+        }
+    }
+
+    /// A surface that publishes the visible text of each frame.
+    struct FrameSurface {
+        drew: Sender<String>,
+    }
+
+    impl Surface for FrameSurface {
+        fn draw(&mut self, app: &mut App) -> Result<()> {
+            self.drew
+                .send(render_to_string(app))
+                .context("cannot report a test frame")
+        }
+    }
+
+    /// An action sink that records what it sent.
+    #[derive(Default)]
+    struct FakeSink(Vec<Action>);
+
+    impl ActionSink for FakeSink {
+        fn send_action(&mut self, action: Action) {
+            self.0.push(action);
         }
     }
 
@@ -582,6 +1152,24 @@ mod tests {
             KeyCode::Char(character),
             crossterm::event::KeyModifiers::empty(),
         ))
+    }
+
+    /// A key press of one raw key code.
+    fn key_code(code: KeyCode) -> Msg {
+        Msg::Key(KeyEvent::new(code, crossterm::event::KeyModifiers::empty()))
+    }
+
+    /// One permission decision for `borsuk/implement-i140`.
+    fn permission_decision(request_id: &str, opened_ms: u64) -> Decision {
+        let task = Task::new(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            140,
+            PathBuf::from("borsuk-implement-i140.jsonl"),
+            1_000,
+        );
+        Decision::permission(&task, request_id, "Write", serde_json::json!({}), opened_ms)
     }
 
     #[test]
@@ -629,7 +1217,8 @@ mod tests {
                 drew: draw_tx,
             };
             let mut app = App::default();
-            run_loop(&mut surface, &mut app, msg_rx.into_iter())
+            let mut sink = FakeSink::default();
+            run_loop(&mut surface, &mut app, &msg_rx, &mut sink)
         });
 
         msg_tx.send(Msg::Resize).unwrap();
@@ -647,13 +1236,62 @@ mod tests {
     }
 
     #[test]
+    fn the_session_poll_draws_new_log_text_without_an_input_message() {
+        let dir = std::env::temp_dir().join(format!("aif-session-poll-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("task.jsonl");
+        fs::write(&log, "first\n").unwrap();
+
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].log_path = log.clone();
+        let mut app = App::default();
+        app.apply_state(state);
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        let (draw_tx, draw_rx) = channel();
+        let (msg_tx, msg_rx) = channel();
+        let handle = thread::spawn(move || {
+            let mut surface = FrameSurface { drew: draw_tx };
+            let mut sink = FakeSink::default();
+            run_loop(&mut surface, &mut app, &msg_rx, &mut sink)
+        });
+
+        msg_tx.send(Msg::Resize).unwrap();
+        let first = draw_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(first.contains("first"), "initial frame: {first}");
+        assert_eq!(
+            draw_rx.recv_timeout(session::POLL_INTERVAL * 2),
+            Err(RecvTimeoutError::Timeout),
+            "an unchanged log must not cause a periodic draw"
+        );
+
+        fs::write(&log, "first\nsecond\n").unwrap();
+        let second = draw_rx.recv_timeout(session::POLL_INTERVAL * 3).ok();
+
+        let ctrl_q = Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        msg_tx.send(ctrl_q).unwrap();
+        handle.join().unwrap().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+
+        let second = second.expect("the file poll did not draw a new frame");
+        assert!(second.contains("second"), "polled frame: {second}");
+    }
+
+    #[test]
     fn the_loop_stops_on_q_without_a_last_draw() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
-        run_loop(
+        let mut sink = FakeSink::default();
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view()), key('q')].into_iter(),
+            &mut sink,
         )
         .unwrap();
         assert_eq!(surface.draws, 1);
@@ -663,27 +1301,49 @@ mod tests {
     fn keys_switch_views_and_toggle_help() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
-        run_loop(&mut surface, &mut app, vec![key('3'), key('?')].into_iter()).unwrap();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('3'), key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
         assert_eq!(app.view, View::Inbox);
         assert!(app.help);
         // While the overlay is open, the view keys do nothing.
-        run_loop(&mut surface, &mut app, vec![key('1')].into_iter()).unwrap();
-        assert_eq!(app.view, View::Inbox);
-        // Escape closes the overlay, then the view keys work again.
-        run_loop(
+        run_messages(
             &mut surface,
             &mut app,
-            vec![Msg::Key(KeyEvent::new(
-                KeyCode::Esc,
-                crossterm::event::KeyModifiers::empty(),
-            ))]
-            .into_iter(),
+            vec![key('1')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox);
+        // Escape closes the overlay, then the view keys work again.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc)].into_iter(),
+            &mut sink,
         )
         .unwrap();
         assert!(!app.help);
-        run_loop(&mut surface, &mut app, vec![key('1')].into_iter()).unwrap();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('1')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
         assert_eq!(app.view, View::Pipeline);
-        run_loop(&mut surface, &mut app, vec![key('?')].into_iter()).unwrap();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
         assert!(app.help);
     }
 
@@ -694,10 +1354,12 @@ mod tests {
             selection: Selection::Row(10_000),
             ..App::default()
         };
-        run_loop(
+        let mut sink = FakeSink::default();
+        run_messages(
             &mut surface,
             &mut app,
             vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
         )
         .unwrap();
         assert!(app.connected);
@@ -725,8 +1387,8 @@ mod tests {
 
     #[test]
     fn an_unconnected_app_shows_the_connecting_banner() {
-        let app = App::default();
-        let text = render_to_string(&app);
+        let mut app = App::default();
+        let text = render_to_string(&mut app);
         assert!(text.contains("connecting to the daemon"));
         assert!(text.contains("down"));
         assert!(text.contains("waiting for the first state push"));
@@ -734,13 +1396,13 @@ mod tests {
 
     #[test]
     fn a_disconnected_app_keeps_the_last_state_under_the_banner() {
-        let app = App {
+        let mut app = App {
             state: Some(crate::tui::pipeline::sample_view()),
             connected: false,
             disconnect: Some("no such file".to_string()),
             ..App::default()
         };
-        let text = render_to_string(&app);
+        let text = render_to_string(&mut app);
         assert!(text.contains("daemon disconnected - reconnecting"));
         // The last state stays visible below the banner.
         assert!(text.contains("refine"));
@@ -749,33 +1411,40 @@ mod tests {
 
     #[test]
     fn the_help_overlay_lists_the_keys_of_this_chunk() {
-        let app = App {
+        let mut app = App {
             help: true,
             ..App::default()
         };
-        let text = render_to_string(&app);
+        let text = render_to_string(&mut app);
         assert!(text.contains("keys"));
-        assert!(text.contains("pipeline view"));
-        assert!(text.contains("move down"));
-        assert!(text.contains("quit"));
+        for entry in [
+            "switch view",
+            "oldest decision",
+            "ctrl-q",
+            "PageUp PageDown",
+            "PageDown",
+            "End",
+        ] {
+            assert!(text.contains(entry), "the help misses {entry}");
+        }
 
-        let closed = App::default();
-        let text = render_to_string(&closed);
-        assert!(!text.contains("pipeline view"));
+        let mut closed = App::default();
+        let text = render_to_string(&mut closed);
+        assert!(!text.contains("PageUp"));
     }
 
     #[test]
     fn a_fresh_toast_shows_and_an_expired_one_does_not() {
-        let fresh = App {
+        let mut fresh = App {
             toast: Some(("sent".to_string(), Instant::now() + Duration::from_secs(4))),
             ..App::default()
         };
-        assert!(render_to_string(&fresh).contains("sent"));
-        let expired = App {
+        assert!(render_to_string(&mut fresh).contains("sent"));
+        let mut expired = App {
             toast: Some(("sent".to_string(), Instant::now())),
             ..App::default()
         };
-        assert!(!render_to_string(&expired).contains("sent"));
+        assert!(!render_to_string(&mut expired).contains("sent"));
     }
 
     #[test]
@@ -783,14 +1452,550 @@ mod tests {
         let mut state = crate::tui::pipeline::sample_view();
         state.paused.global = true;
         state.paused.stages = vec![Stage::Refine];
-        let app = App {
+        let mut app = App {
             state: Some(state),
             connected: true,
             ..App::default()
         };
-        let text = render_to_string(&app);
+        let text = render_to_string(&mut app);
         assert!(text.contains("live"));
         assert!(text.contains("paused"));
+    }
+
+    #[test]
+    fn q_types_into_the_session_input_and_never_quits() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+        assert!(app.session.is_showing("borsuk/refine-i142"));
+
+        // The loop keeps running: the next key still reaches the app, and
+        // both letters land in the input buffer.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('q'), key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("q?▏"), "session screen: {screen}");
+        assert!(!app.help, "the question mark went into the buffer too");
+    }
+
+    #[test]
+    fn the_quit_chord_stops_the_loop_from_anywhere() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let ctrl_q = Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![ctrl_q, key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(!app.help, "the loop stopped at the quit chord");
+    }
+
+    #[test]
+    fn q_types_into_the_inbox_reason_and_never_quits() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('3'), key('n'), key('q'), key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(!app.help, "the letters went into the reason input");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("reason: q?"), "screen: {text}");
+    }
+
+    #[test]
+    fn bang_enters_the_inbox_and_selects_the_oldest_row() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox);
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+    }
+
+    #[test]
+    fn bang_enters_the_inbox_from_the_session_view() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Inbox);
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2")
+        );
+    }
+
+    #[test]
+    fn enter_on_an_inbox_row_opens_the_task_session() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('3'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session);
+        assert_eq!(app.session_task.as_deref(), Some("borsuk/implement-i140"));
+        assert!(app.session.is_showing("borsuk/implement-i140"));
+    }
+
+    #[test]
+    fn the_inbox_badge_shows_in_every_view() {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        for view in [View::Pipeline, View::Session, View::Inbox] {
+            let mut app = App {
+                state: Some(state.clone()),
+                connected: true,
+                view,
+                ..App::default()
+            };
+            let text = render_to_string(&mut app);
+            assert!(text.contains("! 1 open"), "view {view:?} misses the badge");
+        }
+    }
+
+    #[test]
+    fn an_inbox_clock_error_propagates_from_render() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Inbox,
+            ..App::default()
+        };
+        let mut render_result = Ok(());
+
+        terminal
+            .draw(|frame| {
+                render_result =
+                    render_with_clock(frame, &mut app, || Err(anyhow!("clock before epoch")));
+            })
+            .unwrap();
+
+        let error = render_result.unwrap_err();
+        assert!(format!("{error:#}").contains("cannot read the system clock: clock before epoch"));
+    }
+
+    #[test]
+    fn a_pipeline_clock_error_propagates_from_render() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Pipeline,
+            ..App::default()
+        };
+        let mut render_result = Ok(());
+
+        terminal
+            .draw(|frame| {
+                render_result =
+                    render_with_clock(frame, &mut app, || Err(anyhow!("clock before epoch")));
+            })
+            .unwrap();
+
+        let error = render_result.unwrap_err();
+        assert!(format!("{error:#}").contains("cannot read the system clock: clock before epoch"));
+    }
+
+    #[test]
+    fn a_frame_reports_both_terminal_and_render_errors() {
+        let error = finish_draw(
+            Err(anyhow!("terminal write failed")),
+            Err(anyhow!("clock read failed")),
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("terminal write failed"), "error: {text}");
+        assert!(text.contains("clock read failed"), "error: {text}");
+    }
+
+    #[test]
+    fn y_confirms_the_aborting_of_the_selected_task() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(2),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('x'),
+                key('n'),
+                key('y'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.0,
+            vec![Action::Abort {
+                task: "borsuk/refine-i142".to_string()
+            }],
+            "only y sent the abort"
+        );
+        assert!(app.confirm.is_none());
+        assert!(app.visible_toast().is_some());
+    }
+
+    #[test]
+    fn esc_cancels_the_abort_so_y_sends_nothing() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(2),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('x'),
+                key_code(KeyCode::Esc),
+                key('y'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(sink.0.is_empty());
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn a_modified_y_does_not_confirm_a_destructive_action() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(2),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        let ctrl_y = Msg::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('x'),
+                ctrl_y,
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn y_confirms_the_release_of_the_stacked_batch() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(18),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('g'),
+                key('y'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.0,
+            vec![Action::Go {
+                repo: "borsuk".to_string(),
+                prs: vec![3]
+            }]
+        );
+        assert!(app.confirm.is_none());
+        assert!(app.visible_toast().is_some());
+    }
+
+    #[test]
+    fn enter_sends_the_session_chat_action() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('h'), key('i'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.0,
+            vec![Action::Chat {
+                task: "borsuk/refine-i142".to_string(),
+                text: "hi".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn r_follows_the_new_refine_task_on_the_next_push() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(8),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view()), key('r')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session);
+        assert_eq!(
+            sink.0,
+            vec![Action::Refine {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 140
+            }]
+        );
+
+        // The daemon creates the refine task, and the next push resolves
+        // the wanted choice.
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks.push(TaskView {
+            id: "borsuk/refine-i140".to_string(),
+            repo: "borsuk".to_string(),
+            stage: Stage::Refine,
+            kind: ItemKind::Issue,
+            number: 140,
+            state: TaskState::Running,
+            attempt: 1,
+            log_path: PathBuf::from("borsuk-refine-i140.jsonl"),
+        });
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.session_task.as_deref(), Some("borsuk/refine-i140"));
+        assert!(app.wanted.is_none());
+        assert!(app.session.is_showing("borsuk/refine-i140"));
+    }
+
+    #[test]
+    fn r_cannot_send_chat_to_the_previous_session_while_it_waits() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.selection = Selection::Row(8);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('r'), key('h'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Refine {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 140
+            }]
+        );
+        assert_eq!(app.session.task_id(), None);
+    }
+
+    #[test]
+    fn n_follows_the_ticket_create_task_on_the_next_push() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App {
+            selection: Selection::Row(4),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view()), key('n')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session);
+        assert_eq!(
+            sink.0,
+            vec![Action::TicketCreate {
+                repo: "ryba".to_string()
+            }]
+        );
+
+        // The ticket creation is the refine task of item zero.
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks.push(TaskView {
+            id: "ryba/refine-i0".to_string(),
+            repo: "ryba".to_string(),
+            stage: Stage::Refine,
+            kind: ItemKind::Issue,
+            number: 0,
+            state: TaskState::Running,
+            attempt: 1,
+            log_path: PathBuf::from("ryba-refine-i0.jsonl"),
+        });
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.wanted.is_none());
+        assert!(app.session.is_showing("ryba/refine-i0"));
+    }
+
+    #[test]
+    fn n_cannot_send_chat_to_the_previous_session_while_it_waits() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.selection = Selection::Row(4);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('n'), key('h'), key_code(KeyCode::Enter)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.0,
+            vec![Action::TicketCreate {
+                repo: "ryba".to_string()
+            }]
+        );
+        assert_eq!(app.session.task_id(), None);
     }
 
     #[test]
