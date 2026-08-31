@@ -1542,3 +1542,46 @@ send a message it dropped.
 - `Enter` in `NextTurn` mode emits `Action::Chat`.
 - The session header shows the queued count.
 - The pipeline ticket row shows the badge.
+
+## Task 27 — The abort delivers the queued message
+
+**Goal.** Make `ctrl-x` do what the session view promises. A human who queued a
+message and does not want to wait aborts the running turn, and the message starts
+the next turn at once.
+
+**Files.** `src/daemon.rs`.
+
+**Why this task exists.** The `NextTurn` hint reads
+`enter queue · lands after this turn · ctrl-x sends it now`. Today `cancel_task`
+does the opposite: it calls `pending_chats.remove(id)` and
+`remove_task_session_marker(task)`, so the abort DISCARDS the queued message and
+the session with it. The promise came from the approved plan. No earlier task
+carried it. This task carries it.
+
+**Detail.**
+
+- `cancel_task` keeps its present behaviour for a task that holds NO pending
+  chats. Do not change that path.
+- When a task holds pending chats:
+  - keep `pending_chats` for that task,
+  - keep the task session marker,
+  - stop the running session as it does today,
+  - after the cancel, call `TaskTable::reopen` so the task returns to `Queued`.
+- `resume_pending_chats` then launches the queued message as the next turn, with
+  the saved session id. It already refuses a `Running` task and already applies
+  `sched::can_start`, so limits, lanes, and pauses still hold.
+- The sibling guard still applies at request time. An abort does not bypass it.
+- A cancel that cannot reopen must not lose the message silently. Log the error
+  and leave the task terminal.
+
+**Acceptance criteria.**
+- An abort of a task with no pending chats behaves exactly as before: the marker
+  goes, the decisions drop, the state is `Failed("cancelled")`.
+- An abort of a running opencode task that holds one queued message keeps the
+  message, keeps the marker, and returns the task to `Queued`.
+- After that abort the next drive pass launches the queued message as the prompt,
+  with the saved session id.
+- A paused stage still holds the reopened task. The abort does not start work a
+  pause forbids.
+- The sibling guard still refuses a follow-up after an abort when another task
+  holds the same worktree.
