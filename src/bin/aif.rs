@@ -28,6 +28,14 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Parser)]
 #[command(name = "aif", about = "AI Factory terminal UI and control", version)]
 struct Cli {
+    /// Start a new daemon with the whole factory paused: it polls and
+    /// reports, but dispatches nothing until the operator resumes with `P`
+    /// in the UI. A factory that points at live repositories can then start
+    /// without dispatching anything. The flag cannot apply when a daemon
+    /// already runs; pause that daemon with `P`, or stop it with `aif stop`
+    /// first.
+    #[arg(long, global = true)]
+    paused: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -54,10 +62,11 @@ enum Command {
 }
 
 fn main() {
-    let code = match Cli::parse().command {
+    let cli = Cli::parse();
+    let code = match cli.command {
         Some(Command::Stop) => stop(),
         Some(Command::Doctor { config, clean, yes }) => doctor_main(config, clean, yes),
-        Some(Command::Tui) | None => tui(),
+        Some(Command::Tui) | None => tui(cli.paused),
     };
     if code != 0 {
         exit(code);
@@ -65,8 +74,12 @@ fn main() {
 }
 
 /// Ensure a daemon runs, then start the terminal UI.
-fn tui() -> i32 {
-    if let Err(error) = ensure_daemon() {
+///
+/// `paused` reaches a daemon that this call starts. A daemon that already
+/// runs keeps its own state, so the call says so instead of applying the
+/// flag.
+fn tui(paused: bool) -> i32 {
+    if let Err(error) = ensure_daemon(paused) {
         eprintln!("aif: {error:#}");
         return 1;
     }
@@ -83,9 +96,16 @@ fn tui() -> i32 {
 /// The start goes through `systemd-run --user` first and falls back to a
 /// plain detached spawn. It waits up to [`DAEMON_START_TIMEOUT`] for the
 /// daemon to open the socket.
-fn ensure_daemon() -> anyhow::Result<()> {
+fn ensure_daemon(paused: bool) -> anyhow::Result<()> {
     let socket = config::socket_path();
     if doctor::socket_answers(&socket) {
+        if paused {
+            eprintln!(
+                "aif: a daemon already runs on {}; --paused does not apply. \
+                 Pause it with P in the UI, or run `aif stop` first and start again.",
+                socket.display()
+            );
+        }
         return Ok(());
     }
     let program = doctor::daemon_program();
@@ -94,6 +114,7 @@ fn ensure_daemon() -> anyhow::Result<()> {
         &program,
         &RealExec,
         DAEMON_START_TIMEOUT,
+        paused,
         &mut doctor::spawn_detached,
     )
 }
@@ -172,4 +193,29 @@ fn ask_to_remove() -> anyhow::Result<bool> {
         .read_line(&mut line)
         .context("cannot read the removal confirmation")?;
     Ok(count != 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cli_parses_the_paused_flag_before_and_after_the_subcommand() {
+        let parsed = Cli::try_parse_from(["aif", "--paused"]).expect("the arguments must parse");
+        assert!(parsed.paused);
+        assert!(parsed.command.is_none());
+
+        let parsed =
+            Cli::try_parse_from(["aif", "tui", "--paused"]).expect("the arguments must parse");
+        assert!(parsed.paused);
+
+        let parsed = Cli::try_parse_from(["aif"]).expect("the arguments must parse");
+        assert!(!parsed.paused);
+
+        let parsed = Cli::try_parse_from(["aif", "tui"]).expect("the arguments must parse");
+        assert!(!parsed.paused);
+
+        let parsed = Cli::try_parse_from(["aif", "stop"]).expect("the arguments must parse");
+        assert!(!parsed.paused);
+    }
 }

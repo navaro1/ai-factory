@@ -126,9 +126,26 @@ passes it.
 | Command | Effect |
 |---|---|
 | `aif` or `aif tui` | Starts the daemon when needed, then opens the terminal UI. |
+| `aif --paused` or `aif tui --paused` | Starts the daemon with the whole factory paused. |
 | `aif stop` | Stops the daemon. |
 | `aif doctor` | Reports on the installation and the configuration. |
 | `aif doctor --clean` | Removes the worktrees of closed issues and merged pull requests. |
+
+### Start paused
+
+`--paused` starts a new daemon with the factory paused. The daemon polls,
+builds state, serves the socket, and reports to the UI. It dispatches no
+task until you resume with `P` in the UI. The daemon flag is
+`aifd run --paused`; `aif --paused` passes it through when `aif` starts the
+daemon.
+
+A new factory pointed at live repositories needs this flag. Without it, the
+first poll fires the stage gates at once. Agents then create worktrees,
+write code, and open pull requests before you see the UI. The flag cannot
+apply when a daemon already runs. `aif` prints a message instead. Pause
+that daemon with `P`, or stop it with `aif stop` and start again.
+`aif doctor` reports the paused state. The UI shows a bold `paused` badge
+in the header and marks every stage row.
 
 ## The three views
 

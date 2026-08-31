@@ -172,13 +172,16 @@ impl Daemon {
     ///
     /// The runner of each stage comes from the stage's config: `opencode`
     /// selects the one-shot opencode runner, and every other value selects
-    /// the interactive claude runner.
+    /// the interactive claude runner. A true `paused` starts the whole
+    /// factory paused: the daemon polls and reports, but dispatches nothing
+    /// until the operator resumes.
     pub fn new(
         config: Config,
         prompts_dir: PathBuf,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
+        paused: bool,
     ) -> Result<Self> {
         let mut runners: BTreeMap<Stage, Box<dyn Runner>> = BTreeMap::new();
         for stage in Stage::ALL {
@@ -210,6 +213,7 @@ impl Daemon {
             action_rx,
             runners,
             ticket_runner,
+            paused,
         ))
     }
 
@@ -217,7 +221,9 @@ impl Daemon {
     ///
     /// The constructor restores `last_fire_ms` from `state.json` and applies
     /// the stored overrides before the first drive, so an interval policy
-    /// never releases again just because the daemon restarted.
+    /// never releases again just because the daemon restarted. A true
+    /// `paused` sets `Paused.global` before the first drive, so a
+    /// start-paused factory dispatches nothing until the operator resumes.
     // Each argument is one daemon-owned dependency. A bundle would hide the
     // ownership boundary without reducing it.
     #[allow(clippy::too_many_arguments)]
@@ -231,6 +237,7 @@ impl Daemon {
         action_rx: Receiver<Action>,
         runners: BTreeMap<Stage, Box<dyn Runner>>,
         ticket_runner: Box<dyn Runner>,
+        paused: bool,
     ) -> Self {
         let state_path = state_dir.join("state.json");
         let stored = DaemonState::load(&state_path);
@@ -275,7 +282,10 @@ impl Daemon {
             prompts_dir,
             state_dir,
             limits,
-            paused: Paused::default(),
+            paused: Paused {
+                global: paused,
+                ..Paused::default()
+            },
             policies,
             snapshot: Snapshot::default(),
             gates: GateTracker::new(),
@@ -2741,14 +2751,28 @@ mod tests {
 
     impl Rig {
         fn make(steps: Vec<Step>) -> Rig {
-            Self::make_in(temp_root(), steps, |_| {})
+            Self::build(temp_root(), steps, |_| {}, false)
         }
 
         fn make_with(steps: Vec<Step>, tweak: impl FnOnce(&mut Config)) -> Rig {
-            Self::make_in(temp_root(), steps, tweak)
+            Self::build(temp_root(), steps, tweak, false)
+        }
+
+        /// A daemon that starts with the whole factory paused.
+        fn make_paused(steps: Vec<Step>) -> Rig {
+            Self::build(temp_root(), steps, |_| {}, true)
         }
 
         fn make_in(dir: PathBuf, steps: Vec<Step>, tweak: impl FnOnce(&mut Config)) -> Rig {
+            Self::build(dir, steps, tweak, false)
+        }
+
+        fn build(
+            dir: PathBuf,
+            steps: Vec<Step>,
+            tweak: impl FnOnce(&mut Config),
+            paused: bool,
+        ) -> Rig {
             fs::create_dir_all(dir.join("repo")).unwrap();
             let state = dir.join("state");
             let prompts = dir.join("prompts");
@@ -2780,6 +2804,7 @@ mod tests {
                 action_rx,
                 runners,
                 Box::new(FakeRunner::new(jobs.clone(), sessions.clone())),
+                paused,
             );
             let clock_t = t.clone();
             daemon.clock = Arc::new(move || *clock_t.lock().unwrap());
@@ -2887,6 +2912,37 @@ mod tests {
     // ------------------------------------------------------------------
     // Acceptance tests
     // ------------------------------------------------------------------
+
+    #[test]
+    fn a_paused_daemon_polls_but_dispatches_nothing() {
+        let mut rig = Rig::make_paused(vec![]);
+        assert!(rig.daemon.paused.global);
+
+        // The first poll fires the gate; the pause blocks the dispatch.
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        assert_eq!(rig.job_count(), 0);
+        let task = rig.task("borsuk/refine-i142");
+        assert_eq!(task.state, TaskState::Queued);
+
+        // A further drive with no new message still dispatches nothing.
+        rig.drive();
+        assert_eq!(rig.job_count(), 0);
+    }
+
+    #[test]
+    fn a_paused_daemon_dispatches_when_the_operator_resumes() {
+        let mut rig = Rig::make_paused(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        assert_eq!(rig.job_count(), 0);
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Global,
+            paused: false,
+        });
+        assert!(!rig.daemon.paused.global);
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/refine-i142");
+    }
 
     #[test]
     fn a_gate_admits_work_and_a_second_drive_dispatches_nothing() {
