@@ -78,7 +78,7 @@ struct DetailState {
     /// The stable decision id that the screen follows.
     decision_id: String,
     /// The pull request shown inside a release batch.
-    item_index: usize,
+    item_number: Option<u64>,
     /// How many rendered lines the context screen scrolls down.
     scroll: u16,
 }
@@ -212,6 +212,22 @@ impl Inbox {
                 .any(|decision| decision.id == detail.decision_id)
         }) {
             self.detail = None;
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            if let Some(DecisionKind::ReleaseGate { prs }) = state
+                .decisions
+                .iter()
+                .find(|decision| decision.id == detail.decision_id)
+                .map(|decision| &decision.kind)
+            {
+                if detail
+                    .item_number
+                    .is_none_or(|number| !prs.contains(&number))
+                {
+                    detail.item_number = prs.first().copied();
+                    detail.scroll = 0;
+                }
+            }
         }
         let selected_is_gone = self
             .selected_id
@@ -417,9 +433,13 @@ impl Inbox {
 
     /// Open the focused context screen of `decision`.
     fn open_detail(&mut self, decision: &Decision) {
+        let item_number = match &decision.kind {
+            DecisionKind::ReleaseGate { prs } => prs.first().copied(),
+            _ => None,
+        };
         self.detail = Some(DetailState {
             decision_id: decision.id.clone(),
-            item_index: 0,
+            item_number,
             scroll: 0,
         });
     }
@@ -479,23 +499,13 @@ impl Inbox {
             KeyCode::Left | KeyCode::Char('h')
                 if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) =>
             {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.item_index = detail.item_index.saturating_sub(1);
-                    detail.scroll = 0;
-                }
+                self.move_detail_pr(&decision, -1);
                 InboxOutcome::None
             }
             KeyCode::Right | KeyCode::Char('l')
                 if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) =>
             {
-                let last = match &decision.kind {
-                    DecisionKind::ReleaseGate { prs } => prs.len().saturating_sub(1),
-                    _ => 0,
-                };
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.item_index = detail.item_index.saturating_add(1).min(last);
-                    detail.scroll = 0;
-                }
+                self.move_detail_pr(&decision, 1);
                 InboxOutcome::None
             }
             KeyCode::Char(' ') if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) => {
@@ -510,23 +520,45 @@ impl Inbox {
         }
     }
 
+    /// Move the release detail by one pull request and clamp at both ends.
+    fn move_detail_pr(&mut self, decision: &Decision, step: isize) {
+        let DecisionKind::ReleaseGate { prs } = &decision.kind else {
+            return;
+        };
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        let Some(first) = prs.first() else {
+            detail.item_number = None;
+            return;
+        };
+        let current = detail
+            .item_number
+            .and_then(|number| prs.iter().position(|pr| *pr == number))
+            .unwrap_or(0);
+        let last = prs.len() - 1;
+        let next = (current as isize + step).clamp(0, last as isize) as usize;
+        detail.item_number = prs.get(next).copied().or(Some(*first));
+        detail.scroll = 0;
+    }
+
     /// Toggle the pull request that the release detail screen shows.
     fn toggle_detail_pr(&mut self, decision: &Decision) {
         let DecisionKind::ReleaseGate { prs } = &decision.kind else {
             return;
         };
-        let Some(index) = self.detail.as_ref().map(|detail| detail.item_index) else {
+        let Some(number) = self.detail.as_ref().and_then(|detail| detail.item_number) else {
             return;
         };
-        let Some(pr) = prs.get(index).copied() else {
+        if !prs.contains(&number) {
             return;
-        };
+        }
         let checked = self
             .checks
             .entry(decision.id.clone())
             .or_insert_with(|| prs.iter().copied().collect());
-        if !checked.remove(&pr) {
-            checked.insert(pr);
+        if !checked.remove(&number) {
+            checked.insert(number);
         }
     }
 
@@ -1208,7 +1240,7 @@ fn draw_detail(
 ) {
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
-    let (title, lines) = match detail_item_key(decision, detail.item_index) {
+    let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
             let title = format!("{} #{number} · {}", item_title_label(kind), decision.repo);
             let Some(item) = find_item(state, &decision.repo, kind, number) else {
@@ -1393,9 +1425,14 @@ fn read_log_tail(path: &Path) -> std::io::Result<String> {
 }
 
 /// Resolve the repository item that one detail screen shows.
-fn detail_item_key(decision: &Decision, item_index: usize) -> Option<(ItemKind, u64)> {
+fn detail_item_key(decision: &Decision, item_number: Option<u64>) -> Option<(ItemKind, u64)> {
     match &decision.kind {
-        DecisionKind::ReleaseGate { prs } => (ItemKind::Pr, *prs.get(item_index)?),
+        DecisionKind::ReleaseGate { prs } => {
+            let number = item_number
+                .filter(|number| prs.contains(number))
+                .or_else(|| prs.first().copied())?;
+            (ItemKind::Pr, number)
+        }
         DecisionKind::NeedsHuman { kind, number, .. } => (*kind, *number),
         DecisionKind::Permission { .. }
         | DecisionKind::Question { .. }
@@ -1935,6 +1972,43 @@ mod tests {
         assert!(feed.contains("1. [x] #7 First change"), "screen: {feed}");
         assert!(feed.contains("2. [ ] #9 Second change"), "screen: {feed}");
         assert!(rx.try_recv().is_err(), "navigation sent an answer");
+    }
+
+    #[test]
+    fn a_release_repush_keeps_the_current_pull_request_by_number() {
+        let mut first = state_with(vec![Decision::release_gate("borsuk", vec![7, 9], OPENED)]);
+        first.decision_items = vec![
+            ItemView {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Pr,
+                number: 7,
+                title: "First change".to_string(),
+                body: "The first pull request body.".to_string(),
+            },
+            ItemView {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Pr,
+                number: 9,
+                title: "Second change".to_string(),
+                body: "The second pull request body.".to_string(),
+            },
+        ];
+        let mut inbox = selected(&first, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&first, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&first, press_code(KeyCode::Right), &mut tx);
+
+        let mut repushed = first.clone();
+        repushed.decisions = vec![Decision::release_gate("borsuk", vec![9, 7], OPENED)];
+        inbox.observe(&repushed);
+        let screen = render(&repushed, &inbox, OPENED);
+
+        assert!(screen.contains("PR #9"), "screen: {screen}");
+        assert!(
+            screen.contains("The second pull request body."),
+            "screen: {screen}"
+        );
+        assert!(!screen.contains("The first pull request body."));
     }
 
     #[test]
