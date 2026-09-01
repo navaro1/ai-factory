@@ -164,7 +164,7 @@ impl Confirm {
                     state.trains.iter().any(|train| {
                         train.repo == repo
                             && train.in_flight.is_none()
-                            && matches!(train.batch.as_deref(), Some([]))
+                            && train.batch.is_empty()
                             && train.stacked == prs
                     })
                 });
@@ -1965,7 +1965,7 @@ mod tests {
         let mut surface = CountingSurface { draws: 0 };
         let mut state = crate::tui::pipeline::sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].stacked = vec![7];
         let train_row = pipeline::rows(&state)
             .iter()
@@ -2003,7 +2003,7 @@ mod tests {
         let mut surface = CountingSurface { draws: 0 };
         let mut first = crate::tui::pipeline::sample_view();
         first.trains[0].in_flight = None;
-        first.trains[0].batch = Some(Vec::new());
+        first.trains[0].batch.clear();
         first.trains[0].stacked = vec![7];
         let train_row = pipeline::rows(&first)
             .iter()

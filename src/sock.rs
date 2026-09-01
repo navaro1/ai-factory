@@ -207,7 +207,7 @@ impl StateInput<'_> {
                         repo: repo.clone(),
                         queue: train.queue.clone(),
                         stacked: train.stacked.clone(),
-                        batch: Some(train.batch().to_vec()),
+                        batch: train.batch().to_vec(),
                         policy: policy.clone(),
                         next_fire_ms: train.next_deadline_ms(policy, now_ms),
                         in_flight: train.in_flight.clone(),
@@ -216,7 +216,7 @@ impl StateInput<'_> {
                         repo: repo.clone(),
                         queue: Vec::new(),
                         stacked: Vec::new(),
-                        batch: Some(Vec::new()),
+                        batch: Vec::new(),
                         policy: policy.clone(),
                         next_fire_ms: None,
                         in_flight: None,
@@ -315,9 +315,7 @@ pub struct TrainView {
     /// The pull request numbers the human stacked for the next batch.
     pub stacked: Vec<u64>,
     /// The active batch or the exact batch that a failed train must retry.
-    /// None identifies a state message from a daemon without batch support.
-    #[serde(default)]
-    pub batch: Option<Vec<u64>>,
+    pub batch: Vec<u64>,
     /// The active release policy.
     pub policy: ReleasePolicy,
     /// The next automatic fire time, in milliseconds since the Unix epoch.
@@ -1106,12 +1104,12 @@ mod tests {
     }
 
     #[test]
-    fn a_train_batch_survives_json_and_defaults_for_an_old_state() {
+    fn a_train_batch_survives_json_and_is_required() {
         let train = TrainView {
             repo: "borsuk".to_string(),
             queue: vec![9],
             stacked: vec![7],
-            batch: Some(vec![7]),
+            batch: vec![7],
             policy: ReleasePolicy::Manual,
             next_fire_ms: None,
             in_flight: Some("borsuk/release-p7".to_string()),
@@ -1121,8 +1119,7 @@ mod tests {
 
         let mut old_value = serde_json::to_value(&train).unwrap();
         old_value.as_object_mut().unwrap().remove("batch");
-        let old_train: TrainView = serde_json::from_value(old_value).unwrap();
-        assert!(old_train.batch.is_none());
+        assert!(serde_json::from_value::<TrainView>(old_value).is_err());
     }
 
     /// One input mode of every variant.
@@ -1799,7 +1796,7 @@ mod tests {
         let borsuk_view = &view.trains[0];
         assert_eq!(borsuk_view.queue, vec![9]);
         assert_eq!(borsuk_view.stacked, vec![7]);
-        assert_eq!(borsuk_view.batch, Some(vec![7]));
+        assert_eq!(borsuk_view.batch, vec![7]);
         assert_eq!(borsuk_view.policy, ReleasePolicy::Interval { minutes: 30 });
         assert_eq!(borsuk_view.next_fire_ms, None);
         assert_eq!(borsuk_view.in_flight.as_deref(), Some("borsuk/release-p7"));

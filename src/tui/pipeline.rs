@@ -183,10 +183,10 @@ fn row_key(state: &StateView, row: &Row) -> Option<RowKey> {
 
 /// The pull requests shown inside the release batch border.
 fn displayed_batch(train: &crate::sock::TrainView) -> &[u64] {
-    match train.batch.as_deref() {
-        Some([]) => &train.stacked,
-        Some(batch) => batch,
-        None => &[],
+    if train.batch.is_empty() {
+        &train.stacked
+    } else {
+        &train.batch
     }
 }
 
@@ -197,7 +197,6 @@ fn release_batch_task_id(train: &crate::sock::TrainView) -> Option<String> {
     }
     train
         .batch
-        .as_deref()?
         .iter()
         .min()
         .map(|first| format!("{}/release-p{first}", train.repo))
@@ -728,10 +727,7 @@ fn stack_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
         let Some(train) = state.trains.iter().find(|train| train.repo == repo) else {
             return;
         };
-        let Some(batch) = train.batch.as_deref() else {
-            return;
-        };
-        if batch.contains(&pr) || !train.queue.contains(&pr) {
+        if train.batch.contains(&pr) || !train.queue.contains(&pr) {
             return;
         }
         let on = !train.stacked.contains(&pr);
@@ -761,7 +757,7 @@ fn stack_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
         } else {
             train.stacked.retain(|entry| *entry != pr);
         }
-        let batch_order = train.batch.clone().unwrap_or_default();
+        let batch_order = train.batch.clone();
         let queue_order = train.queue.clone();
         train.stacked.sort_by_key(|entry| {
             batch_order
@@ -799,10 +795,7 @@ fn ask_release(app: &mut App) {
         let Some(train) = state.trains.iter().find(|train| train.repo == repo) else {
             return;
         };
-        let Some(batch) = train.batch.as_ref() else {
-            return;
-        };
-        if train.in_flight.is_some() || !batch.is_empty() || train.stacked.is_empty() {
+        if train.in_flight.is_some() || !train.batch.is_empty() || train.stacked.is_empty() {
             return;
         }
         (repo, train.stacked.clone())
@@ -1039,12 +1032,7 @@ fn release_lane_lines(
         );
 
         let batch = displayed_batch(train);
-        if train.batch.is_none() {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(box_line("restart daemon", box_width), THEME.dim()),
-            ]));
-        } else if batch.is_empty() {
+        if batch.is_empty() {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(box_line("select below", box_width), THEME.dim()),
@@ -1186,9 +1174,7 @@ fn selectable_line(is_selected: bool, spans: Vec<Span<'static>>) -> Line<'static
 fn release_batch_title(train: &crate::sock::TrainView) -> (&'static str, Style) {
     if train.in_flight.is_some() {
         ("RELEASING NOW", Style::default().fg(THEME.ok))
-    } else if train.batch.is_none() {
-        ("STATE UNKNOWN", Style::default().fg(THEME.warn))
-    } else if train.batch.as_ref().is_some_and(|batch| !batch.is_empty()) {
+    } else if !train.batch.is_empty() {
         ("RETRY REQUIRED", Style::default().fg(THEME.error))
     } else {
         ("NEXT RELEASE", Style::default().fg(THEME.accent))
@@ -1597,7 +1583,7 @@ pub(crate) fn sample_view() -> StateView {
                 repo: "borsuk".to_string(),
                 queue: vec![7, 9],
                 stacked: vec![5],
-                batch: Some(vec![5]),
+                batch: vec![5],
                 policy: ReleasePolicy::Manual,
                 next_fire_ms: None,
                 in_flight: Some("borsuk/release-p5".to_string()),
@@ -1606,7 +1592,7 @@ pub(crate) fn sample_view() -> StateView {
                 repo: "ryba".to_string(),
                 queue: Vec::new(),
                 stacked: Vec::new(),
-                batch: Some(Vec::new()),
+                batch: Vec::new(),
                 policy: ReleasePolicy::Interval { minutes: 30 },
                 next_fire_ms: Some(super::inbox::now_ms().unwrap() + 90_000),
                 in_flight: None,
@@ -1980,7 +1966,7 @@ mod tests {
     fn release_lane_outlines_the_next_batch_and_removes_it_from_the_queue() {
         let mut state = sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].stacked = vec![7];
         let mut app = App {
             state: Some(state),
@@ -2009,40 +1995,6 @@ mod tests {
         let text = render_to_string(&mut app);
         assert!(text.contains("RETRY REQUIRED"), "board:\n{text}");
         assert!(text.contains("#5"), "saved batch:\n{text}");
-    }
-
-    #[test]
-    fn a_legacy_train_blocks_release_actions_when_its_batch_is_unknown() {
-        let mut state = sample_view();
-        state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
-        state.trains[0].stacked = vec![7];
-        let mut legacy = serde_json::to_value(&state.trains[0]).unwrap();
-        legacy.as_object_mut().unwrap().remove("batch");
-        state.trains[0] = serde_json::from_value(legacy).unwrap();
-        let mut app = app_with_state_and_row(
-            state,
-            Row::Train {
-                repo: "borsuk".to_string(),
-            },
-        );
-        let mut sink = FakeSink::default();
-
-        let text = render_to_string(&mut app);
-        handle_key(&mut app, pressed('g'), &mut sink);
-        select_row(
-            &mut app,
-            Row::ReleasePr {
-                repo: "borsuk".to_string(),
-                pr: 9,
-            },
-        );
-        handle_key(&mut app, pressed(' '), &mut sink);
-
-        assert!(text.contains("STATE UNKNOWN"), "board:\n{text}");
-        assert!(text.contains("restart daemon"), "board:\n{text}");
-        assert!(app.confirm.is_none());
-        assert!(sink.0.is_empty());
     }
 
     #[test]
@@ -2715,7 +2667,7 @@ mod tests {
     fn space_keeps_the_selected_pr_when_the_row_moves() {
         let mut state = sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].stacked.clear();
         let selected = Row::ReleasePr {
             repo: "borsuk".to_string(),
@@ -2733,7 +2685,7 @@ mod tests {
     fn selected_batch_prs_keep_the_release_queue_order() {
         let mut state = sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].stacked.clear();
         let mut app = app_with_state_and_row(
             state,
@@ -2796,7 +2748,7 @@ mod tests {
     fn release_confirmation_includes_a_just_stacked_pull_request() {
         let mut state = sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].stacked = vec![7];
         let mut app = app_with_state_and_row(
             state,
@@ -2821,7 +2773,7 @@ mod tests {
     fn g_only_opens_the_release_confirmation() {
         let mut state = sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].stacked = vec![7];
         let mut app = app_with_state_and_row(
             state,
@@ -2989,7 +2941,7 @@ mod tests {
 
         let mut state = sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch = Some(Vec::new());
+        state.trains[0].batch.clear();
         state.trains[0].queue = vec![3, 7, 9];
         state.trains[0].stacked = vec![3, 7];
         let mut app = App {
