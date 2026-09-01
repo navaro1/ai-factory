@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ReleasePolicy};
 use crate::decisions::{Decision, Decisions};
-use crate::model::{ItemKind, Stage};
+use crate::model::{ItemKind, Snapshot, Stage};
 use crate::sched::{Limits, Paused};
 use crate::tasks::{TaskState, TaskTable};
 use crate::trains::Train;
@@ -64,6 +64,9 @@ pub struct StateView {
     pub tasks: Vec<TaskView>,
     /// The open decisions, in push order.
     pub decisions: Vec<Decision>,
+    /// Repository item content for the open decisions that reference it.
+    #[serde(default)]
+    pub decision_items: Vec<ItemView>,
     /// The release train of each configured repository.
     pub trains: Vec<TrainView>,
     /// What the operator paused.
@@ -112,6 +115,8 @@ pub struct StateInput<'a> {
     pub table: &'a TaskTable,
     /// The open decision queue.
     pub decisions: &'a Decisions,
+    /// The last repository snapshot, for decision item descriptions.
+    pub snapshot: &'a Snapshot,
     /// The release trains, keyed by repository alias.
     pub trains: &'a BTreeMap<String, Train>,
     /// The active release policies, keyed by repository alias.
@@ -132,6 +137,7 @@ impl StateInput<'_> {
             paused,
             table,
             decisions,
+            snapshot,
             trains,
             policies,
             input_modes,
@@ -224,6 +230,7 @@ impl StateInput<'_> {
                 }
             })
             .collect();
+        let decision_items = decision_items(decisions, snapshot);
         let paused = PausedView {
             global: paused.global,
             overrides: paused
@@ -257,10 +264,71 @@ impl StateInput<'_> {
             lanes,
             tasks,
             decisions: decisions.open().to_vec(),
+            decision_items,
             trains,
             paused,
         })
     }
+}
+
+/// Build the repository item content that open decisions can display.
+fn decision_items(decisions: &Decisions, snapshot: &Snapshot) -> Vec<ItemView> {
+    let mut items = Vec::new();
+    for decision in decisions.open() {
+        match &decision.kind {
+            crate::decisions::DecisionKind::NeedsHuman { kind, number, .. } => {
+                push_item(&mut items, snapshot, &decision.repo, *kind, *number);
+            }
+            crate::decisions::DecisionKind::ReleaseGate { prs } => {
+                for number in prs {
+                    push_item(&mut items, snapshot, &decision.repo, ItemKind::Pr, *number);
+                }
+            }
+            crate::decisions::DecisionKind::Permission { .. }
+            | crate::decisions::DecisionKind::Question { .. }
+            | crate::decisions::DecisionKind::Stuck { .. } => {}
+        }
+    }
+    items
+}
+
+/// Add one item once when the latest repository snapshot contains it.
+fn push_item(
+    items: &mut Vec<ItemView>,
+    snapshot: &Snapshot,
+    repo: &str,
+    kind: ItemKind,
+    number: u64,
+) {
+    if items
+        .iter()
+        .any(|item| item.repo == repo && item.kind == kind && item.number == number)
+    {
+        return;
+    }
+    let Some(snapshot) = snapshot.repos.get(repo) else {
+        return;
+    };
+    let content = match kind {
+        ItemKind::Issue => snapshot
+            .issues
+            .get(&number)
+            .map(|item| (item.title.clone(), item.body.clone())),
+        ItemKind::Pr => snapshot
+            .prs
+            .get(&number)
+            .map(|item| (item.title.clone(), item.body.clone())),
+    };
+    let Some((title, body)) = content else {
+        return;
+    };
+    items.push(ItemView {
+        repo: repo.to_string(),
+        kind,
+        number,
+        title,
+        body,
+    });
 }
 
 /// One repository in the state view.
@@ -270,6 +338,21 @@ pub struct RepoView {
     pub alias: String,
     /// The `owner/name` GitHub slug. Empty before the first resolve.
     pub owner_repo: String,
+}
+
+/// One repository item that an open decision references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemView {
+    /// The repository alias.
+    pub repo: String,
+    /// Whether this item is an issue or a pull request.
+    pub kind: ItemKind,
+    /// The issue or pull request number.
+    pub number: u64,
+    /// The current GitHub title.
+    pub title: String,
+    /// The current GitHub description.
+    pub body: String,
 }
 
 /// One pipeline stage in the state view.
@@ -1016,6 +1099,7 @@ mod tests {
             lanes: Vec::new(),
             tasks: Vec::new(),
             decisions: Vec::new(),
+            decision_items: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -1290,6 +1374,7 @@ mod tests {
             paused: &paused,
             table: &table,
             decisions: &decisions,
+            snapshot: &Snapshot::default(),
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
@@ -1693,6 +1778,113 @@ mod tests {
     }
 
     #[test]
+    fn the_view_carries_only_repository_items_that_open_decisions_reference() {
+        use crate::model::{Issue, Pr, RepoSnapshot, Snapshot};
+
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let mut decisions = Decisions::new();
+        decisions.push(Decision::needs_human(
+            "borsuk",
+            ItemKind::Issue,
+            142,
+            "Choose the storage",
+            1_000,
+        ));
+        decisions.push(Decision::release_gate("borsuk", vec![7], 2_000));
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            RepoSnapshot {
+                issues: [(
+                    142,
+                    Issue {
+                        number: 142,
+                        node_id: "issue-node".to_string(),
+                        title: "Choose the storage".to_string(),
+                        body: "Compare SQLite and PostgreSQL.".to_string(),
+                        labels: vec!["needs-human".to_string()],
+                        open: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                prs: [
+                    (
+                        7,
+                        Pr {
+                            number: 7,
+                            node_id: "pr-node-7".to_string(),
+                            title: "Protect the release gate".to_string(),
+                            body: "Require a current release state.".to_string(),
+                            labels: Vec::new(),
+                            open: true,
+                            draft: false,
+                            head_sha: "sha-7".to_string(),
+                            head_ref: "aif/release-7".to_string(),
+                        },
+                    ),
+                    (
+                        9,
+                        Pr {
+                            number: 9,
+                            node_id: "pr-node-9".to_string(),
+                            title: "Unrelated pull request".to_string(),
+                            body: "This item has no decision.".to_string(),
+                            labels: Vec::new(),
+                            open: true,
+                            draft: false,
+                            head_sha: "sha-9".to_string(),
+                            head_ref: "aif/unrelated-9".to_string(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            trains: &trains,
+            policies: &policies,
+            input_modes: &BTreeMap::new(),
+            snapshot: &snapshot,
+            now_ms: 3_000,
+        }
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            view.decision_items,
+            vec![
+                ItemView {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Issue,
+                    number: 142,
+                    title: "Choose the storage".to_string(),
+                    body: "Compare SQLite and PostgreSQL.".to_string(),
+                },
+                ItemView {
+                    repo: "borsuk".to_string(),
+                    kind: ItemKind::Pr,
+                    number: 7,
+                    title: "Protect the release gate".to_string(),
+                    body: "Require a current release state.".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn the_view_build_rejects_a_missing_ordered_task() {
         let config = Config::parse(&config_text()).unwrap();
         let limits = Limits::from_config(&config);
@@ -1709,6 +1901,7 @@ mod tests {
             paused: &paused,
             table: &table,
             decisions: &decisions,
+            snapshot: &Snapshot::default(),
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
@@ -1800,6 +1993,7 @@ mod tests {
             paused: &paused,
             table: &table,
             decisions: &decisions,
+            snapshot: &Snapshot::default(),
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,

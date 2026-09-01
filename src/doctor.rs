@@ -2729,6 +2729,7 @@ mod tests {
             lanes: Vec::new(),
             tasks: Vec::new(),
             decisions: Vec::new(),
+            decision_items: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: true,

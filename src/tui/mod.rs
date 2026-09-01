@@ -378,6 +378,9 @@ impl App {
             View::Inbox if self.inbox.typing() => {
                 self.inbox_dispatch(key, sink);
             }
+            View::Inbox if self.inbox.detail_open() => {
+                self.inbox_dispatch(key, sink);
+            }
             View::Inbox => {
                 if digit_key(key) && self.inbox_row_owns(key) {
                     self.inbox_dispatch(key, sink);
@@ -1060,9 +1063,9 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 22, area);
+    let panel = centered(44, 25, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 20] = [
+    let rows: [(&str, &str); 23] = [
         ("1 2 3", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
@@ -1078,6 +1081,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("g s", "release / policy"),
         ("enter", "open the selected task session"),
         ("enter", "send the chat message"),
+        ("enter", "open selected decision details"),
+        ("s", "submit selected question answer"),
+        ("o", "open task session from details"),
         ("ctrl-x", "abort the shown task"),
         ("PageUp PageDown", "scroll the transcript"),
         ("End", "follow the tail"),
@@ -1571,6 +1577,9 @@ mod tests {
             "toggle the selected pull request",
             "ctrl-q",
             "send the chat message",
+            "open selected decision details",
+            "submit selected question answer",
+            "open task session from details",
             "PageUp PageDown",
             "PageDown",
             "End",
@@ -1742,7 +1751,40 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_an_inbox_row_opens_the_task_session() {
+    fn bang_closes_an_inbox_detail_and_selects_the_oldest_item() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("newer", 9_000),
+            permission_decision("oldest", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('3'),
+                key('j'),
+                key_code(KeyCode::Enter),
+                key('!'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Inbox);
+        assert!(!app.inbox.detail_open());
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:oldest")
+        );
+    }
+
+    #[test]
+    fn enter_opens_inbox_details_esc_returns_and_o_opens_the_task_session() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
         let mut sink = FakeSink::default();
@@ -1755,6 +1797,29 @@ mod tests {
             &mut sink,
         )
         .unwrap();
+
+        assert_eq!(app.view, View::Inbox);
+        assert!(app.inbox.detail_open());
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Inbox);
+        assert!(!app.inbox.detail_open());
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Enter), key('o')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
         assert_eq!(app.view, View::Session);
         assert_eq!(app.session_task.as_deref(), Some("borsuk/implement-i140"));
         assert!(app.session.is_showing("borsuk/implement-i140"));

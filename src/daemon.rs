@@ -486,6 +486,7 @@ impl Daemon {
             paused: &self.paused,
             table: &self.table,
             decisions: &self.decisions,
+            snapshot: &self.snapshot,
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
@@ -6218,6 +6219,7 @@ mod tests {
         assert!(view.tasks.is_empty());
         assert!(view.lanes.is_empty());
         assert!(view.decisions.is_empty());
+        assert!(view.decision_items.is_empty());
         assert!(!view.paused.global);
         assert!(view.paused.overrides.is_empty());
         assert_eq!(view.trains.len(), 1);
@@ -6243,6 +6245,12 @@ mod tests {
         assert_eq!(view.trains[0].stacked, vec![2]);
         assert_eq!(view.decisions.len(), 1);
         assert_eq!(view.decisions[0].id, "gate:borsuk");
+        assert_eq!(view.decision_items.len(), 1);
+        assert_eq!(view.decision_items[0].repo, "borsuk");
+        assert_eq!(view.decision_items[0].kind, ItemKind::Pr);
+        assert_eq!(view.decision_items[0].number, 2);
+        assert_eq!(view.decision_items[0].title, "pr 2");
+        assert_eq!(view.decision_items[0].body, "body 2");
 
         rig.poll(
             vec![issue(142, &["to-refine"])],

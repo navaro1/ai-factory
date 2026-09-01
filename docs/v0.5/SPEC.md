@@ -1288,32 +1288,45 @@ those files. Say in the report which of them you touched and why. No other file.
 
 **Goal.** One place to answer everything.
 
-**Files.** `src/tui/inbox.rs`.
+**Files.** `src/tui/inbox.rs`, `src/tui/mod.rs`, `src/sock.rs`,
+`src/daemon.rs`, `src/tui/transcript.rs`.
 
 **Detail.**
-- Rows list every open decision across repositories with age, repository,
-  stage, and a one-line summary.
+- The inbox shows an oldest-first feed. Each item leads with the decision
+  message. Metadata shows the age, repository, stage, and decision type.
+- Only the selected feed item shows its choices and quick actions.
 - `y` allows and `n` denies with a typed reason. There is deliberately NO
   "allow always" key: `Response::Allow` carries no field for the request's
   `permission_suggestions`, so such a key would send exactly the same message
   as `y` while claiming to do more. Offering a key that does not do what it
   says is worse than offering one fewer key, in a view whose whole purpose is
   to be trusted. Recorded as deferred, not a defect.
-- A `Question` row expands to its options; digits pick, `enter` submits, and
-  `i` types a free answer.
+- A `Question` item expands to its options. Digits pick, `s` submits, and `i`
+  types a free answer.
 - A `ReleaseGate` row expands to the pull request list with checkboxes; space
   toggles and `g` fires.
 - A `Stuck` row offers retry or cancel.
-- `enter` on any row jumps to the session view for its task, when it has one.
+- `enter` opens a focused source detail for every decision type.
+- A release detail shows the pull request title and GitHub description. Left
+  and Right move through a release batch. Space changes the current choice.
+- A `NeedsHuman` detail shows the issue or pull request title and description.
+- A permission, question, or stuck detail shows recent visible transcript
+  entries from the exact task log. It never shows hidden thought blocks.
+- `o` opens the full task session from a task detail. `esc` returns to the
+  same selected feed item.
+- The daemon sends item content only for open decisions that reference it.
 - The badge with the open count appears in every view's status bar, and `!`
   jumps to the oldest decision from anywhere.
 
 **Acceptance criteria.**
-- Every row kind renders and every key sends the matching `Action::Answer`
+- Every decision kind renders and every key sends the matching `Action::Answer`
   with the right response variant, asserted through a fake sender.
 - A response that does not match the decision kind can never be produced by
   the UI; the test asserts the key map per kind.
 - The badge count matches the pushed state in a render test.
+- Feed tests prove the oldest-first order and selected-item actions.
+- Detail tests cover pull request batches, issue descriptions, exact task
+  context, missing sources, narrow terminals, and shell navigation.
 
 ---
 
@@ -1459,11 +1472,9 @@ becomes a new turn in the same opencode session.
 
 **Detail.**
 
-- Bind `KeyCode::Enter` in `pipeline::handle_key`. On `Row::Ticket { index }`
-  resolve `state.tasks[index]`, then set `app.session_task` to the task id, set
-  `app.wanted` to `None`, set `app.view` to `View::Session`, and call
-  `app.show_session_task()`. This is the same path the inbox uses at
-  `mod.rs:444`.
+- Bind `KeyCode::Enter` in `pipeline::handle_key`. On `Row::Ticket { index }`,
+  resolve `state.tasks[index]`. Then set the task id and open `View::Session`.
+  Clear `app.wanted`, and call `app.show_session_task()`.
 - `Row::Stage`, `Row::Repo`, and `Row::Train` do nothing on `Enter`.
 - `Enter` works for a task in any state. A `Done` or `Failed` task still has its
   log file, so its transcript is readable.

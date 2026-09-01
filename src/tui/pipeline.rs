@@ -1667,6 +1667,7 @@ pub(crate) fn sample_view() -> StateView {
             ),
         ],
         decisions: Vec::new(),
+        decision_items: Vec::new(),
         trains: vec![
             TrainView {
                 repo: "borsuk".to_string(),
@@ -1761,6 +1762,7 @@ mod tests {
             lanes: Vec::new(),
             tasks: Vec::new(),
             decisions: Vec::new(),
+            decision_items: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,

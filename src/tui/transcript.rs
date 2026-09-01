@@ -195,11 +195,7 @@ fn claude_assistant(value: &Value, raw: &str) -> Vec<Entry> {
             _ => {}
         }
     }
-    if items.is_empty() {
-        raw_fallback(raw)
-    } else {
-        items
-    }
+    items
 }
 
 /// Parse one claude `user` line.
@@ -832,6 +828,13 @@ mod tests {
     #[test]
     fn a_subagent_line_is_skipped() {
         let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_9","message":{"content":[{"type":"text","text":"nested work"}]}}"#;
+
+        assert!(parse(line).is_empty());
+    }
+
+    #[test]
+    fn an_assistant_line_with_only_a_thinking_block_is_skipped() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"private reasoning"}]}}"#;
 
         assert!(parse(line).is_empty());
     }

@@ -230,15 +230,27 @@ decide alone arrives in one place:
 - an issue or pull request with the `needs-human` label,
 - a release train that waits for your go.
 
-Each row type has one answer path:
+The oldest decision is at the top. Each item starts with the decision message.
+The selected item shows its choices and quick actions.
+
+Press `enter` to open the source context:
+
+- A release decision shows the pull request title and description.
+- A `needs-human` decision shows the issue or pull request description.
+- A task decision shows recent visible agent context from the exact task log.
+- Press `o` in a task detail to open the full session.
+- Press `esc` to return to the same feed item.
+- Use Left and Right to move through a release batch.
+
+Each decision type has one answer path:
 
 | Row type | Keys |
 |---|---|
-| Permission | `y` allow. `n` deny, with a typed reason. Enter opens the session. |
-| Question | `1`–`9` pick an option. `i` types a free answer. Enter submits. |
-| Stuck | `r` retry. `c` cancel. Enter opens the session. |
-| Needs human | `t` write a comment and clear the label. `c` clears the label. |
-| Release gate | `1`–`9` mark one pull request. Space marks all. `g` releases. |
+| Permission | `y` allows. `n` denies, with a typed reason. |
+| Question | `1`–`9` picks an option. `s` submits. `i` types a free answer. |
+| Stuck | `r` retries. `c` cancels. |
+| Needs human | `t` writes a comment and clears the label. `c` clears the label. |
+| Release gate | `1`–`9` includes one pull request. Space changes all. `g` releases. |
 
 There is no "allow always" key. This is deliberate. The wire protocol can
 not carry a saved permission, and a key that promises more than it does

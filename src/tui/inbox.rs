@@ -1,28 +1,32 @@
 //! Draws the decisions inbox and handles its keys.
 //!
 //! The inbox is the one place where everything that needs a human waits.
-//! It lists every open decision across the repositories. Each answer key
-//! sends one [`Action::Answer`] for the selected row. The response fits the
-//! row kind. The key map follows:
+//! It shows every open decision as an oldest-first feed. The selected item
+//! shows its choices and quick actions. Each answer key sends one
+//! [`Action::Answer`] for that item. The key map follows:
 //!
 //! | Kind | Keys |
 //! |---|---|
-//! | `Permission` | `y` allow, `n` type a deny reason, `enter` open the session |
-//! | `Question` | `1`..`9` pick, `enter` submit, `i` type a free answer |
-//! | `Stuck` | `r` retry, `c` cancel, `enter` open the session |
-//! | `NeedsHuman` | `t` type a comment, `c` cancel the label |
-//! | `ReleaseGate` | `1`..`9` toggle one pull request, `space` all or none, `g` fire |
+//! | `Permission` | `y` allow, `n` type a deny reason, `enter` show context |
+//! | `Question` | `1`..`9` pick, `s` submit, `i` type text, `enter` show context |
+//! | `Stuck` | `r` retry, `c` cancel, `enter` show context |
+//! | `NeedsHuman` | `t` type a comment, `c` clear the label, `enter` show the item |
+//! | `ReleaseGate` | `1`..`9` toggle one pull request, `space` all or none, `g` release, `enter` show a pull request |
 //!
 //! Global keys: `j`, `k`, and the arrow keys move the selection, and `!`
-//! selects the oldest decision. `enter` submits on a `Question` row and
-//! jumps to the session view on the other rows that carry a task.
+//! selects the oldest decision. A detail screen uses `esc` to return. It uses
+//! `o` to open the full task session when the decision has one.
 //!
-//! Two contracts shape this module. The age of a row comes from the
+//! Three contracts shape this module. The age of an item comes from the
 //! `opened_ms` of the decision, so a re-push never resets it. A gate row
 //! is a snapshot, so the checkboxes live here and show the optimistic
-//! local change; the next push corrects the list.
+//! local change; the next push corrects the list. Agent context only uses
+//! visible transcript entries from the exact task log.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,13 +34,21 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
+use super::theme::THEME;
+use super::transcript;
 use crate::decisions::{Decision, DecisionKind, Response};
 use crate::model::ItemKind;
-use crate::sock::{Action, Client, StateView};
+use crate::sock::{Action, Client, ItemView, StateView};
+
+/// The maximum task log section that one detail draw reads.
+const CONTEXT_LOG_BYTES: u64 = 128 * 1024;
+
+/// The maximum visible transcript entries on one decision detail screen.
+const CONTEXT_ENTRIES: usize = 16;
 
 /// The local UI state of the inbox view.
 ///
@@ -56,6 +68,19 @@ pub struct Inbox {
     input: Option<TextInput>,
     /// A short hint that explains a blocked intent.
     hint: Option<&'static str>,
+    /// The focused context screen, when Enter opened one decision.
+    detail: Option<DetailState>,
+}
+
+/// Local navigation state for one focused decision screen.
+#[derive(Debug)]
+struct DetailState {
+    /// The stable decision id that the screen follows.
+    decision_id: String,
+    /// The pull request shown inside a release batch.
+    item_index: usize,
+    /// How many rendered lines the context screen scrolls down.
+    scroll: u16,
 }
 
 /// The option picks for one exact question snapshot.
@@ -180,21 +205,29 @@ impl Inbox {
         }) {
             self.input = None;
         }
+        if self.detail.as_ref().is_some_and(|detail| {
+            !state
+                .decisions
+                .iter()
+                .any(|decision| decision.id == detail.decision_id)
+        }) {
+            self.detail = None;
+        }
         let selected_is_gone = self
             .selected_id
             .as_deref()
             .is_none_or(|id| !state.decisions.iter().any(|d| d.id == id));
         if selected_is_gone {
-            self.selected_id = state.decisions.first().map(|d| d.id.clone());
+            self.selected_id = oldest_decision(state).map(|decision| decision.id.clone());
         }
     }
 
     /// Select the row at `index`, clamped to the open rows.
     pub fn select_index(&mut self, state: &StateView, index: usize) {
-        self.selected_id = state
-            .decisions
+        let ordered = ordered_decisions(state);
+        self.selected_id = ordered
             .get(index)
-            .or_else(|| state.decisions.last())
+            .or_else(|| ordered.last())
             .map(|d| d.id.clone());
     }
 
@@ -203,6 +236,9 @@ impl Inbox {
     /// The oldest row is the one with the smallest `opened_ms`; a tie
     /// keeps the earlier push order.
     pub fn select_oldest(&mut self, state: &StateView) {
+        self.detail = None;
+        self.input = None;
+        self.hint = None;
         self.selected_id = oldest_decision(state).map(|decision| decision.id.clone());
     }
 
@@ -219,6 +255,11 @@ impl Inbox {
     /// operator types a reason.
     pub fn typing(&self) -> bool {
         self.input.is_some()
+    }
+
+    /// True while one focused decision context screen is open.
+    pub fn detail_open(&self) -> bool {
+        self.detail.is_some()
     }
 
     /// Handle one key while the inbox view is open.
@@ -242,6 +283,9 @@ impl Inbox {
         }
         if !key.modifiers.is_empty() {
             return InboxOutcome::None;
+        }
+        if self.detail.is_some() {
+            return self.detail_key(state, key, sink);
         }
         if state.decisions.is_empty() {
             return InboxOutcome::None;
@@ -276,8 +320,7 @@ impl Inbox {
         }
         let id = self.selected_id.as_deref();
         Some(
-            state
-                .decisions
+            ordered_decisions(state)
                 .iter()
                 .position(|d| Some(d.id.as_str()) == id)
                 .unwrap_or(0),
@@ -294,10 +337,11 @@ impl Inbox {
         let Some(index) = self.selected_index(state) else {
             return InboxOutcome::None;
         };
-        let Some(decision) = state.decisions.get(index) else {
+        let ordered = ordered_decisions(state);
+        let Some(decision) = ordered.get(index) else {
             return InboxOutcome::None;
         };
-        let decision = decision.clone();
+        let decision = (*decision).clone();
         match (&decision.kind, key.code) {
             (DecisionKind::Permission { .. }, KeyCode::Char('y')) => {
                 self.answer(&decision.id, Response::Allow, sink);
@@ -307,8 +351,9 @@ impl Inbox {
                 self.open_input(&decision, "reason", InputKind::DenyReason);
                 InboxOutcome::None
             }
-            (DecisionKind::Permission { task, .. }, KeyCode::Enter) => {
-                InboxOutcome::OpenSession(task.clone())
+            (DecisionKind::Permission { .. }, KeyCode::Enter) => {
+                self.open_detail(&decision);
+                InboxOutcome::None
             }
             (DecisionKind::Question { .. }, KeyCode::Char(digit @ '1'..='9')) => {
                 self.pick_option(&decision, digit);
@@ -318,8 +363,12 @@ impl Inbox {
                 self.open_input(&decision, "answer", InputKind::FreeText);
                 InboxOutcome::None
             }
-            (DecisionKind::Question { .. }, KeyCode::Enter) => {
+            (DecisionKind::Question { .. }, KeyCode::Char('s')) => {
                 self.submit_question(&decision, sink);
+                InboxOutcome::None
+            }
+            (DecisionKind::Question { .. }, KeyCode::Enter) => {
+                self.open_detail(&decision);
                 InboxOutcome::None
             }
             (DecisionKind::Stuck { .. }, KeyCode::Char('r')) => {
@@ -330,8 +379,9 @@ impl Inbox {
                 self.answer(&decision.id, Response::Cancel, sink);
                 InboxOutcome::None
             }
-            (DecisionKind::Stuck { task, .. }, KeyCode::Enter) => {
-                InboxOutcome::OpenSession(task.clone())
+            (DecisionKind::Stuck { .. }, KeyCode::Enter) => {
+                self.open_detail(&decision);
+                InboxOutcome::None
             }
             (DecisionKind::NeedsHuman { .. }, KeyCode::Char('t')) => {
                 self.open_input(&decision, "comment", InputKind::FreeText);
@@ -339,6 +389,10 @@ impl Inbox {
             }
             (DecisionKind::NeedsHuman { .. }, KeyCode::Char('c')) => {
                 self.answer(&decision.id, Response::Cancel, sink);
+                InboxOutcome::None
+            }
+            (DecisionKind::NeedsHuman { .. }, KeyCode::Enter) => {
+                self.open_detail(&decision);
                 InboxOutcome::None
             }
             (DecisionKind::ReleaseGate { .. }, KeyCode::Char(digit @ '1'..='9')) => {
@@ -353,7 +407,126 @@ impl Inbox {
                 self.fire_gate(&decision, sink);
                 InboxOutcome::None
             }
+            (DecisionKind::ReleaseGate { .. }, KeyCode::Enter) => {
+                self.open_detail(&decision);
+                InboxOutcome::None
+            }
             _ => InboxOutcome::None,
+        }
+    }
+
+    /// Open the focused context screen of `decision`.
+    fn open_detail(&mut self, decision: &Decision) {
+        self.detail = Some(DetailState {
+            decision_id: decision.id.clone(),
+            item_index: 0,
+            scroll: 0,
+        });
+    }
+
+    /// Handle one key while a focused decision context screen is open.
+    fn detail_key(
+        &mut self,
+        state: &StateView,
+        key: KeyEvent,
+        sink: &mut impl ActionSink,
+    ) -> InboxOutcome {
+        let Some(id) = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.decision_id.clone())
+        else {
+            return InboxOutcome::None;
+        };
+        let Some(decision) = state
+            .decisions
+            .iter()
+            .find(|decision| decision.id == id)
+            .cloned()
+        else {
+            self.detail = None;
+            return InboxOutcome::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.detail = None;
+                InboxOutcome::None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_add(1);
+                }
+                InboxOutcome::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_sub(1);
+                }
+                InboxOutcome::None
+            }
+            KeyCode::PageDown => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_add(8);
+                }
+                InboxOutcome::None
+            }
+            KeyCode::PageUp => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_sub(8);
+                }
+                InboxOutcome::None
+            }
+            KeyCode::Left | KeyCode::Char('h')
+                if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) =>
+            {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.item_index = detail.item_index.saturating_sub(1);
+                    detail.scroll = 0;
+                }
+                InboxOutcome::None
+            }
+            KeyCode::Right | KeyCode::Char('l')
+                if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) =>
+            {
+                let last = match &decision.kind {
+                    DecisionKind::ReleaseGate { prs } => prs.len().saturating_sub(1),
+                    _ => 0,
+                };
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.item_index = detail.item_index.saturating_add(1).min(last);
+                    detail.scroll = 0;
+                }
+                InboxOutcome::None
+            }
+            KeyCode::Char(' ') if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) => {
+                self.toggle_detail_pr(&decision);
+                InboxOutcome::None
+            }
+            KeyCode::Char('o') => match task_id(&decision) {
+                Some(task) => InboxOutcome::OpenSession(task.to_string()),
+                None => InboxOutcome::None,
+            },
+            _ => self.row_key(state, key, sink),
+        }
+    }
+
+    /// Toggle the pull request that the release detail screen shows.
+    fn toggle_detail_pr(&mut self, decision: &Decision) {
+        let DecisionKind::ReleaseGate { prs } = &decision.kind else {
+            return;
+        };
+        let Some(index) = self.detail.as_ref().map(|detail| detail.item_index) else {
+            return;
+        };
+        let Some(pr) = prs.get(index).copied() else {
+            return;
+        };
+        let checked = self
+            .checks
+            .entry(decision.id.clone())
+            .or_insert_with(|| prs.iter().copied().collect());
+        if !checked.remove(&pr) {
+            checked.insert(pr);
         }
     }
 
@@ -752,21 +925,24 @@ pub fn age_text(opened_ms: u64, now_ms: u64) -> String {
     }
 }
 
-/// The one-line summary of a decision.
-fn summary(decision: &Decision) -> String {
+/// The primary message of one feed item.
+fn feed_message(decision: &Decision) -> String {
     let text = match &decision.kind {
         DecisionKind::Permission { tool, input, .. } => {
-            format!("{tool} {}", input_summary(input))
+            format!("Allow {tool} for {}?", input_summary(input))
         }
-        DecisionKind::Question { questions, .. } => question_summary(questions),
-        DecisionKind::Stuck { reason, .. } => reason.clone(),
+        DecisionKind::Question { questions, .. } => question_message(questions),
+        DecisionKind::Stuck { task, reason } => format!("Task {task} stopped: {reason}"),
         DecisionKind::NeedsHuman {
             kind,
             number,
             title,
-        } => format!("#{number} {title} ({})", item_word(*kind)),
+        } => format!("{} #{number} needs a decision: {title}", item_label(*kind)),
+        DecisionKind::ReleaseGate { prs } if prs.len() == 1 => {
+            format!("Release pull request #{}?", prs[0])
+        }
         DecisionKind::ReleaseGate { prs } => {
-            format!("release {} pull requests: {}", prs.len(), pr_list(prs))
+            format!("Release {} pull requests: {}?", prs.len(), pr_list(prs))
         }
     };
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -783,30 +959,32 @@ fn input_summary(input: &serde_json::Value) -> String {
     input.to_string().chars().take(60).collect()
 }
 
-/// The short summary of the questions of one row.
-fn question_summary(questions: &serde_json::Value) -> String {
+/// The primary message of one question decision.
+fn question_message(questions: &serde_json::Value) -> String {
     let parsed = parse_questions(questions);
     let Some(first) = parsed.first() else {
-        return "a question with unreadable options".to_string();
+        return "The agent sent a question with unreadable options.".to_string();
     };
-    let total_options: usize = parsed.iter().map(|q| q.options.len()).sum();
     if parsed.len() == 1 {
-        format!("{} ({} options)", first.text, total_options)
+        first.text.clone()
     } else {
-        format!(
-            "{} questions, starting with: {} ({} options)",
-            parsed.len(),
-            first.text,
-            total_options
-        )
+        format!("{} questions, starting with: {}", parsed.len(), first.text)
     }
 }
 
-/// The human word for one item kind.
-fn item_word(kind: ItemKind) -> &'static str {
+/// The title-case word for one repository item kind.
+fn item_label(kind: ItemKind) -> &'static str {
     match kind {
-        ItemKind::Issue => "issue",
-        ItemKind::Pr => "pull request",
+        ItemKind::Issue => "Issue",
+        ItemKind::Pr => "Pull request",
+    }
+}
+
+/// The compact title label for one repository item kind.
+fn item_title_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "Issue",
+        ItemKind::Pr => "PR",
     }
 }
 
@@ -828,29 +1006,73 @@ fn stage_text(decision: &Decision) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+/// The open decisions in explicit age order, with push order as the tie break.
+fn ordered_decisions(state: &StateView) -> Vec<&Decision> {
+    let mut ordered: Vec<(usize, &Decision)> = state.decisions.iter().enumerate().collect();
+    ordered.sort_by_key(|(position, decision)| (decision.opened_ms, *position));
+    ordered.into_iter().map(|(_, decision)| decision).collect()
+}
+
+/// The visible name of one decision kind.
+fn kind_label(decision: &Decision) -> &'static str {
+    match decision.kind {
+        DecisionKind::Permission { .. } => "PERMISSION",
+        DecisionKind::Question { .. } => "QUESTION",
+        DecisionKind::Stuck { .. } => "STUCK",
+        DecisionKind::NeedsHuman { .. } => "NEEDS HUMAN",
+        DecisionKind::ReleaseGate { .. } => "RELEASE",
+    }
+}
+
+/// The task id of a task-backed decision.
+fn task_id(decision: &Decision) -> Option<&str> {
+    match &decision.kind {
+        DecisionKind::Permission { task, .. }
+        | DecisionKind::Question { task, .. }
+        | DecisionKind::Stuck { task, .. } => Some(task),
+        DecisionKind::NeedsHuman { .. } | DecisionKind::ReleaseGate { .. } => None,
+    }
+}
+
 /// Draw the inbox into `area`.
 ///
 /// The shell calls this from its render closure when the inbox view is
 /// open. `now_ms` stamps the age column; the shell passes [`now_ms`].
 pub fn draw(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms: u64) {
+    if let Some(detail) = inbox.detail.as_ref() {
+        if let Some(decision) = state
+            .decisions
+            .iter()
+            .find(|decision| decision.id == detail.decision_id)
+        {
+            draw_detail(f, area, state, inbox, decision, detail, now_ms);
+            return;
+        }
+    }
+    draw_feed(f, area, state, inbox, now_ms);
+}
+
+/// Draw the oldest-first decision feed.
+fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms: u64) {
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_span = None;
+    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
     if state.decisions.is_empty() {
         lines.push(Line::from(
             "No open decisions. The factory asks here when an agent needs you.",
         ));
     }
-    for decision in &state.decisions {
+    for decision in ordered_decisions(state) {
         let selected = inbox.selected_id.as_deref() == Some(decision.id.as_str());
         let row_index = lines.len();
-        lines.push(row_line(decision, now_ms, selected));
+        lines.extend(feed_lines(state, decision, inbox, now_ms, width, selected));
         if selected {
-            lines.extend(detail_lines(decision, inbox));
             selected_span = Some((row_index, lines.len().saturating_sub(1)));
         }
+        lines.push(Line::from(""));
     }
-    let title = format!("decisions - {} open", state.decisions.len());
+    let title = format!("decisions · {} open · oldest first", state.decisions.len());
     let inner_height = usize::from(rows[0].height.saturating_sub(2));
     let scroll = selected_span
         .filter(|_| inner_height > 0)
@@ -868,43 +1090,52 @@ pub fn draw(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms:
     f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
 }
 
-/// Build one row line of the list.
-fn row_line(decision: &Decision, now_ms: u64, selected: bool) -> Line<'static> {
-    let mut style = Style::new();
+/// Build one content-first feed item.
+fn feed_lines(
+    state: &StateView,
+    decision: &Decision,
+    inbox: &Inbox,
+    now_ms: u64,
+    width: usize,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let mut style = Style::new().fg(THEME.text);
     if selected {
-        style = style.add_modifier(Modifier::BOLD);
+        style = style.patch(THEME.selected()).add_modifier(Modifier::BOLD);
     }
     let marker = if selected { "> " } else { "  " };
-    Line::from(vec![
-        Span::styled(marker.to_string(), style),
-        Span::styled(
-            format!("{:>4}  ", age_text(decision.opened_ms, now_ms)),
-            style,
-        ),
-        Span::styled(format!("{:<10} ", decision.repo), style),
-        Span::styled(format!("{:<9} ", stage_text(decision)), style),
-        Span::styled(summary(decision), style),
-    ])
+    let mut metadata = format!(
+        "{marker}{} · {} · {}",
+        kind_label(decision),
+        age_text(decision.opened_ms, now_ms),
+        decision.repo
+    );
+    if decision.stage.is_some() {
+        metadata.push_str(&format!(" · {}", stage_text(decision)));
+    }
+    let mut lines = vec![Line::styled(metadata, style)];
+    lines.extend(wrapped_lines(&feed_message(decision), width, "  ", style));
+    if selected {
+        lines.extend(choice_lines(state, decision, inbox, style));
+        lines.extend(wrapped_lines(&feed_actions(decision), width, "  ", style));
+    }
+    lines
 }
 
-/// Build the detail lines of the selected row.
-fn detail_lines(decision: &Decision, inbox: &Inbox) -> Vec<Line<'static>> {
-    let dim = Style::new().add_modifier(Modifier::DIM);
-    let dim_line = move |text: String| Line::from(Span::styled(text, dim));
+/// Build choices that the selected feed item needs for a quick answer.
+fn choice_lines(
+    state: &StateView,
+    decision: &Decision,
+    inbox: &Inbox,
+    style: Style,
+) -> Vec<Line<'static>> {
     match &decision.kind {
-        DecisionKind::Permission {
-            task, tool, input, ..
-        } => vec![
-            dim_line(format!("  task {task} asks to use {tool}")),
-            dim_line(format!("  input {}", input_summary(input))),
-        ],
         DecisionKind::Question { questions, .. } => {
             let mut lines = Vec::new();
             let mut flat = 0;
             for (question_index, question) in parse_questions(questions).into_iter().enumerate() {
-                lines.push(dim_line(format!("  {}", question.text)));
                 if question.multi_select {
-                    lines.push(dim_line("  (pick any number of options)".to_string()));
+                    lines.push(Line::styled("  Select all applicable options.", style));
                 }
                 for (option_index, (label, description)) in question.options.iter().enumerate() {
                     flat += 1;
@@ -919,36 +1150,280 @@ fn detail_lines(decision: &Decision, inbox: &Inbox) -> Vec<Line<'static>> {
                         format!("{label} {description}")
                     };
                     if flat <= 9 {
-                        lines.push(dim_line(format!("  {flat}. [{mark}] {text}")));
+                        lines.push(Line::styled(format!("  {flat}. [{mark}] {text}"), style));
                     } else {
-                        lines.push(dim_line(format!("     [{mark}] {text}")));
+                        lines.push(Line::styled(format!("     [{mark}] {text}"), style));
                     }
                 }
             }
             lines
         }
-        DecisionKind::Stuck { task, .. } => {
-            vec![dim_line(format!(
-                "  task {task} failed on its last attempt"
-            ))]
-        }
-        DecisionKind::NeedsHuman { kind, number, .. } => vec![dim_line(format!(
-            "  the {} #{number} carries the needs-human label",
-            item_word(*kind)
-        ))],
         DecisionKind::ReleaseGate { prs } => {
             let checked = inbox.checked_prs(decision);
             let mut lines = Vec::new();
             for (index, pr) in prs.iter().enumerate() {
                 let mark = if checked.contains(pr) { "x" } else { " " };
-                lines.push(dim_line(format!("  {}. [{mark}] #{pr}", index + 1)));
+                let title = find_item(state, &decision.repo, ItemKind::Pr, *pr)
+                    .map(|item| format!(" {}", item.title))
+                    .unwrap_or_default();
+                lines.push(Line::styled(
+                    format!("  {}. [{mark}] #{pr}{title}", index + 1),
+                    style,
+                ));
             }
-            lines.push(dim_line(
-                "  the list is a snapshot; the next push corrects it".to_string(),
-            ));
             lines
         }
+        DecisionKind::Permission { .. }
+        | DecisionKind::Stuck { .. }
+        | DecisionKind::NeedsHuman { .. } => Vec::new(),
     }
+}
+
+/// The visible quick actions of one feed item.
+fn feed_actions(decision: &Decision) -> String {
+    match decision.kind {
+        DecisionKind::Permission { .. } => "[y] allow · [n] deny · [enter] details".to_string(),
+        DecisionKind::Question { .. } => {
+            "[1-9] pick · [s] submit · [i] write · [enter] details".to_string()
+        }
+        DecisionKind::Stuck { .. } => "[r] retry · [c] cancel task · [enter] details".to_string(),
+        DecisionKind::NeedsHuman { .. } => {
+            "[t] comment · [c] clear label · [enter] details".to_string()
+        }
+        DecisionKind::ReleaseGate { .. } => {
+            "[1-9] include · [space] all/none · [g] release · [enter] details".to_string()
+        }
+    }
+}
+
+/// Draw one focused repository or agent context screen.
+fn draw_detail(
+    f: &mut Frame,
+    area: Rect,
+    state: &StateView,
+    inbox: &Inbox,
+    decision: &Decision,
+    detail: &DetailState,
+    now_ms: u64,
+) {
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let (title, lines) = match detail_item_key(decision, detail.item_index) {
+        Some((kind, number)) => {
+            let title = format!("{} #{number} · {}", item_title_label(kind), decision.repo);
+            let Some(item) = find_item(state, &decision.repo, kind, number) else {
+                let noun = match kind {
+                    ItemKind::Issue => "issue",
+                    ItemKind::Pr => "pull request",
+                };
+                return draw_missing_item_detail(
+                    f,
+                    rows[0],
+                    rows[1],
+                    state,
+                    inbox,
+                    detail,
+                    title,
+                    format!("The {noun} description is unavailable."),
+                );
+            };
+            let mut lines = vec![Line::styled(
+                item.title.clone(),
+                Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
+            )];
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Description", THEME.dim()));
+            let body = if item.body.trim().is_empty() {
+                "No description."
+            } else {
+                item.body.as_str()
+            };
+            lines.extend(wrapped_lines(
+                body,
+                width,
+                "",
+                Style::default().fg(THEME.text),
+            ));
+            (title, lines)
+        }
+        None => agent_detail_lines(state, decision, now_ms, width),
+    };
+    let content = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title(title))
+        .scroll((detail.scroll, 0));
+    f.render_widget(content, rows[0]);
+    f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
+}
+
+/// Draw a repository detail whose latest item snapshot is absent.
+#[allow(clippy::too_many_arguments)]
+fn draw_missing_item_detail(
+    f: &mut Frame,
+    content_area: Rect,
+    footer_area: Rect,
+    state: &StateView,
+    inbox: &Inbox,
+    detail: &DetailState,
+    title: String,
+    message: String,
+) {
+    let content = Paragraph::new(message)
+        .block(Block::bordered().title(title))
+        .scroll((detail.scroll, 0));
+    f.render_widget(content, content_area);
+    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
+}
+
+/// Build the initial task context screen until transcript context is available.
+fn agent_detail_lines(
+    state: &StateView,
+    decision: &Decision,
+    now_ms: u64,
+    width: usize,
+) -> (String, Vec<Line<'static>>) {
+    let title = format!(
+        "{} · {} · {}",
+        kind_label(decision),
+        decision.repo,
+        age_text(decision.opened_ms, now_ms)
+    );
+    let mut lines = wrapped_lines(
+        &feed_message(decision),
+        width,
+        "",
+        Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Recent agent context", THEME.dim()));
+    let Some(task_id) = task_id(decision) else {
+        lines.push(Line::styled(
+            "No task session is available for this decision.",
+            THEME.dim(),
+        ));
+        return (title, lines);
+    };
+    let Some(task) = state.tasks.iter().find(|task| task.id == task_id) else {
+        lines.push(Line::styled(
+            "The task session is unavailable.",
+            THEME.dim(),
+        ));
+        return (title, lines);
+    };
+    let entries = match recent_context(&task.log_path, decision_request_id(decision)) {
+        Ok(entries) => entries,
+        Err(_) => {
+            lines.push(Line::styled("The task log is unavailable.", THEME.dim()));
+            return (title, lines);
+        }
+    };
+    if entries.is_empty() {
+        lines.push(Line::styled(
+            "No visible agent context is available.",
+            THEME.dim(),
+        ));
+        return (title, lines);
+    }
+    let render_width = u16::try_from(width).unwrap_or(u16::MAX);
+    for entry in entries {
+        lines.extend(transcript::render(&entry, render_width));
+    }
+    (title, lines)
+}
+
+/// Return the request id that bounds permission and question context.
+fn decision_request_id(decision: &Decision) -> Option<&str> {
+    match &decision.kind {
+        DecisionKind::Permission { request_id, .. } | DecisionKind::Question { request_id, .. } => {
+            Some(request_id)
+        }
+        DecisionKind::Stuck { .. }
+        | DecisionKind::NeedsHuman { .. }
+        | DecisionKind::ReleaseGate { .. } => None,
+    }
+}
+
+/// Read and parse the newest visible context for one task decision.
+fn recent_context(
+    path: &Path,
+    request_id: Option<&str>,
+) -> std::io::Result<Vec<transcript::Entry>> {
+    let raw = read_log_tail(path)?;
+    let raw_lines: Vec<&str> = raw.lines().collect();
+    let end = request_id
+        .and_then(|request_id| {
+            raw_lines.iter().rposition(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("request_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|found| found == request_id)
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .map_or(raw_lines.len(), |index| index + 1);
+    let mut entries: Vec<transcript::Entry> = raw_lines[..end]
+        .iter()
+        .flat_map(|line| transcript::parse(line))
+        .collect();
+    if entries.len() > CONTEXT_ENTRIES {
+        entries.drain(..entries.len() - CONTEXT_ENTRIES);
+    }
+    Ok(entries)
+}
+
+/// Read a bounded tail of one task log without a partial first line.
+fn read_log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(CONTEXT_LOG_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=newline);
+        } else {
+            bytes.clear();
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Resolve the repository item that one detail screen shows.
+fn detail_item_key(decision: &Decision, item_index: usize) -> Option<(ItemKind, u64)> {
+    match &decision.kind {
+        DecisionKind::ReleaseGate { prs } => (ItemKind::Pr, *prs.get(item_index)?),
+        DecisionKind::NeedsHuman { kind, number, .. } => (*kind, *number),
+        DecisionKind::Permission { .. }
+        | DecisionKind::Question { .. }
+        | DecisionKind::Stuck { .. } => return None,
+    }
+    .into()
+}
+
+/// Find one repository item in the decision-specific state projection.
+fn find_item<'a>(
+    state: &'a StateView,
+    repo: &str,
+    kind: ItemKind,
+    number: u64,
+) -> Option<&'a ItemView> {
+    state
+        .decision_items
+        .iter()
+        .find(|item| item.repo == repo && item.kind == kind && item.number == number)
+}
+
+/// Wrap text with a fixed prefix on every display line.
+fn wrapped_lines(text: &str, width: usize, prefix: &str, style: Style) -> Vec<Line<'static>> {
+    let body_width = width.saturating_sub(prefix.chars().count()).max(1);
+    transcript::wrap(text, body_width)
+        .into_iter()
+        .map(|line| Line::styled(format!("{prefix}{line}"), style))
+        .collect()
 }
 
 /// Whether one option of a question row carries a pick.
@@ -971,25 +1446,53 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
             input.label, input.buffer
         );
     }
+    if let Some(detail) = inbox.detail.as_ref() {
+        let Some(decision) = state
+            .decisions
+            .iter()
+            .find(|decision| decision.id == detail.decision_id)
+        else {
+            return "esc back".to_string();
+        };
+        return match decision.kind {
+            DecisionKind::ReleaseGate { .. } => {
+                "esc back · j k scroll · h l pull request · space include/exclude · g release"
+                    .to_string()
+            }
+            DecisionKind::Permission { .. } => {
+                "esc back · j k scroll · y allow · n deny · o session".to_string()
+            }
+            DecisionKind::Question { .. } => {
+                "esc back · j k scroll · 1-9 pick · s submit · i write · o session".to_string()
+            }
+            DecisionKind::Stuck { .. } => {
+                "esc back · j k scroll · r retry · c cancel · o session".to_string()
+            }
+            DecisionKind::NeedsHuman { .. } => {
+                "esc back · j k scroll · t comment · c clear label".to_string()
+            }
+        };
+    }
     let Some(index) = inbox.selected_index(state) else {
         return "j k move · ! oldest".to_string();
     };
-    let Some(decision) = state.decisions.get(index) else {
+    let ordered = ordered_decisions(state);
+    let Some(decision) = ordered.get(index) else {
         return "j k move · ! oldest".to_string();
     };
     match &decision.kind {
         DecisionKind::Permission { .. } => {
-            "j k move · y allow · n deny · enter session".to_string()
+            "j k move · y allow · n deny · enter details".to_string()
         }
         DecisionKind::Question { .. } => {
-            "j k move · 1-9 pick · enter submit · i free answer".to_string()
+            "j k move · 1-9 pick · s submit · i write · enter details".to_string()
         }
-        DecisionKind::Stuck { .. } => "j k move · r retry · c cancel · enter session".to_string(),
+        DecisionKind::Stuck { .. } => "j k move · r retry · c cancel · enter details".to_string(),
         DecisionKind::NeedsHuman { .. } => {
-            "j k move · t comment · c cancel · no retry: the label can outlive its task".to_string()
+            "j k move · t comment · c clear label · enter details".to_string()
         }
         DecisionKind::ReleaseGate { .. } => {
-            "j k move · 1-9 toggle · space all or none · g fire".to_string()
+            "j k move · 1-9 include · space all or none · g release · enter details".to_string()
         }
     }
 }
@@ -1009,8 +1512,8 @@ mod tests {
 
     use super::*;
     use crate::model::Stage;
-    use crate::sock::PausedView;
-    use crate::tasks::Task;
+    use crate::sock::{InputMode, PausedView, TaskView};
+    use crate::tasks::{Task, TaskState};
 
     /// The epoch time every test decision opens at.
     const OPENED: u64 = 10_000_000;
@@ -1068,6 +1571,7 @@ mod tests {
             lanes: Vec::new(),
             tasks: Vec::new(),
             decisions,
+            decision_items: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -1142,7 +1646,18 @@ mod tests {
 
     /// Render the inbox at one test height.
     fn render_with_height(state: &StateView, inbox: &Inbox, now_ms: u64, height: u16) -> String {
-        let backend = TestBackend::new(100, height);
+        render_at_size(state, inbox, now_ms, 100, height)
+    }
+
+    /// Render the inbox at one test width and height.
+    fn render_at_size(
+        state: &StateView,
+        inbox: &Inbox,
+        now_ms: u64,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| draw(f, f.area(), state, inbox, now_ms))
@@ -1179,31 +1694,367 @@ mod tests {
     }
 
     #[test]
-    fn rows_render_age_repo_stage_and_summary() {
+    fn feed_items_render_age_repo_stage_and_primary_message() {
         let state = full_state();
         let inbox = Inbox::new();
         let screen = render(&state, &inbox, OPENED + 90_000);
 
-        assert!(screen.contains("decisions - 5 open"), "screen: {screen}");
-        assert!(screen.contains("  1m"), "age: {screen}");
-        assert!(screen.contains("borsuk"), "repo: {screen}");
-        assert!(screen.contains("implement"), "stage: {screen}");
-        assert!(screen.contains("Write src/main.rs"), "summary: {screen}");
         assert!(
-            screen.contains("Which database? (2 options)"),
-            "summary: {screen}"
-        );
-        assert!(screen.contains("3 failures"), "summary: {screen}");
-        assert!(
-            screen.contains("#142 Fix the flake (issue)"),
-            "summary: {screen}"
+            screen.contains("decisions · 5 open · oldest first"),
+            "screen: {screen}"
         );
         assert!(
-            screen.contains("release 2 pull requests: #7 #9"),
-            "summary: {screen}"
+            screen.contains("PERMISSION · 1m · borsuk · implement"),
+            "metadata: {screen}"
         );
-        // A row without a stage shows a placeholder.
-        assert!(screen.contains("-        "), "stage gap: {screen}");
+        assert!(
+            screen.contains("Allow Write for src/main.rs?"),
+            "message: {screen}"
+        );
+        assert!(screen.contains("Which database?"), "message: {screen}");
+        assert!(
+            screen.contains("Task borsuk/implement-i142 stopped: 3 failures"),
+            "message: {screen}"
+        );
+        assert!(
+            screen.contains("Issue #142 needs a decision: Fix the flake"),
+            "message: {screen}"
+        );
+        assert!(
+            screen.contains("Release 2 pull requests: #7 #9?"),
+            "message: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_feed_lists_decisions_from_oldest_to_newest() {
+        let worker = worker();
+        let decisions = vec![
+            Decision::permission(
+                &worker,
+                "newest",
+                "Write",
+                serde_json::json!({"file_path": "src/main.rs"}),
+                OPENED + 2_000,
+            ),
+            Decision::release_gate("borsuk", vec![7], OPENED),
+            Decision::needs_human(
+                "borsuk",
+                ItemKind::Issue,
+                142,
+                "Choose the storage",
+                OPENED + 1_000,
+            ),
+        ];
+        let state = state_with(decisions);
+        let mut inbox = Inbox::new();
+        inbox.observe(&state);
+
+        let screen = render(&state, &inbox, OPENED + 4_000);
+
+        let release = screen
+            .find("Release pull request #7?")
+            .expect("the oldest release decision is absent");
+        let human = screen
+            .find("Issue #142 needs a decision: Choose the storage")
+            .expect("the middle decision is absent");
+        let permission = screen
+            .find("Allow Write for src/main.rs?")
+            .expect("the newest permission decision is absent");
+        assert!(release < human && human < permission, "screen: {screen}");
+        assert_eq!(inbox.selected_id(), Some("gate:borsuk"));
+        assert!(
+            screen.contains("decisions · 3 open · oldest first"),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_feed_shows_quick_actions_only_on_the_selected_item() {
+        let worker = worker();
+        let state = state_with(vec![
+            Decision::permission(
+                &worker,
+                "req-1",
+                "Write",
+                serde_json::json!({"file_path": "first.rs"}),
+                OPENED,
+            ),
+            Decision::stuck(&worker, "second task failure", OPENED + 1),
+        ]);
+        let inbox = selected(&state, 0);
+
+        let screen = render(&state, &inbox, OPENED + 2);
+
+        assert_eq!(
+            screen.matches("[enter] details").count(),
+            1,
+            "screen: {screen}"
+        );
+        assert!(!screen.contains("[r] retry"), "screen: {screen}");
+    }
+
+    #[test]
+    fn enter_on_a_release_decision_opens_the_pull_request_description() {
+        use crate::sock::ItemView;
+
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "Protect the release gate".to_string(),
+            body: "Require a current release state before the train starts.".to_string(),
+        });
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        let outcome = inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED + 15_000);
+
+        assert_eq!(outcome, InboxOutcome::None);
+        assert!(rx.try_recv().is_err(), "Enter sent an answer");
+        assert!(screen.contains("PR #7"), "screen: {screen}");
+        assert!(
+            screen.contains("Protect the release gate"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("Require a current release state before the train starts."),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("esc back"), "screen: {screen}");
+    }
+
+    #[test]
+    fn a_question_detail_shows_only_its_task_context_and_o_opens_that_session() {
+        let correct_log =
+            std::env::temp_dir().join(format!("aif-inbox-correct-{}.jsonl", uuid::Uuid::new_v4()));
+        let other_log =
+            std::env::temp_dir().join(format!("aif-inbox-other-{}.jsonl", uuid::Uuid::new_v4()));
+        fs::write(
+            &correct_log,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",",
+                "\"text\":\"I inspected the storage adapter before this question.\"}]}}\n",
+                "{\"type\":\"control_request\",\"request_id\":\"req-2\",",
+                "\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\"}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &other_log,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"WRONG TASK CONTEXT\"}]}}\n",
+        )
+        .unwrap();
+        let mut state = state_with(vec![every_decision()[1].clone()]);
+        state.tasks = vec![
+            task_view("borsuk/implement-i142", &correct_log),
+            task_view("borsuk/refine-i999", &other_log),
+        ];
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+        let outcome = inbox.handle_key(&state, press('o'), &mut tx);
+
+        assert!(
+            screen.contains("I inspected the storage adapter before this question."),
+            "screen: {screen}"
+        );
+        assert!(!screen.contains("WRONG TASK CONTEXT"), "screen: {screen}");
+        assert_eq!(
+            outcome,
+            InboxOutcome::OpenSession("borsuk/implement-i142".to_string())
+        );
+        assert!(rx.try_recv().is_err(), "detail navigation sent an answer");
+
+        fs::remove_file(correct_log).unwrap();
+        fs::remove_file(other_log).unwrap();
+    }
+
+    #[test]
+    fn a_missing_pull_request_snapshot_has_a_clear_detail_message() {
+        let state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(screen.contains("PR #7"), "screen: {screen}");
+        assert!(
+            screen.contains("The pull request description is unavailable."),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_release_detail_moves_between_pull_requests_and_toggles_the_current_one() {
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7, 9], OPENED)]);
+        state.decision_items = vec![
+            ItemView {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Pr,
+                number: 7,
+                title: "First change".to_string(),
+                body: "The first pull request body.".to_string(),
+            },
+            ItemView {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Pr,
+                number: 9,
+                title: "Second change".to_string(),
+                body: "The second pull request body.".to_string(),
+            },
+        ];
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(
+            render(&state, &inbox, OPENED).contains("The first pull request body."),
+            "the first pull request did not open"
+        );
+
+        inbox.handle_key(&state, press_code(KeyCode::Right), &mut tx);
+        let second = render(&state, &inbox, OPENED);
+        assert!(second.contains("PR #9"), "screen: {second}");
+        assert!(
+            second.contains("The second pull request body."),
+            "screen: {second}"
+        );
+        assert!(!second.contains("The first pull request body."));
+
+        inbox.handle_key(&state, press(' '), &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Esc), &mut tx);
+        let feed = render(&state, &inbox, OPENED);
+        assert!(!inbox.detail_open());
+        assert_eq!(inbox.selected_id(), Some("gate:borsuk"));
+        assert!(feed.contains("1. [x] #7 First change"), "screen: {feed}");
+        assert!(feed.contains("2. [ ] #9 Second change"), "screen: {feed}");
+        assert!(rx.try_recv().is_err(), "navigation sent an answer");
+    }
+
+    #[test]
+    fn enter_on_a_needs_human_issue_opens_its_description() {
+        let mut state = state_with(vec![Decision::needs_human(
+            "borsuk",
+            ItemKind::Issue,
+            142,
+            "Choose the storage",
+            OPENED,
+        )]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+            title: "Choose the storage".to_string(),
+            body: "Compare the operational cost of both storage options.".to_string(),
+        });
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(screen.contains("Issue #142"), "screen: {screen}");
+        assert!(
+            screen.contains("Compare the operational cost of both storage options."),
+            "screen: {screen}"
+        );
+        assert!(rx.try_recv().is_err(), "Enter sent an answer");
+    }
+
+    #[test]
+    fn enter_opens_question_context_and_s_submits_the_selected_answer() {
+        let state = state_with(vec![every_decision()[1].clone()]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('1'), &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(inbox.detail_open());
+        assert!(rx.try_recv().is_err(), "Enter submitted the answer");
+
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "perm:borsuk/implement-i142:req-2".to_string(),
+                response: Response::Answers {
+                    updated_input: serde_json::json!({"answers": {"Storage": "SQLite"}}),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_missing_task_log_has_a_clear_context_message() {
+        let state = {
+            let mut state = state_with(vec![every_decision()[2].clone()]);
+            let path = std::env::temp_dir()
+                .join(format!("aif-inbox-missing-{}.jsonl", uuid::Uuid::new_v4()));
+            state.tasks.push(task_view("borsuk/implement-i142", &path));
+            state
+        };
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(
+            screen.contains("The task log is unavailable."),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_detail_keeps_the_description_and_back_key_readable() {
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "Protect releases".to_string(),
+            body: "This description explains the release. It stays readable on a narrow terminal."
+                .to_string(),
+        });
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        let screen = render_at_size(&state, &inbox, OPENED, 44, 12);
+
+        assert!(
+            screen.contains("This description explains"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("narrow terminal."), "screen: {screen}");
+        assert!(screen.contains("esc back"), "screen: {screen}");
+        assert!(
+            screen.lines().all(|line| line.chars().count() == 44),
+            "screen: {screen}"
+        );
+    }
+
+    /// One visible task with a chosen log path.
+    fn task_view(id: &str, log_path: &std::path::Path) -> TaskView {
+        TaskView {
+            id: id.to_string(),
+            repo: "borsuk".to_string(),
+            stage: Stage::Implement,
+            kind: ItemKind::Issue,
+            number: 142,
+            state: TaskState::AwaitingUser,
+            attempt: 1,
+            log_path: log_path.to_path_buf(),
+            input: InputMode::Live,
+            queued_messages: 0,
+        }
     }
 
     #[test]
@@ -1245,13 +2096,13 @@ mod tests {
         let state = full_state();
         let inbox = Inbox::new();
         let first = render(&state, &inbox, OPENED + 3_600_000);
-        assert!(first.contains("  1h"), "screen: {first}");
+        assert!(first.contains("PERMISSION · 1h"), "screen: {first}");
 
         // The daemon re-pushes the row five minutes later. The age grows
         // from opened_ms and never falls back to zero.
         let repushed = full_state();
         let second = render(&repushed, &inbox, OPENED + 3_900_000);
-        assert!(second.contains("  1h"), "screen: {second}");
+        assert!(second.contains("PERMISSION · 1h"), "screen: {second}");
     }
 
     #[test]
@@ -1279,7 +2130,7 @@ mod tests {
             "screen: {screen}"
         );
         assert!(
-            screen.contains("1-9 pick · enter submit · i free answer"),
+            screen.contains("1-9 pick · s submit · i write · enter details"),
             "footer: {screen}"
         );
     }
@@ -1293,7 +2144,7 @@ mod tests {
         assert!(screen.contains("1. [x] #7"), "screen: {screen}");
         assert!(screen.contains("2. [x] #9"), "screen: {screen}");
         assert!(
-            screen.contains("1-9 toggle · space all or none · g fire"),
+            screen.contains("1-9 include · space all or none · g release · enter details"),
             "footer: {screen}"
         );
 
@@ -1306,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_y_sends_allow_a_sends_nothing_and_enter_opens_the_session() {
+    fn permission_y_sends_allow_enter_opens_details_and_o_opens_the_session() {
         let state = full_state();
         let (mut tx, rx) = fake_sink();
         let mut inbox = selected(&state, 0);
@@ -1328,6 +2179,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         let outcome = inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert_eq!(outcome, InboxOutcome::None);
+        assert!(inbox.detail_open());
+        let outcome = inbox.handle_key(&state, press('o'), &mut tx);
         assert_eq!(
             outcome,
             InboxOutcome::OpenSession("borsuk/implement-i142".to_string())
@@ -1382,14 +2236,14 @@ mod tests {
     }
 
     #[test]
-    fn question_digits_pick_enter_submits_the_answers() {
+    fn question_digits_pick_and_s_submits_the_answers() {
         let state = full_state();
         let (mut tx, rx) = fake_sink();
         let mut inbox = selected(&state, 1);
 
         inbox.handle_key(&state, press('1'), &mut tx);
         assert!(rx.try_recv().is_err(), "a pick alone sends nothing");
-        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
 
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1403,12 +2257,12 @@ mod tests {
     }
 
     #[test]
-    fn question_enter_without_a_pick_is_blocked_with_a_hint() {
+    fn question_s_without_a_pick_is_blocked_with_a_hint() {
         let state = full_state();
         let (mut tx, rx) = fake_sink();
         let mut inbox = selected(&state, 1);
 
-        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
 
         assert!(
             rx.try_recv().is_err(),
@@ -1419,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn question_enter_without_a_multi_select_pick_is_blocked_with_a_hint() {
+    fn question_s_without_a_multi_select_pick_is_blocked_with_a_hint() {
         let decision = Decision::question(
             &worker(),
             "req-multi",
@@ -1438,7 +2292,7 @@ mod tests {
         let (mut tx, rx) = fake_sink();
         let mut inbox = selected(&state, 0);
 
-        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
 
         assert!(rx.try_recv().is_err(), "an empty choice sent an answer");
         let screen = render(&state, &inbox, OPENED);
@@ -1505,7 +2359,7 @@ mod tests {
         assert!(screen.contains("3. [x] memcached"), "screen: {screen}");
 
         inbox.handle_key(&state, press('2'), &mut tx);
-        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
 
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1532,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn stuck_r_retries_c_cancels_and_enter_opens_the_session() {
+    fn stuck_r_retries_c_cancels_enter_opens_details_and_o_opens_the_session() {
         let state = full_state();
         let (mut tx, rx) = fake_sink();
         let mut inbox = selected(&state, 2);
@@ -1556,6 +2410,9 @@ mod tests {
         );
 
         let outcome = inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert_eq!(outcome, InboxOutcome::None);
+        assert!(inbox.detail_open());
+        let outcome = inbox.handle_key(&state, press('o'), &mut tx);
         assert_eq!(
             outcome,
             InboxOutcome::OpenSession("borsuk/implement-i142".to_string())
@@ -1591,8 +2448,11 @@ mod tests {
             }
         );
 
-        // The row has no task, so enter jumps nowhere.
+        // Enter opens the issue context. The detail has no task session.
         let outcome = inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert_eq!(outcome, InboxOutcome::None);
+        assert!(inbox.detail_open());
+        let outcome = inbox.handle_key(&state, press('o'), &mut tx);
         assert_eq!(outcome, InboxOutcome::None);
         assert!(rx.try_recv().is_err());
     }
@@ -1816,7 +2676,7 @@ mod tests {
         let changed_state = state_with(vec![changed]);
         inbox.observe(&changed_state);
 
-        inbox.handle_key(&changed_state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&changed_state, press('s'), &mut tx);
 
         assert!(rx.try_recv().is_err(), "a stale option sent an answer");
         let screen = render(&changed_state, &inbox, OPENED);
@@ -1921,7 +2781,7 @@ mod tests {
 
         let screen = render_with_height(&state, &inbox, OPENED, 8);
 
-        assert!(screen.contains(">   0s"), "selection: {screen}");
+        assert!(screen.contains("> PERMISSION · 0s"), "selection: {screen}");
         assert!(screen.contains("file-11.rs"), "selected row: {screen}");
     }
 
@@ -1972,10 +2832,10 @@ mod tests {
         let state = full_state();
         let cases: [(usize, &str); 5] = [
             (0, "y allow · n deny"),
-            (1, "1-9 pick · enter submit · i free answer"),
+            (1, "1-9 pick · s submit · i write · enter details"),
             (2, "r retry · c cancel"),
-            (3, "t comment · c cancel · no retry"),
-            (4, "1-9 toggle · space all or none · g fire"),
+            (3, "t comment · c clear label · enter details"),
+            (4, "1-9 include · space all or none · g release"),
         ];
         for (index, expected) in cases {
             let inbox = selected(&state, index);
@@ -1991,7 +2851,7 @@ mod tests {
         let mut inbox = selected(&state, 1);
 
         inbox.handle_key(&state, press('5'), &mut tx);
-        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
         assert!(
             rx.try_recv().is_err(),
             "screen: {}",
