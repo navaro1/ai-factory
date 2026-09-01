@@ -13,7 +13,8 @@
 //! | `NeedsHuman` | `t` type a comment, `c` clear the label, `enter` show the item |
 //! | `ReleaseGate` | `1`..`9` toggle one pull request, `space` all or none, `g` release, `enter` show a pull request |
 //!
-//! Global keys: `j`, `k`, and the arrow keys move the selection, and `!`
+//! Global keys: `j`, `k`, and the arrow keys move the selection. `PageUp` and
+//! `PageDown` scroll a selected item that is taller than the viewport. `!`
 //! selects the oldest decision. A detail screen uses `esc` to return. It uses
 //! `o` to open the full task session when the decision has one.
 //!
@@ -23,6 +24,7 @@
 //! local change; the next push corrects the list. Agent context only uses
 //! visible transcript entries from the exact task log.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -50,6 +52,9 @@ const CONTEXT_LOG_BYTES: u64 = 128 * 1024;
 /// The maximum visible transcript entries on one decision detail screen.
 const CONTEXT_ENTRIES: usize = 16;
 
+/// The line count that one page key moves.
+const SCROLL_STEP: u16 = 8;
+
 /// The local UI state of the inbox view.
 ///
 /// The state holds data that the pushed state does not carry. This data
@@ -68,6 +73,10 @@ pub struct Inbox {
     input: Option<TextInput>,
     /// A short hint that explains a blocked intent.
     hint: Option<&'static str>,
+    /// The line offset inside a selected feed item that exceeds the viewport.
+    feed_scroll: Cell<u16>,
+    /// The largest valid selected-item offset from the last feed draw.
+    feed_scroll_max: Cell<u16>,
     /// The focused context screen, when Enter opened one decision.
     detail: Option<DetailState>,
 }
@@ -80,7 +89,9 @@ struct DetailState {
     /// The pull request shown inside a release batch.
     item_number: Option<u64>,
     /// How many rendered lines the context screen scrolls down.
-    scroll: u16,
+    scroll: Cell<u16>,
+    /// The largest valid detail offset from the last draw.
+    scroll_max: Cell<u16>,
 }
 
 /// The option picks for one exact question snapshot.
@@ -225,7 +236,8 @@ impl Inbox {
                     .is_none_or(|number| !prs.contains(&number))
                 {
                     detail.item_number = prs.first().copied();
-                    detail.scroll = 0;
+                    detail.scroll.set(0);
+                    detail.scroll_max.set(0);
                 }
             }
         }
@@ -234,6 +246,8 @@ impl Inbox {
             .as_deref()
             .is_none_or(|id| !state.decisions.iter().any(|d| d.id == id));
         if selected_is_gone {
+            self.feed_scroll.set(0);
+            self.feed_scroll_max.set(0);
             self.selected_id = oldest_decision(state).map(|decision| decision.id.clone());
         }
     }
@@ -241,10 +255,15 @@ impl Inbox {
     /// Select the row at `index`, clamped to the open rows.
     pub fn select_index(&mut self, state: &StateView, index: usize) {
         let ordered = ordered_decisions(state);
-        self.selected_id = ordered
+        let next = ordered
             .get(index)
             .or_else(|| ordered.last())
             .map(|d| d.id.clone());
+        if self.selected_id != next {
+            self.feed_scroll.set(0);
+            self.feed_scroll_max.set(0);
+        }
+        self.selected_id = next;
     }
 
     /// Select the oldest decision, as the `!` key promises.
@@ -255,6 +274,8 @@ impl Inbox {
         self.detail = None;
         self.input = None;
         self.hint = None;
+        self.feed_scroll.set(0);
+        self.feed_scroll_max.set(0);
         self.selected_id = oldest_decision(state).map(|decision| decision.id.clone());
     }
 
@@ -313,9 +334,20 @@ impl Inbox {
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(state, 1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(state, -1),
+            KeyCode::PageDown => self.scroll_feed(i32::from(SCROLL_STEP)),
+            KeyCode::PageUp => self.scroll_feed(-i32::from(SCROLL_STEP)),
             KeyCode::Esc => InboxOutcome::None,
             _ => self.row_key(state, key, sink),
         }
+    }
+
+    /// Move inside a selected feed item and clamp to its last drawn content.
+    fn scroll_feed(&self, step: i32) -> InboxOutcome {
+        let current = i32::from(self.feed_scroll.get());
+        let maximum = i32::from(self.feed_scroll_max.get());
+        let next = (current + step).clamp(0, maximum) as u16;
+        self.feed_scroll.set(next);
+        InboxOutcome::None
     }
 
     /// Move the selection by `step` rows and clamp at the ends.
@@ -440,7 +472,8 @@ impl Inbox {
         self.detail = Some(DetailState {
             decision_id: decision.id.clone(),
             item_number,
-            scroll: 0,
+            scroll: Cell::new(0),
+            scroll_max: Cell::new(0),
         });
     }
 
@@ -473,27 +506,19 @@ impl Inbox {
                 InboxOutcome::None
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = detail.scroll.saturating_add(1);
-                }
+                self.scroll_detail(1);
                 InboxOutcome::None
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = detail.scroll.saturating_sub(1);
-                }
+                self.scroll_detail(-1);
                 InboxOutcome::None
             }
             KeyCode::PageDown => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = detail.scroll.saturating_add(8);
-                }
+                self.scroll_detail(i32::from(SCROLL_STEP));
                 InboxOutcome::None
             }
             KeyCode::PageUp => {
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = detail.scroll.saturating_sub(8);
-                }
+                self.scroll_detail(-i32::from(SCROLL_STEP));
                 InboxOutcome::None
             }
             KeyCode::Left | KeyCode::Char('h')
@@ -520,6 +545,17 @@ impl Inbox {
         }
     }
 
+    /// Move inside a detail screen and clamp to its last drawn content.
+    fn scroll_detail(&self, step: i32) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        let current = i32::from(detail.scroll.get());
+        let maximum = i32::from(detail.scroll_max.get());
+        let next = (current + step).clamp(0, maximum) as u16;
+        detail.scroll.set(next);
+    }
+
     /// Move the release detail by one pull request and clamp at both ends.
     fn move_detail_pr(&mut self, decision: &Decision, step: isize) {
         let DecisionKind::ReleaseGate { prs } = &decision.kind else {
@@ -539,7 +575,8 @@ impl Inbox {
         let last = prs.len() - 1;
         let next = (current as isize + step).clamp(0, last as isize) as usize;
         detail.item_number = prs.get(next).copied().or(Some(*first));
-        detail.scroll = 0;
+        detail.scroll.set(0);
+        detail.scroll_max.set(0);
     }
 
     /// Toggle the pull request that the release detail screen shows.
@@ -1109,11 +1146,26 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms
     let scroll = selected_span
         .filter(|_| inner_height > 0)
         .map(|(start, end)| {
-            end.saturating_add(1)
+            let item_height = end.saturating_sub(start).saturating_add(1);
+            let maximum = item_height
                 .saturating_sub(inner_height)
-                .min(start)
+                .min(usize::from(u16::MAX)) as u16;
+            inbox.feed_scroll_max.set(maximum);
+            let local = inbox.feed_scroll.get().min(maximum);
+            inbox.feed_scroll.set(local);
+            if maximum > 0 {
+                start.saturating_add(usize::from(local))
+            } else {
+                end.saturating_add(1)
+                    .saturating_sub(inner_height)
+                    .min(start)
+            }
         })
-        .unwrap_or(0)
+        .unwrap_or_else(|| {
+            inbox.feed_scroll.set(0);
+            inbox.feed_scroll_max.set(0);
+            0
+        })
         .min(usize::from(u16::MAX)) as u16;
     let list = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
@@ -1296,9 +1348,10 @@ fn draw_detail(
         }
         None => agent_detail_lines(state, decision, now_ms, width),
     };
+    let scroll = clamped_detail_scroll(detail, lines.len(), rows[0]);
     let content = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
-        .scroll((detail.scroll, 0));
+        .scroll((scroll, 0));
     f.render_widget(content, rows[0]);
     f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
 }
@@ -1315,11 +1368,24 @@ fn draw_missing_item_detail(
     title: String,
     message: String,
 ) {
+    let scroll = clamped_detail_scroll(detail, 1, content_area);
     let content = Paragraph::new(message)
         .block(Block::bordered().title(title))
-        .scroll((detail.scroll, 0));
+        .scroll((scroll, 0));
     f.render_widget(content, content_area);
     f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
+}
+
+/// Clamp a detail offset to the content height from this draw.
+fn clamped_detail_scroll(detail: &DetailState, line_count: usize, area: Rect) -> u16 {
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let maximum = line_count
+        .saturating_sub(inner_height)
+        .min(usize::from(u16::MAX)) as u16;
+    detail.scroll_max.set(maximum);
+    let scroll = detail.scroll.get().min(maximum);
+    detail.scroll.set(scroll);
+    scroll
 }
 
 /// Build the initial task context screen until transcript context is available.
@@ -1535,17 +1601,21 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
     };
     match &decision.kind {
         DecisionKind::Permission { .. } => {
-            "j k move · y allow · n deny · enter details".to_string()
+            "PgUp PgDn scroll · j k move · y allow · n deny · enter details".to_string()
         }
         DecisionKind::Question { .. } => {
-            "j k move · 1-9 pick · s submit · i write · enter details".to_string()
+            "PgUp PgDn scroll · j k move · 1-9 pick · s submit · i write · enter details"
+                .to_string()
         }
-        DecisionKind::Stuck { .. } => "j k move · r retry · c cancel · enter details".to_string(),
+        DecisionKind::Stuck { .. } => {
+            "PgUp PgDn scroll · j k move · r retry · c cancel · enter details".to_string()
+        }
         DecisionKind::NeedsHuman { .. } => {
-            "j k move · t comment · c clear label · enter details".to_string()
+            "PgUp PgDn scroll · j k move · t comment · c clear label · enter details".to_string()
         }
         DecisionKind::ReleaseGate { .. } => {
-            "j k move · 1-9 include · space all or none · g release · enter details".to_string()
+            "PgUp PgDn scroll · j k move · 1-9 include · space all or none · g release · enter details"
+                .to_string()
         }
     }
 }
@@ -2137,6 +2207,39 @@ mod tests {
         assert!(
             screen.lines().all(|line| line.chars().count() == 44),
             "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn detail_page_keys_stop_at_the_last_content_line() {
+        let body = (1..=20)
+            .map(|number| format!("description line {number:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "Protect releases".to_string(),
+            body,
+        });
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        render_at_size(&state, &inbox, OPENED, 60, 10);
+
+        for _ in 0..20 {
+            inbox.handle_key(&state, press_code(KeyCode::PageDown), &mut tx);
+        }
+        let bottom = render_at_size(&state, &inbox, OPENED, 60, 10);
+        assert!(bottom.contains("description line 20"), "screen: {bottom}");
+
+        inbox.handle_key(&state, press_code(KeyCode::PageUp), &mut tx);
+        let previous_page = render_at_size(&state, &inbox, OPENED, 60, 10);
+        assert!(
+            previous_page.contains("description line 12"),
+            "screen: {previous_page}"
         );
     }
 
@@ -2935,6 +3038,45 @@ mod tests {
 
         assert!(screen.contains("> PERMISSION · 0s"), "selection: {screen}");
         assert!(screen.contains("file-11.rs"), "selected row: {screen}");
+    }
+
+    #[test]
+    fn page_keys_scroll_and_clamp_a_selected_item_that_exceeds_the_viewport() {
+        let options: Vec<serde_json::Value> = (1..=9)
+            .map(|number| {
+                serde_json::json!({
+                    "label": format!("option {number}"),
+                    "description": "",
+                })
+            })
+            .collect();
+        let decision = Decision::question(
+            &worker(),
+            "req-tall",
+            serde_json::json!([{
+                "question": "Choose one option.",
+                "header": "Choice",
+                "options": options,
+                "multiSelect": false,
+            }]),
+            OPENED,
+        );
+        let state = state_with(vec![decision]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+
+        let top = render_at_size(&state, &inbox, OPENED, 60, 8);
+        assert!(top.contains("option 1"), "screen: {top}");
+        assert!(!top.contains("option 9"), "screen: {top}");
+
+        inbox.handle_key(&state, press_code(KeyCode::PageDown), &mut tx);
+        let bottom = render_at_size(&state, &inbox, OPENED, 60, 8);
+        assert!(bottom.contains("option 9"), "screen: {bottom}");
+
+        inbox.handle_key(&state, press_code(KeyCode::PageDown), &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::PageUp), &mut tx);
+        let top_again = render_at_size(&state, &inbox, OPENED, 60, 8);
+        assert!(top_again.contains("option 1"), "screen: {top_again}");
     }
 
     #[test]

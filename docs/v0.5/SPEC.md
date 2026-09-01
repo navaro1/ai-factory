@@ -1314,6 +1314,8 @@ those files. Say in the report which of them you touched and why. No other file.
   entries from the exact task log. It never shows hidden thought blocks.
 - `o` opens the full task session from a task detail. `esc` returns to the
   same selected feed item.
+- Page Up and Page Down scroll within a selected feed item when its choices
+  exceed the viewport. The scroll offset stays inside that item.
 - The daemon sends item content only for open decisions that reference it.
 - The badge with the open count appears in every view's status bar, and `!`
   jumps to the oldest decision from anywhere.

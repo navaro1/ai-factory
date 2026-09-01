@@ -1085,7 +1085,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("s", "submit selected question answer"),
         ("o", "open task session from details"),
         ("ctrl-x", "abort the shown task"),
-        ("PageUp PageDown", "scroll the transcript"),
+        ("PageUp PageDown", "scroll content"),
         ("End", "follow the tail"),
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),

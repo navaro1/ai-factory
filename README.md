@@ -241,6 +241,7 @@ Press `enter` to open the source context:
 - Press `o` in a task detail to open the full session.
 - Press `esc` to return to the same feed item.
 - Use Left and Right to move through a release batch.
+- Use Page Up and Page Down when one feed item is taller than the screen.
 
 Each decision type has one answer path:
 
