@@ -157,14 +157,17 @@ bar of every view shows the count of open decisions.
 
 ### Pipeline, view 1
 
-The pipeline groups the tickets by stage, and inside a stage by repository.
-Each stage header shows its running and queued counts against the limit.
-The release group shows the queue, the stacked set, the policy, and the
-countdown to the next fire.
+The pipeline shows Refine, Implement, Review, and Release as four side-by-side lanes.
+Each lane groups its tickets by repository.
+Each lane header shows its running and queued counts against the limit.
+The release lane puts the next, active, or retry batch inside a border.
+The waiting pull requests start below the border.
+The oldest request is at the top, and the newest request is at the bottom.
 
 | Key | Action |
 |---|---|
-| `j` / `k` | Move the selection. |
+| `j` / `k` or Up / Down | Move the selection inside a lane. |
+| `h` / `l` or Left / Right | Move the selection between lanes. |
 | `enter` | Open the session of the selected ticket. Every stage. Every state. |
 | `+` / `-` | Change the limit of the selected stage. On a repository row, change its lane reservation. |
 | `p` | Pause or resume the selected stage or repository. `P` pauses or resumes everything. |
@@ -172,8 +175,8 @@ countdown to the next fire.
 | `n` | Create a new ticket for the selected repository. |
 | `x` | Abort the selected task, after a confirmation. |
 | `R` | Retry a failed task. |
-| space | Stack the head of the release queue. |
-| `g` | Fire the release train, after a confirmation that lists the pull requests. |
+| Space | Add or remove the selected waiting pull request from the next release. |
+| `g` | Start the outlined next release after a confirmation. |
 | `s` | Cycle the release policy: manual, interval, threshold. |
 
 ### Session, view 2

@@ -207,6 +207,7 @@ impl StateInput<'_> {
                         repo: repo.clone(),
                         queue: train.queue.clone(),
                         stacked: train.stacked.clone(),
+                        batch: train.batch().to_vec(),
                         policy: policy.clone(),
                         next_fire_ms: train.next_deadline_ms(policy, now_ms),
                         in_flight: train.in_flight.clone(),
@@ -215,6 +216,7 @@ impl StateInput<'_> {
                         repo: repo.clone(),
                         queue: Vec::new(),
                         stacked: Vec::new(),
+                        batch: Vec::new(),
                         policy: policy.clone(),
                         next_fire_ms: None,
                         in_flight: None,
@@ -312,6 +314,9 @@ pub struct TrainView {
     pub queue: Vec<u64>,
     /// The pull request numbers the human stacked for the next batch.
     pub stacked: Vec<u64>,
+    /// The active batch or the exact batch that a failed train must retry.
+    #[serde(default)]
+    pub batch: Vec<u64>,
     /// The active release policy.
     pub policy: ReleasePolicy,
     /// The next automatic fire time, in milliseconds since the Unix epoch.
@@ -1099,6 +1104,26 @@ mod tests {
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 
+    #[test]
+    fn a_train_batch_survives_json_and_defaults_for_an_old_state() {
+        let train = TrainView {
+            repo: "borsuk".to_string(),
+            queue: vec![9],
+            stacked: vec![7],
+            batch: vec![7],
+            policy: ReleasePolicy::Manual,
+            next_fire_ms: None,
+            in_flight: Some("borsuk/release-p7".to_string()),
+        };
+        let text = serde_json::to_string(&train).unwrap();
+        assert_eq!(serde_json::from_str::<TrainView>(&text).unwrap(), train);
+
+        let mut old_value = serde_json::to_value(&train).unwrap();
+        old_value.as_object_mut().unwrap().remove("batch");
+        let old_train: TrainView = serde_json::from_value(old_value).unwrap();
+        assert!(old_train.batch.is_empty());
+    }
+
     /// One input mode of every variant.
     fn every_input_mode() -> Vec<InputMode> {
         vec![
@@ -1660,6 +1685,7 @@ mod tests {
         borsuk.enqueue(9);
         borsuk.stacked = vec![7];
         borsuk.last_fire_ms = Some(60_000);
+        borsuk.fire(&[7], 90_000).unwrap();
         trains.insert("borsuk".to_string(), borsuk);
 
         let mut policies = BTreeMap::new();
@@ -1767,15 +1793,15 @@ mod tests {
         assert_eq!(view.decisions.len(), 1);
         assert_eq!(view.decisions[0].id, "stuck:borsuk/implement-i142:1");
 
-        // The train view carries the queue, the stacked set, the policy,
-        // and the next fire time: 60 s last fire plus 30 minutes.
+        // The train view carries the waiting queue and the full active batch.
         assert_eq!(view.trains.len(), 2, "one train view per repository");
         let borsuk_view = &view.trains[0];
-        assert_eq!(borsuk_view.queue, vec![7, 9]);
+        assert_eq!(borsuk_view.queue, vec![9]);
         assert_eq!(borsuk_view.stacked, vec![7]);
+        assert_eq!(borsuk_view.batch, vec![7]);
         assert_eq!(borsuk_view.policy, ReleasePolicy::Interval { minutes: 30 });
-        assert_eq!(borsuk_view.next_fire_ms, Some(60_000 + 30 * 60_000));
-        assert_eq!(borsuk_view.in_flight, None);
+        assert_eq!(borsuk_view.next_fire_ms, None);
+        assert_eq!(borsuk_view.in_flight.as_deref(), Some("borsuk/release-p7"));
         // A repository without a train entry gets an empty view with the
         // config policy.
         assert_eq!(view.trains[1].repo, "qubitsok");

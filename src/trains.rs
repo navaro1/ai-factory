@@ -142,6 +142,11 @@ impl Train {
         }
     }
 
+    /// The active batch or the exact batch that a failed train must retry.
+    pub fn batch(&self) -> &[u64] {
+        self.fired.as_deref().unwrap_or(&[])
+    }
+
     /// Whether the train may fire now, and with which pull requests.
     ///
     /// - `Manual` never fires on its own.
@@ -455,6 +460,24 @@ mod tests {
         assert_eq!(exec.calls().len(), 0, "failure makes no label call");
         let again = t.should_fire(&policy, 2_000).unwrap();
         assert_eq!(again, vec![1, 2, 3], "the retry reuses the same set");
+    }
+
+    #[test]
+    fn batch_reports_the_active_and_saved_retry_set() {
+        let mut t = train(&[1, 2, 3]);
+        assert!(t.batch().is_empty());
+
+        t.fire(&[1, 3], 1_000).unwrap();
+        assert_eq!(t.batch(), &[1, 3]);
+
+        let exec = ScriptExec::new();
+        let client = GhClient::new(&exec);
+        t.finish(false, "acme/borsuk", &client).unwrap();
+        assert_eq!(t.batch(), &[1, 3], "a failed batch stays visible for retry");
+
+        t.fire(&[1, 3], 2_000).unwrap();
+        t.finish(true, "acme/borsuk", &client).unwrap();
+        assert!(t.batch().is_empty(), "a successful batch leaves no outline");
     }
 
     #[test]

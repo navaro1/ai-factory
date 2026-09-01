@@ -1,12 +1,9 @@
 //! Draws the pipeline view and handles its keys.
 //!
-//! The view lists the four stages in pipeline order. Inside a stage it
-//! groups the tickets by repository. A stage header row shows the running
-//! and queued counts against the limit and marks a limit that differs from
-//! the config file with a star. The release stage shows one train row per
-//! repository with the queue, the stacked set, the policy, and the
-//! countdown. A pause marks the paused stage header, the repository group
-//! row, and the queued tickets that cannot start.
+//! The view draws the four stages as side-by-side lanes. Inside a stage it
+//! groups the tickets by repository. The release lane draws the selected,
+//! active, or retry batch inside one border. The waiting queue shows its
+//! oldest pull request first and its newest pull request last.
 //!
 //! Chunk 19 adds the interaction keys to this file. The `Row` model and
 //! the selection movement exist so those keys can resolve their target.
@@ -18,19 +15,18 @@ use crate::model::Stage;
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView};
 use crate::tasks::TaskState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use super::{emit, App, Confirm, Selection, View, Wanted};
 
-/// One selectable row of the pipeline view, in draw order.
+/// One selectable item in the logical pipeline board.
 ///
-/// The list holds every stage header, every repository header, every
-/// ticket, and every release train row. `j` and `k` walk this list, so a
-/// later chunk can act on the selected row.
+/// The list holds every stage, repository, ticket, train, and release pull
+/// request. Vertical movement uses one stage subset of this list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Row {
     /// The header row of one stage.
@@ -55,9 +51,16 @@ pub(super) enum Row {
         /// The repository alias.
         repo: String,
     },
+    /// One pull request in a release batch or waiting queue.
+    ReleasePr {
+        /// The repository alias.
+        repo: String,
+        /// The pull request number.
+        pr: u64,
+    },
 }
 
-/// The selectable rows of the pipeline view, in draw order.
+/// The selectable items of the pipeline board, in stage order.
 pub(super) fn rows(state: &StateView) -> Vec<Row> {
     let mut rows = Vec::new();
     for stage in Stage::ALL {
@@ -81,13 +84,76 @@ pub(super) fn rows(state: &StateView) -> Vec<Row> {
                 stage,
                 repo: repo.alias.clone(),
             });
-            rows.extend(tickets.into_iter().map(|index| Row::Ticket { index }));
-            if let Some(repo) = train {
-                rows.push(Row::Train { repo });
+            if stage != Stage::Release {
+                rows.extend(tickets.into_iter().map(|index| Row::Ticket { index }));
+                continue;
             }
+            let Some(train_repo) = train else {
+                rows.extend(tickets.into_iter().map(|index| Row::Ticket { index }));
+                continue;
+            };
+            let Some(train) = state.trains.iter().find(|train| train.repo == train_repo) else {
+                rows.extend(tickets.into_iter().map(|index| Row::Ticket { index }));
+                continue;
+            };
+            rows.push(Row::Train {
+                repo: train_repo.clone(),
+            });
+            let batch = displayed_batch(train);
+            rows.extend(batch.iter().copied().map(|pr| Row::ReleasePr {
+                repo: train_repo.clone(),
+                pr,
+            }));
+            let batch_task = release_batch_task_id(train).and_then(|id| {
+                tickets
+                    .iter()
+                    .copied()
+                    .find(|index| state.tasks[*index].id == id)
+            });
+            if let Some(index) = batch_task {
+                rows.push(Row::Ticket { index });
+            }
+            rows.extend(
+                train
+                    .queue
+                    .iter()
+                    .copied()
+                    .filter(|pr| !batch.contains(pr))
+                    .map(|pr| Row::ReleasePr {
+                        repo: train_repo.clone(),
+                        pr,
+                    }),
+            );
+            rows.extend(
+                tickets
+                    .into_iter()
+                    .filter(|index| Some(*index) != batch_task)
+                    .map(|index| Row::Ticket { index }),
+            );
         }
     }
     rows
+}
+
+/// The pull requests shown inside the release batch border.
+fn displayed_batch(train: &crate::sock::TrainView) -> &[u64] {
+    if train.batch.is_empty() {
+        &train.stacked
+    } else {
+        &train.batch
+    }
+}
+
+/// The task that executes the active or saved retry batch.
+fn release_batch_task_id(train: &crate::sock::TrainView) -> Option<String> {
+    if let Some(id) = &train.in_flight {
+        return Some(id.clone());
+    }
+    train
+        .batch
+        .iter()
+        .min()
+        .map(|first| format!("{}/release-p{first}", train.repo))
 }
 
 /// True when the stage shows no repository group and no train.
@@ -110,16 +176,17 @@ fn task_is_paused(state: &StateView, task: &TaskView) -> bool {
         || state.paused.repos.iter().any(|repo| repo == &task.repo)
 }
 
-/// Move the selection of the app by `delta` rows in the pipeline view.
+/// Move the selection by `delta` items inside one stage lane.
 ///
-/// `1` moves down and `-1` moves up. The movement clamps at the ends. With
-/// no selection, `j` picks the first row and `k` picks the last one.
+/// `1` moves down and `-1` moves up. The movement stops at the lane ends.
+/// With no selection, `j` selects the first item and `k` selects the last item.
 pub(super) fn move_selection(app: &mut App, delta: isize) {
     let Some(state) = app.state.as_ref() else {
         app.selection = Selection::None;
         return;
     };
-    let count = rows(state).len();
+    let all = rows(state);
+    let count = all.len();
     if count == 0 {
         app.selection = Selection::None;
         return;
@@ -134,11 +201,78 @@ pub(super) fn move_selection(app: &mut App, delta: isize) {
             }
         }
         Selection::Row(index) => {
-            let target = index as isize + delta;
-            target.clamp(0, last as isize) as usize
+            let Some(stage) = all.get(index).and_then(|row| row_stage(state, row)) else {
+                app.selection = Selection::None;
+                return;
+            };
+            let lane: Vec<usize> = all
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row_stage(state, row) == Some(stage))
+                .map(|(index, _)| index)
+                .collect();
+            let position = lane.iter().position(|entry| *entry == index).unwrap_or(0);
+            let target = (position as isize + delta).clamp(0, lane.len() as isize - 1) as usize;
+            lane[target]
         }
     };
     app.selection = Selection::Row(next);
+}
+
+/// Move between stage lanes and keep the nearest vertical row position.
+pub(super) fn move_horizontal(app: &mut App, delta: isize) {
+    let Some(state) = app.state.as_ref() else {
+        app.selection = Selection::None;
+        return;
+    };
+    let all = rows(state);
+    if all.is_empty() {
+        app.selection = Selection::None;
+        return;
+    }
+    let Selection::Row(index) = app.selection else {
+        let stage = if delta < 0 {
+            Stage::Release
+        } else {
+            Stage::Refine
+        };
+        app.selection = all
+            .iter()
+            .position(|row| *row == Row::Stage { stage })
+            .map_or(Selection::None, Selection::Row);
+        return;
+    };
+    let Some(source_stage) = all.get(index).and_then(|row| row_stage(state, row)) else {
+        app.selection = Selection::None;
+        return;
+    };
+    let source_stage_index = Stage::ALL
+        .iter()
+        .position(|stage| *stage == source_stage)
+        .unwrap_or(0);
+    let target_stage_index =
+        (source_stage_index as isize + delta).clamp(0, Stage::ALL.len() as isize - 1) as usize;
+    let target_stage = Stage::ALL[target_stage_index];
+    let source_lane: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row_stage(state, row) == Some(source_stage))
+        .map(|(index, _)| index)
+        .collect();
+    let target_lane: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row_stage(state, row) == Some(target_stage))
+        .map(|(index, _)| index)
+        .collect();
+    let source_position = source_lane
+        .iter()
+        .position(|entry| *entry == index)
+        .unwrap_or(0);
+    let target_position = source_position.min(target_lane.len().saturating_sub(1));
+    if let Some(target) = target_lane.get(target_position) {
+        app.selection = Selection::Row(*target);
+    }
 }
 
 /// The one change `+` or `-` resolved from the selected row.
@@ -198,7 +332,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
         KeyCode::Char('n') => create_ticket(app, sink),
         KeyCode::Char('x') => ask_abort(app),
         KeyCode::Char('R') => retry_failed(app, sink),
-        KeyCode::Char(' ') => stack_head(app, sink),
+        KeyCode::Char(' ') => stack_selected_pr(app, sink),
         KeyCode::Char('g') => ask_release(app),
         KeyCode::Char('s') => cycle_policy(app, sink),
         KeyCode::Enter => open_selected_task(app),
@@ -274,7 +408,7 @@ fn change_amount(app: &mut App, sink: &mut impl ActionSink, change: AmountChange
                 let slots = change.apply(slots, 0);
                 Target::Lane { stage, repo, slots }
             }
-            Row::Ticket { .. } | Row::Train { .. } => return,
+            Row::Ticket { .. } | Row::Train { .. } | Row::ReleasePr { .. } => return,
         }
     };
     match target {
@@ -350,6 +484,10 @@ fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
                 None => return,
             },
             Row::Train { repo } => {
+                let label = repo.clone();
+                (PauseScope::Repo { repo }, label)
+            }
+            Row::ReleasePr { repo, .. } => {
                 let label = repo.clone();
                 (PauseScope::Repo { repo }, label)
             }
@@ -531,21 +669,21 @@ fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
     }
 }
 
-/// Stack or unstack the first pull request of the selected train queue.
-fn stack_head(app: &mut App, sink: &mut impl ActionSink) {
+/// Stack or unstack the selected pull request in a waiting release queue.
+fn stack_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
     let found = {
         let Some(state) = app.state.as_ref() else {
             return;
         };
-        let Some(Row::Train { repo }) = selected_row(app) else {
+        let Some(Row::ReleasePr { repo, pr }) = selected_row(app) else {
             return;
         };
         let Some(train) = state.trains.iter().find(|train| train.repo == repo) else {
             return;
         };
-        let Some(pr) = train.queue.first().copied() else {
+        if train.batch.contains(&pr) || !train.queue.contains(&pr) {
             return;
-        };
+        }
         let on = !train.stacked.contains(&pr);
         (repo, pr, on)
     };
@@ -573,6 +711,26 @@ fn stack_head(app: &mut App, sink: &mut impl ActionSink) {
         } else {
             train.stacked.retain(|entry| *entry != pr);
         }
+        let batch_order = train.batch.clone();
+        let queue_order = train.queue.clone();
+        train.stacked.sort_by_key(|entry| {
+            batch_order
+                .iter()
+                .position(|candidate| candidate == entry)
+                .or_else(|| {
+                    queue_order
+                        .iter()
+                        .position(|candidate| candidate == entry)
+                        .map(|position| batch_order.len() + position)
+                })
+                .unwrap_or(usize::MAX)
+        });
+    }
+    let selected = Row::ReleasePr { repo, pr };
+    if let Some(state) = app.state.as_ref() {
+        if let Some(index) = rows(state).iter().position(|row| row == &selected) {
+            app.selection = Selection::Row(index);
+        }
     }
 }
 
@@ -582,19 +740,40 @@ fn ask_release(app: &mut App) {
         let Some(state) = app.state.as_ref() else {
             return;
         };
-        let Some(Row::Train { repo }) = selected_row(app) else {
+        let Some(row) = selected_row(app) else {
+            return;
+        };
+        let Some(repo) = selected_release_repo(state, &row) else {
             return;
         };
         let Some(train) = state.trains.iter().find(|train| train.repo == repo) else {
             return;
         };
-        if train.stacked.is_empty() {
+        if train.in_flight.is_some() || !train.batch.is_empty() || train.stacked.is_empty() {
             return;
         }
         (repo, train.stacked.clone())
     };
     let (repo, prs) = found;
     app.confirm = Some(Confirm::Go { repo, prs });
+}
+
+/// The release repository that owns one selected release row.
+fn selected_release_repo(state: &StateView, row: &Row) -> Option<String> {
+    match row {
+        Row::Repo {
+            stage: Stage::Release,
+            repo,
+        }
+        | Row::Train { repo }
+        | Row::ReleasePr { repo, .. } => Some(repo.clone()),
+        Row::Ticket { index } => state
+            .tasks
+            .get(*index)
+            .filter(|task| task.stage == Stage::Release)
+            .map(|task| task.repo.clone()),
+        Row::Stage { .. } | Row::Repo { .. } => None,
+    }
 }
 
 /// Cycle the policy of the selected train and send `Action::Policy`.
@@ -655,39 +834,339 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
         Selection::Row(index) if index < all.len() => Some(index),
         _ => None,
     };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (index, row) in all.iter().enumerate() {
-        let is_selected = selected == Some(index);
-        let marker = if is_selected {
-            Span::styled(
-                "▸ ",
-                Style::default()
-                    .fg(THEME.accent)
-                    .add_modifier(Modifier::BOLD),
-            )
+    let lanes = Layout::horizontal([
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+    ])
+    .split(area);
+    for (stage, lane) in Stage::ALL.into_iter().zip(lanes.iter().copied()) {
+        let inner_width = lane.width.saturating_sub(2);
+        let mut lines = if stage == Stage::Release {
+            release_lane_lines(state, &all, selected, now_ms, inner_width)
         } else {
-            Span::raw("  ")
+            ordinary_lane_lines(state, &all, selected, stage, now_ms)
         };
-        let mut spans = vec![marker];
-        spans.extend(row_spans(state, row, now_ms));
-        let mut line = Line::from(spans);
-        if is_selected {
-            line = line.style(THEME.selected());
+        if state
+            .stages
+            .iter()
+            .any(|view| view.stage == stage && view.overridden)
+        {
+            lines.push(Line::from(Span::styled("  * config limit", THEME.dim())));
         }
-        lines.push(line);
-        if let Row::Stage { stage } = row {
-            if stage_is_empty(state, *stage) {
-                lines.push(Line::from(Span::styled("    no tasks", THEME.dim())));
+        let block = Block::bordered().title(Span::styled(
+            stage.as_str().to_string(),
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let scroll = lane_scroll(&lines, lane.height);
+        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), lane);
+    }
+}
+
+/// The smallest vertical scroll that keeps the selected item visible.
+fn lane_scroll(lines: &[Line<'_>], lane_height: u16) -> u16 {
+    let visible = lane_height.saturating_sub(2) as usize;
+    let selected = lines.iter().position(|line| {
+        line.spans
+            .first()
+            .is_some_and(|span| span.content.as_ref() == "▸ ")
+    });
+    selected
+        .map(|line| line.saturating_sub(visible.saturating_sub(1)))
+        .unwrap_or(0)
+        .min(u16::MAX as usize) as u16
+}
+
+/// Lines for a refine, implement, or review lane.
+fn ordinary_lane_lines(
+    state: &StateView,
+    all: &[Row],
+    selected: Option<usize>,
+    stage: Stage,
+    now_ms: u64,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, row) in all.iter().enumerate() {
+        if row_stage(state, row) != Some(stage) {
+            continue;
+        }
+        lines.push(selectable_line(
+            selected == Some(index),
+            row_spans(state, row, now_ms),
+        ));
+        if matches!(row, Row::Stage { .. }) {
+            if stage_is_paused(state, stage) {
+                lines.push(Line::from(Span::styled(
+                    "  paused",
+                    Style::default().fg(THEME.warn),
+                )));
+            }
+            if stage_is_empty(state, stage) {
+                lines.push(Line::from(Span::styled("  no tasks", THEME.dim())));
             }
         }
     }
-    if state.stages.iter().any(|stage| stage.overridden) {
+    lines
+}
+
+/// Lines for the release lane, including each repository's batch border.
+fn release_lane_lines(
+    state: &StateView,
+    all: &[Row],
+    selected: Option<usize>,
+    now_ms: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let stage_row = Row::Stage {
+        stage: Stage::Release,
+    };
+    push_row_line(state, all, selected, &stage_row, now_ms, &mut lines);
+    if stage_is_paused(state, Stage::Release) {
         lines.push(Line::from(Span::styled(
-            "  * limit differs from the config file",
-            THEME.dim(),
+            "  paused",
+            Style::default().fg(THEME.warn),
         )));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    if stage_is_empty(state, Stage::Release) {
+        lines.push(Line::from(Span::styled("  no tasks", THEME.dim())));
+        return lines;
+    }
+
+    for repo in &state.repos {
+        let repo_row = Row::Repo {
+            stage: Stage::Release,
+            repo: repo.alias.clone(),
+        };
+        if !all.contains(&repo_row) {
+            continue;
+        }
+        let train = state.trains.iter().find(|train| train.repo == repo.alias);
+        push_custom_row_line(
+            all,
+            selected,
+            &repo_row,
+            release_repo_spans(state, &repo.alias, train),
+            &mut lines,
+        );
+        let Some(train) = train else {
+            for (index, _) in state
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| task.stage == Stage::Release && task.repo == repo.alias)
+            {
+                let row = Row::Ticket { index };
+                push_row_line(state, all, selected, &row, now_ms, &mut lines);
+            }
+            continue;
+        };
+        if let Some(fire) = train.next_fire_ms {
+            let remaining = fire.saturating_sub(now_ms);
+            lines.push(Line::from(Span::styled(
+                format!("  fires {}", format_countdown(remaining)),
+                THEME.dim(),
+            )));
+        }
+
+        let train_row = Row::Train {
+            repo: repo.alias.clone(),
+        };
+        let box_width = width.saturating_sub(2).max(2);
+        let (title, border_style) = release_batch_title(train);
+        push_custom_row_line(
+            all,
+            selected,
+            &train_row,
+            vec![Span::styled(box_top(title, box_width), border_style)],
+            &mut lines,
+        );
+
+        let batch = displayed_batch(train);
+        if batch.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(box_line("select below", box_width), THEME.dim()),
+            ]));
+        } else {
+            for pr in batch {
+                let row = Row::ReleasePr {
+                    repo: repo.alias.clone(),
+                    pr: *pr,
+                };
+                push_custom_row_line(
+                    all,
+                    selected,
+                    &row,
+                    vec![Span::styled(
+                        box_line(&format!("#{pr}"), box_width),
+                        Style::default().fg(THEME.text),
+                    )],
+                    &mut lines,
+                );
+            }
+        }
+        if let Some(task_id) = release_batch_task_id(train) {
+            if let Some((index, task)) = state
+                .tasks
+                .iter()
+                .enumerate()
+                .find(|(_, task)| task.id == task_id)
+            {
+                let row = Row::Ticket { index };
+                push_custom_row_line(
+                    all,
+                    selected,
+                    &row,
+                    vec![Span::styled(
+                        box_line(&task_label(state, task), box_width),
+                        state_style(&task.state),
+                    )],
+                    &mut lines,
+                );
+            }
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(box_bottom(box_width), border_style),
+        ]));
+
+        let waiting: Vec<u64> = train
+            .queue
+            .iter()
+            .copied()
+            .filter(|pr| !batch.contains(pr))
+            .collect();
+        for (position, pr) in waiting.iter().enumerate() {
+            let row = Row::ReleasePr {
+                repo: repo.alias.clone(),
+                pr: *pr,
+            };
+            let status = if train.stacked.contains(pr) {
+                "next batch"
+            } else if position == 0 {
+                "next"
+            } else if position + 1 == waiting.len() {
+                "new"
+            } else {
+                "ready"
+            };
+            push_custom_row_line(
+                all,
+                selected,
+                &row,
+                vec![
+                    Span::styled(format!("#{pr}"), Style::default().fg(THEME.text)),
+                    Span::styled(format!(" {status}"), THEME.dim()),
+                ],
+                &mut lines,
+            );
+        }
+
+        let batch_task = release_batch_task_id(train);
+        for (index, _) in state.tasks.iter().enumerate().filter(|(_, task)| {
+            task.stage == Stage::Release
+                && task.repo == repo.alias
+                && Some(task.id.as_str()) != batch_task.as_deref()
+        }) {
+            let row = Row::Ticket { index };
+            push_row_line(state, all, selected, &row, now_ms, &mut lines);
+        }
+    }
+    lines
+}
+
+/// Add a row with its standard spans and selection marker.
+fn push_row_line(
+    state: &StateView,
+    all: &[Row],
+    selected: Option<usize>,
+    row: &Row,
+    now_ms: u64,
+    lines: &mut Vec<Line<'static>>,
+) {
+    push_custom_row_line(all, selected, row, row_spans(state, row, now_ms), lines);
+}
+
+/// Add a row with custom spans and its selection marker.
+fn push_custom_row_line(
+    all: &[Row],
+    selected: Option<usize>,
+    row: &Row,
+    spans: Vec<Span<'static>>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let is_selected = all.iter().position(|entry| entry == row) == selected;
+    lines.push(selectable_line(is_selected, spans));
+}
+
+/// One line with the board selection marker.
+fn selectable_line(is_selected: bool, spans: Vec<Span<'static>>) -> Line<'static> {
+    let marker = if is_selected {
+        Span::styled(
+            "▸ ",
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+    let mut all = vec![marker];
+    all.extend(spans);
+    let mut line = Line::from(all);
+    if is_selected {
+        line = line.style(THEME.selected());
+    }
+    line
+}
+
+/// The batch border title and color for one train state.
+fn release_batch_title(train: &crate::sock::TrainView) -> (&'static str, Style) {
+    if train.in_flight.is_some() {
+        ("RELEASING NOW", Style::default().fg(THEME.ok))
+    } else if !train.batch.is_empty() {
+        ("RETRY REQUIRED", Style::default().fg(THEME.error))
+    } else {
+        ("NEXT RELEASE", Style::default().fg(THEME.accent))
+    }
+}
+
+/// The top line of a box with a title clipped to the available width.
+fn box_top(title: &str, width: u16) -> String {
+    let inside = width.saturating_sub(2) as usize;
+    let title: String = title.chars().take(inside).collect();
+    format!(
+        "┌{title}{}┐",
+        "─".repeat(inside.saturating_sub(title.chars().count()))
+    )
+}
+
+/// One padded content line of a box.
+fn box_line(text: &str, width: u16) -> String {
+    let inside = width.saturating_sub(2) as usize;
+    let text: String = text.chars().take(inside).collect();
+    format!(
+        "│{text}{}│",
+        " ".repeat(inside.saturating_sub(text.chars().count()))
+    )
+}
+
+/// The bottom line of a box.
+fn box_bottom(width: u16) -> String {
+    format!("└{}┘", "─".repeat(width.saturating_sub(2) as usize))
+}
+
+/// The stage column that owns one selectable row.
+fn row_stage(state: &StateView, row: &Row) -> Option<Stage> {
+    match row {
+        Row::Stage { stage } | Row::Repo { stage, .. } => Some(*stage),
+        Row::Ticket { index } => state.tasks.get(*index).map(|task| task.stage),
+        Row::Train { .. } | Row::ReleasePr { .. } => Some(Stage::Release),
+    }
 }
 
 /// The spans of one row of the pipeline view.
@@ -700,15 +1179,16 @@ fn row_spans(state: &StateView, row: &Row, now_ms: u64) -> Vec<Span<'static>> {
             None => vec![Span::raw("    (missing task)")],
         },
         Row::Train { repo } => train_spans(state, repo, now_ms),
+        Row::ReleasePr { pr, .. } => vec![Span::styled(
+            format!("#{pr}"),
+            Style::default().fg(THEME.text),
+        )],
     }
 }
 
-/// The spans of one stage header row: name, running/queued, and limit.
+/// The count spans below one stage lane title.
 fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
-    let header = Style::default()
-        .fg(THEME.accent)
-        .add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled(stage.as_str().to_string(), header)];
+    let mut spans = Vec::new();
     let Some(view) = state.stages.iter().find(|s| s.stage == stage) else {
         return spans;
     };
@@ -717,7 +1197,6 @@ fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
     } else {
         THEME.dim
     };
-    spans.push(Span::raw("  "));
     spans.push(Span::styled(
         view.running.to_string(),
         Style::default().fg(running_color),
@@ -732,9 +1211,6 @@ fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
             Style::default().fg(THEME.warn).add_modifier(Modifier::BOLD),
         ));
     }
-    if stage_is_paused(state, stage) {
-        spans.push(paused_span());
-    }
     spans
 }
 
@@ -748,12 +1224,34 @@ fn paused_span() -> Span<'static> {
 
 /// The spans of one repository group header row.
 fn repo_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(repo.to_string(), THEME.dim().add_modifier(Modifier::BOLD)),
-    ];
+    let mut spans = vec![Span::styled(
+        repo.to_string(),
+        THEME.dim().add_modifier(Modifier::BOLD),
+    )];
     if state.paused.repos.iter().any(|entry| entry == repo) {
         spans.push(paused_span());
+    }
+    spans
+}
+
+/// The repository, pause, and policy spans of one release section.
+fn release_repo_spans(
+    state: &StateView,
+    repo: &str,
+    train: Option<&crate::sock::TrainView>,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        repo.to_string(),
+        THEME.dim().add_modifier(Modifier::BOLD),
+    )];
+    if state.paused.repos.iter().any(|entry| entry == repo) {
+        spans.push(Span::styled(" paused", Style::default().fg(THEME.warn)));
+    }
+    if let Some(train) = train {
+        spans.push(Span::styled(
+            format!(" {}", policy_label(&train.policy)),
+            THEME.dim(),
+        ));
     }
     spans
 }
@@ -767,7 +1265,6 @@ fn repo_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
 /// visible from the board.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = vec![
-        Span::raw("    "),
         Span::styled(
             format!("{}{}", task.kind.as_str(), task.number),
             Style::default().fg(THEME.text),
@@ -779,32 +1276,59 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     } else {
         spans.push(state_span(&task.state));
     }
-    if task.attempt > 1 {
+    if task.queued_messages > 0 {
         spans.push(Span::styled(
-            format!("  attempt {}", task.attempt),
+            format!(" m{}", task.queued_messages),
             THEME.dim(),
         ));
     }
-    if task.queued_messages > 0 {
-        spans.push(Span::styled(
-            format!("  {} queued", task.queued_messages),
-            THEME.dim(),
-        ));
+    if task.attempt > 1 {
+        spans.push(Span::styled(format!(" a{}", task.attempt), THEME.dim()));
     }
     spans
 }
 
+/// The compact text of one task inside a nested release border.
+fn task_label(state: &StateView, task: &TaskView) -> String {
+    let status = if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
+        "paused"
+    } else {
+        state_label(&task.state)
+    };
+    let mut label = format!("{}{} {status}", task.kind.as_str(), task.number);
+    if task.queued_messages > 0 {
+        label.push_str(&format!(" m{}", task.queued_messages));
+    }
+    if task.attempt > 1 {
+        label.push_str(&format!(" a{}", task.attempt));
+    }
+    label
+}
+
 /// The colored label of one task state.
 fn state_span(state: &TaskState) -> Span<'static> {
+    Span::styled(state_label(state), state_style(state))
+}
+
+/// The compact board label of one task state.
+fn state_label(state: &TaskState) -> &'static str {
     match state {
-        TaskState::Queued => Span::styled("queued", THEME.dim()),
-        TaskState::Running => Span::styled("running", Style::default().fg(THEME.accent)),
-        TaskState::AwaitingUser => Span::styled("awaiting user", Style::default().fg(THEME.warn)),
-        TaskState::Done => Span::styled("done", Style::default().fg(THEME.ok)),
-        TaskState::Failed(reason) => Span::styled(
-            format!("failed: {reason}"),
-            Style::default().fg(THEME.error),
-        ),
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::AwaitingUser => "needs input",
+        TaskState::Done => "done",
+        TaskState::Failed(_) => "failed",
+    }
+}
+
+/// The board color of one task state.
+fn state_style(state: &TaskState) -> Style {
+    match state {
+        TaskState::Queued => THEME.dim(),
+        TaskState::Running => Style::default().fg(THEME.accent),
+        TaskState::AwaitingUser => Style::default().fg(THEME.warn),
+        TaskState::Done => Style::default().fg(THEME.ok),
+        TaskState::Failed(_) => Style::default().fg(THEME.error),
     }
 }
 
@@ -1012,7 +1536,8 @@ pub(crate) fn sample_view() -> StateView {
             TrainView {
                 repo: "borsuk".to_string(),
                 queue: vec![7, 9],
-                stacked: vec![3],
+                stacked: vec![5],
+                batch: vec![5],
                 policy: ReleasePolicy::Manual,
                 next_fire_ms: None,
                 in_flight: Some("borsuk/release-p5".to_string()),
@@ -1021,6 +1546,7 @@ pub(crate) fn sample_view() -> StateView {
                 repo: "ryba".to_string(),
                 queue: Vec::new(),
                 stacked: Vec::new(),
+                batch: Vec::new(),
                 policy: ReleasePolicy::Interval { minutes: 30 },
                 next_fire_ms: Some(super::inbox::now_ms().unwrap() + 90_000),
                 in_flight: None,
@@ -1039,7 +1565,13 @@ pub(crate) fn sample_view() -> StateView {
 /// Test support for this file and for the shell tests in `mod.rs`.
 #[cfg(test)]
 pub(super) fn render_to_string(app: &mut App) -> String {
-    let backend = TestBackend::new(80, 24);
+    render_to_size(app, 80, 24)
+}
+
+/// Render the app into a test backend with an explicit terminal size.
+#[cfg(test)]
+fn render_to_size(app: &mut App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| super::render(frame, app).unwrap())
@@ -1143,7 +1675,7 @@ mod tests {
             }
         );
         assert_eq!(rows[refine_start + 5], Row::Ticket { index: 7 });
-        // The release stage holds the ticket and the train of each repo.
+        // The release lane puts the active batch above the waiting queue.
         let release_start = rows
             .iter()
             .position(|row| {
@@ -1152,15 +1684,36 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(rows[release_start + 2], Row::Ticket { index: 6 });
         assert_eq!(
-            rows[release_start + 3],
+            rows[release_start + 2],
             Row::Train {
                 repo: "borsuk".to_string(),
             }
         );
         assert_eq!(
+            rows[release_start + 3],
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 5,
+            }
+        );
+        assert_eq!(rows[release_start + 4], Row::Ticket { index: 6 });
+        assert_eq!(
             rows[release_start + 5],
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 7,
+            }
+        );
+        assert_eq!(
+            rows[release_start + 6],
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 9,
+            }
+        );
+        assert_eq!(
+            rows[release_start + 8],
             Row::Train {
                 repo: "ryba".to_string(),
             }
@@ -1175,20 +1728,69 @@ mod tests {
         assert_eq!(app.selection, Selection::None);
 
         app.state = Some(sample_view());
-        let last = rows(app.state.as_ref().unwrap()).len() - 1;
+        let all = rows(app.state.as_ref().unwrap());
+        let last = all.len() - 1;
+        let last_refine = all
+            .iter()
+            .rposition(|row| row_stage(app.state.as_ref().unwrap(), row) == Some(Stage::Refine))
+            .unwrap();
 
         move_selection(&mut app, 1);
         assert_eq!(app.selection, Selection::Row(0));
         for _ in 0..(last + 5) {
             move_selection(&mut app, 1);
         }
-        assert_eq!(app.selection, Selection::Row(last));
+        assert_eq!(app.selection, Selection::Row(last_refine));
         move_selection(&mut app, -1);
-        assert_eq!(app.selection, Selection::Row(last - 1));
+        assert_eq!(app.selection, Selection::Row(last_refine - 1));
         // A fresh selection with k picks the last row.
         app.selection = Selection::None;
         move_selection(&mut app, -1);
         assert_eq!(app.selection, Selection::Row(last));
+    }
+
+    #[test]
+    fn vertical_movement_stays_inside_the_selected_stage_lane() {
+        let state = sample_view();
+        let all = rows(&state);
+        let last_refine = all
+            .iter()
+            .position(|row| *row == Row::Ticket { index: 7 })
+            .unwrap();
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            selection: Selection::Row(last_refine),
+            ..App::default()
+        };
+
+        move_selection(&mut app, 1);
+
+        assert_eq!(app.selection, Selection::Row(last_refine));
+    }
+
+    #[test]
+    fn horizontal_movement_keeps_the_nearest_vertical_position() {
+        let state = sample_view();
+        let all = rows(&state);
+        let refine_ticket = all
+            .iter()
+            .position(|row| *row == Row::Ticket { index: 0 })
+            .unwrap();
+        let implement_ticket = all
+            .iter()
+            .position(|row| *row == Row::Ticket { index: 2 })
+            .unwrap();
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            selection: Selection::Row(refine_ticket),
+            ..App::default()
+        };
+
+        move_horizontal(&mut app, 1);
+
+        assert_eq!(app.selection, Selection::Row(implement_ticket));
     }
 
     #[test]
@@ -1208,6 +1810,53 @@ mod tests {
     }
 
     #[test]
+    fn stages_render_as_four_side_by_side_lanes() {
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 120, 24);
+        let header = text.lines().find(|line| {
+            ["refine", "implement", "review", "release"]
+                .iter()
+                .all(|stage| line.contains(stage))
+        });
+
+        assert!(
+            header.is_some(),
+            "all four stage names must share one board row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_tall_lane_scrolls_to_keep_its_selected_task_visible() {
+        let mut state = sample_view();
+        for number in 200..210 {
+            state.tasks.push(task(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                number,
+                TaskState::Queued,
+                1,
+            ));
+        }
+        let selected_task = state.tasks.len() - 1;
+        let mut app = app_with_state_and_row(
+            state,
+            Row::Ticket {
+                index: selected_task,
+            },
+        );
+
+        let text = render_to_size(&mut app, 80, 10);
+
+        assert!(text.contains("▸ i209 queued"), "board:\n{text}");
+    }
+
+    #[test]
     fn full_state_shows_stage_counts_and_tickets() {
         let mut app = App {
             state: Some(sample_view()),
@@ -1215,20 +1864,20 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        assert!(text.contains("refine  1/1 of 3"));
-        assert!(text.contains("implement  1/1 of 5*"));
-        assert!(text.contains("limit differs from the config file"));
+        assert!(text.contains("1/1 of 3"));
+        assert!(text.contains("1/1 of 5*"));
+        assert!(text.contains("* config limit"));
         assert!(text.contains("borsuk"));
         assert!(text.contains("ryba"));
         assert!(text.contains("i142 queued"));
         assert!(text.contains("i143 running"));
         assert!(text.contains("i140 running"));
-        assert!(text.contains("attempt 2"));
+        assert!(text.contains("i140 running a2"));
         assert!(text.contains("i7 queued"));
         assert!(text.contains("p7 running"));
-        assert!(text.contains("p9 awaiting user"));
+        assert!(text.contains("p9 needs input"));
         assert!(text.contains("p5 running"));
-        assert!(text.contains("i9 failed: exit 1"));
+        assert!(text.contains("i9 failed a3"));
     }
 
     #[test]
@@ -1239,13 +1888,83 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        assert!(text.contains("train"));
-        assert!(text.contains("queue 7,9"));
-        assert!(text.contains("stacked 3"));
-        assert!(text.contains("policy manual"));
-        assert!(text.contains("batch borsuk/release-p5"));
-        assert!(text.contains("policy every 30m"));
-        assert!(text.contains("fires in 1m"));
+        assert!(text.contains("borsuk manual"));
+        assert!(text.contains("RELEASING NOW"));
+        assert!(text.contains("#5"));
+        assert!(text.contains("#7 next"));
+        assert!(text.contains("#9 new"));
+        assert!(text.contains("ryba every 30m"));
+        assert!(text.contains("fires 1m"));
+    }
+
+    #[test]
+    fn release_lane_outlines_the_active_batch_above_its_bottom_up_queue() {
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+        assert!(text.contains("RELEASING NOW"), "board:\n{text}");
+        assert!(text.contains("#5"), "active pull request:\n{text}");
+        let first = text.find("#7").expect("the oldest waiting pull request");
+        let second = text.find("#9").expect("the newest waiting pull request");
+        assert!(
+            first < second,
+            "the queue must grow from top to bottom:\n{text}"
+        );
+    }
+
+    #[test]
+    fn release_lane_outlines_the_next_batch_and_removes_it_from_the_queue() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked = vec![7];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+        assert!(text.contains("NEXT RELEASE"), "board:\n{text}");
+        assert!(text.contains("│#7"), "outlined pull request:\n{text}");
+        assert!(text.contains("#9 next"), "waiting queue:\n{text}");
+        assert!(!text.contains("#7 next"), "duplicate queue item:\n{text}");
+    }
+
+    #[test]
+    fn release_lane_marks_a_saved_failed_batch_for_retry() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.tasks[6].state = TaskState::Failed("merge failed".to_string());
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+        assert!(text.contains("RETRY REQUIRED"), "board:\n{text}");
+        assert!(text.contains("#5"), "saved batch:\n{text}");
+    }
+
+    #[test]
+    fn release_lane_without_a_train_does_not_repeat_other_stage_tasks() {
+        let mut state = sample_view();
+        state.trains.clear();
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+        assert_eq!(text.matches("i142 queued").count(), 1, "board:\n{text}");
+        assert_eq!(text.matches("i140 running").count(), 1, "board:\n{text}");
+        assert!(text.contains("p5 running"), "release task:\n{text}");
     }
 
     #[test]
@@ -1258,7 +1977,10 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         let line = text.lines().find(|line| line.contains("i142")).unwrap();
-        assert!(line.starts_with("▸"), "unmarked selected line: {line}");
+        assert!(
+            line.contains("│▸ i142 queued"),
+            "unmarked selected line: {line}"
+        );
     }
 
     #[test]
@@ -1279,15 +2001,7 @@ mod tests {
         let text = render_to_string(&mut app);
         // A global pause marks the four stage headers, the status bar, and
         // the two queued tickets.
-        let marked: Vec<&str> = text
-            .lines()
-            .filter(|line| line.contains("paused"))
-            .collect();
-        assert_eq!(marked.len(), 7);
-        assert_eq!(
-            marked.iter().filter(|line| line.contains(" of ")).count(),
-            4
-        );
+        assert_eq!(text.matches("paused").count(), 7);
         assert!(text.contains("i142 paused"));
         assert!(text.contains("i7 paused"));
         assert!(!text.contains("i142 queued"));
@@ -1308,13 +2022,8 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        let lines: Vec<&str> = text
-            .lines()
-            .filter(|line| line.contains("paused"))
-            .collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("refine"));
-        assert!(lines[1].contains("i142"));
+        assert_eq!(text.matches("paused").count(), 2);
+        assert!(text.contains("i142 paused"));
     }
 
     #[test]
@@ -1333,18 +2042,12 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        // Every group row of borsuk carries the mark. The train row stays
-        // unmarked: the daemon fires trains regardless of a pause.
-        let marked = text
-            .lines()
-            .filter(|line| line.contains("borsuk") && line.contains("paused"))
-            .count();
-        assert_eq!(marked, 4);
-        let train = text
-            .lines()
-            .find(|line| line.contains("train") && line.contains("queue 7,9"))
-            .expect("the borsuk train row must be visible");
-        assert!(!train.contains("paused"), "marked train row: {train}");
+        // Every group row of borsuk carries the mark. The fifth pause mark
+        // belongs to its queued refine ticket.
+        assert_eq!(text.matches("borsuk").count(), 4);
+        assert_eq!(text.matches("paused").count(), 5);
+        assert!(text.contains("borsuk paused"));
+        assert!(!text.contains("RELEASING NOW paused"));
         assert!(text.contains("i142 paused"));
         assert!(!text.contains("i142 queued"));
         // A running ticket of the paused repository keeps its true state.
@@ -1375,11 +2078,10 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        assert!(text.contains("i143 running  2 queued"), "board: {text}");
+        assert!(text.contains("i143 running m2"), "board: {text}");
 
         // A ticket without queued messages shows no badge.
-        let line = text.lines().find(|line| line.contains("i142")).unwrap();
-        assert_eq!(line.trim_end(), "      i142 queued");
+        assert!(!text.contains("i142 queued m"));
     }
 
     #[test]
@@ -1436,6 +2138,35 @@ mod tests {
             selection: Selection::Row(index),
             ..App::default()
         }
+    }
+
+    /// The sample app with one selected logical board row.
+    fn app_with_row(row: Row) -> App {
+        app_with_state_and_row(sample_view(), row)
+    }
+
+    /// One app with the requested state and logical board row selected.
+    fn app_with_state_and_row(state: StateView, row: Row) -> App {
+        let index = rows(&state)
+            .iter()
+            .position(|entry| entry == &row)
+            .expect("the sample view must contain the selected row");
+        App {
+            state: Some(state),
+            connected: true,
+            selection: Selection::Row(index),
+            ..App::default()
+        }
+    }
+
+    /// Select one logical board item in an existing test app.
+    fn select_row(app: &mut App, row: Row) {
+        let state = app.state.as_ref().expect("the app must hold state");
+        let index = rows(state)
+            .iter()
+            .position(|entry| entry == &row)
+            .expect("the state must contain the selected row");
+        app.selection = Selection::Row(index);
     }
 
     #[test]
@@ -1759,17 +2490,31 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_header_or_train_row_changes_nothing() {
-        // Row 0 is the refine stage header, row 1 the borsuk repository
-        // header, rows 18 and 20 the two train rows.
-        for index in [0_usize, 1, 18, 20] {
-            let mut app = app_with_selection(index);
+    fn enter_on_a_non_ticket_row_changes_nothing() {
+        let non_ticket_rows = [
+            Row::Stage {
+                stage: Stage::Refine,
+            },
+            Row::Repo {
+                stage: Stage::Refine,
+                repo: "borsuk".to_string(),
+            },
+            Row::Train {
+                repo: "borsuk".to_string(),
+            },
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 5,
+            },
+        ];
+        for row in non_ticket_rows {
+            let mut app = app_with_row(row.clone());
             let mut sink = FakeSink::default();
             handle_key(&mut app, pressed_enter(), &mut sink);
-            assert!(sink.0.is_empty(), "selection {index}");
-            assert_eq!(app.view, View::Pipeline, "selection {index}");
-            assert!(app.session_task.is_none(), "selection {index}");
-            assert!(app.toast.is_none(), "selection {index}");
+            assert!(sink.0.is_empty(), "selection {row:?}");
+            assert_eq!(app.view, View::Pipeline, "selection {row:?}");
+            assert!(app.session_task.is_none(), "selection {row:?}");
+            assert!(app.toast.is_none(), "selection {row:?}");
         }
 
         // A pipeline with no selection also ignores Enter.
@@ -1833,29 +2578,105 @@ mod tests {
     }
 
     #[test]
-    fn space_stacks_the_first_queue_entry_of_a_train() {
-        let mut app = app_with_selection(18);
+    fn space_toggles_the_selected_waiting_pr_and_blocks_the_active_batch() {
+        let mut app = app_with_row(Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 9,
+        });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed(' '), &mut sink);
         assert_eq!(
             sink.0,
             vec![Action::Stack {
                 repo: "borsuk".to_string(),
-                pr: 7,
+                pr: 9,
                 on: true
             }]
         );
 
-        // A train with an empty queue stacks nothing.
-        let mut app = app_with_selection(20);
+        let mut app = app_with_row(Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 5,
+        });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed(' '), &mut sink);
-        assert!(sink.0.is_empty());
+        assert!(sink.0.is_empty(), "the active batch cannot change");
+    }
+
+    #[test]
+    fn an_active_release_marks_a_future_batch_choice_in_the_queue() {
+        let mut app = app_with_row(Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 9,
+        });
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed(' '), &mut sink);
+
+        let text = render_to_string(&mut app);
+        assert!(text.contains("#9 next batch"), "board:\n{text}");
+    }
+
+    #[test]
+    fn space_keeps_the_selected_pr_when_the_row_moves() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked.clear();
+        let selected = Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 9,
+        };
+        let mut app = app_with_state_and_row(state, selected.clone());
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed(' '), &mut sink);
+
+        assert_eq!(selected_row(&app), Some(selected));
+    }
+
+    #[test]
+    fn selected_batch_prs_keep_the_release_queue_order() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked.clear();
+        let mut app = app_with_state_and_row(
+            state,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 9,
+            },
+        );
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed(' '), &mut sink);
+        select_row(
+            &mut app,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 7,
+            },
+        );
+
+        handle_key(&mut app, pressed(' '), &mut sink);
+        handle_key(&mut app, pressed('g'), &mut sink);
+
+        assert_eq!(app.state.as_ref().unwrap().trains[0].stacked, vec![7, 9]);
+        assert_eq!(
+            app.confirm,
+            Some(Confirm::Go {
+                repo: "borsuk".to_string(),
+                prs: vec![7, 9],
+            })
+        );
     }
 
     #[test]
     fn repeated_space_toggles_the_same_queue_entry() {
-        let mut app = app_with_selection(18);
+        let mut app = app_with_row(Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 7,
+        });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed(' '), &mut sink);
         handle_key(&mut app, pressed(' '), &mut sink);
@@ -1879,7 +2700,17 @@ mod tests {
 
     #[test]
     fn release_confirmation_includes_a_just_stacked_pull_request() {
-        let mut app = app_with_selection(18);
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked = vec![7];
+        let mut app = app_with_state_and_row(
+            state,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 9,
+            },
+        );
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed(' '), &mut sink);
         handle_key(&mut app, pressed('g'), &mut sink);
@@ -1887,14 +2718,23 @@ mod tests {
             app.confirm,
             Some(Confirm::Go {
                 repo: "borsuk".to_string(),
-                prs: vec![3, 7],
+                prs: vec![7, 9],
             })
         );
     }
 
     #[test]
     fn g_only_opens_the_release_confirmation() {
-        let mut app = app_with_selection(18);
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked = vec![7];
+        let mut app = app_with_state_and_row(
+            state,
+            Row::Train {
+                repo: "borsuk".to_string(),
+            },
+        );
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('g'), &mut sink);
         assert!(sink.0.is_empty(), "g must not send before the confirm");
@@ -1902,12 +2742,22 @@ mod tests {
             app.confirm,
             Some(Confirm::Go {
                 repo: "borsuk".to_string(),
-                prs: vec![3]
+                prs: vec![7]
             })
         );
 
+        // An active or saved batch cannot start again.
+        let mut app = app_with_row(Row::Train {
+            repo: "borsuk".to_string(),
+        });
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('g'), &mut sink);
+        assert!(app.confirm.is_none());
+
         // An empty stacked set opens no confirmation.
-        let mut app = app_with_selection(20);
+        let mut app = app_with_row(Row::Train {
+            repo: "ryba".to_string(),
+        });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('g'), &mut sink);
         assert!(app.confirm.is_none());
@@ -1915,7 +2765,9 @@ mod tests {
 
     #[test]
     fn s_cycles_the_release_policy() {
-        let mut app = app_with_selection(18);
+        let mut app = app_with_row(Row::Train {
+            repo: "borsuk".to_string(),
+        });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('s'), &mut sink);
         assert_eq!(
@@ -1940,7 +2792,9 @@ mod tests {
 
     #[test]
     fn repeated_s_completes_the_full_policy_cycle() {
-        let mut app = app_with_selection(18);
+        let mut app = app_with_row(Row::Train {
+            repo: "borsuk".to_string(),
+        });
         let mut sink = FakeSink::default();
         for _ in 0..3 {
             handle_key(&mut app, pressed('s'), &mut sink);
@@ -1985,11 +2839,34 @@ mod tests {
             (8, 'r', "sent refine borsuk i140"),
             (4, 'n', "sent new ticket ryba"),
             (5, 'R', "sent retry ryba/refine-i9"),
-            (18, ' ', "sent stack #7 borsuk"),
-            (18, 's', "sent policy borsuk every 30m"),
         ];
         for (selection, character, expected) in cases {
             let mut app = app_with_selection(selection);
+            let mut sink = FakeSink::default();
+            handle_key(&mut app, pressed(character), &mut sink);
+            assert_eq!(sink.0.len(), 1, "key {character}");
+            assert_eq!(app.visible_toast(), Some(expected), "key {character}");
+        }
+
+        let release_cases = [
+            (
+                Row::ReleasePr {
+                    repo: "borsuk".to_string(),
+                    pr: 7,
+                },
+                ' ',
+                "sent stack #7 borsuk",
+            ),
+            (
+                Row::Train {
+                    repo: "borsuk".to_string(),
+                },
+                's',
+                "sent policy borsuk every 30m",
+            ),
+        ];
+        for (row, character, expected) in release_cases {
+            let mut app = app_with_row(row);
             let mut sink = FakeSink::default();
             handle_key(&mut app, pressed(character), &mut sink);
             assert_eq!(sink.0.len(), 1, "key {character}");

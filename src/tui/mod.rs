@@ -376,8 +376,10 @@ impl App {
                 KeyCode::Char('2') => self.view = View::Session,
                 KeyCode::Char('3') => self.view = View::Inbox,
                 KeyCode::Char('?') => self.help = true,
-                KeyCode::Char('j') => pipeline::move_selection(self, 1),
-                KeyCode::Char('k') => pipeline::move_selection(self, -1),
+                KeyCode::Char('j') | KeyCode::Down => pipeline::move_selection(self, 1),
+                KeyCode::Char('k') | KeyCode::Up => pipeline::move_selection(self, -1),
+                KeyCode::Char('h') | KeyCode::Left => pipeline::move_horizontal(self, -1),
+                KeyCode::Char('l') | KeyCode::Right => pipeline::move_horizontal(self, 1),
                 _ => pipeline::handle_key(self, key, sink),
             },
         }
@@ -969,7 +971,7 @@ fn banner_text(app: &App) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
     let hints = Span::styled(
-        " 1/2/3 views   j/k move   ! inbox   ? help   ctrl-q quit ",
+        " 1/2/3 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
         THEME.dim(),
     );
     f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
@@ -1035,13 +1037,14 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 20, area);
+    let panel = centered(44, 21, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 18] = [
+    let rows: [(&str, &str); 19] = [
         ("1 2 3", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
-        ("j k", "move the selection"),
+        ("j k", "move inside a lane"),
+        ("h l", "move between lanes"),
         ("?", "toggle this help"),
         ("ctrl-q", "quit"),
         ("+ -", "stage limit / repo lane"),
@@ -1354,6 +1357,36 @@ mod tests {
     }
 
     #[test]
+    fn h_and_l_move_between_pipeline_stage_lanes() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('j'),
+                key('j'),
+                key('j'),
+                key('l'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        let state = app.state.as_ref().unwrap();
+        let Selection::Row(index) = app.selection else {
+            panic!("the pipeline must hold a selection");
+        };
+        assert_eq!(
+            pipeline::rows(state)[index],
+            pipeline::Row::Ticket { index: 2 }
+        );
+    }
+
+    #[test]
     fn a_state_push_connects_and_clamps_the_selection() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App {
@@ -1434,6 +1467,8 @@ mod tests {
         for entry in [
             "switch view",
             "oldest decision",
+            "h l",
+            "move between lanes",
             "ctrl-q",
             "send the chat message",
             "PageUp PageDown",
@@ -1828,20 +1863,27 @@ mod tests {
     #[test]
     fn y_confirms_the_release_of_the_stacked_batch() {
         let mut surface = CountingSurface { draws: 0 };
+        let mut state = crate::tui::pipeline::sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked = vec![7];
+        let train_row = pipeline::rows(&state)
+            .iter()
+            .position(|row| {
+                row == &pipeline::Row::Train {
+                    repo: "borsuk".to_string(),
+                }
+            })
+            .unwrap();
         let mut app = App {
-            selection: Selection::Row(18),
+            selection: Selection::Row(train_row),
             ..App::default()
         };
         let mut sink = FakeSink::default();
         run_messages(
             &mut surface,
             &mut app,
-            vec![
-                Msg::State(crate::tui::pipeline::sample_view()),
-                key('g'),
-                key('y'),
-            ]
-            .into_iter(),
+            vec![Msg::State(state), key('g'), key('y')].into_iter(),
             &mut sink,
         )
         .unwrap();
@@ -1849,7 +1891,7 @@ mod tests {
             sink.0,
             vec![Action::Go {
                 repo: "borsuk".to_string(),
-                prs: vec![3]
+                prs: vec![7]
             }]
         );
         assert!(app.confirm.is_none());
