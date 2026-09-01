@@ -159,15 +159,29 @@ impl Confirm {
                 Action::Abort { task: task.clone() },
                 format!("sent abort {task}"),
             ),
-            Confirm::Go { repo, prs } => emit(
-                app,
-                sink,
-                Action::Go {
-                    repo: repo.clone(),
-                    prs: prs.clone(),
-                },
-                format!("sent release {repo} {}", pr_text(&prs)),
-            ),
+            Confirm::Go { repo, prs } => {
+                let current = app.state.as_ref().is_some_and(|state| {
+                    state.trains.iter().any(|train| {
+                        train.repo == repo
+                            && train.in_flight.is_none()
+                            && matches!(train.batch.as_deref(), Some([]))
+                            && train.stacked == prs
+                    })
+                });
+                if !current {
+                    app.show_toast("release batch changed; press g again");
+                    return;
+                }
+                emit(
+                    app,
+                    sink,
+                    Action::Go {
+                        repo: repo.clone(),
+                        prs: prs.clone(),
+                    },
+                    format!("sent release {repo} {}", pr_text(&prs)),
+                );
+            }
         }
     }
 }
@@ -214,6 +228,18 @@ impl App {
     /// the session task, so both views stay in step with the daemon.
     fn apply_state(&mut self, view: StateView) {
         let count = pipeline::rows(&view).len();
+        let keyed_selection = self
+            .state
+            .as_ref()
+            .map(|state| pipeline::selection_key(state, self.selection));
+        let next_selection = match keyed_selection {
+            Some(Some(key)) => pipeline::selection_for_key(&view, &key),
+            Some(None) => Selection::None,
+            None => match self.selection {
+                Selection::Row(index) if count > 0 => Selection::Row(index.min(count - 1)),
+                _ => Selection::None,
+            },
+        };
         self.inbox.observe(&view);
         let wanted_task = self.wanted.as_ref().and_then(|wanted| {
             view.tasks
@@ -231,10 +257,7 @@ impl App {
         self.state = Some(view);
         self.connected = true;
         self.disconnect = None;
-        self.selection = match self.selection {
-            Selection::Row(index) if count > 0 => Selection::Row(index.min(count - 1)),
-            _ => Selection::None,
-        };
+        self.selection = next_selection;
         if self
             .toast
             .as_ref()
@@ -1037,21 +1060,22 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 21, area);
+    let panel = centered(44, 22, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 19] = [
+    let rows: [(&str, &str); 20] = [
         ("1 2 3", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
-        ("j k", "move inside a lane"),
-        ("h l", "move between lanes"),
+        ("j k Up Down", "move inside a lane"),
+        ("h l Left Right", "move between lanes"),
         ("?", "toggle this help"),
         ("ctrl-q", "quit"),
         ("+ -", "stage limit / repo lane"),
         ("p P", "pause scope / all"),
         ("r n", "refine / new ticket"),
         ("x R", "abort / retry"),
-        ("space g s", "stack / release / policy"),
+        ("space", "toggle the selected pull request"),
+        ("g s", "release / policy"),
         ("enter", "open the selected task session"),
         ("enter", "send the chat message"),
         ("ctrl-x", "abort the shown task"),
@@ -1407,6 +1431,80 @@ mod tests {
     }
 
     #[test]
+    fn a_state_push_keeps_the_selected_release_pr_by_identity() {
+        let mut first = crate::tui::pipeline::sample_view();
+        first.trains[0].queue = vec![9];
+        let selected = pipeline::Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 9,
+        };
+        let index = pipeline::rows(&first)
+            .iter()
+            .position(|row| row == &selected)
+            .unwrap();
+        let mut app = App {
+            state: Some(first),
+            connected: true,
+            selection: Selection::Row(index),
+            ..App::default()
+        };
+        let next = crate::tui::pipeline::sample_view();
+
+        app.apply_state(next);
+
+        let Selection::Row(index) = app.selection else {
+            panic!("the pull request must stay selected");
+        };
+        assert_eq!(pipeline::rows(app.state.as_ref().unwrap())[index], selected);
+    }
+
+    #[test]
+    fn a_state_push_keeps_the_selected_task_by_id() {
+        let first = crate::tui::pipeline::sample_view();
+        let selected_id = first.tasks[1].id.clone();
+        let mut app = App {
+            state: Some(first),
+            connected: true,
+            selection: Selection::Row(3),
+            ..App::default()
+        };
+        let mut next = crate::tui::pipeline::sample_view();
+        let mut earlier = next.tasks[0].clone();
+        earlier.id = "borsuk/refine-i141".to_string();
+        earlier.number = 141;
+        next.tasks.insert(0, earlier);
+
+        app.apply_state(next);
+
+        let Selection::Row(index) = app.selection else {
+            panic!("the task must stay selected");
+        };
+        let pipeline::Row::Ticket { index } = pipeline::rows(app.state.as_ref().unwrap())[index]
+        else {
+            panic!("the selection must remain a task");
+        };
+        assert_eq!(app.state.as_ref().unwrap().tasks[index].id, selected_id);
+    }
+
+    #[test]
+    fn a_state_push_clears_a_selection_that_no_longer_exists() {
+        let first = crate::tui::pipeline::sample_view();
+        let selected_id = first.tasks[1].id.clone();
+        let mut app = App {
+            state: Some(first),
+            connected: true,
+            selection: Selection::Row(3),
+            ..App::default()
+        };
+        let mut next = crate::tui::pipeline::sample_view();
+        next.tasks.retain(|task| task.id != selected_id);
+
+        app.apply_state(next);
+
+        assert_eq!(app.selection, Selection::None);
+    }
+
+    #[test]
     fn banner_text_covers_every_state() {
         let mut app = App::default();
         assert_eq!(banner_text(&app), " connecting to the daemon ");
@@ -1467,8 +1565,10 @@ mod tests {
         for entry in [
             "switch view",
             "oldest decision",
-            "h l",
+            "j k Up Down",
+            "h l Left Right",
             "move between lanes",
+            "toggle the selected pull request",
             "ctrl-q",
             "send the chat message",
             "PageUp PageDown",
@@ -1865,7 +1965,7 @@ mod tests {
         let mut surface = CountingSurface { draws: 0 };
         let mut state = crate::tui::pipeline::sample_view();
         state.trains[0].in_flight = None;
-        state.trains[0].batch.clear();
+        state.trains[0].batch = Some(Vec::new());
         state.trains[0].stacked = vec![7];
         let train_row = pipeline::rows(&state)
             .iter()
@@ -1896,6 +1996,45 @@ mod tests {
         );
         assert!(app.confirm.is_none());
         assert!(app.visible_toast().is_some());
+    }
+
+    #[test]
+    fn y_blocks_a_release_that_changed_after_its_confirmation_opened() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut first = crate::tui::pipeline::sample_view();
+        first.trains[0].in_flight = None;
+        first.trains[0].batch = Some(Vec::new());
+        first.trains[0].stacked = vec![7];
+        let train_row = pipeline::rows(&first)
+            .iter()
+            .position(|row| {
+                row == &pipeline::Row::Train {
+                    repo: "borsuk".to_string(),
+                }
+            })
+            .unwrap();
+        let mut changed = first.clone();
+        changed.trains[0].stacked = vec![9];
+        let mut app = App {
+            selection: Selection::Row(train_row),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(first), key('g'), Msg::State(changed), key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty());
+        assert!(app.confirm.is_none());
+        assert_eq!(
+            app.visible_toast(),
+            Some("release batch changed; press g again")
+        );
     }
 
     #[test]

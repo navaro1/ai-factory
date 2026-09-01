@@ -4772,6 +4772,70 @@ mod tests {
     }
 
     #[test]
+    fn reverse_stack_actions_keep_the_release_prompt_in_queue_order() {
+        let dir = temp_root();
+        let steps: Vec<Step> = vec![
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/9/labels",
+                    "-f",
+                    "labels[]=release-stacked",
+                ],
+                gh_ok(),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=release-stacked",
+                ],
+                gh_ok(),
+            ),
+        ]
+        .into_iter()
+        .chain(fresh_train_steps(
+            &rig_repo(&dir),
+            &train_wt(&dir),
+            &rig_gitdir(&dir),
+        ))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(7, false, &[]), pr(9, false, &[])]);
+
+        rig.act(Action::Stack {
+            repo: "borsuk".to_string(),
+            pr: 9,
+            on: true,
+        });
+        rig.act(Action::Stack {
+            repo: "borsuk".to_string(),
+            pr: 7,
+            on: true,
+        });
+        let batch = match rig.decision("gate:borsuk").unwrap().kind {
+            DecisionKind::ReleaseGate { prs } => prs,
+            other => panic!("expected a release gate, got {other:?}"),
+        };
+        assert_eq!(batch, vec![7, 9]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: batch,
+        });
+
+        let prompt = rig.job(0).prompt;
+        assert!(prompt.contains("- #7 pr 7\n- #9 pr 9"), "prompt:\n{prompt}");
+        assert!(prompt.contains("Merge order is 7, 9."), "prompt:\n{prompt}");
+    }
+
+    #[test]
     fn aborting_a_release_returns_its_batch_to_the_train() {
         let dir = temp_root();
         let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));

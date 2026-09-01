@@ -96,6 +96,13 @@ impl Train {
             gh.add_label(owner_repo, pr, STACKED_LABEL)
                 .with_context(|| format!("cannot add {STACKED_LABEL} to pr {pr}"))?;
             self.stacked.push(pr);
+            let queue = self.queue.clone();
+            self.stacked.sort_by_key(|number| {
+                queue
+                    .iter()
+                    .position(|candidate| candidate == number)
+                    .unwrap_or(usize::MAX)
+            });
         } else {
             if !self.stacked.contains(&pr) {
                 return Ok(());
@@ -516,6 +523,42 @@ mod tests {
         t.stack(2, true, "acme/borsuk", &client).unwrap();
         assert_eq!(t.stacked, vec![2]);
         assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn reverse_stack_actions_keep_the_release_queue_order() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/9/labels",
+                    "-f",
+                    "labels[]=release-stacked",
+                ]),
+                CmdOut::ok(response("HTTP/2 200", "{}")),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=release-stacked",
+                ]),
+                CmdOut::ok(response("HTTP/2 200", "{}")),
+            );
+        let client = GhClient::new(&exec);
+        let mut t = train(&[7, 9]);
+
+        t.stack(9, true, "acme/borsuk", &client).unwrap();
+        t.stack(7, true, "acme/borsuk", &client).unwrap();
+
+        assert_eq!(t.stacked, vec![7, 9]);
     }
 
     #[test]
