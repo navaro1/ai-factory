@@ -951,7 +951,8 @@ impl Daemon {
                     &self.paused,
                     &self.table,
                     task.stage,
-                    &task.repo
+                    &task.repo,
+                    &task.id,
                 ),
                 Verdict::Yes
             ) {
@@ -1055,7 +1056,8 @@ impl Daemon {
                     &self.paused,
                     &self.table,
                     task.stage,
-                    &task.repo
+                    &task.repo,
+                    &task.id,
                 ),
                 Verdict::Yes
             ) {
@@ -1599,24 +1601,21 @@ impl Daemon {
             }
             Action::Pause { scope, paused } => {
                 match scope {
-                    PauseScope::Global => self.paused.global = paused,
-                    PauseScope::Stage { stage } => {
-                        if paused {
-                            self.paused.stages.insert(stage);
-                        } else {
-                            self.paused.stages.remove(&stage);
-                        }
-                    }
-                    PauseScope::Repo { repo } => {
+                    PauseScope::Global => self.paused.set_global(paused),
+                    PauseScope::Stage { stage } => self.paused.set_stage(stage, paused),
+                    PauseScope::Lane { stage, repo } => {
                         if !self.config.repos.contains_key(&repo) {
                             eprintln!("the pause change for {repo}: no such repository");
                             return;
                         }
-                        if paused {
-                            self.paused.repos.insert(repo);
-                        } else {
-                            self.paused.repos.remove(&repo);
+                        self.paused.set_lane(stage, repo, paused);
+                    }
+                    PauseScope::Task { task } => {
+                        if !self.table.by_id.contains_key(&task) {
+                            eprintln!("the pause change for {task}: no such task");
+                            return;
                         }
+                        self.paused.set_task(task, paused);
                     }
                 }
                 self.changed = true;
@@ -3234,6 +3233,28 @@ mod tests {
     }
 
     #[test]
+    fn a_task_resume_override_dispatches_only_that_task() {
+        let mut rig = Rig::make_paused(vec![]);
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+        assert_eq!(rig.job_count(), 0);
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/refine-i143".to_string(),
+            },
+            paused: false,
+        });
+
+        assert!(rig.daemon.paused.global);
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/refine-i143");
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
+    }
+
+    #[test]
     fn a_gate_admits_work_and_a_second_drive_dispatches_nothing() {
         let mut rig = Rig::make(vec![]);
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -3923,14 +3944,15 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_repository_fires_its_train_but_cannot_start_the_release() {
+    fn a_paused_release_lane_fires_its_train_but_cannot_start_the_release() {
         let mut rig = Rig::make(vec![]);
         rig.act(Action::Policy {
             repo: "borsuk".to_string(),
             policy: ReleasePolicy::Interval { minutes: 60 },
         });
         rig.act(Action::Pause {
-            scope: PauseScope::Repo {
+            scope: PauseScope::Lane {
+                stage: Stage::Release,
                 repo: "borsuk".to_string(),
             },
             paused: true,
@@ -4570,7 +4592,8 @@ mod tests {
             slots: 1,
         });
         rig.act(Action::Pause {
-            scope: PauseScope::Repo {
+            scope: PauseScope::Lane {
+                stage: Stage::Implement,
                 repo: "missing".to_string(),
             },
             paused: true,
@@ -4583,7 +4606,11 @@ mod tests {
             .limits
             .lanes
             .contains_key(&(Stage::Implement, "missing".to_string())));
-        assert!(!rig.daemon.paused.repos.contains("missing"));
+        assert!(!rig
+            .daemon
+            .paused
+            .lanes
+            .contains_key(&(Stage::Implement, "missing".to_string())));
     }
 
     #[test]
@@ -6192,8 +6219,7 @@ mod tests {
         assert!(view.lanes.is_empty());
         assert!(view.decisions.is_empty());
         assert!(!view.paused.global);
-        assert!(view.paused.stages.is_empty());
-        assert!(view.paused.repos.is_empty());
+        assert!(view.paused.overrides.is_empty());
         assert_eq!(view.trains.len(), 1);
         assert_eq!(view.trains[0].repo, "borsuk");
         assert_eq!(view.trains[0].queue, Vec::<u64>::new());
@@ -6274,8 +6300,7 @@ mod tests {
         });
         let view = rx.try_recv().expect("the pause change must publish a view");
         assert!(view.paused.global);
-        assert!(view.paused.stages.is_empty());
-        assert!(view.paused.repos.is_empty());
+        assert!(view.paused.overrides.is_empty());
 
         rig.act(Action::Policy {
             repo: "borsuk".to_string(),

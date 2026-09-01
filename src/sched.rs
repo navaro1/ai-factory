@@ -5,7 +5,7 @@
 //! Which queued task should start next? The scheduler is pure logic. It runs
 //! no process and performs no input or output.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::config::Config;
 use crate::model::Stage;
@@ -82,7 +82,7 @@ pub enum Reason {
     /// The stage has room in total, but the strict lane reservations of the
     /// other repositories leave none for this repository.
     LaneBlocked,
-    /// The operator paused this stage, this repository, or the whole factory.
+    /// The operator paused this task, lane, stage, or the whole factory.
     Paused,
 }
 
@@ -91,23 +91,59 @@ pub enum Reason {
 pub struct Paused {
     /// The whole factory takes no new work.
     pub global: bool,
-    /// The paused stages.
-    pub stages: BTreeSet<Stage>,
-    /// The paused repositories, by alias.
-    pub repos: BTreeSet<String>,
+    /// Explicit states for stages.
+    pub stages: BTreeMap<Stage, bool>,
+    /// Explicit states for repository lanes.
+    pub lanes: BTreeMap<(Stage, String), bool>,
+    /// Explicit states for tasks, by stable task id.
+    pub tasks: BTreeMap<String, bool>,
 }
 
 impl Paused {
-    /// True when this stage of this repository may not start.
+    /// Set the whole-factory state and remove all narrower states.
+    pub fn set_global(&mut self, paused: bool) {
+        self.global = paused;
+        self.stages.clear();
+        self.lanes.clear();
+        self.tasks.clear();
+    }
+
+    /// Set one stage state.
+    pub fn set_stage(&mut self, stage: Stage, paused: bool) {
+        self.stages.insert(stage, paused);
+    }
+
+    /// Set one repository lane state.
+    pub fn set_lane(&mut self, stage: Stage, repo: String, paused: bool) {
+        self.lanes.insert((stage, repo), paused);
+    }
+
+    /// Set one task state.
+    pub fn set_task(&mut self, task: String, paused: bool) {
+        self.tasks.insert(task, paused);
+    }
+
+    /// True when this repository lane may not start.
     pub fn blocks(&self, stage: Stage, repo: &str) -> bool {
-        self.global || self.stages.contains(&stage) || self.repos.contains(repo)
+        self.lanes
+            .get(&(stage, repo.to_string()))
+            .copied()
+            .or_else(|| self.stages.get(&stage).copied())
+            .unwrap_or(self.global)
+    }
+
+    /// True when the pause hierarchy blocks one exact task.
+    pub fn blocks_task(&self, stage: Stage, repo: &str, task: &str) -> bool {
+        self.tasks
+            .get(task)
+            .copied()
+            .unwrap_or_else(|| self.blocks(stage, repo))
     }
 }
 
-/// Whether one stage of one repository may start a task now.
+/// Whether one exact task may start now.
 ///
-/// This is the only start predicate. A paused stage, repository, or factory
-/// reports
+/// A paused lane, stage, or factory reports
 /// `Verdict::No(Reason::Paused)` at once. Otherwise the check counts running
 /// tasks only. A count at or above the stage limit reports
 /// `Verdict::No(Reason::StageFull)`. Otherwise the strict lane reservations
@@ -126,10 +162,16 @@ pub fn can_start(
     table: &TaskTable,
     stage: Stage,
     repo: &str,
+    task: &str,
 ) -> Verdict {
-    if paused.blocks(stage, repo) {
+    if paused.blocks_task(stage, repo, task) {
         return Verdict::No(Reason::Paused);
     }
+    capacity_verdict(limits, table, stage, repo)
+}
+
+/// The capacity result for one repository lane, without a pause check.
+fn capacity_verdict(limits: &Limits, table: &TaskTable, stage: Stage, repo: &str) -> Verdict {
     let running = table.counts_by_stage()[&stage];
     let limit = limits.limit(stage);
     if running >= limit {
@@ -155,8 +197,8 @@ pub fn can_start(
 
 /// The next queued task to dispatch, or None.
 ///
-/// The walk goes in insertion order. It skips tasks whose repository or stage
-/// is paused and tasks the capacity check refuses, and it returns the first
+/// The walk goes in insertion order. It skips tasks whose exact pause state
+/// blocks a start. It also skips tasks that fail the capacity check. It returns the first
 /// task that may start. It never reorders: an earlier task that may start
 /// always wins over a later one, so a later task from another repository
 /// never starves the head of the queue.
@@ -169,7 +211,7 @@ pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Opt
             continue;
         }
         if matches!(
-            can_start(limits, paused, table, task.stage, &task.repo),
+            can_start(limits, paused, table, task.stage, &task.repo, &task.id),
             Verdict::Yes
         ) {
             return Some(task.id.clone());
@@ -226,6 +268,17 @@ mod tests {
     /// Plain implement limits of 3 and no reservations.
     fn plain_limits() -> Limits {
         limits(&[(Stage::Implement, 3)], &[])
+    }
+
+    /// Check capacity with a task that has no exact pause state.
+    fn can_start(
+        limits: &Limits,
+        paused: &Paused,
+        table: &TaskTable,
+        stage: Stage,
+        repo: &str,
+    ) -> Verdict {
+        super::can_start(limits, paused, table, stage, repo, "test-task")
     }
 
     /// A table with one queued implement task per `(repo, number)`.
@@ -382,7 +435,7 @@ mod tests {
         assert!(out[0].contains("stage.implement"), "message: {}", out[0]);
     }
 
-    /// Pausing a stage, a repository, or everything blocks dispatch and the
+    /// Pausing a stage, a repository lane, or everything blocks dispatch and the
     /// refusal names the pause.
     #[test]
     fn pausing_blocks_dispatch_and_reports_the_right_reason() {
@@ -401,7 +454,7 @@ mod tests {
         );
 
         let stage = Paused {
-            stages: BTreeSet::from([Stage::Implement]),
+            stages: BTreeMap::from([(Stage::Implement, true)]),
             ..Paused::default()
         };
         assert_eq!(next_dispatch(&limits, &table, &stage), None);
@@ -411,7 +464,7 @@ mod tests {
         );
 
         let repo = Paused {
-            repos: BTreeSet::from(["borsuk".to_string()]),
+            lanes: BTreeMap::from([((Stage::Implement, "borsuk".to_string()), true)]),
             ..Paused::default()
         };
         assert_eq!(
@@ -421,7 +474,7 @@ mod tests {
         assert_eq!(
             next_dispatch(&limits, &table, &repo),
             Some(ids[1].clone()),
-            "the paused repository is skipped, the free one still dispatches"
+            "the paused lane is skipped, the free one still dispatches"
         );
 
         // Unpaused and free, can_start says yes.
@@ -436,6 +489,37 @@ mod tests {
             Verdict::Yes
         );
         assert_eq!(next_dispatch(&limits, &table, &none), Some(ids[0].clone()));
+    }
+
+    #[test]
+    fn the_most_specific_pause_state_wins() {
+        let mut paused = Paused {
+            global: true,
+            ..Paused::default()
+        };
+        paused.set_stage(Stage::Implement, false);
+        paused.set_lane(Stage::Implement, "borsuk".to_string(), true);
+        paused.set_task("borsuk/implement-i1".to_string(), false);
+
+        assert!(!paused.blocks_task(Stage::Implement, "borsuk", "borsuk/implement-i1"));
+        assert!(paused.blocks_task(Stage::Implement, "borsuk", "borsuk/implement-i2"));
+        assert!(!paused.blocks_task(Stage::Implement, "qubitsok", "qubitsok/implement-i3"));
+        assert!(paused.blocks_task(Stage::Review, "qubitsok", "qubitsok/review-p4"));
+    }
+
+    #[test]
+    fn a_global_change_removes_all_narrower_states() {
+        let mut paused = Paused::default();
+        paused.set_stage(Stage::Implement, true);
+        paused.set_lane(Stage::Review, "borsuk".to_string(), false);
+        paused.set_task("borsuk/review-p7".to_string(), true);
+
+        paused.set_global(true);
+
+        assert!(paused.global);
+        assert!(paused.stages.is_empty());
+        assert!(paused.lanes.is_empty());
+        assert!(paused.tasks.is_empty());
     }
 
     /// A pause on one stage blocks only that stage.
@@ -467,7 +551,7 @@ mod tests {
             .unwrap();
 
         let paused = Paused {
-            stages: BTreeSet::from([Stage::Implement]),
+            stages: BTreeMap::from([(Stage::Implement, true)]),
             ..Paused::default()
         };
         assert_eq!(

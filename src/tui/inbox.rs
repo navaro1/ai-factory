@@ -1071,8 +1071,7 @@ mod tests {
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
-                stages: Vec::new(),
-                repos: Vec::new(),
+                overrides: Vec::new(),
             },
         }
     }

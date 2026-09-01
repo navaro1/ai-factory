@@ -209,17 +209,75 @@ fn stage_is_empty(state: &StateView, stage: Stage) -> bool {
     !any_task && !any_train
 }
 
-/// True when the operator paused the whole factory or this stage.
+/// True when the pause hierarchy blocks this stage.
 fn stage_is_paused(state: &StateView, stage: Stage) -> bool {
-    state.paused.global || state.paused.stages.contains(&stage)
+    pause_override(state, &PauseScope::Stage { stage }).unwrap_or(state.paused.global)
 }
 
-/// True when a pause blocks the start of this task: the factory, its
-/// stage, or its repository.
+/// True when a pause blocks the start of this task.
 fn task_is_paused(state: &StateView, task: &TaskView) -> bool {
-    state.paused.global
-        || state.paused.stages.contains(&task.stage)
-        || state.paused.repos.iter().any(|repo| repo == &task.repo)
+    task_pause_override(state, task)
+        .unwrap_or_else(|| lane_is_paused(state, task.stage, &task.repo))
+}
+
+/// The explicit state of one task, when the operator set one.
+fn task_pause_override(state: &StateView, task: &TaskView) -> Option<bool> {
+    pause_override(
+        state,
+        &PauseScope::Task {
+            task: task.id.clone(),
+        },
+    )
+}
+
+/// True when one repository lane inherits or owns a pause.
+fn lane_is_paused(state: &StateView, stage: Stage, repo: &str) -> bool {
+    pause_override(
+        state,
+        &PauseScope::Lane {
+            stage,
+            repo: repo.to_string(),
+        },
+    )
+    .unwrap_or_else(|| stage_is_paused(state, stage))
+}
+
+/// The explicit state of one exact scope, when one exists.
+fn pause_override(state: &StateView, scope: &PauseScope) -> Option<bool> {
+    state
+        .paused
+        .overrides
+        .iter()
+        .find(|entry| &entry.scope == scope)
+        .map(|entry| entry.paused)
+}
+
+/// The effective state of one exact scope.
+fn scope_is_paused(state: &StateView, scope: &PauseScope) -> bool {
+    match scope {
+        PauseScope::Global => state.paused.global,
+        PauseScope::Stage { stage } => stage_is_paused(state, *stage),
+        PauseScope::Lane { stage, repo } => lane_is_paused(state, *stage, repo),
+        PauseScope::Task { task } => state
+            .tasks
+            .iter()
+            .find(|entry| &entry.id == task)
+            .is_some_and(|entry| task_is_paused(state, entry)),
+    }
+}
+
+/// Set one optimistic pause state in the current view.
+fn set_pause_override(state: &mut StateView, scope: PauseScope, paused: bool) {
+    if scope == PauseScope::Global {
+        state.paused.global = paused;
+        state.paused.overrides.clear();
+        return;
+    }
+    state.paused.overrides.retain(|entry| entry.scope != scope);
+    state
+        .paused
+        .overrides
+        .push(crate::sock::PauseOverrideView { scope, paused });
 }
 
 /// Move the selection by `delta` items inside one stage lane.
@@ -501,8 +559,8 @@ fn change_amount(app: &mut App, sink: &mut impl ActionSink, change: AmountChange
 
 /// Pause or resume the selected scope with `p`.
 ///
-/// A stage row pauses the stage. A repository, ticket, or train row pauses
-/// the repository of that row.
+/// A stage row changes one stage. A repository row changes one stage lane.
+/// A task row changes one task. A release row changes one release lane.
 fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
     let found = {
         let Some(state) = app.state.as_ref() else {
@@ -513,16 +571,16 @@ fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
         };
         let (scope, label) = match row {
             Row::Stage { stage } => (PauseScope::Stage { stage }, stage.as_str().to_string()),
-            Row::Repo { repo, .. } => {
-                let label = repo.clone();
-                (PauseScope::Repo { repo }, label)
+            Row::Repo { stage, repo } => {
+                let label = format!("{}/{repo}", stage.as_str());
+                (PauseScope::Lane { stage, repo }, label)
             }
             Row::Ticket { index } => match state.tasks.get(index) {
                 Some(task) => {
-                    let label = task.repo.clone();
+                    let label = task.id.clone();
                     (
-                        PauseScope::Repo {
-                            repo: task.repo.clone(),
+                        PauseScope::Task {
+                            task: task.id.clone(),
                         },
                         label,
                     )
@@ -530,19 +588,27 @@ fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
                 None => return,
             },
             Row::Train { repo } => {
-                let label = repo.clone();
-                (PauseScope::Repo { repo }, label)
+                let label = format!("release/{repo}");
+                (
+                    PauseScope::Lane {
+                        stage: Stage::Release,
+                        repo,
+                    },
+                    label,
+                )
             }
             Row::ReleasePr { repo, .. } => {
-                let label = repo.clone();
-                (PauseScope::Repo { repo }, label)
+                let label = format!("release/{repo}");
+                (
+                    PauseScope::Lane {
+                        stage: Stage::Release,
+                        repo,
+                    },
+                    label,
+                )
             }
         };
-        let paused = match &scope {
-            PauseScope::Stage { stage } => !state.paused.stages.contains(stage),
-            PauseScope::Repo { repo } => !state.paused.repos.contains(repo),
-            PauseScope::Global => true,
-        };
+        let paused = !scope_is_paused(state, &scope);
         (scope, paused, label)
     };
     let (scope, paused, label) = found;
@@ -557,27 +623,7 @@ fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
         format!("sent {operation} {label}"),
     );
     if let Some(state) = app.state.as_mut() {
-        match scope {
-            PauseScope::Global => state.paused.global = paused,
-            PauseScope::Stage { stage } => {
-                if paused {
-                    if !state.paused.stages.contains(&stage) {
-                        state.paused.stages.push(stage);
-                    }
-                } else {
-                    state.paused.stages.retain(|entry| *entry != stage);
-                }
-            }
-            PauseScope::Repo { repo } => {
-                if paused {
-                    if !state.paused.repos.contains(&repo) {
-                        state.paused.repos.push(repo);
-                    }
-                } else {
-                    state.paused.repos.retain(|entry| *entry != repo);
-                }
-            }
-        }
+        set_pause_override(state, scope, paused);
     }
 }
 
@@ -598,7 +644,7 @@ fn pause_all(app: &mut App, sink: &mut impl ActionSink) {
         format!("sent {operation} all"),
     );
     if let Some(state) = app.state.as_mut() {
-        state.paused.global = paused;
+        set_pause_override(state, PauseScope::Global, paused);
     }
 }
 
@@ -944,11 +990,8 @@ fn ordinary_lane_lines(
             row_spans(state, row, now_ms),
         ));
         if matches!(row, Row::Stage { .. }) {
-            if stage_is_paused(state, stage) {
-                lines.push(Line::from(Span::styled(
-                    "  paused",
-                    Style::default().fg(THEME.warn),
-                )));
+            if let Some(status) = stage_pause_line(state, stage) {
+                lines.push(status);
             }
             if stage_is_empty(state, stage) {
                 lines.push(Line::from(Span::styled("  no tasks", THEME.dim())));
@@ -971,11 +1014,8 @@ fn release_lane_lines(
         stage: Stage::Release,
     };
     push_row_line(state, all, selected, &stage_row, now_ms, &mut lines);
-    if stage_is_paused(state, Stage::Release) {
-        lines.push(Line::from(Span::styled(
-            "  paused",
-            Style::default().fg(THEME.warn),
-        )));
+    if let Some(status) = stage_pause_line(state, Stage::Release) {
+        lines.push(status);
     }
     if stage_is_empty(state, Stage::Release) {
         lines.push(Line::from(Span::styled("  no tasks", THEME.dim())));
@@ -1125,6 +1165,25 @@ fn release_lane_lines(
     lines
 }
 
+/// The inherited or explicit pause status below one stage row.
+fn stage_pause_line(state: &StateView, stage: Stage) -> Option<Line<'static>> {
+    match pause_override(state, &PauseScope::Stage { stage }) {
+        Some(false) => Some(Line::from(Span::styled(
+            "  resumed",
+            Style::default().fg(THEME.ok),
+        ))),
+        Some(true) => Some(Line::from(Span::styled(
+            "  paused",
+            Style::default().fg(THEME.warn),
+        ))),
+        None if state.paused.global => Some(Line::from(Span::styled(
+            "  paused",
+            Style::default().fg(THEME.warn),
+        ))),
+        None => None,
+    }
+}
+
 /// Add a row with its standard spans and selection marker.
 fn push_row_line(
     state: &StateView,
@@ -1219,7 +1278,7 @@ fn row_stage(state: &StateView, row: &Row) -> Option<Stage> {
 fn row_spans(state: &StateView, row: &Row, now_ms: u64) -> Vec<Span<'static>> {
     match row {
         Row::Stage { stage } => stage_spans(state, *stage),
-        Row::Repo { repo, .. } => repo_spans(state, repo),
+        Row::Repo { stage, repo } => repo_spans(state, *stage, repo),
         Row::Ticket { index } => match state.tasks.get(*index) {
             Some(task) => ticket_spans(state, task),
             None => vec![Span::raw("    (missing task)")],
@@ -1263,19 +1322,35 @@ fn stage_spans(state: &StateView, stage: Stage) -> Vec<Span<'static>> {
 /// The bold warn span that marks a paused scope.
 fn paused_span() -> Span<'static> {
     Span::styled(
-        "  paused",
+        " paused",
         Style::default().fg(THEME.warn).add_modifier(Modifier::BOLD),
     )
 }
 
+/// The bold success span that marks an explicit resumed scope.
+fn resumed_span() -> Span<'static> {
+    Span::styled(
+        " resumed",
+        Style::default().fg(THEME.ok).add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The spans of one repository group header row.
-fn repo_spans(state: &StateView, repo: &str) -> Vec<Span<'static>> {
+fn repo_spans(state: &StateView, stage: Stage, repo: &str) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         repo.to_string(),
         THEME.dim().add_modifier(Modifier::BOLD),
     )];
-    if state.paused.repos.iter().any(|entry| entry == repo) {
-        spans.push(paused_span());
+    match pause_override(
+        state,
+        &PauseScope::Lane {
+            stage,
+            repo: repo.to_string(),
+        },
+    ) {
+        Some(true) => spans.push(paused_span()),
+        Some(false) => spans.push(resumed_span()),
+        None => {}
     }
     spans
 }
@@ -1290,8 +1365,16 @@ fn release_repo_spans(
         repo.to_string(),
         THEME.dim().add_modifier(Modifier::BOLD),
     )];
-    if state.paused.repos.iter().any(|entry| entry == repo) {
-        spans.push(Span::styled(" paused", Style::default().fg(THEME.warn)));
+    match pause_override(
+        state,
+        &PauseScope::Lane {
+            stage: Stage::Release,
+            repo: repo.to_string(),
+        },
+    ) {
+        Some(true) => spans.push(Span::styled(" paused", Style::default().fg(THEME.warn))),
+        Some(false) => spans.push(Span::styled(" resumed", Style::default().fg(THEME.ok))),
+        None => {}
     }
     if let Some(train) = train {
         spans.push(Span::styled(
@@ -1317,7 +1400,9 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
         ),
         Span::raw(" "),
     ];
-    if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
+    if matches!(task.state, TaskState::Queued) && task_pause_override(state, task) == Some(false) {
+        spans.push(Span::styled("resumed", Style::default().fg(THEME.ok)));
+    } else if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
         spans.push(Span::styled("paused", Style::default().fg(THEME.warn)));
     } else {
         spans.push(state_span(&task.state));
@@ -1336,7 +1421,11 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
 
 /// The compact text of one task inside a nested release border.
 fn task_label(state: &StateView, task: &TaskView) -> String {
-    let status = if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
+    let status = if matches!(task.state, TaskState::Queued)
+        && task_pause_override(state, task) == Some(false)
+    {
+        "resumed"
+    } else if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
         "paused"
     } else {
         state_label(&task.state)
@@ -1600,8 +1689,7 @@ pub(crate) fn sample_view() -> StateView {
         ],
         paused: PausedView {
             global: false,
-            stages: Vec::new(),
-            repos: Vec::new(),
+            overrides: Vec::new(),
         },
     }
 }
@@ -1676,8 +1764,7 @@ mod tests {
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
-                stages: Vec::new(),
-                repos: Vec::new(),
+                overrides: Vec::new(),
             },
         }
     }
@@ -2034,8 +2121,7 @@ mod tests {
         let state = StateView {
             paused: PausedView {
                 global: true,
-                stages: Vec::new(),
-                repos: Vec::new(),
+                overrides: Vec::new(),
             },
             ..sample_view()
         };
@@ -2057,8 +2143,12 @@ mod tests {
         let state = StateView {
             paused: PausedView {
                 global: false,
-                stages: vec![Stage::Refine],
-                repos: Vec::new(),
+                overrides: vec![crate::sock::PauseOverrideView {
+                    scope: PauseScope::Stage {
+                        stage: Stage::Refine,
+                    },
+                    paused: true,
+                }],
             },
             ..sample_view()
         };
@@ -2073,12 +2163,71 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_repository_marks_its_group_rows_and_queued_tickets() {
+    fn a_task_resume_override_wins_over_a_global_pause() {
+        let mut state = sample_view();
+        state.paused.global = true;
+        state.paused.overrides.push(crate::sock::PauseOverrideView {
+            scope: PauseScope::Task {
+                task: "borsuk/refine-i142".to_string(),
+            },
+            paused: false,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+
+        assert!(text.contains("i142 resumed"), "board:\n{text}");
+        assert!(!text.contains("i142 paused"), "board:\n{text}");
+        assert!(text.contains("i7 paused"), "board:\n{text}");
+    }
+
+    #[test]
+    fn resumed_stage_and_lane_overrides_show_their_exact_scope() {
+        let mut state = sample_view();
+        state.paused.global = true;
+        state.paused.overrides.extend([
+            crate::sock::PauseOverrideView {
+                scope: PauseScope::Stage {
+                    stage: Stage::Implement,
+                },
+                paused: false,
+            },
+            crate::sock::PauseOverrideView {
+                scope: PauseScope::Lane {
+                    stage: Stage::Refine,
+                    repo: "borsuk".to_string(),
+                },
+                paused: false,
+            },
+        ]);
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+
+        assert_eq!(text.matches("resumed").count(), 2, "board:\n{text}");
+        assert!(text.contains("borsuk resumed"), "board:\n{text}");
+    }
+
+    #[test]
+    fn a_paused_lane_marks_its_group_row_and_queued_tickets() {
         let state = StateView {
             paused: PausedView {
                 global: false,
-                stages: Vec::new(),
-                repos: vec!["borsuk".to_string()],
+                overrides: vec![crate::sock::PauseOverrideView {
+                    scope: PauseScope::Lane {
+                        stage: Stage::Refine,
+                        repo: "borsuk".to_string(),
+                    },
+                    paused: true,
+                }],
             },
             ..sample_view()
         };
@@ -2088,17 +2237,16 @@ mod tests {
             ..App::default()
         };
         let text = render_to_string(&mut app);
-        // Every group row of borsuk carries the mark. The fifth pause mark
-        // belongs to its queued refine ticket.
+        // Only the selected lane group and its queued ticket carry the mark.
         assert_eq!(text.matches("borsuk").count(), 4);
-        assert_eq!(text.matches("paused").count(), 5);
+        assert_eq!(text.matches("paused").count(), 2);
         assert!(text.contains("borsuk paused"));
         assert!(!text.contains("RELEASING NOW paused"));
         assert!(text.contains("i142 paused"));
         assert!(!text.contains("i142 queued"));
-        // A running ticket of the paused repository keeps its true state.
+        // A running ticket of the paused lane keeps its true state.
         assert!(text.contains("i140 running"));
-        // The unpaused repository keeps its queued state.
+        // The other repository keeps its queued state.
         assert!(text.contains("i7 queued"));
         assert!(!text.contains("i7 paused"));
     }
@@ -2351,29 +2499,30 @@ mod tests {
             }]
         );
 
-        // A repository row pauses that repository.
+        // A repository row pauses only its stage lane.
         let mut app = app_with_selection(1);
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('p'), &mut sink);
         assert_eq!(
             sink.0,
             vec![Action::Pause {
-                scope: PauseScope::Repo {
+                scope: PauseScope::Lane {
+                    stage: Stage::Refine,
                     repo: "borsuk".to_string()
                 },
                 paused: true
             }]
         );
 
-        // A ticket row pauses the repository of its task.
+        // A ticket row pauses only that task.
         let mut app = app_with_selection(2);
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('p'), &mut sink);
         assert_eq!(
             sink.0,
             vec![Action::Pause {
-                scope: PauseScope::Repo {
-                    repo: "borsuk".to_string()
+                scope: PauseScope::Task {
+                    task: "borsuk/refine-i142".to_string()
                 },
                 paused: true
             }]
@@ -2392,14 +2541,108 @@ mod tests {
     }
 
     #[test]
+    fn p_on_a_repository_row_resumes_only_its_selected_lane() {
+        let mut app = app_with_selection(1);
+        app.state.as_mut().unwrap().paused.global = true;
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed('p'), &mut sink);
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Pause {
+                scope: PauseScope::Lane {
+                    stage: Stage::Refine,
+                    repo: "borsuk".to_string(),
+                },
+                paused: false,
+            }]
+        );
+        assert_eq!(app.visible_toast(), Some("sent resume refine/borsuk"));
+    }
+
+    #[test]
+    fn release_rows_change_only_their_release_lane() {
+        let mut app = app_with_row(Row::Train {
+            repo: "borsuk".to_string(),
+        });
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed('p'), &mut sink);
+        select_row(
+            &mut app,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 9,
+            },
+        );
+        handle_key(&mut app, pressed('p'), &mut sink);
+
+        assert_eq!(
+            sink.0,
+            vec![
+                Action::Pause {
+                    scope: PauseScope::Lane {
+                        stage: Stage::Release,
+                        repo: "borsuk".to_string(),
+                    },
+                    paused: true,
+                },
+                Action::Pause {
+                    scope: PauseScope::Lane {
+                        stage: Stage::Release,
+                        repo: "borsuk".to_string(),
+                    },
+                    paused: false,
+                },
+            ]
+        );
+        assert_eq!(app.visible_toast(), Some("sent resume release/borsuk"));
+    }
+
+    #[test]
+    fn p_capital_removes_all_specific_states() {
+        let mut app = app_with_selection(0);
+        app.state
+            .as_mut()
+            .unwrap()
+            .paused
+            .overrides
+            .push(crate::sock::PauseOverrideView {
+                scope: PauseScope::Task {
+                    task: "borsuk/refine-i142".to_string(),
+                },
+                paused: true,
+            });
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed('P'), &mut sink);
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Pause {
+                scope: PauseScope::Global,
+                paused: true,
+            }]
+        );
+        assert!(app.state.as_ref().unwrap().paused.global);
+        assert!(app.state.as_ref().unwrap().paused.overrides.is_empty());
+    }
+
+    #[test]
     fn pause_keys_toggle_the_current_scope_and_name_the_operation() {
         let mut app = app_with_selection(0);
         app.state
             .as_mut()
             .unwrap()
             .paused
-            .stages
-            .push(Stage::Refine);
+            .overrides
+            .push(crate::sock::PauseOverrideView {
+                scope: PauseScope::Stage {
+                    stage: Stage::Refine,
+                },
+                paused: true,
+            });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('p'), &mut sink);
         assert_eq!(
@@ -2430,20 +2673,25 @@ mod tests {
             .as_mut()
             .unwrap()
             .paused
-            .repos
-            .push("borsuk".to_string());
+            .overrides
+            .push(crate::sock::PauseOverrideView {
+                scope: PauseScope::Task {
+                    task: "borsuk/refine-i142".to_string(),
+                },
+                paused: true,
+            });
         let mut sink = FakeSink::default();
         handle_key(&mut app, pressed('p'), &mut sink);
         assert_eq!(
             sink.0,
             vec![Action::Pause {
-                scope: PauseScope::Repo {
-                    repo: "borsuk".to_string(),
+                scope: PauseScope::Task {
+                    task: "borsuk/refine-i142".to_string(),
                 },
                 paused: false,
             }]
         );
-        assert_eq!(app.visible_toast(), Some("sent resume borsuk"));
+        assert_eq!(app.visible_toast(), Some("sent resume borsuk/refine-i142"));
 
         let mut app = app_with_selection(0);
         app.state.as_mut().unwrap().paused.global = true;

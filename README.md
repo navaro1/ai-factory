@@ -145,9 +145,9 @@ write code, and open pull requests before you see the UI. The flag cannot
 apply when a daemon already runs. `aif` prints a message instead. Pause
 that daemon with `P`, or stop it with `aif stop` and start again.
 `aif doctor` reports the paused state. The UI shows a bold `paused` badge
-in the header and marks every stage row. A paused repository marks its
-group row the same way. A queued ticket that a pause blocks shows `paused`
-instead of `queued`.
+in the header and marks every stage row. An exact stage, lane, or task state
+marks its scope. A resumed item under a broader pause shows `resumed`.
+A queued ticket that a pause blocks shows `paused` instead of `queued`.
 
 ## The three views
 
@@ -170,7 +170,7 @@ The oldest request is at the top, and the newest request is at the bottom.
 | `h` / `l` or Left / Right | Move the selection between lanes. |
 | `enter` | Open the session of the selected ticket. Every stage. Every state. |
 | `+` / `-` | Change the limit of the selected stage. On a repository row, change its lane reservation. |
-| `p` | Pause or resume the selected stage or repository. `P` pauses or resumes everything. |
+| `p` | Pause or resume the exact selected item. `P` pauses or resumes everything. |
 | `r` | Refine the selected ticket in the session view. |
 | `n` | Create a new ticket for the selected repository. |
 | `x` | Abort the selected task, after a confirmation. |
@@ -178,6 +178,18 @@ The oldest request is at the top, and the newest request is at the bottom.
 | Space | Add or remove the selected waiting pull request from the next release. |
 | `g` | Start the outlined next release after a confirmation. |
 | `s` | Cycle the release policy: manual, interval, threshold. |
+
+Lowercase `p` follows the selected row:
+
+- A stage row changes only that stage.
+- A repository row changes only that repository lane in the current stage.
+- A task row changes only that task.
+- A release box or waiting pull request changes its repository release lane.
+
+The most specific state wins. The order is factory, stage, repository lane,
+and task. A second `p` changes the same state again. Uppercase `P` changes the
+whole factory and removes all narrower states. A pause blocks future task
+starts. It does not stop an active task.
 
 ### Session, view 2
 

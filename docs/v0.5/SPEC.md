@@ -608,17 +608,20 @@ repository lane reservations.
   Free capacity for any other repository is
   `limit(stage) - running(stage) - sum_over_other_repos(max(0, reserve(other) -
   running(stage, other)))`.
-- `can_start(&Limits, &Paused, &TaskTable, stage, repo) -> Verdict` where
+- `can_start(&Limits, &Paused, &TaskTable, stage, repo, task) -> Verdict` where
   `Verdict` is `Yes`, or `No(Reason)` with `Reason` naming `StageFull`,
   `LaneBlocked`, or `Paused`. There is exactly ONE such predicate. Do not also
   expose a capacity-only variant that ignores pause: two near-identical
   predicates invite a caller to reach for the wrong one, and the wrong one
-  would dispatch into a paused stage silently.
+  would dispatch a paused task silently.
 - `next_dispatch(&Limits, &TaskTable, &Paused) -> Option<TaskId>` walks queued
   tasks in insertion order, skips those blocked, and returns the first that may
   start. It never reorders and never starves an earlier task by preferring a
   later one from another repository.
-- `Paused { global: bool, stages: BTreeSet<Stage>, repos: BTreeSet<String> }`.
+- `Paused` contains the global state and explicit `bool` maps for stages,
+  repository lanes, and tasks. A task state overrides its lane state. A lane
+  state overrides its stage state. A stage state overrides the global state.
+  A global change removes all narrower states.
 - `warnings(&Limits) -> Vec<String>` reports a stage whose lane reservations
   equal its limit, since no other repository can ever run there. `doctor` shows
   these.
@@ -630,8 +633,10 @@ repository lane reservations.
 - The reserving repository can use its slot at once when its work arrives.
 - A repository with no reservation may use all remaining capacity.
 - Reservations equal to the limit produce a warning.
-- Pausing a stage, a repository, or everything blocks dispatch and reports the
-  right reason.
+- A task, repository lane, stage, or global pause blocks the applicable task.
+  The scheduler reports the right reason.
+- A resumed task can start below a paused lane, stage, or factory. Sibling
+  tasks keep their inherited pause state.
 - Insertion order is preserved; a test asserts no starvation of the head task.
 
 ---
@@ -1077,6 +1082,11 @@ loop {
 - In: `Action` as a tagged enum with `Refine`, `Chat`, `Answer`, `Abort`,
   `Retry`, `Stack`, `Go`, `Policy`, `Limit`, `Lane`, `Pause`, `TicketCreate`,
   `Reconcile`, `Stop`.
+- A pause scope is `global`, `stage`, `lane`, or `task`. A lane contains one
+  stage and one repository. The protocol has no repository-wide pause scope.
+- `PausedView` contains `global` and an `overrides` list. Each override contains
+  one pause scope and one `paused` value. The old `stages` and `repos` fields do
+  not exist.
 - The server accepts connections on a thread, sends the current state at once,
   then forwards every later push. A slow or dead client is dropped, never
   blocks the daemon: use a bounded channel per subscriber and drop the
@@ -1224,8 +1234,9 @@ those files. Say in the report which of them you touched and why. No other file.
 - `+` and `-` change the selected stage limit and send `Action::Limit`.
   With a repository row selected they change the lane reservation and send
   `Action::Lane`.
-- `p` pauses or resumes the selected scope, stage or repository, and `P` does
-  the same globally.
+- `p` pauses or resumes the exact selected stage, repository lane, or task.
+  A release row selects its repository release lane. `P` changes the global
+  state and removes all narrower states.
 - `r` on a ticket sends `Action::Refine` and switches to the session view.
 - `n` sends `Action::TicketCreate` for the selected repository and switches to
   the session view.

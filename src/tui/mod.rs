@@ -1071,7 +1071,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("?", "toggle this help"),
         ("ctrl-q", "quit"),
         ("+ -", "stage limit / repo lane"),
-        ("p P", "pause scope / all"),
+        ("p P", "pause selected / all"),
         ("r n", "refine / new ticket"),
         ("x R", "abort / retry"),
         ("space", "toggle the selected pull request"),
@@ -1601,7 +1601,6 @@ mod tests {
     fn the_header_shows_the_pause_flag_and_socket_state() {
         let mut state = crate::tui::pipeline::sample_view();
         state.paused.global = true;
-        state.paused.stages = vec![Stage::Refine];
         let mut app = App {
             state: Some(state),
             connected: true,

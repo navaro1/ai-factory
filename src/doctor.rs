@@ -20,7 +20,7 @@ use serde_json::Value;
 use aif::config::{parse_owner_repo, Config, RepoConfig};
 use aif::exec::Exec;
 use aif::sched::{self, Limits};
-use aif::sock::{Client, PausedView, Push};
+use aif::sock::{Client, PauseScope, PausedView, Push};
 use aif::worktree::{Cleanable, WorktreeManager};
 
 /// The oldest claude version the factory accepts.
@@ -846,26 +846,44 @@ fn no_state_check(error: anyhow::Error) -> Check {
 
 /// The paused check for one paused-state view, split out for tests.
 fn paused_check_from_view(paused: &PausedView) -> Check {
-    let (status, detail) = if paused.global {
+    let exact_states: Vec<String> = paused
+        .overrides
+        .iter()
+        .map(|entry| {
+            let operation = if entry.paused { "paused" } else { "resumed" };
+            match &entry.scope {
+                PauseScope::Global => format!("{operation} factory"),
+                PauseScope::Stage { stage } => {
+                    format!("{operation} stage {}", stage.as_str())
+                }
+                PauseScope::Lane { stage, repo } => {
+                    format!("{operation} lane {}/{repo}", stage.as_str())
+                }
+                PauseScope::Task { task } => format!("{operation} task {task}"),
+            }
+        })
+        .collect();
+    let (status, detail) = if paused.global && exact_states.is_empty() {
         (
             Status::Info,
             "the whole factory is paused; no task dispatches until the operator resumes (press P in the UI)"
                 .to_string(),
         )
+    } else if paused.global {
+        (
+            Status::Info,
+            format!(
+                "the whole factory is paused; exact states: {}",
+                exact_states.join(", ")
+            ),
+        )
+    } else if exact_states.is_empty() {
+        (Status::Pass, "running; nothing is paused".to_string())
     } else {
-        let mut parts = Vec::new();
-        if !paused.stages.is_empty() {
-            let names: Vec<&str> = paused.stages.iter().map(|s| s.as_str()).collect();
-            parts.push(format!("paused stages: {}", names.join(", ")));
-        }
-        if !paused.repos.is_empty() {
-            parts.push(format!("paused repositories: {}", paused.repos.join(", ")));
-        }
-        if parts.is_empty() {
-            (Status::Pass, "running; nothing is paused".to_string())
-        } else {
-            (Status::Info, parts.join("; "))
-        }
+        (
+            Status::Info,
+            format!("exact states: {}", exact_states.join(", ")),
+        )
     };
     Check {
         label: "paused".to_string(),
@@ -2688,8 +2706,7 @@ mod tests {
     fn the_paused_check_reports_a_globally_paused_daemon() {
         let check = paused_check_from_view(&PausedView {
             global: true,
-            stages: Vec::new(),
-            repos: Vec::new(),
+            overrides: Vec::new(),
         });
         assert_eq!(check.label, "paused");
         assert_eq!(check.status, Status::Info);
@@ -2715,8 +2732,7 @@ mod tests {
             trains: Vec::new(),
             paused: PausedView {
                 global: true,
-                stages: Vec::new(),
-                repos: Vec::new(),
+                overrides: Vec::new(),
             },
         });
         let missing_config = dir.join("factory.toml");
@@ -2748,8 +2764,7 @@ mod tests {
     fn the_paused_check_reports_a_running_daemon_and_partial_pauses() {
         let check = paused_check_from_view(&PausedView {
             global: false,
-            stages: Vec::new(),
-            repos: Vec::new(),
+            overrides: Vec::new(),
         });
         assert_eq!(check.status, Status::Pass);
         assert!(
@@ -2760,8 +2775,21 @@ mod tests {
 
         let check = paused_check_from_view(&PausedView {
             global: false,
-            stages: vec![Stage::Refine],
-            repos: vec!["borsuk".to_string()],
+            overrides: vec![
+                aif::sock::PauseOverrideView {
+                    scope: PauseScope::Stage {
+                        stage: Stage::Refine,
+                    },
+                    paused: true,
+                },
+                aif::sock::PauseOverrideView {
+                    scope: PauseScope::Lane {
+                        stage: Stage::Release,
+                        repo: "borsuk".to_string(),
+                    },
+                    paused: false,
+                },
+            ],
         });
         assert_eq!(check.status, Status::Info);
         assert!(check.detail.contains("refine"), "detail: {}", check.detail);

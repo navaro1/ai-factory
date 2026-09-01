@@ -226,12 +226,30 @@ impl StateInput<'_> {
             .collect();
         let paused = PausedView {
             global: paused.global,
-            stages: Stage::ALL
+            overrides: paused
+                .stages
                 .iter()
-                .copied()
-                .filter(|stage| paused.stages.contains(stage))
+                .map(|(stage, value)| PauseOverrideView {
+                    scope: PauseScope::Stage { stage: *stage },
+                    paused: *value,
+                })
+                .chain(
+                    paused
+                        .lanes
+                        .iter()
+                        .map(|((stage, repo), value)| PauseOverrideView {
+                            scope: PauseScope::Lane {
+                                stage: *stage,
+                                repo: repo.clone(),
+                            },
+                            paused: *value,
+                        }),
+                )
+                .chain(paused.tasks.iter().map(|(task, value)| PauseOverrideView {
+                    scope: PauseScope::Task { task: task.clone() },
+                    paused: *value,
+                }))
                 .collect(),
-            repos: paused.repos.iter().cloned().collect(),
         };
         Ok(StateView {
             repos,
@@ -327,13 +345,21 @@ pub struct TrainView {
 
 /// The paused flags in the state view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PausedView {
     /// True when the whole factory takes no new work.
     pub global: bool,
-    /// The paused stages, in pipeline order.
-    pub stages: Vec<Stage>,
-    /// The paused repositories, in alias order.
-    pub repos: Vec<String>,
+    /// More specific states that override an inherited pause state.
+    pub overrides: Vec<PauseOverrideView>,
+}
+
+/// One explicit state below the whole-factory pause level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseOverrideView {
+    /// The exact scope that owns this state.
+    pub scope: PauseScope,
+    /// True when the scope is paused. False when it is resumed.
+    pub paused: bool,
 }
 
 /// One message from the daemon to a UI.
@@ -455,10 +481,17 @@ pub enum PauseScope {
         /// The stage to pause or resume.
         stage: Stage,
     },
-    /// One repository.
-    Repo {
-        /// The repository alias to pause or resume.
+    /// One repository lane inside one stage.
+    Lane {
+        /// The stage of the lane.
+        stage: Stage,
+        /// The repository alias.
         repo: String,
+    },
+    /// One task.
+    Task {
+        /// The stable task identifier.
+        task: String,
     },
 }
 
@@ -986,8 +1019,7 @@ mod tests {
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
-                stages: Vec::new(),
-                repos: Vec::new(),
+                overrides: Vec::new(),
             },
         }
     }
@@ -1080,11 +1112,62 @@ mod tests {
             "{\"action\":\"limit\",\"stage\":\"refine\",\"limit\":2}"
         );
 
-        let scope = PauseScope::Repo {
+        let scope = PauseScope::Lane {
+            stage: Stage::Release,
             repo: "borsuk".to_string(),
         };
         let text = serde_json::to_string(&scope).unwrap();
-        assert_eq!(text, "{\"scope\":\"repo\",\"repo\":\"borsuk\"}");
+        assert_eq!(
+            text,
+            "{\"scope\":\"lane\",\"stage\":\"release\",\"repo\":\"borsuk\"}"
+        );
+    }
+
+    #[test]
+    fn pause_scope_json_accepts_one_lane_and_one_task() {
+        let lane = serde_json::from_str::<PauseScope>(
+            "{\"scope\":\"lane\",\"stage\":\"implement\",\"repo\":\"borsuk\"}",
+        );
+        let task = serde_json::from_str::<PauseScope>(
+            "{\"scope\":\"task\",\"task\":\"borsuk/implement-i44\"}",
+        );
+
+        assert!(lane.is_ok(), "a repository lane must be a pause scope");
+        assert!(task.is_ok(), "one task must be a pause scope");
+    }
+
+    #[test]
+    fn paused_view_json_keeps_one_specific_override() {
+        let input = serde_json::json!({
+            "global": true,
+            "overrides": [{
+                "scope": {"scope": "task", "task": "borsuk/implement-i44"},
+                "paused": false
+            }]
+        });
+
+        let view: PausedView = serde_json::from_value(input.clone()).unwrap();
+        let output = serde_json::to_value(view).unwrap();
+
+        assert_eq!(output["overrides"], input["overrides"]);
+    }
+
+    #[test]
+    fn the_pause_protocol_rejects_removed_repository_fields() {
+        let repository_scope =
+            serde_json::from_str::<PauseScope>("{\"scope\":\"repo\",\"repo\":\"borsuk\"}");
+        let old_view = serde_json::from_value::<PausedView>(serde_json::json!({
+            "global": false,
+            "stages": ["refine"],
+            "repos": ["borsuk"],
+            "overrides": []
+        }));
+
+        assert!(repository_scope.is_err(), "a repository is not one lane");
+        assert!(
+            old_view.is_err(),
+            "removed pause fields must fail to decode"
+        );
     }
 
     #[test]
@@ -1694,8 +1777,11 @@ mod tests {
 
         let paused = Paused {
             global: false,
-            stages: [Stage::Review].into_iter().collect(),
-            repos: ["qubitsok".to_string()].into_iter().collect(),
+            stages: [(Stage::Review, true)].into_iter().collect(),
+            lanes: [((Stage::Refine, "qubitsok".to_string()), true)]
+                .into_iter()
+                .collect(),
+            tasks: BTreeMap::new(),
         };
 
         // The daemon decides the input mode of each task. The build only
@@ -1815,8 +1901,21 @@ mod tests {
             view.paused,
             PausedView {
                 global: false,
-                stages: vec![Stage::Review],
-                repos: vec!["qubitsok".to_string()],
+                overrides: vec![
+                    PauseOverrideView {
+                        scope: PauseScope::Stage {
+                            stage: Stage::Review,
+                        },
+                        paused: true,
+                    },
+                    PauseOverrideView {
+                        scope: PauseScope::Lane {
+                            stage: Stage::Refine,
+                            repo: "qubitsok".to_string(),
+                        },
+                        paused: true,
+                    },
+                ],
             }
         );
     }
