@@ -1148,7 +1148,7 @@ fn feed_lines(
     let mut lines = vec![Line::styled(metadata, style)];
     lines.extend(wrapped_lines(&feed_message(decision), width, "  ", style));
     if selected {
-        lines.extend(choice_lines(state, decision, inbox, style));
+        lines.extend(choice_lines(state, decision, inbox, width, style));
         lines.extend(wrapped_lines(&feed_actions(decision), width, "  ", style));
     }
     lines
@@ -1159,15 +1159,26 @@ fn choice_lines(
     state: &StateView,
     decision: &Decision,
     inbox: &Inbox,
+    width: usize,
     style: Style,
 ) -> Vec<Line<'static>> {
     match &decision.kind {
         DecisionKind::Question { questions, .. } => {
             let mut lines = Vec::new();
             let mut flat = 0;
-            for (question_index, question) in parse_questions(questions).into_iter().enumerate() {
+            let questions = parse_questions(questions);
+            let show_group_prompts = questions.len() > 1;
+            for (question_index, question) in questions.into_iter().enumerate() {
+                if show_group_prompts {
+                    lines.extend(wrapped_lines(&question.text, width, "  ", style));
+                }
                 if question.multi_select {
-                    lines.push(Line::styled("  Select all applicable options.", style));
+                    lines.extend(wrapped_lines(
+                        "Select all applicable options.",
+                        width,
+                        "  ",
+                        style,
+                    ));
                 }
                 for (option_index, (label, description)) in question.options.iter().enumerate() {
                     flat += 1;
@@ -1181,11 +1192,12 @@ fn choice_lines(
                     } else {
                         format!("{label} {description}")
                     };
-                    if flat <= 9 {
-                        lines.push(Line::styled(format!("  {flat}. [{mark}] {text}"), style));
+                    let choice = if flat <= 9 {
+                        format!("{flat}. [{mark}] {text}")
                     } else {
-                        lines.push(Line::styled(format!("     [{mark}] {text}"), style));
-                    }
+                        format!("   [{mark}] {text}")
+                    };
+                    lines.extend(wrapped_lines(&choice, width, "  ", style));
                 }
             }
             lines
@@ -1198,8 +1210,10 @@ fn choice_lines(
                 let title = find_item(state, &decision.repo, ItemKind::Pr, *pr)
                     .map(|item| format!(" {}", item.title))
                     .unwrap_or_default();
-                lines.push(Line::styled(
-                    format!("  {}. [{mark}] #{pr}{title}", index + 1),
+                lines.extend(wrapped_lines(
+                    &format!("{}. [{mark}] #{pr}{title}", index + 1),
+                    width,
+                    "  ",
                     style,
                 ));
             }
@@ -1259,10 +1273,12 @@ fn draw_detail(
                     format!("The {noun} description is unavailable."),
                 );
             };
-            let mut lines = vec![Line::styled(
-                item.title.clone(),
+            let mut lines = wrapped_lines(
+                &item.title,
+                width,
+                "",
                 Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
-            )];
+            );
             lines.push(Line::from(""));
             lines.push(Line::styled("Description", THEME.dim()));
             let body = if item.body.trim().is_empty() {
@@ -2124,6 +2140,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_narrow_feed_wraps_a_long_question_option() {
+        let decision = Decision::question(
+            &worker(),
+            "req-long-option",
+            serde_json::json!([{
+                "question": "Which option?",
+                "header": "Choice",
+                "options": [{
+                    "label": "Use the option that continues beyond the narrow terminal edge.",
+                    "description": "",
+                }],
+                "multiSelect": false,
+            }]),
+            OPENED,
+        );
+        let state = state_with(vec![decision]);
+        let inbox = selected(&state, 0);
+
+        let screen = render_at_size(&state, &inbox, OPENED, 44, 14);
+
+        assert!(screen.contains("narrow terminal edge."), "screen: {screen}");
+        assert!(
+            screen.lines().all(|line| line.chars().count() == 44),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn narrow_feed_and_detail_wrap_a_long_pull_request_title() {
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "Protect the release when its title continues beyond a narrow terminal."
+                .to_string(),
+            body: "A short description.".to_string(),
+        });
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+
+        let feed = render_at_size(&state, &inbox, OPENED, 44, 16);
+        assert!(feed.contains("title continues"), "feed: {feed}");
+        assert!(feed.contains("terminal."), "feed: {feed}");
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let detail = render_at_size(&state, &inbox, OPENED, 44, 16);
+        assert!(detail.contains("terminal."), "detail: {detail}");
+    }
+
     /// One visible task with a chosen log path.
     fn task_view(id: &str, log_path: &std::path::Path) -> TaskView {
         TaskView {
@@ -2437,6 +2504,8 @@ mod tests {
         inbox.handle_key(&state, press('2'), &mut tx);
         inbox.handle_key(&state, press('3'), &mut tx);
         let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("Which database?"), "screen: {screen}");
+        assert!(screen.contains("Which caches?"), "screen: {screen}");
         assert!(screen.contains("1. [x] SQLite"), "screen: {screen}");
         assert!(screen.contains("2. [x] redis"), "screen: {screen}");
         assert!(screen.contains("3. [x] memcached"), "screen: {screen}");
