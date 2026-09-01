@@ -1874,8 +1874,12 @@ mod tests {
             concat!(
                 "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",",
                 "\"text\":\"I inspected the storage adapter before this question.\"}]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",",
+                "\"thinking\":\"PRIVATE THOUGHT CONTEXT\"}]}}\n",
                 "{\"type\":\"control_request\",\"request_id\":\"req-2\",",
-                "\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\"}}\n"
+                "\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",",
+                "\"text\":\"LATER TASK CONTEXT\"}]}}\n"
             ),
         )
         .unwrap();
@@ -1901,6 +1905,11 @@ mod tests {
             "screen: {screen}"
         );
         assert!(!screen.contains("WRONG TASK CONTEXT"), "screen: {screen}");
+        assert!(
+            !screen.contains("PRIVATE THOUGHT CONTEXT"),
+            "screen: {screen}"
+        );
+        assert!(!screen.contains("LATER TASK CONTEXT"), "screen: {screen}");
         assert_eq!(
             outcome,
             InboxOutcome::OpenSession("borsuk/implement-i142".to_string())
