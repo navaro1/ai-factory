@@ -92,6 +92,18 @@ pub struct Issue {
     pub body: String,
     /// The label names on the issue.
     pub labels: Vec<String>,
+    /// The GitHub login of the issue author.
+    #[serde(default)]
+    pub author: String,
+    /// The GitHub logins of the assigned users.
+    #[serde(default)]
+    pub assignees: Vec<String>,
+    /// The GitHub update time in RFC 3339 form.
+    #[serde(default)]
+    pub updated_at: String,
+    /// The GitHub web reference for the issue.
+    #[serde(default)]
+    pub github_url: String,
     /// Whether the issue is open.
     pub open: bool,
 }
@@ -274,6 +286,10 @@ mod tests {
             title: format!("issue {number}"),
             body: String::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            author: String::new(),
+            assignees: Vec::new(),
+            updated_at: String::new(),
+            github_url: String::new(),
             open: true,
         }
     }

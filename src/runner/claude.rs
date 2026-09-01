@@ -76,6 +76,11 @@ fn build_args(job: &Job, session_id: &str) -> Vec<String> {
     }
     args.push("--permission-prompt-tool".to_string());
     args.push("stdio".to_string());
+    if let Some(tools) = job.allowed_tools.as_ref() {
+        args.push("--tools".to_string());
+        args.push(tools.join(","));
+        args.push("--strict-mcp-config".to_string());
+    }
     if let Some(resume_id) = job.resume.as_deref() {
         args.push("--resume".to_string());
         args.push(resume_id.to_string());
@@ -984,6 +989,7 @@ not json at all
             log: dir.join("task.jsonl"),
             resume: resume.map(String::from),
             yolo,
+            allowed_tools: None,
         }
     }
 
@@ -1278,6 +1284,24 @@ cat > /dev/null
                 "11111111-2222-4333-8444-555555555555",
             ]
         );
+    }
+
+    #[test]
+    fn a_ticket_job_exposes_only_the_read_only_tools() {
+        let mut job = job(Path::new("/w"), None, true);
+        job.allowed_tools = Some(vec![
+            "Read".to_string(),
+            "Glob".to_string(),
+            "Grep".to_string(),
+        ]);
+        let args = build_args(&job, "11111111-2222-4333-8444-555555555555");
+
+        let tools = args.iter().position(|arg| arg == "--tools").unwrap();
+        assert_eq!(args[tools + 1], "Read,Glob,Grep");
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+        for forbidden in ["Write", "Edit", "Bash", "WebFetch", "WebSearch"] {
+            assert!(!args.iter().any(|arg| arg.contains(forbidden)));
+        }
     }
 
     #[test]

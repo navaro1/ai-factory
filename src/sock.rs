@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ReleasePolicy};
 use crate::decisions::{Decision, Decisions};
-use crate::model::{ItemKind, Snapshot, Stage};
+use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::sched::{Limits, Paused};
 use crate::tasks::{TaskState, TaskTable};
 use crate::trains::Train;
@@ -67,6 +67,9 @@ pub struct StateView {
     /// Repository item content for the open decisions that reference it.
     #[serde(default)]
     pub decision_items: Vec<ItemView>,
+    /// Compact open issue rows for the Tickets view.
+    #[serde(default)]
+    pub tickets: Vec<TicketSummary>,
     /// The release train of each configured repository.
     pub trains: Vec<TrainView>,
     /// What the operator paused.
@@ -231,6 +234,32 @@ impl StateInput<'_> {
             })
             .collect();
         let decision_items = decision_items(decisions, snapshot);
+        let mut tickets: Vec<TicketSummary> = config
+            .repos
+            .keys()
+            .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
+            .flat_map(|(repo, items)| {
+                items
+                    .issues
+                    .values()
+                    .filter(|issue| issue.open)
+                    .map(|issue| TicketSummary {
+                        repo: repo.clone(),
+                        number: issue.number,
+                        title: issue.title.clone(),
+                        labels: issue.labels.clone(),
+                        updated_at: issue.updated_at.clone(),
+                        group: TicketGroup::from_labels(&issue.labels),
+                    })
+            })
+            .collect();
+        tickets.sort_by(|left, right| {
+            left.group
+                .cmp(&right.group)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| left.repo.cmp(&right.repo))
+                .then_with(|| left.number.cmp(&right.number))
+        });
         let paused = PausedView {
             global: paused.global,
             overrides: paused
@@ -265,6 +294,7 @@ impl StateInput<'_> {
             tasks,
             decisions: decisions.open().to_vec(),
             decision_items,
+            tickets,
             trains,
             paused,
         })
@@ -353,6 +383,242 @@ pub struct ItemView {
     pub title: String,
     /// The current GitHub description.
     pub body: String,
+}
+
+/// One compact open issue row in the Tickets view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketSummary {
+    /// The repository alias.
+    pub repo: String,
+    /// The issue number.
+    pub number: u64,
+    /// The current issue title.
+    pub title: String,
+    /// The current label names.
+    pub labels: Vec<String>,
+    /// The GitHub update time in RFC 3339 form.
+    pub updated_at: String,
+    /// The workflow group shown in the Tickets view.
+    #[serde(default)]
+    pub group: TicketGroup,
+}
+
+/// One ticket workflow group, in display order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketGroup {
+    /// Neither workflow label appears.
+    #[default]
+    Untouched,
+    /// The issue has `to-refine`. This wins when both labels appear.
+    ToRefine,
+    /// The issue has `refined` and not `to-refine`.
+    Refined,
+}
+
+impl TicketGroup {
+    /// Classify one label set.
+    fn from_labels(labels: &[String]) -> Self {
+        if labels.iter().any(|label| label == "to-refine") {
+            TicketGroup::ToRefine
+        } else if labels.iter().any(|label| label == "refined") {
+            TicketGroup::Refined
+        } else {
+            TicketGroup::Untouched
+        }
+    }
+}
+
+/// The editable title and description of one issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketContent {
+    /// The issue title.
+    pub title: String,
+    /// The issue description.
+    pub body: String,
+}
+
+/// The source of one content update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TicketContentSource {
+    /// The operator typed the content.
+    Direct,
+    /// The operator applied one Claude proposal.
+    Proposal {
+        /// The proposal identity shown in the focus view.
+        proposal_id: String,
+    },
+}
+
+/// One repository label from the GitHub label catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoLabel {
+    /// The label name.
+    pub name: String,
+    /// The six-digit hexadecimal color without `#`.
+    pub color: String,
+}
+
+/// One valid Claude title and description proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketProposal {
+    /// The proposal identity.
+    pub id: String,
+    /// The proposed title.
+    pub title: String,
+    /// The proposed description.
+    pub body: String,
+    /// The title at proposal creation time.
+    pub original_title: String,
+    /// The description at proposal creation time.
+    pub original_body: String,
+}
+
+/// Full issue content returned for one focus request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketDetails {
+    /// The request identity from the UI.
+    pub request: String,
+    /// The repository alias.
+    pub repo: String,
+    /// The confirmed issue data.
+    pub issue: Issue,
+    /// The latest valid Claude proposal, when one exists.
+    pub proposal: Option<TicketProposal>,
+    /// The chat configuration error, when chat is unavailable.
+    pub chat_error: Option<String>,
+}
+
+/// A repository label catalog response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketLabels {
+    /// The request identity from the UI.
+    pub request: String,
+    /// The repository alias.
+    pub repo: String,
+    /// The last valid repository label catalog.
+    pub labels: Vec<RepoLabel>,
+    /// A fetch error. Existing catalog values stay usable.
+    pub error: Option<String>,
+}
+
+/// A content conflict between the pending and GitHub values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketConflict {
+    /// The latest GitHub issue.
+    pub remote: Issue,
+    /// The pending local content.
+    pub pending: TicketContent,
+    /// The pending content source.
+    pub source: TicketContentSource,
+}
+
+/// The state of one user-requested GitHub change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketResultKind {
+    /// The request waits for GitHub.
+    Pending,
+    /// GitHub confirmed the complete request.
+    Success,
+    /// GitHub content changed before the update.
+    Conflict,
+    /// One step succeeded and a later step failed.
+    PartialFailure,
+    /// GitHub rejected the request or could not connect.
+    Failure,
+}
+
+/// One result for a ticket mutation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketResult {
+    /// The request identity from the UI.
+    pub request: String,
+    /// The repository alias.
+    pub repo: String,
+    /// The issue number.
+    pub number: u64,
+    /// The result state.
+    pub kind: TicketResultKind,
+    /// A concise result message.
+    pub message: String,
+    /// The confirmed issue after success, when available.
+    pub issue: Option<Issue>,
+    /// The content comparison when a conflict occurs.
+    pub conflict: Option<TicketConflict>,
+}
+
+/// One ticket command inside [`Action::Ticket`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "ticket_action", rename_all = "snake_case")]
+pub enum TicketAction {
+    /// Load full details for one issue.
+    Details {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
+    /// Load the repository label catalog.
+    Labels {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+    },
+    /// Update title and description with conflict protection.
+    UpdateContent {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+        /// The content that the operator last confirmed.
+        expected: TicketContent,
+        /// The content to write.
+        desired: TicketContent,
+        /// The update source.
+        source: TicketContentSource,
+    },
+    /// Add or remove one existing label.
+    ToggleLabel {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+        /// The label name.
+        label: String,
+        /// True adds the label. False removes it.
+        on: bool,
+    },
+    /// Create and attach one repository label.
+    CreateLabel {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+        /// The new label name.
+        name: String,
+        /// The six-digit hexadecimal color.
+        color: String,
+    },
+    /// Start or resume the Claude conversation for one issue.
+    Chat {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
 }
 
 /// One pipeline stage in the state view.
@@ -451,6 +717,12 @@ pub struct PauseOverrideView {
 pub enum Push {
     /// The whole current state.
     State(StateView),
+    /// Full issue data for one focus request.
+    TicketDetails(TicketDetails),
+    /// One repository label catalog.
+    TicketLabels(TicketLabels),
+    /// One ticket mutation state.
+    TicketResult(TicketResult),
 }
 
 /// One command from a UI or from `aif stop` to the daemon.
@@ -544,6 +816,8 @@ pub enum Action {
         /// The repository alias.
         repo: String,
     },
+    /// Perform one ticket review or mutation action.
+    Ticket(TicketAction),
     /// Force an early poll of one repository, or of all when None.
     Reconcile {
         /// The repository alias, or None for every repository.
@@ -745,6 +1019,15 @@ impl Server {
                 eprintln!("aifd: the control socket pusher stopped")
             }
         }
+    }
+
+    /// Send one ticket response to the currently connected clients.
+    ///
+    /// Ticket responses are request results. The server does not retain one
+    /// as the initial state for a later client.
+    pub fn push(&self, push: Push) {
+        let push = Arc::new(push);
+        broadcast(&mut lock(&self.registry), &push);
     }
 }
 
@@ -1100,6 +1383,7 @@ mod tests {
             tasks: Vec::new(),
             decisions: Vec::new(),
             decision_items: Vec::new(),
+            tickets: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -1268,6 +1552,30 @@ mod tests {
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn ticket_detail_actions_and_pushes_keep_the_request_identity() {
+        let action = Action::Ticket(TicketAction::Details {
+            request: "ticket-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        });
+        let action_text = serde_json::to_string(&action).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Action>(&action_text).unwrap(),
+            action
+        );
+
+        let push = Push::TicketDetails(TicketDetails {
+            request: "ticket-7".to_string(),
+            repo: "borsuk".to_string(),
+            issue: ticket_issue(7, "Review the ticket"),
+            proposal: None,
+            chat_error: None,
+        });
+        let push_text = serde_json::to_string(&push).unwrap();
+        assert_eq!(serde_json::from_str::<Push>(&push_text).unwrap(), push);
     }
 
     #[test]
@@ -1777,6 +2085,157 @@ mod tests {
         text
     }
 
+    /// One issue for a ticket summary test.
+    fn ticket_issue(number: u64, title: &str) -> crate::model::Issue {
+        crate::model::Issue {
+            number,
+            node_id: format!("node-{number}"),
+            title: title.to_string(),
+            body: format!("body {number}"),
+            labels: Vec::new(),
+            author: "author".to_string(),
+            assignees: Vec::new(),
+            updated_at: format!("2026-08-{number:02}T12:00:00Z"),
+            github_url: format!("https://github.com/acme/repo/issues/{number}"),
+            open: true,
+        }
+    }
+
+    #[test]
+    fn the_view_lists_open_issues_from_every_repository_and_no_pull_requests() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let input_modes = BTreeMap::new();
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            crate::model::RepoSnapshot {
+                issues: [(7, ticket_issue(7, "First issue"))].into_iter().collect(),
+                prs: [(
+                    9,
+                    crate::model::Pr {
+                        number: 9,
+                        node_id: "pr-9".to_string(),
+                        title: "Not a ticket".to_string(),
+                        body: String::new(),
+                        labels: Vec::new(),
+                        open: true,
+                        draft: false,
+                        head_sha: "sha-9".to_string(),
+                        head_ref: "branch-9".to_string(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        snapshot.repos.insert(
+            "qubitsok".to_string(),
+            crate::model::RepoSnapshot {
+                issues: [(3, ticket_issue(3, "Second issue"))].into_iter().collect(),
+                prs: BTreeMap::new(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            snapshot: &snapshot,
+            trains: &trains,
+            policies: &policies,
+            input_modes: &input_modes,
+            now_ms: 1_000,
+        }
+        .build()
+        .unwrap();
+
+        let identities: Vec<(&str, u64)> = view
+            .tickets
+            .iter()
+            .map(|ticket| (ticket.repo.as_str(), ticket.number))
+            .collect();
+        assert_eq!(identities, vec![("borsuk", 7), ("qubitsok", 3)]);
+        assert!(view
+            .tickets
+            .iter()
+            .all(|ticket| ticket.title != "Not a ticket"));
+    }
+
+    #[test]
+    fn ticket_summaries_group_and_sort_with_to_refine_precedence() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let input_modes = BTreeMap::new();
+        let mut untouched_old = ticket_issue(1, "old untouched");
+        untouched_old.updated_at = "2026-08-01T00:00:00Z".to_string();
+        let mut untouched_new = ticket_issue(2, "new untouched");
+        untouched_new.updated_at = "2026-08-30T00:00:00Z".to_string();
+        let mut both = ticket_issue(3, "both labels");
+        both.labels = vec!["refined".to_string(), "to-refine".to_string()];
+        let mut refined = ticket_issue(4, "refined");
+        refined.labels = vec!["refined".to_string()];
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            crate::model::RepoSnapshot {
+                issues: [(1, untouched_old), (3, both), (4, refined)]
+                    .into_iter()
+                    .collect(),
+                prs: BTreeMap::new(),
+            },
+        );
+        snapshot.repos.insert(
+            "qubitsok".to_string(),
+            crate::model::RepoSnapshot {
+                issues: [(2, untouched_new)].into_iter().collect(),
+                prs: BTreeMap::new(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            snapshot: &snapshot,
+            trains: &trains,
+            policies: &policies,
+            input_modes: &input_modes,
+            now_ms: 1_000,
+        }
+        .build()
+        .unwrap();
+
+        let order: Vec<(&str, u64, TicketGroup)> = view
+            .tickets
+            .iter()
+            .map(|ticket| (ticket.repo.as_str(), ticket.number, ticket.group))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("qubitsok", 2, TicketGroup::Untouched),
+                ("borsuk", 1, TicketGroup::Untouched),
+                ("borsuk", 3, TicketGroup::ToRefine),
+                ("borsuk", 4, TicketGroup::Refined),
+            ]
+        );
+    }
+
     #[test]
     fn the_view_carries_only_repository_items_that_open_decisions_reference() {
         use crate::model::{Issue, Pr, RepoSnapshot, Snapshot};
@@ -1808,6 +2267,10 @@ mod tests {
                         title: "Choose the storage".to_string(),
                         body: "Compare SQLite and PostgreSQL.".to_string(),
                         labels: vec!["needs-human".to_string()],
+                        author: "piotr".to_string(),
+                        assignees: vec!["owner".to_string()],
+                        updated_at: "2026-08-30T12:00:00Z".to_string(),
+                        github_url: "https://github.com/acme/borsuk/issues/142".to_string(),
                         open: true,
                     },
                 )]

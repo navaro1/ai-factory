@@ -76,6 +76,13 @@ pub struct RepoConfig {
     pub release: ReleasePolicy,
 }
 
+/// The optional Claude model for issue review conversations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TicketChatConfig {
+    /// The explicit Claude model. None enables the documented fallback.
+    pub model: Option<String>,
+}
+
 /// The whole factory configuration.
 ///
 /// Build it with [`Config::parse`] for the structural part or
@@ -88,6 +95,8 @@ pub struct Config {
     pub stages: BTreeMap<Stage, StageConfig>,
     /// Repositories keyed by alias.
     pub repos: BTreeMap<String, RepoConfig>,
+    /// Settings for the read-only issue conversation.
+    pub ticket_chat: TicketChatConfig,
 }
 
 impl Config {
@@ -97,10 +106,32 @@ impl Config {
         &self.stages[&stage]
     }
 
+    /// Return the configured ticket model or the valid refine fallback.
+    pub fn ticket_chat_model(&self) -> Result<&str, String> {
+        if let Some(model) = self.ticket_chat.model.as_deref() {
+            let model = model.trim();
+            if !model.is_empty() {
+                return Ok(model);
+            }
+            return Err("ticket_chat.model must not be empty".to_string());
+        }
+        let refine = self.stage(Stage::Refine);
+        if refine.runner == "claude" {
+            return Ok(refine.model.as_str());
+        }
+        Err(
+            "ticket chat needs ticket_chat.model because the refine runner is not Claude"
+                .to_string(),
+        )
+    }
+
     /// Parse configuration text and run every check that needs no
     /// filesystem or git access. Absent optional keys take their defaults.
     pub fn parse(text: &str) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text).context("invalid TOML")?;
+        let ticket_chat = TicketChatConfig {
+            model: raw.ticket_chat.model,
+        };
 
         let mut stages = BTreeMap::new();
         for (name, raw_stage) in raw.stage {
@@ -190,7 +221,11 @@ impl Config {
             }
         }
 
-        Ok(Config { stages, repos })
+        Ok(Config {
+            stages,
+            repos,
+            ticket_chat,
+        })
     }
 
     /// Read and parse the config file. `None` resolves the default path from
@@ -279,6 +314,12 @@ struct RawRepo {
     release: ReleasePolicy,
 }
 
+/// The raw shape of the optional `[ticket_chat]` table.
+#[derive(Debug, Default, Deserialize)]
+struct RawTicketChat {
+    model: Option<String>,
+}
+
 /// The raw shape of the whole file.
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
@@ -286,6 +327,8 @@ struct RawConfig {
     stage: BTreeMap<String, RawStage>,
     #[serde(default)]
     repo: BTreeMap<String, RawRepo>,
+    #[serde(default)]
+    ticket_chat: RawTicketChat,
 }
 
 /// Whether `alias` matches `[a-z0-9._-]+`.
@@ -477,6 +520,35 @@ mod tests {
         assert!(repo.lanes.is_empty());
         assert_eq!(repo.release, ReleasePolicy::Manual);
         assert_eq!(repo.owner_repo, "");
+    }
+
+    #[test]
+    fn ticket_chat_uses_its_model_or_the_claude_refine_model() {
+        let explicit = config_text(&[], "[ticket_chat]\nmodel = \"claude-opus-5[1m]\"\n").replacen(
+            "runner = \"runner\"",
+            "runner = \"claude\"",
+            1,
+        );
+        let config = Config::parse(&explicit).unwrap();
+        assert_eq!(config.ticket_chat_model().unwrap(), "claude-opus-5[1m]");
+
+        let fallback = config_text(&[], "[repo.x]\npath = \"/tmp/x\"\n").replacen(
+            "runner = \"runner\"",
+            "runner = \"claude\"",
+            1,
+        );
+        let config = Config::parse(&fallback).unwrap();
+        assert_eq!(config.ticket_chat_model().unwrap(), "model");
+    }
+
+    #[test]
+    fn missing_ticket_chat_model_does_not_invalidate_non_claude_configuration() {
+        let text = config_text(&[], "[repo.x]\npath = \"/tmp/x\"\n");
+        let config = Config::parse(&text).expect("ticket review must remain available");
+        assert!(config
+            .ticket_chat_model()
+            .unwrap_err()
+            .contains("ticket_chat.model"));
     }
 
     #[test]

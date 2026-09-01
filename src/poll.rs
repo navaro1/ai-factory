@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -38,6 +39,8 @@ pub enum DaemonMsg {
     /// the repository; the reader already merged the cached entries of the
     /// pages that answered 304 into it.
     Polled {
+        /// The poll start time in milliseconds since the Unix epoch.
+        started_ms: u64,
         /// The repository alias of the poller.
         repo: String,
         /// The complete snapshot of the repository.
@@ -170,10 +173,12 @@ fn poller_loop(
     let mut client = GhClient::new(exec.as_ref());
     let mut backoff = interval;
     loop {
+        let started_ms = wall_clock_ms();
         let failed = match fetch_repo(&mut client, &owner_repo) {
             Ok(snapshot) => {
                 backoff = interval;
                 let polled = DaemonMsg::Polled {
+                    started_ms,
                     repo: repo.clone(),
                     snapshot,
                 };
@@ -200,6 +205,16 @@ fn poller_loop(
             backoff = next_backoff(backoff, max_backoff);
         }
     }
+}
+
+/// The current wall-clock time in milliseconds since the Unix epoch.
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Fetch the issues and the pull requests of one repository into a snapshot.
@@ -293,7 +308,7 @@ mod tests {
     /// One GitHub issue object with the given number.
     fn issue_json(number: u64) -> String {
         format!(
-            r#"{{"number":{number},"node_id":"node-{number}","title":"issue {number}","body":"body {number}","state":"open","labels":[]}}"#
+            r#"{{"number":{number},"node_id":"node-{number}","title":"issue {number}","body":"body {number}","state":"open","labels":[],"user":{{"login":"author-{number}"}},"assignees":[],"updated_at":"2026-08-01T00:00:00Z","html_url":"https://github.com/acme/borsuk/issues/{number}"}}"#
         )
     }
 
@@ -312,6 +327,10 @@ mod tests {
             title: format!("issue {number}"),
             body: format!("body {number}"),
             labels: vec![],
+            author: format!("author-{number}"),
+            assignees: Vec::new(),
+            updated_at: "2026-08-01T00:00:00Z".to_string(),
+            github_url: format!("https://github.com/acme/borsuk/issues/{number}"),
             open: true,
         }
     }
@@ -429,10 +448,12 @@ mod tests {
         let DaemonMsg::Polled {
             repo,
             snapshot: first,
+            started_ms: first_started_ms,
         } = next_msg(&rx, "the first poll")
         else {
             panic!("the first message was not Polled");
         };
+        assert!(first_started_ms > 0);
         assert_eq!(repo, REPO);
         assert_eq!(
             first,
@@ -443,6 +464,7 @@ mod tests {
         let DaemonMsg::Polled {
             repo,
             snapshot: second,
+            ..
         } = next_msg(&rx, "the woken poll")
         else {
             panic!("the wake did not produce a Polled message");
@@ -543,6 +565,7 @@ mod tests {
         let DaemonMsg::Polled {
             repo,
             snapshot: snap,
+            ..
         } = next_msg(&rx, "the recovery poll")
         else {
             panic!("the fourth message was not Polled");
@@ -765,7 +788,7 @@ path = "/repos/b"
         let mut first_polls = BTreeMap::new();
         for _ in 0..2 {
             match next_msg(&rx, "the first poll of each repository") {
-                DaemonMsg::Polled { repo, snapshot } => {
+                DaemonMsg::Polled { repo, snapshot, .. } => {
                     first_polls.insert(repo, snapshot);
                 }
                 other => panic!("unexpected message: {other:?}"),
@@ -785,6 +808,7 @@ path = "/repos/b"
             DaemonMsg::Polled {
                 repo,
                 snapshot: snap,
+                ..
             } if repo == "a" => {
                 assert_eq!(
                     snap,

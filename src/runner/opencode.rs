@@ -423,6 +423,7 @@ not json at all
             log: dir.join("task.jsonl"),
             resume: None,
             yolo: true,
+            allowed_tools: None,
         }
     }
 

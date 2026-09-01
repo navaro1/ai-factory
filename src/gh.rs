@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::exec::{CmdOut, Exec};
 use crate::model::{Issue, Pr};
+use crate::sock::RepoLabel;
 
 /// The page size every list request asks for.
 const PAGE_SIZE: usize = 100;
@@ -128,6 +129,104 @@ impl<'a> GhClient<'a> {
         )
     }
 
+    /// Fetch one issue and reject a pull request object.
+    pub fn fetch_issue(&self, owner_repo: &str, number: u64) -> Result<Issue> {
+        let url = format!("repos/{owner_repo}/issues/{number}");
+        let args = ["api", "-i", "-X", "GET", url.as_str()];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        issue_response(&out, "fetch_issue")
+    }
+
+    /// Fetch every repository label in name order.
+    pub fn fetch_labels(&self, owner_repo: &str) -> Result<Vec<RepoLabel>> {
+        let mut labels = Vec::new();
+        let mut page = 1u64;
+        loop {
+            let url = format!("repos/{owner_repo}/labels?per_page={PAGE_SIZE}&page={page}");
+            let args = ["api", "-i", "-X", "GET", url.as_str()];
+            let out = self
+                .exec
+                .run("gh", &args, None)
+                .context("gh api failed to run")?;
+            let response = checked_response(&out)?;
+            let values: Vec<Value> = serde_json::from_str(&response.body)
+                .context("gh api returned a broken label catalog body")?;
+            for value in &values {
+                labels.push(RepoLabel {
+                    name: str_field(value, "name")?.to_string(),
+                    color: str_field(value, "color")?.to_string(),
+                });
+            }
+            if values.len() < PAGE_SIZE || !response.link_next {
+                break;
+            }
+            page += 1;
+        }
+        labels.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(labels)
+    }
+
+    /// Create one repository label and return GitHub's label.
+    pub fn create_label(&self, owner_repo: &str, name: &str, color: &str) -> Result<RepoLabel> {
+        let url = format!("repos/{owner_repo}/labels");
+        let name_field = format!("name={name}");
+        let color_field = format!("color={color}");
+        let args = [
+            "api",
+            "-i",
+            "-X",
+            "POST",
+            url.as_str(),
+            "-f",
+            name_field.as_str(),
+            "-f",
+            color_field.as_str(),
+        ];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let response = checked_response(&out)?;
+        let value: Value = serde_json::from_str(&response.body)
+            .context("gh api returned a broken create label body")?;
+        Ok(RepoLabel {
+            name: str_field(&value, "name")?.to_string(),
+            color: str_field(&value, "color")?.to_string(),
+        })
+    }
+
+    /// Update one issue title and description and return GitHub's issue.
+    pub fn update_issue(
+        &self,
+        owner_repo: &str,
+        number: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<Issue> {
+        let url = format!("repos/{owner_repo}/issues/{number}");
+        let title_field = format!("title={title}");
+        let body_field = format!("body={body}");
+        let args = [
+            "api",
+            "-i",
+            "-X",
+            "PATCH",
+            url.as_str(),
+            "-f",
+            title_field.as_str(),
+            "-f",
+            body_field.as_str(),
+        ];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        issue_response(&out, "update_issue")
+    }
+
     /// Fetch every page of one list and merge its current items.
     ///
     /// The walk goes to the next page while the current page is known to
@@ -228,8 +327,35 @@ impl<'a> GhClient<'a> {
         checked_response(&out).map(|_| ())
     }
 
+    /// Add one label and return the complete confirmed label names.
+    pub fn add_label_names(
+        &self,
+        owner_repo: &str,
+        number: u64,
+        label: &str,
+    ) -> Result<Vec<String>> {
+        let url = format!("repos/{owner_repo}/issues/{number}/labels");
+        let field = format!("labels[]={label}");
+        let args = [
+            "api",
+            "-i",
+            "-X",
+            "POST",
+            url.as_str(),
+            "-f",
+            field.as_str(),
+        ];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let response = checked_response(&out)?;
+        label_array_names(&response.body, "add label")
+    }
+
     /// Remove one label from an issue or a pull request.
     pub fn remove_label(&self, owner_repo: &str, number: u64, label: &str) -> Result<()> {
+        let label = encode_path_segment(label);
         let url = format!("repos/{owner_repo}/issues/{number}/labels/{label}");
         let args = ["api", "-i", "-X", "DELETE", url.as_str()];
         let out = self
@@ -237,6 +363,33 @@ impl<'a> GhClient<'a> {
             .run("gh", &args, None)
             .context("gh api failed to run")?;
         checked_response(&out).map(|_| ())
+    }
+
+    /// Remove one label and return confirmed names.
+    ///
+    /// `None` means GitHub reported that the label was already absent.
+    pub fn remove_label_names(
+        &self,
+        owner_repo: &str,
+        number: u64,
+        label: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let label = encode_path_segment(label);
+        let url = format!("repos/{owner_repo}/issues/{number}/labels/{label}");
+        let args = ["api", "-i", "-X", "DELETE", url.as_str()];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let parsed = parse_response(&out.stdout).with_context(|| {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            format!("gh api exited with status {}: {detail}", out.status)
+        })?;
+        if parsed.status == 404 {
+            return Ok(None);
+        }
+        let response = checked_response(&out)?;
+        Ok(Some(label_array_names(&response.body, "remove label")?))
     }
 
     /// Create an issue and return the issue GitHub answered with.
@@ -265,6 +418,27 @@ impl<'a> GhClient<'a> {
         issue_from_value(&value)?
             .ok_or_else(|| anyhow!("create_issue returned a pull request object"))
     }
+}
+
+/// Parse one issue response and reject a pull request object.
+fn issue_response(out: &CmdOut, operation: &str) -> Result<Issue> {
+    let response = checked_response(out)?;
+    let value: Value = serde_json::from_str(&response.body)
+        .with_context(|| format!("gh api returned a broken {operation} body"))?;
+    issue_from_value(&value)?.ok_or_else(|| anyhow!("{operation} returned a pull request object"))
+}
+
+/// Parse the label names from one label-array response.
+fn label_array_names(body: &str, operation: &str) -> Result<Vec<String>> {
+    let value: Value = serde_json::from_str(body)
+        .with_context(|| format!("gh api returned a broken {operation} body"))?;
+    let labels = value
+        .as_array()
+        .ok_or_else(|| anyhow!("gh api returned a non-array {operation} body"))?;
+    labels
+        .iter()
+        .map(|label| Ok(str_field(label, "name")?.to_string()))
+        .collect()
 }
 
 /// One parsed `gh api -i` response: the status, the interesting head fields,
@@ -368,6 +542,10 @@ fn issue_from_value(value: &Value) -> Result<Option<Issue>> {
         title: str_field(value, "title")?.to_string(),
         body: nullable_str(value, "body")?.to_string(),
         labels: label_names(value)?,
+        author: author_login(value)?.to_string(),
+        assignees: assignee_logins(value)?,
+        updated_at: str_field(value, "updated_at")?.to_string(),
+        github_url: str_field(value, "html_url")?.to_string(),
         open: state_is_open(value)?,
     }))
 }
@@ -442,6 +620,45 @@ fn label_names(value: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+/// The issue author login, or `unknown` after GitHub deletes the account.
+fn author_login(value: &Value) -> Result<&str> {
+    match value.get("user") {
+        Some(Value::Null) => Ok("unknown"),
+        Some(user) => user
+            .get("login")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("GitHub object has no string field \"user.login\"")),
+        None => Err(anyhow!("GitHub object has no field \"user\"")),
+    }
+}
+
+/// Encode one UTF-8 value as one RFC 3986 path segment.
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+/// The assigned GitHub logins of one issue.
+fn assignee_logins(value: &Value) -> Result<Vec<String>> {
+    value
+        .get("assignees")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("GitHub object has no array field \"assignees\""))?
+        .iter()
+        .map(|assignee| Ok(str_field(assignee, "login")?.to_string()))
+        .collect()
+}
+
 /// Whether the GitHub object is in the open state.
 fn state_is_open(value: &Value) -> Result<bool> {
     match str_field(value, "state")? {
@@ -477,7 +694,7 @@ mod tests {
     /// One GitHub issue object with the given number.
     fn issue_json(number: u64) -> String {
         format!(
-            r#"{{"number":{number},"node_id":"node-{number}","title":"issue {number}","body":"body {number}","state":"open","labels":[]}}"#
+            r#"{{"number":{number},"node_id":"node-{number}","title":"issue {number}","body":"body {number}","state":"open","labels":[],"user":{{"login":"author-{number}"}},"assignees":[{{"login":"owner-{number}"}}],"updated_at":"2026-08-{number:02}T12:00:00Z","html_url":"https://github.com/acme/borsuk/issues/{number}"}}"#
         )
     }
 
@@ -512,6 +729,10 @@ mod tests {
         assert_eq!(one.title, "issue 1");
         assert_eq!(one.node_id, "node-1");
         assert_eq!(one.body, "body 1");
+        assert_eq!(one.author, "author-1");
+        assert_eq!(one.assignees, vec!["owner-1"]);
+        assert_eq!(one.updated_at, "2026-08-01T12:00:00Z");
+        assert_eq!(one.github_url, "https://github.com/acme/borsuk/issues/1");
         assert!(one.open);
         let calls = exec.calls();
         assert_eq!(calls.len(), 1);
@@ -644,7 +865,7 @@ mod tests {
         let next_link = "link: <https://api.github.com/repositories/1/issues?state=open&page=2>\
              ; rel=\"next\", <https://api.github.com/repositories/1/issues?state=open&page=2>\
              ; rel=\"last\"";
-        let edited_page = r#"[{"number":101,"node_id":"node-101","title":"issue 101","body":"body 101","state":"open","labels":[{"name":"refined"}]}]"#;
+        let edited_page = r#"[{"number":101,"node_id":"node-101","title":"issue 101","body":"body 101","state":"open","labels":[{"name":"refined"}],"user":{"login":"author-101"},"assignees":[{"login":"owner-101"}],"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/acme/borsuk/issues/101"}]"#;
         let exec = ScriptExec::new()
             .expect(
                 gh(&[
@@ -1083,7 +1304,7 @@ mod tests {
 
     #[test]
     fn an_unknown_item_state_is_rejected() {
-        let issue = r#"[{"number":1,"node_id":"node-1","title":"issue 1","body":"body","state":"unknown","labels":[]}]"#;
+        let issue = r#"[{"number":1,"node_id":"node-1","title":"issue 1","body":"body","state":"unknown","labels":[],"user":{"login":"author"},"assignees":[],"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/acme/borsuk/issues/1"}]"#;
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
@@ -1153,8 +1374,48 @@ mod tests {
     }
 
     #[test]
+    fn remove_label_encodes_the_label_as_one_path_segment() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                "repos/acme/borsuk/issues/7/labels/needs%2Freview%20%2B%20qa",
+            ]),
+            CmdOut::ok(response("HTTP/2 204", &[], "")),
+        );
+        let client = GhClient::new(&exec);
+        client
+            .remove_label("acme/borsuk", 7, "needs/review + qa")
+            .unwrap();
+
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_issue_with_a_deleted_author_stays_in_the_issue_list() {
+        let issue = r#"[{"number":1,"node_id":"node-1","title":"issue 1","body":"body","state":"open","labels":[],"user":null,"assignees":[],"updated_at":"2026-08-01T12:00:00Z","html_url":"https://github.com/acme/borsuk/issues/1"}]"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &[], issue)),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let fetched = client.fetch_issues("acme/borsuk").unwrap();
+
+        assert_eq!(fetched.items[&1].author, "unknown");
+    }
+
+    #[test]
     fn create_issue_returns_the_created_issue() {
-        let created = r#"{"number":42,"node_id":"IC_42","title":"decision","body":"why","state":"open","labels":[]}"#;
+        let created = r#"{"number":42,"node_id":"IC_42","title":"decision","body":"why","state":"open","labels":[],"user":{"login":"author"},"assignees":[],"updated_at":"2026-08-30T12:00:00Z","html_url":"https://github.com/acme/borsuk/issues/42"}"#;
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",

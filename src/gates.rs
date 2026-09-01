@@ -268,6 +268,10 @@ mod tests {
             title: format!("issue {number}"),
             body: String::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            author: String::new(),
+            assignees: Vec::new(),
+            updated_at: String::new(),
+            github_url: String::new(),
             open: true,
         }
     }

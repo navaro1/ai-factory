@@ -1,12 +1,10 @@
 //! Reads and writes `state.json`, the daemon's only private file.
 //!
-//! The file holds only what GitHub cannot hold: the operator's stage limit
-//! overrides, lane overrides, and release policy overrides, plus the
-//! `last_fire_ms` stamp of every release train. GitHub holds all work state,
-//! so the daemon rebuilds everything else after a restart. The daemon writes
-//! the file through a temporary file and a rename, and only when a value
-//! changed. A missing or corrupt file is not an error: the loader logs once
-//! and the daemon continues with the config defaults.
+//! The file holds only what GitHub cannot hold. It stores runtime overrides,
+//! release train times, and active ticket conversation state. GitHub holds
+//! all issue content and labels. Task logs hold full chat transcripts. The
+//! daemon writes the file through a temporary file and a rename. A missing or
+//! corrupt file is not an error. The loader logs once and uses the defaults.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,6 +15,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ReleasePolicy;
 use crate::model::Stage;
+use crate::sock::TicketProposal;
+
+/// One issue conversation that survives a daemon restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketConversationState {
+    /// The repository alias.
+    pub repo: String,
+    /// The issue number.
+    pub number: u64,
+    /// The Claude session identity, when the first run started.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// True while the current `to-refine` label interval sent its handoff.
+    #[serde(default)]
+    pub handoff_active: bool,
+    /// The latest valid proposal. The full transcript stays in the task log.
+    #[serde(default)]
+    pub proposal: Option<TicketProposal>,
+}
 
 /// One persisted lane reservation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,12 +65,15 @@ struct StateFile {
     /// The last fire stamp of each train, by repository alias.
     #[serde(default)]
     last_fire_ms: BTreeMap<String, u64>,
+    /// Active issue conversations.
+    #[serde(default)]
+    ticket_conversations: Vec<TicketConversationState>,
 }
 
 /// The state the daemon persists across restarts.
 ///
-/// Every field holds overrides only: a value that matches the config file is
-/// absent. An empty state is the state that matches the config.
+/// The override fields contain only values that differ from the config file.
+/// The conversation field contains each active ticket chat.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DaemonState {
     /// The stage limit overrides, by stage.
@@ -64,6 +84,8 @@ pub struct DaemonState {
     pub policies: BTreeMap<String, ReleasePolicy>,
     /// The last fire stamp of each train, by repository alias.
     pub last_fire_ms: BTreeMap<String, u64>,
+    /// Active issue conversations.
+    pub ticket_conversations: Vec<TicketConversationState>,
 }
 
 impl DaemonState {
@@ -109,6 +131,7 @@ impl DaemonState {
                         .collect(),
                     policies: file.policies,
                     last_fire_ms: file.last_fire_ms,
+                    ticket_conversations: file.ticket_conversations,
                 }
             }
             Err(e) => {
@@ -140,6 +163,7 @@ impl DaemonState {
                 .collect(),
             policies: self.policies.clone(),
             last_fire_ms: self.last_fire_ms.clone(),
+            ticket_conversations: self.ticket_conversations.clone(),
         };
         serde_json::to_string(&file).context("cannot serialize the daemon state")
     }
@@ -209,6 +233,13 @@ mod tests {
                 ReleasePolicy::Interval { minutes: 5 },
             )]),
             last_fire_ms: BTreeMap::from([("borsuk".to_string(), 1_000)]),
+            ticket_conversations: vec![TicketConversationState {
+                repo: "borsuk".to_string(),
+                number: 42,
+                session_id: Some("session-42".to_string()),
+                handoff_active: true,
+                proposal: None,
+            }],
         };
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);

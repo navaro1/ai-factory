@@ -649,7 +649,6 @@ mod tests {
     use crate::tasks::TaskState;
     use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
     use ratatui::Terminal;
     use std::fs;
     use std::io::Write;
@@ -1211,7 +1210,7 @@ mod tests {
         view.show(&task_with_mode(&log, InputMode::Live, 0));
         assert_ne!(
             drawn_border_style(&view).fg,
-            Some(Color::DarkGray),
+            Some(THEME.dim),
             "a live bar keeps its normal border"
         );
 
@@ -1222,7 +1221,7 @@ mod tests {
         view.show(&task_with_mode(&log, closed, 0));
         assert_eq!(
             drawn_border_style(&view).fg,
-            Some(Color::DarkGray),
+            Some(THEME.dim),
             "a closed bar renders a dim border"
         );
     }
@@ -1295,7 +1294,7 @@ mod tests {
         assert!(!screen.contains("enter send"), "bar: {screen}");
         assert_eq!(
             drawn_border_style(&view).fg,
-            Some(Color::DarkGray),
+            Some(THEME.dim),
             "a disabled bar renders dim"
         );
     }

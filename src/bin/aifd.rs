@@ -98,6 +98,10 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
         let server = Arc::clone(&server);
         move |view| server.publish(view)
     }));
+    daemon.set_ticket_pusher(Box::new({
+        let server = Arc::clone(&server);
+        move |push| server.push(push)
+    }));
     let result = daemon.run();
     drop(server);
     result

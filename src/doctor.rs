@@ -825,10 +825,17 @@ fn paused_check(client: &Client) -> Check {
         Ok(pushes) => pushes,
         Err(error) => return no_state_check(error),
     };
-    match pushes.next() {
-        Some(Ok(Push::State(view))) => paused_check_from_view(&view.paused),
-        Some(Err(error)) => no_state_check(error),
-        None => no_state_check(anyhow!("the daemon closed the stream without a state push")),
+    loop {
+        match pushes.next() {
+            Some(Ok(Push::State(view))) => return paused_check_from_view(&view.paused),
+            Some(Ok(Push::TicketDetails(_) | Push::TicketLabels(_) | Push::TicketResult(_))) => {}
+            Some(Err(error)) => return no_state_check(error),
+            None => {
+                return no_state_check(anyhow!(
+                    "the daemon closed the stream without a state push"
+                ));
+            }
+        }
     }
 }
 
@@ -2730,6 +2737,7 @@ mod tests {
             tasks: Vec::new(),
             decisions: Vec::new(),
             decision_items: Vec::new(),
+            tickets: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: true,

@@ -24,6 +24,9 @@ model = "claude-opus-5[1m]"
 runner = "claude"
 limit = 1
 
+[ticket_chat]
+model = "claude-opus-5[1m]"
+
 [repo.borsuk]
 path = "/home/navaro/Workplace/borsuk"
 lanes = { implement = 1 }

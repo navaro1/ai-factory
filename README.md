@@ -63,7 +63,7 @@ do not exist:
 |---|---|
 | `factory.toml` | Your configuration, copied from the example. |
 | `factory.example.toml` | A portable reference copy of the example. |
-| `prompts/refine.md` and three more | The default prompt of each stage, for you to edit. |
+| `prompts/*.md` | The four stage prompts and the ticket chat prompt. |
 
 The installer never overwrites a file that exists. Edit
 `~/.config/aif/factory.toml` and set the path of every repository.
@@ -96,6 +96,9 @@ model = "claude-opus-5[1m]"
 runner = "claude"
 limit = 1
 
+[ticket_chat]
+model = "claude-opus-5[1m]"
+
 [repo.borsuk]
 path = "/home/you/Workplace/borsuk"
 lanes = { implement = 1 }
@@ -116,6 +119,8 @@ release = { policy = "threshold", count = 3 }
 - `lanes` reserves stage slots for one repository.
 - `release.policy` is `manual`, `interval` with `minutes`, or `threshold`
   with `count`.
+- `ticket_chat.model` selects the Claude model for read-only issue review.
+- The Claude refine model supplies the default when Claude runs refinement.
 
 `yolo` is not `--dangerously-skip-permissions`. That flag closes the control
 channel, and then the agent can not ask you anything. AI Factory never
@@ -149,11 +154,11 @@ in the header and marks every stage row. An exact stage, lane, or task state
 marks its scope. A resumed item under a broader pause shows `resumed`.
 A queued ticket that a pause blocks shows `paused` instead of `queued`.
 
-## The three views
+## The four views
 
-Keys `1`, `2`, and `3` switch the views. `!` jumps to the oldest row of the
-decisions inbox. `?` opens the help overlay. `q` quits the UI. The status
-bar of every view shows the count of open decisions.
+Keys `1`, `2`, `3`, and `4` switch the views. `!` opens the oldest inbox row.
+`?` opens the help overlay. `q` quits the UI.
+The status bar of every view shows the open decision count.
 
 ### Pipeline, view 1
 
@@ -257,20 +262,48 @@ There is no "allow always" key. This is deliberate. The wire protocol can
 not carry a saved permission, and a key that promises more than it does
 would break trust.
 
+### Tickets, view 4
+
+The Tickets view shows every open issue from every configured repository.
+It excludes pull requests. It groups untouched, `to-refine`, and `refined`
+issues.
+
+| Context | Key | Action |
+|---|---|---|
+| List | `/` | Search repository, number, title, and label text. |
+| List | `enter` | Open the selected issue. |
+| Issue | `e` | Edit the title and description. |
+| Issue | `l` | Open the repository label picker. |
+| Issue | `c` | Start or resume the read-only Claude chat. |
+| Issue | `a` | Apply the latest shown Claude proposal. |
+| Editor | `ctrl-s` | Save the content edit. |
+| Label picker | Space | Apply one label change. |
+| Label picker | `n` | Create and attach a repository label. |
+| Conflict | `g` | Keep the GitHub version. |
+| Conflict | `p` | Reapply the pending version after another fetch. |
+| Nested view | `esc` | Return one level. |
+
+The issue focus shows all issue details and the GitHub reference.
+Wide terminals put the details and chat beside each other.
+Narrow terminals put the chat below the details.
+
+Claude starts with analysis. Claude can use only `Read`, `Glob`, and `Grep`.
+Claude cannot change GitHub. AIF applies a shown proposal only after key `a`.
+
 ## How state survives
 
 - GitHub carries the flow. The labels and the pull request states are the
   record.
 - The worktree of each issue carries the agent session id and the last
   reviewed commit as marker files.
-- `state.json` in `~/.local/state/aif` holds only the runtime overrides and
-  the last release times.
+- `state.json` holds runtime overrides, release times, and active ticket chat
+  metadata. Task logs hold the full transcripts.
 - After a restart, the first poll rebuilds everything. Work resumes in
   place.
 
 ## Known limits
 
-- A label change becomes visible at the next poll, at most 60 seconds later.
+- An external GitHub label change becomes visible at the next 60-second poll.
 - A restart kills the agent processes of the running tasks. The gates
   re-open that work at the next poll.
 - Anyone who can set the trigger labels on a repository can start work

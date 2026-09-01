@@ -41,9 +41,13 @@ use crate::runner::claude::ClaudeRunner;
 use crate::runner::opencode::OpenCodeRunner;
 use crate::runner::{Answer, Job, RunEvent, Runner, Session};
 use crate::sched::{self, Limits, Paused, Verdict};
-use crate::sock::{Action, InputMode, PauseScope, StateInput, StateView};
-use crate::state::DaemonState;
-use crate::tasks::{self, Task, TaskState, TaskTable};
+use crate::sock::{
+    Action, InputMode, PauseScope, Push, StateInput, StateView, TicketAction, TicketDetails,
+    TicketProposal,
+};
+use crate::state::{DaemonState, TicketConversationState};
+use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
+use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::worktree::WorktreeManager;
 
@@ -56,6 +60,10 @@ pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
 /// The task of a reaped session stays `AwaitingUser` and a chat message
 /// resumes it later with a fresh process.
 pub const DEFAULT_IDLE_REAP_MS: u64 = 30 * 60_000;
+
+/// The one message sent for each new ticket refinement interval.
+pub const TICKET_REFINEMENT_MESSAGE: &str =
+    "The issue now has the to-refine label. Continue the refinement analysis in this session.";
 
 /// The item number of a ticket-creation task. A real issue never carries
 /// number 0, so the daemon uses it as the marker of a ticket session.
@@ -77,6 +85,15 @@ pub enum Inbound {
     Run(RunEvent),
     /// One operator action from the control socket.
     Act(Action),
+}
+
+/// The assistant text data needed for one strict proposal parse.
+#[derive(Debug, Default)]
+struct TicketTurnText {
+    /// The last complete assistant text event of the turn.
+    last: String,
+    /// True when an earlier event contained proposal marker text.
+    earlier_marker: bool,
 }
 
 /// The daemon: every module assembled into one event loop.
@@ -123,6 +140,12 @@ pub struct Daemon {
     release_batches: BTreeMap<String, Vec<u64>>,
     /// The source issue worktree of each review task.
     review_issue_numbers: BTreeMap<String, u64>,
+    /// The controller for every issue review and mutation action.
+    ticket_controller: TicketController,
+    /// Active issue conversations, keyed by repository and issue number.
+    ticket_conversations: BTreeMap<(String, u64), TicketConversationState>,
+    /// The final-text candidate of each active ticket turn.
+    ticket_turn_text: BTreeMap<String, TicketTurnText>,
 
     /// One live session per running or parked task.
     sessions: BTreeMap<String, Box<dyn Session>>,
@@ -153,6 +176,8 @@ pub struct Daemon {
     /// `Server::publish`, and tests wire it to a channel. None until
     /// `set_pusher` runs, so an early view goes nowhere.
     pusher: Option<Box<dyn Fn(StateView) + Send>>,
+    /// The pusher for ticket detail, label, and result messages.
+    ticket_pusher: Option<Box<dyn Fn(Push) + Send>>,
 
     /// The inbound end of the poller channel.
     poll_rx: Receiver<DaemonMsg>,
@@ -258,6 +283,17 @@ impl Daemon {
             }
         }
         let policies = stored.policies;
+        let ticket_conversations = stored
+            .ticket_conversations
+            .into_iter()
+            .filter(|conversation| config.repos.contains_key(&conversation.repo))
+            .map(|conversation| {
+                (
+                    (conversation.repo.clone(), conversation.number),
+                    conversation,
+                )
+            })
+            .collect();
 
         let mut trains = BTreeMap::new();
         for alias in config.repos.keys() {
@@ -272,6 +308,7 @@ impl Daemon {
         }
 
         let (run_tx, run_rx) = mpsc::channel();
+        let ticket_controller = TicketController::new(exec.clone());
         let mut daemon = Daemon {
             config,
             exec,
@@ -296,6 +333,9 @@ impl Daemon {
             trains,
             release_batches: BTreeMap::new(),
             review_issue_numbers: BTreeMap::new(),
+            ticket_controller,
+            ticket_conversations,
+            ticket_turn_text: BTreeMap::new(),
             sessions: BTreeMap::new(),
             stopping_sessions: BTreeSet::new(),
             pending_chats: BTreeMap::new(),
@@ -310,6 +350,7 @@ impl Daemon {
             shutdown: false,
             saved: None,
             pusher: None,
+            ticket_pusher: None,
             poll_rx,
             run_tx,
             run_rx,
@@ -464,6 +505,11 @@ impl Daemon {
         self.pusher = Some(pusher);
     }
 
+    /// Attach the pusher for ticket detail, label, and result messages.
+    pub fn set_ticket_pusher(&mut self, pusher: Box<dyn Fn(Push) + Send>) {
+        self.ticket_pusher = Some(pusher);
+    }
+
     /// Build the state view from the live state and hand it to the pusher.
     ///
     /// The call runs at the end of every drive pass and pushes only when
@@ -518,7 +564,11 @@ impl Daemon {
             DaemonMsg::PollFailed { repo, error } => {
                 eprintln!("the poll of {repo} failed: {error}");
             }
-            DaemonMsg::Polled { repo, snapshot } => self.apply_poll(&repo, snapshot),
+            DaemonMsg::Polled {
+                started_ms,
+                repo,
+                snapshot,
+            } => self.apply_poll(&repo, snapshot, started_ms),
         }
     }
 
@@ -526,7 +576,14 @@ impl Daemon {
     ///
     /// A poll that repeats the previous snapshot marks nothing changed, so
     /// it writes no state and raises no dirty flag.
-    fn apply_poll(&mut self, repo: &str, fresh: RepoSnapshot) {
+    fn apply_poll(&mut self, repo: &str, fresh: RepoSnapshot, started_ms: u64) {
+        if self
+            .ticket_controller
+            .last_mutation_ms(repo)
+            .is_some_and(|confirmed_ms| started_ms <= confirmed_ms)
+        {
+            return;
+        }
         let old = self.snapshot.repos.get(repo).cloned();
         let unchanged = old.as_ref() == Some(&fresh);
         self.snapshot.apply(repo, fresh.clone());
@@ -538,9 +595,8 @@ impl Daemon {
         if !unchanged {
             self.reconcile_unready(repo, &fresh);
         }
-        let ready = self.gates.observe(repo, &fresh);
-        let mut changed = !ready.is_empty();
-        self.pending_ready.extend(ready);
+        self.reconcile_ticket_conversations(repo, &fresh);
+        let mut changed = self.observe_ready_work(repo, &fresh);
         changed |= self.derive_needs_human(repo, &fresh);
         if !unchanged {
             changed = true;
@@ -548,6 +604,25 @@ impl Daemon {
         if changed {
             self.changed = true;
         }
+    }
+
+    /// Observe pipeline gates and reserve issue refinement for ticket chat.
+    fn observe_ready_work(&mut self, repo: &str, fresh: &RepoSnapshot) -> bool {
+        let ready: Vec<ReadyWork> = self
+            .gates
+            .observe(repo, fresh)
+            .into_iter()
+            .filter(|work| {
+                !(work.stage == Stage::Refine
+                    && work.kind == ItemKind::Issue
+                    && self
+                        .ticket_conversations
+                        .contains_key(&(work.repo.clone(), work.number)))
+            })
+            .collect();
+        let changed = !ready.is_empty();
+        self.pending_ready.extend(ready);
+        changed
     }
 
     /// Retire work whose item closed, went back to draft, or vanished.
@@ -579,11 +654,15 @@ impl Daemon {
 
     /// Cancel every active task of one item and stop its live session.
     fn cancel_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
+        let ticket_conversation = self
+            .ticket_conversations
+            .contains_key(&(repo.to_string(), number));
         let ids: Vec<String> = self
             .table
             .active()
             .iter()
             .filter(|task| task.repo == repo && task.kind == kind && task.number == number)
+            .filter(|task| task.purpose != TaskPurpose::TicketChat || !ticket_conversation)
             .map(|task| task.id.clone())
             .collect();
         for id in ids {
@@ -636,6 +715,7 @@ impl Daemon {
             .filter(|task| task.repo == repo)
             .filter(|task| {
                 task.stage == Stage::Refine
+                    && task.purpose == TaskPurpose::Pipeline
                     && task.state == TaskState::AwaitingUser
                     && refine_transitioned(fresh, task.number)
             })
@@ -1197,6 +1277,28 @@ impl Daemon {
     /// here; a resume carries the session id to continue.
     fn launch_task(&mut self, task: &Task, prompt: String, resume: Option<String>) -> Result<()> {
         let stage_cfg = self.config.stage(task.stage);
+        let (model, variant, yolo, allowed_tools) = if Self::is_ticket_chat(task) {
+            (
+                self.config
+                    .ticket_chat_model()
+                    .map_err(|error| anyhow!(error))?
+                    .to_string(),
+                None,
+                true,
+                Some(vec![
+                    "Read".to_string(),
+                    "Glob".to_string(),
+                    "Grep".to_string(),
+                ]),
+            )
+        } else {
+            (
+                stage_cfg.model.clone(),
+                stage_cfg.variant.clone(),
+                stage_cfg.yolo,
+                None,
+            )
+        };
         let cwd = self
             .task_cwd(&task.id)
             .ok_or_else(|| anyhow!("repository {} left the config", task.repo))?;
@@ -1204,13 +1306,14 @@ impl Daemon {
             task: task.id.clone(),
             stage: task.stage,
             repo: task.repo.clone(),
-            model: stage_cfg.model.clone(),
-            variant: stage_cfg.variant.clone(),
+            model,
+            variant,
             prompt,
             cwd,
             log: task.log_path.clone(),
             resume,
-            yolo: stage_cfg.yolo,
+            yolo,
+            allowed_tools,
         };
         let session = if Self::is_ticket_task(task) {
             self.ticket_runner.start(&job, self.run_tx.clone())?
@@ -1314,6 +1417,8 @@ impl Daemon {
                     return;
                 };
                 task.session_id = Some(session_id.clone());
+                let ticket_key = (task.repo.clone(), task.number);
+                let ticket_chat = task.purpose == TaskPurpose::TicketChat;
                 let marker = self
                     .task_cwd(&task_id)
                     .ok_or_else(|| anyhow!("the task has no worktree"))
@@ -1330,6 +1435,14 @@ impl Daemon {
                         self.fail_run(&task, &reason);
                     }
                     return;
+                }
+                if ticket_chat {
+                    if let Some(conversation) = self.ticket_conversations.get_mut(&ticket_key) {
+                        conversation.session_id = Some(session_id);
+                    }
+                    if let Some(fresh) = self.snapshot.repos.get(&ticket_key.0).cloned() {
+                        self.reconcile_ticket_conversations(&ticket_key.0, &fresh);
+                    }
                 }
                 self.changed = true;
             }
@@ -1356,12 +1469,37 @@ impl Daemon {
                     self.changed = true;
                 }
             }
-            RunEvent::Text { .. } | RunEvent::Tool { .. } => {
+            RunEvent::Text { text, .. } => {
+                if self
+                    .table
+                    .by_id
+                    .get(&task_id)
+                    .is_some_and(Self::is_ticket_chat)
+                {
+                    let turn = self.ticket_turn_text.entry(task_id).or_default();
+                    if proposal_marker_text(&turn.last) {
+                        turn.earlier_marker = true;
+                    }
+                    turn.last = text;
+                }
+                // The runner also tees this into the task log.
+            }
+            RunEvent::Tool { .. } => {
                 // The runner tees this into the task log; the interfaces read
                 // the log file, so the daemon stores nothing here.
             }
-            RunEvent::TurnEnd { ok, summary, .. } => self.on_turn_end(&task_id, ok, &summary),
-            RunEvent::Exit { ok, detail, .. } => self.on_exit_event(&task_id, ok, &detail),
+            RunEvent::TurnEnd { ok, summary, .. } => {
+                if ok {
+                    self.finish_ticket_proposal_turn(&task_id);
+                } else {
+                    self.ticket_turn_text.remove(&task_id);
+                }
+                self.on_turn_end(&task_id, ok, &summary);
+            }
+            RunEvent::Exit { ok, detail, .. } => {
+                self.ticket_turn_text.remove(&task_id);
+                self.on_exit_event(&task_id, ok, &detail);
+            }
         }
     }
 
@@ -1526,7 +1664,9 @@ impl Daemon {
                     ),
                 }
             }
-            Action::Chat { task, text } => self.chat(&task, &text),
+            Action::Chat { task, text } => {
+                self.chat(&task, &text);
+            }
             Action::Answer {
                 decision_id,
                 response,
@@ -1622,6 +1762,142 @@ impl Daemon {
                 self.changed = true;
             }
             Action::TicketCreate { repo } => self.ticket_create(&repo),
+            Action::Ticket(action) => {
+                let chat = match &action {
+                    TicketAction::Chat { repo, number, .. } => Some((repo.clone(), *number)),
+                    _ => None,
+                };
+                let proposal_apply = match &action {
+                    TicketAction::UpdateContent {
+                        request,
+                        repo,
+                        number,
+                        source: crate::sock::TicketContentSource::Proposal { proposal_id },
+                        ..
+                    } => Some((request.clone(), repo.clone(), *number, proposal_id.clone())),
+                    _ => None,
+                };
+                let mut effects = self.ticket_controller.handle(
+                    action,
+                    &self.snapshot,
+                    &self.config,
+                    self.now_ms,
+                );
+                if let Some((repo, _, confirmed_ms)) = effects.confirmed.as_mut() {
+                    let completed_ms = (self.clock)().max(self.now_ms);
+                    self.now_ms = completed_ms;
+                    *confirmed_ms = completed_ms;
+                    self.ticket_controller
+                        .record_confirmed_mutation(repo, completed_ms);
+                }
+                for push in &mut effects.pushes {
+                    if let Push::TicketDetails(details) = push {
+                        details.proposal = self
+                            .ticket_conversations
+                            .get(&(details.repo.clone(), details.issue.number))
+                            .and_then(|conversation| conversation.proposal.clone());
+                    }
+                }
+                let start_chat = chat.filter(|_| effects.pushes.is_empty());
+                let proposal_succeeded = proposal_apply.as_ref().is_some_and(|_| {
+                    effects.pushes.iter().any(|push| {
+                        matches!(
+                            push,
+                            Push::TicketResult(result)
+                                if result.kind == crate::sock::TicketResultKind::Success
+                        )
+                    })
+                });
+                let observed_conflict = effects.pushes.iter().find_map(|push| match push {
+                    Push::TicketResult(result)
+                        if result.kind == crate::sock::TicketResultKind::Conflict =>
+                    {
+                        result
+                            .conflict
+                            .as_ref()
+                            .map(|conflict| (result.repo.clone(), conflict.remote.clone()))
+                    }
+                    _ => None,
+                });
+                if let Some((repo, issue)) = observed_conflict {
+                    if let Some(items) = self.snapshot.repos.get_mut(&repo) {
+                        items.issues.insert(issue.number, issue);
+                        self.changed = true;
+                    }
+                    if let Some(fresh) = self.snapshot.repos.get(&repo).cloned() {
+                        self.complete_parked_refines(&repo, &fresh);
+                        self.reconcile_unready(&repo, &fresh);
+                        self.reconcile_ticket_conversations(&repo, &fresh);
+                        let ready = self.observe_ready_work(&repo, &fresh);
+                        let decisions = self.derive_needs_human(&repo, &fresh);
+                        self.changed |= ready || decisions;
+                    }
+                }
+                if let Some((repo, issue, _confirmed_ms)) = effects.confirmed {
+                    if let Some(items) = self.snapshot.repos.get_mut(&repo) {
+                        items.issues.insert(issue.number, issue);
+                        self.changed = true;
+                    }
+                    if let Some(fresh) = self.snapshot.repos.get(&repo).cloned() {
+                        self.complete_parked_refines(&repo, &fresh);
+                        self.reconcile_unready(&repo, &fresh);
+                        self.reconcile_ticket_conversations(&repo, &fresh);
+                        let ready = self.observe_ready_work(&repo, &fresh);
+                        let decisions = self.derive_needs_human(&repo, &fresh);
+                        self.changed |= ready || decisions;
+                    }
+                }
+                if let Some(pusher) = self.ticket_pusher.as_ref() {
+                    for push in effects.pushes {
+                        pusher(push);
+                    }
+                }
+                if let Some((repo, number)) = start_chat {
+                    self.ticket_chat(&repo, number);
+                }
+                if proposal_succeeded {
+                    if let Some((request, repo, number, proposal_id)) = proposal_apply {
+                        let mut cleared = false;
+                        if let Some(conversation) =
+                            self.ticket_conversations.get_mut(&(repo.clone(), number))
+                        {
+                            if conversation
+                                .proposal
+                                .as_ref()
+                                .is_some_and(|proposal| proposal.id == proposal_id)
+                            {
+                                conversation.proposal = None;
+                                self.changed = true;
+                                cleared = true;
+                            }
+                        }
+                        if cleared {
+                            if let Some(issue) = self
+                                .snapshot
+                                .repos
+                                .get(&repo)
+                                .and_then(|items| items.issues.get(&number))
+                                .cloned()
+                            {
+                                if let Some(pusher) = self.ticket_pusher.as_ref() {
+                                    pusher(Push::TicketDetails(TicketDetails {
+                                        request,
+                                        repo: repo.clone(),
+                                        issue,
+                                        proposal: None,
+                                        chat_error: self.config.ticket_chat_model().err(),
+                                    }));
+                                }
+                            }
+                        }
+                        let id = tasks::ticket_chat_id(&repo, number);
+                        self.chat(
+                            &id,
+                            "AIF applied the shown proposal to the GitHub issue. Continue with the confirmed content.",
+                        );
+                    }
+                }
+            }
             Action::Reconcile { repo } => self.reconcile(repo.as_deref()),
             Action::Stop => self.shutdown = true,
         }
@@ -1636,14 +1912,15 @@ impl Daemon {
     /// also keeps the message for a resumed turn. The call refuses any
     /// message while another task of the same worktree item is active. It
     /// also refuses a task with no session id and no session marker.
-    fn chat(&mut self, id: &str, text: &str) {
+    /// The result is true when the daemon delivered or queued the message.
+    fn chat(&mut self, id: &str, text: &str) -> bool {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             eprintln!("the chat message for {id}: no such task");
-            return;
+            return false;
         };
         if let Some(refusal) = self.sibling_refusal(&task) {
             eprintln!("{refusal}");
-            return;
+            return false;
         }
         // Never steer an opencode session: the one-shot runner has no
         // steering channel, so only a claude task may receive a live send.
@@ -1676,14 +1953,14 @@ impl Daemon {
                         }
                     }
                 }
-                return;
+                return true;
             }
         }
         let session_id = match self.followup_session_id(&task) {
             Ok(session_id) => session_id,
             Err(error) => {
                 eprintln!("the chat message for {id}: {error:#}");
-                return;
+                return false;
             }
         };
         if session_id.is_none() {
@@ -1691,13 +1968,13 @@ impl Daemon {
                 "the chat message for {id}: no session id and no session marker; \
                  there is no agent session to continue"
             );
-            return;
+            return false;
         }
         // The wire and the daemon use the same policy. A saved session does
         // not make an unsupported task state accept a message.
         if let InputMode::Closed { reason } = self.input_mode(&task) {
             eprintln!("the chat message for {id}: {reason}");
-            return;
+            return false;
         }
         self.pending_chats
             .entry(id.to_string())
@@ -1709,11 +1986,12 @@ impl Daemon {
         if task.state.is_terminal() {
             if let Err(error) = self.table.reopen(id, self.now_ms) {
                 eprintln!("the chat message for {id}: {error:#}");
-                return;
+                return true;
             }
             self.changed = true;
             self.decisions.drop_for_task(id);
         }
+        true
     }
 
     /// The item whose workspace the task runs in.
@@ -2160,8 +2438,177 @@ impl Daemon {
             log,
             self.now_ms,
         ) {
-            Ok(_) => self.changed = true,
+            Ok(task) => {
+                task.purpose = TaskPurpose::TicketCreate;
+                self.changed = true;
+            }
             Err(e) => eprintln!("the ticket session for {repo}: {e:#}"),
+        }
+    }
+
+    /// Queue or reuse one read-only issue conversation.
+    fn ticket_chat(&mut self, repo: &str, number: u64) {
+        let handoff_active = self
+            .snapshot
+            .repos
+            .get(repo)
+            .and_then(|snapshot| snapshot.issues.get(&number))
+            .is_some_and(|issue| issue.labels.iter().any(|label| label == "to-refine"));
+        self.ticket_conversations
+            .entry((repo.to_string(), number))
+            .or_insert_with(|| TicketConversationState {
+                repo: repo.to_string(),
+                number,
+                session_id: None,
+                handoff_active,
+                proposal: None,
+            });
+        let log = self
+            .state_dir
+            .join("logs")
+            .join(format!("{repo}__ticket-i{number}.jsonl"));
+        match self
+            .table
+            .upsert_ticket_chat(repo, number, log, self.now_ms)
+        {
+            Ok(_) => self.changed = true,
+            Err(error) => eprintln!("the ticket chat for {repo}#{number}: {error:#}"),
+        }
+    }
+
+    /// Restore, hand off, or end each conversation after GitHub changes.
+    fn reconcile_ticket_conversations(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let keys: Vec<(String, u64)> = self
+            .ticket_conversations
+            .keys()
+            .filter(|(conversation_repo, _)| conversation_repo == repo)
+            .cloned()
+            .collect();
+        for key in keys {
+            let number = key.1;
+            let issue = fresh.issues.get(&number).filter(|issue| issue.open);
+            let ended = issue.is_none()
+                || issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "refined"));
+            if ended {
+                self.end_ticket_conversation(&key);
+                continue;
+            }
+
+            let id = tasks::ticket_chat_id(repo, number);
+            if !self.table.by_id.contains_key(&id) {
+                let log = self
+                    .state_dir
+                    .join("logs")
+                    .join(format!("{repo}__ticket-i{number}.jsonl"));
+                let session_id = self
+                    .ticket_conversations
+                    .get(&key)
+                    .and_then(|conversation| conversation.session_id.clone());
+                match self
+                    .table
+                    .upsert_ticket_chat(repo, number, log, self.now_ms)
+                {
+                    Ok(task) => task.session_id = session_id,
+                    Err(error) => {
+                        eprintln!("the ticket chat restore for {repo}#{number}: {error:#}");
+                        continue;
+                    }
+                }
+                self.changed = true;
+            }
+
+            let has_label =
+                issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "to-refine"));
+            let (was_active, has_session) = self
+                .ticket_conversations
+                .get(&key)
+                .map(|conversation| {
+                    (
+                        conversation.handoff_active,
+                        conversation.session_id.is_some(),
+                    )
+                })
+                .unwrap_or((false, false));
+            if was_active && !has_label {
+                if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
+                    conversation.handoff_active = false;
+                }
+                self.changed = true;
+            } else if !was_active
+                && has_label
+                && has_session
+                && self.chat(&id, TICKET_REFINEMENT_MESSAGE)
+            {
+                if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
+                    conversation.handoff_active = true;
+                }
+                self.changed = true;
+            }
+        }
+    }
+
+    /// Stop one issue conversation and remove its private state.
+    fn end_ticket_conversation(&mut self, key: &(String, u64)) {
+        let id = tasks::ticket_chat_id(&key.0, key.1);
+        self.ticket_turn_text.remove(&id);
+        if self.table.by_id.contains_key(&id) {
+            self.cancel_task(&id, false);
+            self.table.remove(&id);
+        }
+        if self.ticket_conversations.remove(key).is_some() {
+            self.changed = true;
+        }
+    }
+
+    /// Accept one strict final proposal block and refresh the focus data.
+    fn finish_ticket_proposal_turn(&mut self, id: &str) {
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        if turn.earlier_marker {
+            return;
+        }
+        let Some(content) = crate::ticket::parse_ticket_proposal(&turn.last) else {
+            return;
+        };
+        let Some(task) = self
+            .table
+            .by_id
+            .get(id)
+            .filter(|task| Self::is_ticket_chat(task))
+        else {
+            return;
+        };
+        let key = (task.repo.clone(), task.number);
+        let Some(issue) = self
+            .snapshot
+            .repos
+            .get(&task.repo)
+            .and_then(|snapshot| snapshot.issues.get(&task.number))
+            .cloned()
+        else {
+            return;
+        };
+        let proposal = TicketProposal {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: content.title,
+            body: content.body,
+            original_title: issue.title.clone(),
+            original_body: issue.body.clone(),
+        };
+        let Some(conversation) = self.ticket_conversations.get_mut(&key) else {
+            return;
+        };
+        conversation.proposal = Some(proposal.clone());
+        self.changed = true;
+        if let Some(pusher) = self.ticket_pusher.as_ref() {
+            pusher(Push::TicketDetails(TicketDetails {
+                request: proposal.id.clone(),
+                repo: task.repo.clone(),
+                issue,
+                proposal: Some(proposal),
+                chat_error: self.config.ticket_chat_model().err(),
+            }));
         }
     }
 
@@ -2273,9 +2720,22 @@ impl Daemon {
         })
     }
 
-    /// True when the task is a ticket-creation session.
+    /// True when the task is an issue-creation session.
+    fn is_ticket_creation(task: &Task) -> bool {
+        task.purpose == TaskPurpose::TicketCreate
+            || (task.stage == Stage::Refine
+                && task.kind == ItemKind::Issue
+                && task.number == TICKET_NUMBER)
+    }
+
+    /// True when the task is a read-only issue conversation.
+    fn is_ticket_chat(task: &Task) -> bool {
+        task.purpose == TaskPurpose::TicketChat
+    }
+
+    /// True when the task uses the dedicated ticket runner.
     fn is_ticket_task(task: &Task) -> bool {
-        task.stage == Stage::Refine && task.kind == ItemKind::Issue && task.number == TICKET_NUMBER
+        Self::is_ticket_creation(task) || Self::is_ticket_chat(task)
     }
 
     /// True when this task uses the interactive Claude protocol.
@@ -2311,12 +2771,37 @@ impl Daemon {
     /// or from the built-in default. Every placeholder must be known; an
     /// unknown one is an error that names it, never a silent literal.
     fn render_prompt(&self, task: &Task, repo_cfg: &RepoConfig, worktree: &Path) -> Result<String> {
-        if Self::is_ticket_task(task) {
+        if Self::is_ticket_creation(task) {
             return fill_template(
                 TICKET_PROMPT,
                 &[
                     ("repo", task.repo.clone()),
                     ("owner_repo", repo_cfg.owner_repo.clone()),
+                    ("worktree", worktree.display().to_string()),
+                ],
+            );
+        }
+        if Self::is_ticket_chat(task) {
+            let template = self.ticket_chat_prompt_template()?;
+            let issue = self
+                .snapshot
+                .repos
+                .get(&task.repo)
+                .and_then(|snapshot| snapshot.issues.get(&task.number))
+                .ok_or_else(|| anyhow!("the issue is absent from the current snapshot"))?;
+            return fill_template(
+                &template,
+                &[
+                    ("repo", task.repo.clone()),
+                    ("owner_repo", repo_cfg.owner_repo.clone()),
+                    ("number", task.number.to_string()),
+                    ("title", issue.title.clone()),
+                    ("body", issue.body.clone()),
+                    ("labels", issue.labels.join(", ")),
+                    ("author", issue.author.clone()),
+                    ("assignees", issue.assignees.join(", ")),
+                    ("updated_at", issue.updated_at.clone()),
+                    ("github_url", issue.github_url.clone()),
                     ("worktree", worktree.display().to_string()),
                 ],
             );
@@ -2379,6 +2864,18 @@ impl Daemon {
         }
     }
 
+    /// Read the ticket chat prompt template or use the built-in text.
+    fn ticket_chat_prompt_template(&self) -> Result<String> {
+        let path = self.prompts_dir.join("ticket-chat.md");
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(TICKET_CHAT_PROMPT.to_string())
+            }
+            Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
+        }
+    }
+
     /// Assemble the persisted view of the current state.
     ///
     /// Only overrides go in: a value that matches the config stays out.
@@ -2412,6 +2909,7 @@ impl Daemon {
             lanes,
             policies: self.policies.clone(),
             last_fire_ms,
+            ticket_conversations: self.ticket_conversations.values().cloned().collect(),
         }
     }
 
@@ -2455,6 +2953,11 @@ fn event_task(event: &RunEvent) -> &str {
         | RunEvent::TurnEnd { task, .. }
         | RunEvent::Exit { task, .. } => task,
     }
+}
+
+/// True when assistant text contains a full or partial proposal marker.
+fn proposal_marker_text(text: &str) -> bool {
+    text.contains("<aif") || text.contains("</aif") || text.contains("aif-ticket")
 }
 
 /// Extract the issue number from one factory pull request branch.
@@ -2692,6 +3195,35 @@ If the operator asks for something you cannot decide alone, say so plainly
 and ask again.
 "#;
 
+/// The built-in prompt of a read-only issue conversation.
+pub const TICKET_CHAT_PROMPT: &str = r#"You review GitHub issue #{number} in repository
+{repo} ({owner_repo}). The repository checkout is {worktree}.
+
+Issue title: {title}
+Issue description:
+{body}
+
+Labels: {labels}
+Author: {author}
+Assignees: {assignees}
+Updated: {updated_at}
+GitHub reference: {github_url}
+
+Start with analysis. Do not propose a title or description change unless the
+operator explicitly requests that change. You can use only Read, Glob, and
+Grep. Do not edit files. Do not use a GitHub write command.
+
+When the operator explicitly requests a title or description change, finish
+the assistant turn with exactly one complete block in this form:
+
+<aif-ticket-proposal-v1>
+{"title":"New title","body":"New description"}
+</aif-ticket-proposal-v1>
+
+Put valid JSON between the markers. Do not quote the block. Do not put the
+block in a code fence. Include no text after the closing marker.
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2699,7 +3231,7 @@ mod tests {
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// The fake wall-clock time every rig starts at.
@@ -2996,7 +3528,11 @@ mod tests {
                 release: ReleasePolicy::Manual,
             },
         );
-        Config { stages, repos }
+        Config {
+            stages,
+            repos,
+            ticket_chat: crate::config::TicketChatConfig::default(),
+        }
     }
 
     /// One open issue.
@@ -3007,6 +3543,10 @@ mod tests {
             title: format!("issue {number}"),
             body: format!("body {number}"),
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            author: "author".to_string(),
+            assignees: Vec::new(),
+            updated_at: format!("2026-08-{number:02}T12:00:00Z"),
+            github_url: format!("https://github.com/acme/borsuk/issues/{number}"),
             open: true,
         }
     }
@@ -3114,6 +3654,12 @@ mod tests {
 
         /// Apply one poll of the `borsuk` repository.
         fn poll(&mut self, issues: Vec<Issue>, prs: Vec<Pr>) {
+            let started_ms = *self.t.lock().unwrap();
+            self.poll_started(issues, prs, started_ms);
+        }
+
+        /// Apply one poll with an explicit start time.
+        fn poll_started(&mut self, issues: Vec<Issue>, prs: Vec<Pr>, started_ms: u64) {
             let mut issue_map = BTreeMap::new();
             for one in issues {
                 issue_map.insert(one.number, one);
@@ -3123,6 +3669,7 @@ mod tests {
                 pr_map.insert(one.number, one);
             }
             self.daemon.handle(Inbound::Poll(DaemonMsg::Polled {
+                started_ms,
                 repo: "borsuk".to_string(),
                 snapshot: RepoSnapshot {
                     issues: issue_map,
@@ -4570,6 +5117,588 @@ mod tests {
         rig.event(turn_ended("borsuk/refine-i0"));
 
         assert_eq!(rig.task("borsuk/refine-i0").state, TaskState::AwaitingUser);
+    }
+
+    #[test]
+    fn ticket_chat_starts_once_with_issue_context_and_read_only_tools() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+
+        rig.act(Action::Ticket(crate::sock::TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/ticket-i7");
+        assert_eq!(job.cwd, rig.repo);
+        assert_eq!(job.model, "m");
+        assert_eq!(
+            job.allowed_tools,
+            Some(vec![
+                "Read".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string()
+            ])
+        );
+        assert!(job.prompt.contains("issue 7"));
+        assert!(job.prompt.contains("body 7"));
+        assert!(job.prompt.contains("Start with analysis"));
+        assert!(job.prompt.contains("<aif-ticket-proposal-v1>"));
+        assert_eq!(
+            rig.task("borsuk/ticket-i7").purpose,
+            crate::tasks::TaskPurpose::TicketChat
+        );
+
+        rig.act(Action::Ticket(crate::sock::TicketAction::Chat {
+            request: "chat-again-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the second request must reuse the session"
+        );
+    }
+
+    #[test]
+    fn a_restart_resumes_the_same_ticket_chat_after_the_first_poll() {
+        let dir = temp_root();
+        let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+        first.poll(vec![issue(7, &[])], vec![]);
+        first.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        first.event(started("borsuk/ticket-i7", "session-ticket-7"));
+        drop(first);
+
+        let mut second = Rig::make_in(dir, vec![], |_| {});
+        assert_eq!(
+            second.job_count(),
+            0,
+            "restore must wait for current GitHub state"
+        );
+        second.poll(vec![issue(7, &[])], vec![]);
+
+        assert_eq!(second.job_count(), 1);
+        let resumed = second.job(0);
+        assert_eq!(resumed.task, "borsuk/ticket-i7");
+        assert_eq!(resumed.resume.as_deref(), Some("session-ticket-7"));
+    }
+
+    #[test]
+    fn each_to_refine_label_interval_sends_one_handoff_to_the_same_session() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
+        rig.event(turn_ended("borsuk/ticket-i7"));
+        let session = rig.session(0);
+
+        rig.poll(vec![issue(7, &["to-refine"])], vec![]);
+        rig.poll(vec![issue(7, &["to-refine"])], vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.poll(vec![issue(7, &["to-refine"])], vec![]);
+
+        let sends = session.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert!(sends.iter().all(|text| text.contains("refinement")));
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/refine-i7"));
+    }
+
+    #[test]
+    fn a_label_transition_before_session_start_sends_the_handoff_after_start() {
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=to-refine",
+            ],
+            CmdOut::ok("HTTP/1.1 200 OK\r\n\r\n[{\"name\":\"to-refine\"}]"),
+        )];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        let session = rig.session(0);
+
+        rig.act(Action::Ticket(TicketAction::ToggleLabel {
+            request: "label-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            label: "to-refine".to_string(),
+            on: true,
+        }));
+        assert!(session.sends.lock().unwrap().is_empty());
+
+        rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
+
+        assert_eq!(session.sends.lock().unwrap().len(), 1);
+        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+    }
+
+    #[test]
+    fn a_blocked_handoff_retries_after_the_sibling_task_stops() {
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=to-refine",
+            ],
+            CmdOut::ok("HTTP/1.1 200 OK\r\n\r\n[{\"name\":\"to-refine\"}]"),
+        )];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
+        rig.event(turn_ended("borsuk/ticket-i7"));
+        let session = rig.session(0);
+        let blocker = rig
+            .daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                7,
+                rig.daemon.state_dir.join("logs/blocker.jsonl"),
+                T0,
+            )
+            .unwrap()
+            .id
+            .clone();
+        rig.daemon
+            .table
+            .transition(&blocker, TaskState::Running, T0)
+            .unwrap();
+
+        rig.act(Action::Ticket(TicketAction::ToggleLabel {
+            request: "label-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            label: "to-refine".to_string(),
+            on: true,
+        }));
+        assert!(session.sends.lock().unwrap().is_empty());
+        assert!(!rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+
+        rig.daemon
+            .table
+            .transition(&blocker, TaskState::Done, T0 + 1)
+            .unwrap();
+        rig.set_now(T0 + 1);
+        rig.poll(vec![issue(7, &["to-refine"])], vec![]);
+        assert_eq!(session.sends.lock().unwrap().len(), 1);
+        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+    }
+
+    #[test]
+    fn refined_issue_uses_one_ticket_chat_cleanup_path() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        let session = rig.session(0);
+
+        rig.poll(vec![issue(7, &["refined"])], vec![]);
+        rig.poll(vec![issue(7, &["refined"])], vec![]);
+
+        assert!(session.stopped.load(Ordering::SeqCst));
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/ticket-i7"));
+        assert!(rig.daemon.ticket_conversations.is_empty());
+    }
+
+    #[test]
+    fn a_direct_refined_label_change_admits_implementation_without_a_poll() {
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=refined",
+            ],
+            CmdOut::ok("HTTP/1.1 200 OK\r\n\r\n[{\"name\":\"refined\"}]"),
+        )];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+
+        rig.act(Action::Ticket(TicketAction::ToggleLabel {
+            request: "label-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            label: "refined".to_string(),
+            on: true,
+        }));
+
+        assert!(rig.daemon.ticket_conversations.is_empty());
+        assert!(rig.daemon.table.by_id.contains_key("borsuk/implement-i7"));
+    }
+
+    #[test]
+    fn closed_issue_uses_the_same_ticket_chat_cleanup_path() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        let session = rig.session(0);
+
+        rig.poll(vec![], vec![]);
+        rig.poll(vec![], vec![]);
+
+        assert!(session.stopped.load(Ordering::SeqCst));
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/ticket-i7"));
+        assert!(rig.daemon.ticket_conversations.is_empty());
+    }
+
+    #[test]
+    fn only_the_final_complete_ticket_block_becomes_a_persisted_proposal() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/ticket-i7".to_string(),
+            text: "Analysis first.".to_string(),
+        });
+        rig.event(RunEvent::Text {
+            task: "borsuk/ticket-i7".to_string(),
+            text: concat!(
+                "<aif-ticket-proposal-v1>\n",
+                "{\"title\":\"Proposed title\",\"body\":\"Proposed body\"}\n",
+                "</aif-ticket-proposal-v1>"
+            )
+            .to_string(),
+        });
+        rig.event(turn_ended("borsuk/ticket-i7"));
+
+        let proposal = rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            .proposal
+            .as_ref()
+            .unwrap();
+        assert_eq!(proposal.title, "Proposed title");
+        assert_eq!(proposal.body, "Proposed body");
+        assert_eq!(proposal.original_title, "issue 7");
+        assert_eq!(proposal.original_body, "body 7");
+        let Push::TicketDetails(details) = push_rx.try_recv().unwrap() else {
+            panic!("the proposal must refresh the focused details");
+        };
+        assert_eq!(details.proposal, Some(proposal.clone()));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/ticket-i7".to_string(),
+            text: "<aif-ticket-proposal-".to_string(),
+        });
+        rig.event(RunEvent::Text {
+            task: "borsuk/ticket-i7".to_string(),
+            text: "v1>\n{\"title\":\"Bad\",\"body\":\"Split\"}\n</aif-ticket-proposal-v1>"
+                .to_string(),
+        });
+        rig.event(turn_ended("borsuk/ticket-i7"));
+        assert_eq!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+                .proposal
+                .as_ref()
+                .unwrap()
+                .title,
+            "Proposed title"
+        );
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/ticket-i7".to_string(),
+            text: "</aif-".to_string(),
+        });
+        rig.event(RunEvent::Text {
+            task: "borsuk/ticket-i7".to_string(),
+            text: concat!(
+                "<aif-ticket-proposal-v1>\n",
+                "{\"title\":\"Duplicate\",\"body\":\"Marker\"}\n",
+                "</aif-ticket-proposal-v1>"
+            )
+            .to_string(),
+        });
+        rig.event(turn_ended("borsuk/ticket-i7"));
+        assert_eq!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+                .proposal
+                .as_ref()
+                .unwrap()
+                .title,
+            "Proposed title"
+        );
+    }
+
+    #[test]
+    fn proposal_application_updates_only_content_and_notifies_the_same_session() {
+        let response = |title: &str, body: &str| {
+            CmdOut::ok(format!(
+                "HTTP/1.1 200 OK\r\n\r\n{}",
+                json!({
+                    "number": 7,
+                    "node_id": "node-7",
+                    "title": title,
+                    "body": body,
+                    "state": "open",
+                    "labels": [{"name": "ui"}],
+                    "user": {"login": "author"},
+                    "assignees": [],
+                    "updated_at": "2026-08-07T12:00:00Z",
+                    "html_url": "https://github.com/acme/borsuk/issues/7"
+                })
+            ))
+        };
+        let steps = vec![
+            gh_step(
+                &["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/7"],
+                response("issue 7", "body 7"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "PATCH",
+                    "repos/acme/borsuk/issues/7",
+                    "-f",
+                    "title=Proposed title",
+                    "-f",
+                    "body=Proposed body",
+                ],
+                response("Proposed title", "Proposed body"),
+            ),
+        ];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &["ui"])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        let session = rig.session(0);
+        rig.daemon
+            .ticket_conversations
+            .get_mut(&("borsuk".to_string(), 7))
+            .unwrap()
+            .proposal = Some(TicketProposal {
+            id: "proposal-7".to_string(),
+            title: "Proposed title".to_string(),
+            body: "Proposed body".to_string(),
+            original_title: "issue 7".to_string(),
+            original_body: "body 7".to_string(),
+        });
+
+        rig.act(Action::Ticket(TicketAction::UpdateContent {
+            request: "apply-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            expected: crate::sock::TicketContent {
+                title: "issue 7".to_string(),
+                body: "body 7".to_string(),
+            },
+            desired: crate::sock::TicketContent {
+                title: "Proposed title".to_string(),
+                body: "Proposed body".to_string(),
+            },
+            source: crate::sock::TicketContentSource::Proposal {
+                proposal_id: "proposal-7".to_string(),
+            },
+        }));
+
+        let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
+        assert_eq!(confirmed.title, "Proposed title");
+        assert_eq!(confirmed.labels, vec!["ui".to_string()]);
+        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            .proposal
+            .is_none());
+        let sends = session.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1);
+        assert!(sends[0].contains("proposal"));
+        assert!(sends[0].contains("applied"));
+    }
+
+    #[test]
+    fn a_content_conflict_refreshes_the_confirmed_daemon_snapshot() {
+        let remote = CmdOut::ok(format!(
+            "HTTP/1.1 200 OK\r\n\r\n{}",
+            json!({
+                "number": 7,
+                "node_id": "node-7",
+                "title": "Remote title",
+                "body": "Remote body",
+                "state": "open",
+                "labels": [{"name": "ui"}],
+                "user": {"login": "author"},
+                "assignees": [],
+                "updated_at": "2026-08-07T12:00:00Z",
+                "html_url": "https://github.com/acme/borsuk/issues/7"
+            })
+        ));
+        let steps = vec![gh_step(
+            &["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/7"],
+            remote,
+        )];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &["ui"])], vec![]);
+
+        rig.act(Action::Ticket(TicketAction::UpdateContent {
+            request: "save-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            expected: crate::sock::TicketContent {
+                title: "issue 7".to_string(),
+                body: "body 7".to_string(),
+            },
+            desired: crate::sock::TicketContent {
+                title: "Pending title".to_string(),
+                body: "Pending body".to_string(),
+            },
+            source: crate::sock::TicketContentSource::Direct,
+        }));
+
+        let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
+        assert_eq!(confirmed.title, "Remote title");
+        assert_eq!(confirmed.body, "Remote body");
+    }
+
+    #[test]
+    fn a_proposal_notice_failure_does_not_undo_the_github_update() {
+        let response = |title: &str, body: &str| {
+            CmdOut::ok(format!(
+                "HTTP/1.1 200 OK\r\n\r\n{}",
+                json!({
+                    "number": 7,
+                    "node_id": "node-7",
+                    "title": title,
+                    "body": body,
+                    "state": "open",
+                    "labels": [{"name": "ui"}],
+                    "user": {"login": "author"},
+                    "assignees": [],
+                    "updated_at": "2026-08-07T12:00:00Z",
+                    "html_url": "https://github.com/acme/borsuk/issues/7"
+                })
+            ))
+        };
+        let steps = vec![
+            gh_step(
+                &["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/7"],
+                response("issue 7", "body 7"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "PATCH",
+                    "repos/acme/borsuk/issues/7",
+                    "-f",
+                    "title=Proposed title",
+                    "-f",
+                    "body=Proposed body",
+                ],
+                response("Proposed title", "Proposed body"),
+            ),
+        ];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &["ui"])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        let session = rig.session(0);
+        session.fail_send.store(true, Ordering::SeqCst);
+        rig.daemon
+            .ticket_conversations
+            .get_mut(&("borsuk".to_string(), 7))
+            .unwrap()
+            .proposal = Some(TicketProposal {
+            id: "proposal-7".to_string(),
+            title: "Proposed title".to_string(),
+            body: "Proposed body".to_string(),
+            original_title: "issue 7".to_string(),
+            original_body: "body 7".to_string(),
+        });
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+
+        rig.act(Action::Ticket(TicketAction::UpdateContent {
+            request: "apply-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            expected: crate::sock::TicketContent {
+                title: "issue 7".to_string(),
+                body: "body 7".to_string(),
+            },
+            desired: crate::sock::TicketContent {
+                title: "Proposed title".to_string(),
+                body: "Proposed body".to_string(),
+            },
+            source: crate::sock::TicketContentSource::Proposal {
+                proposal_id: "proposal-7".to_string(),
+            },
+        }));
+
+        let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
+        assert_eq!(confirmed.title, "Proposed title");
+        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            .proposal
+            .is_none());
+        let pushes: Vec<Push> = push_rx.try_iter().collect();
+        assert!(pushes.iter().any(|push| {
+            matches!(
+                push,
+                Push::TicketDetails(details)
+                    if details.repo == "borsuk"
+                        && details.issue.number == 7
+                        && details.proposal.is_none()
+            )
+        }));
     }
 
     #[test]
@@ -6233,6 +7362,73 @@ mod tests {
         // A quiet second drive publishes nothing.
         rig.drive();
         assert!(rx.try_recv().is_err(), "an unchanged drive must not push");
+    }
+
+    #[test]
+    fn a_ticket_details_action_pushes_the_confirmed_issue() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+
+        rig.act(Action::Ticket(crate::sock::TicketAction::Details {
+            request: "details-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+
+        let crate::sock::Push::TicketDetails(details) = push_rx.try_recv().unwrap() else {
+            panic!("the action must push ticket details");
+        };
+        assert_eq!(details.request, "details-7");
+        assert_eq!(details.repo, "borsuk");
+        assert_eq!(details.issue.number, 7);
+        assert_eq!(details.issue.author, "author");
+    }
+
+    #[test]
+    fn a_poll_without_a_later_start_time_cannot_replace_a_label_mutation() {
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=urgent",
+            ],
+            CmdOut::ok("HTTP/1.1 200 OK\r\n\r\n[{\"name\":\"ui\"},{\"name\":\"urgent\"}]"),
+        )];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![issue(7, &["ui"])], vec![]);
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let clock_calls_for_daemon = clock_calls.clone();
+        rig.daemon.clock =
+            Arc::new(
+                move || match clock_calls_for_daemon.fetch_add(1, Ordering::SeqCst) {
+                    0 => T0 + 100,
+                    1 => T0 + 300,
+                    _ => T0 + 400,
+                },
+            );
+        rig.act(Action::Ticket(crate::sock::TicketAction::ToggleLabel {
+            request: "label-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            label: "urgent".to_string(),
+            on: true,
+        }));
+        assert!(rig.daemon.snapshot.repos["borsuk"].issues[&7]
+            .labels
+            .contains(&"urgent".to_string()));
+
+        rig.poll_started(vec![issue(7, &["ui"])], vec![], T0 + 200);
+
+        assert!(rig.daemon.snapshot.repos["borsuk"].issues[&7]
+            .labels
+            .contains(&"urgent".to_string()));
     }
 
     #[test]

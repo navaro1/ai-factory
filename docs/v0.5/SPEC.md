@@ -6,9 +6,9 @@ and reviewers read.
 
 ## What v0.5 is
 
-A daemon plus a terminal UI that drive AI coding agents against GitHub issues
-in several repositories. An issue flows through four fixed stages with no human
-step except ticket shaping and the configured release gate.
+A daemon plus a terminal UI drive AI coding agents against GitHub issues in
+several repositories. The Tickets view supports review and ticket shaping.
+An issue then flows through four fixed stages.
 
 ```
 issue labelled to-refine ──refine──▶ labelled refined ──implement──▶ draft PR
@@ -27,13 +27,13 @@ draft PR ──review──▶ PR ready ──release──▶ merged
 3. Concurrency is `std::thread` plus `std::sync::mpsc`. The daemon has exactly
    one event loop thread that owns all mutable state. No `Mutex` around domain
    state, no `Arc<RwLock<_>>` for the model.
-4. No polling loops and no tick thread. The event loop blocks on
+4. No domain polling loops and no tick thread. The event loop blocks on
    `recv_timeout(next_deadline)`. Deadlines are computed from pending work
    (train fires, idle reaper expiries). The only periodic clock in the whole
    system is each repository's 60 s ETag poll thread.
 5. GitHub is the source of truth. Do not build a journal, an event log, or a
-   task database. The only file the daemon writes for its own memory is
-   `state.json` (chunk 15), which holds runtime overrides and last train times.
+   task database. `state.json` holds runtime overrides, train times, and active
+   ticket conversation metadata. Task logs hold full transcripts.
 6. Every unit test runs offline. Never call the network, `gh`, `git` against a
    real remote, `claude`, or `opencode` in a test. Use scripted fake binaries
    on `PATH` and recorded fixtures.
@@ -194,6 +194,7 @@ src/model.rs        Stage, ItemKind, Issue, Pr, Snapshot, Task, TaskState
 src/config.rs       factory.toml
 src/exec.rs         the Exec indirection for every external command
 src/gh.rs           gh CLI wrapper, ETag cache, JSON to model
+src/ticket.rs       ticket review actions and GitHub changes
 src/poll.rs         one poller thread per repository
 src/gates.rs        the four stage predicates
 src/tasks.rs        task table and state machine
@@ -214,6 +215,7 @@ src/tui/transcript.rs
 src/tui/pipeline.rs
 src/tui/inbox.rs
 src/tui/session.rs
+src/tui/tickets.rs
 ```
 
 ## Naming rules
@@ -222,9 +224,11 @@ src/tui/session.rs
   `review`, `release`.
 - Labels the factory reads: `to-refine`, `refined`, `needs-human`,
   `release-stacked`.
+- The Tickets view gives `to-refine` priority when both workflow labels exist.
 - Task id format: `<repo>/<stage>-<kind><number>` where kind is `i` or `p`,
   for example `borsuk/implement-i142`. The attempt is a field, not part of
   the id.
+- Ticket chat uses `<repo>/ticket-i<number>` as its task identifier.
 - Branch for issue work: `aif/<repo>/issue-<n>`.
 - Worktree path: `<state_dir>/worktrees/<repo>/issue-<n>`.
 - Train worktree path: `<state_dir>/worktrees/<repo>/train`.
@@ -1697,3 +1701,94 @@ fixture, so the parser is right and the process plumbing was never exercised.
   wait so a regression fails instead of hanging the suite.
 - The claude runner still writes its prompt on stdin, and its existing tests
   pass unchanged.
+
+## Task 30 — Tickets view
+
+**Goal.** Add complete issue review and ticket shaping inside the terminal UI.
+
+**Files.** `src/model.rs`, `src/gh.rs`, `src/poll.rs`, `src/ticket.rs`,
+`src/sock.rs`, `src/state.rs`, `src/tasks.rs`, `src/config.rs`,
+`src/runner/`, `src/daemon.rs`, `src/tui/`, and `docs/v0.5/`.
+
+**Issue list.**
+
+- Key `4` opens the Tickets view.
+- The list includes every open issue from every configured repository.
+- The list excludes GitHub pull request objects.
+- The list groups untouched, `to-refine`, and `refined` issues in that order.
+- An untouched issue has neither workflow label.
+- The `to-refine` label wins when both workflow labels exist.
+- Each group sorts by update time, repository alias, and issue number.
+- Key `/` searches the repository, number, title, and label text.
+- Key `Enter` opens the selected issue.
+
+**Issue focus.**
+
+- The focus shows the title, description, labels, author, assignees, update
+  time, and GitHub reference.
+- The GitHub URL is a reference only.
+- Key `e` opens the title and description editor.
+- `Ctrl+S` saves the direct content edit.
+- AIF fetches current GitHub content before each content update.
+- A remote content change opens a comparison view.
+- Key `g` keeps the GitHub version.
+- Key `p` fetches GitHub again before it reapplies the pending version.
+- Key `Esc` returns one level and keeps a pending local version.
+
+**Labels.**
+
+- Key `l` opens the repository label picker.
+- Key `Space` applies one label toggle immediately.
+- AIF treats removal of an absent label as success.
+- Key `n` opens the new-label form.
+- The form accepts an optional `#` before exactly six hexadecimal digits.
+- AIF creates the repository label before AIF attaches it.
+- A partial failure states that creation succeeded and attachment failed.
+- A catalog failure retains the last valid catalog.
+- The picker uses each color from the GitHub label catalog.
+
+**Ticket chat.**
+
+- Key `c` starts or resumes one Claude chat for the focused issue.
+- Chat can start before a workflow label exists.
+- Ticket chat allows only the `Read`, `Glob`, and `Grep` tools.
+- `[ticket_chat] model` selects the Claude model.
+- A missing setting uses the refine model only when Claude runs refinement.
+- An invalid chat setting does not disable ticket review.
+- `prompts/ticket-chat.md` customizes the ticket prompt.
+- A new `to-refine` transition sends one refinement message to the same
+  session.
+- A later transition sends a new message after label removal.
+- The conversation survives a daemon restart.
+- The conversation ends when `refined` appears or the issue closes.
+
+**Proposals.**
+
+- Claude returns one final `aif-ticket-proposal-v1` data block.
+- AIF rejects a malformed, quoted, duplicated, split, or incomplete block.
+- AIF stores the proposal with its original title and description.
+- The state file does not store the full transcript.
+- Key `a` applies the latest shown proposal through the content update service.
+- Proposal application never changes labels.
+- A stale proposal opens the standard content comparison.
+- A successful application notifies the same Claude session.
+- A notice failure does not undo the GitHub update.
+
+**Wire and display.**
+
+- `StateView` contains compact ticket summaries.
+- The daemon sends separate details, label, and result messages.
+- Every user change shows pending, success, conflict, partial failure, or
+  failure with a word and a symbol.
+- AIF ignores a poll that starts before a confirmed mutation.
+- The focus splits at 104 columns and stacks below that width.
+- The terminal uses the approved true-color Tickets palette.
+- A list without an open chat has no transcript poll deadline.
+
+**Acceptance criteria.**
+
+- Offline tests cover all list, search, detail, edit, label, chat, restart, and
+  proposal paths.
+- Render tests cover 120-column and 80-column terminals.
+- Old configuration files and old state files load without changes.
+- Formatting, Clippy, all tests, and the installer test pass.

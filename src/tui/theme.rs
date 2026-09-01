@@ -7,16 +7,19 @@ use ratatui::style::{Color, Modifier, Style};
 
 /// The color palette of the terminal UI.
 ///
-/// Every color works on a dark and on a light terminal, because the base
-/// text keeps the terminal default foreground.
+/// The palette defines both foreground and background colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Theme {
+    /// The base background of the terminal application.
+    pub(super) background: Color,
     /// The normal foreground of text.
     pub(super) text: Color,
     /// The foreground of secondary text.
     pub(super) dim: Color,
     /// The foreground of highlights, stage headers, and the active tab.
     pub(super) accent: Color,
+    /// The foreground of repository aliases.
+    pub(super) repo: Color,
     /// The foreground of healthy state, such as a running count.
     pub(super) ok: Color,
     /// The foreground of attention state, such as a pause or a toast.
@@ -29,13 +32,15 @@ pub(super) struct Theme {
 
 /// The one palette the whole UI uses.
 pub(super) const THEME: Theme = Theme {
-    text: Color::Reset,
-    dim: Color::DarkGray,
-    accent: Color::Cyan,
-    ok: Color::Green,
-    warn: Color::Yellow,
-    error: Color::Red,
-    selected_bg: Color::DarkGray,
+    background: Color::Rgb(0x09, 0x0C, 0x14),
+    text: Color::Rgb(0xE7, 0xEC, 0xFF),
+    dim: Color::Rgb(0x87, 0x90, 0xAD),
+    accent: Color::Rgb(0x55, 0xE6, 0xFF),
+    repo: Color::Rgb(0xFF, 0x5F, 0xD7),
+    ok: Color::Rgb(0x7D, 0xFF, 0xB2),
+    warn: Color::Rgb(0xFF, 0xCC, 0x66),
+    error: Color::Rgb(0xFF, 0x6B, 0x7A),
+    selected_bg: Color::Rgb(0x18, 0x20, 0x33),
 };
 
 impl Theme {
@@ -60,5 +65,21 @@ impl Theme {
     /// The style of the toast that confirms a sent action.
     pub(super) fn toast(self) -> Style {
         Style::default().fg(Color::Black).bg(self.warn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticket_palette_uses_the_required_true_colors() {
+        assert_eq!(THEME.background, Color::Rgb(0x09, 0x0C, 0x14));
+        assert_eq!(THEME.text, Color::Rgb(0xE7, 0xEC, 0xFF));
+        assert_eq!(THEME.accent, Color::Rgb(0x55, 0xE6, 0xFF));
+        assert_eq!(THEME.repo, Color::Rgb(0xFF, 0x5F, 0xD7));
+        assert_eq!(THEME.warn, Color::Rgb(0xFF, 0xCC, 0x66));
+        assert_eq!(THEME.ok, Color::Rgb(0x7D, 0xFF, 0xB2));
+        assert_eq!(THEME.error, Color::Rgb(0xFF, 0x6B, 0x7A));
     }
 }

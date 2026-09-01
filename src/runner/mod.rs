@@ -40,6 +40,8 @@ pub struct Job {
     pub resume: Option<String>,
     /// Whether tools are auto-approved without asking a human.
     pub yolo: bool,
+    /// The exact Claude tool allowlist, when this job restricts tools.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// One asynchronous report from a running agent.

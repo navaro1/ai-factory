@@ -1695,6 +1695,7 @@ mod tests {
             tasks: Vec::new(),
             decisions,
             decision_items: Vec::new(),
+            tickets: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,

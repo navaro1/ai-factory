@@ -57,6 +57,19 @@ impl fmt::Display for TaskState {
     }
 }
 
+/// The workflow purpose of one task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPurpose {
+    /// A normal pipeline task.
+    #[default]
+    Pipeline,
+    /// An interactive issue-creation task.
+    TicketCreate,
+    /// A read-only conversation about one open issue.
+    TicketChat,
+}
+
 /// One stage of one item in one repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
@@ -70,6 +83,9 @@ pub struct Task {
     pub kind: ItemKind,
     /// The issue or pull request number.
     pub number: u64,
+    /// The workflow purpose of this task.
+    #[serde(default)]
+    pub purpose: TaskPurpose,
     /// The current state.
     pub state: TaskState,
     /// The current attempt number. The first queued run is attempt 1.
@@ -105,6 +121,7 @@ impl Task {
             stage,
             kind,
             number,
+            purpose: TaskPurpose::Pipeline,
             state: TaskState::Queued,
             attempt: 1,
             session_id: None,
@@ -114,11 +131,31 @@ impl Task {
             updated_ms: now_ms,
         }
     }
+
+    /// Create one queued read-only conversation for an issue.
+    fn ticket_chat(repo: &str, number: u64, log_path: PathBuf, now_ms: u64) -> Self {
+        let mut task = Self::new(
+            repo,
+            Stage::Refine,
+            ItemKind::Issue,
+            number,
+            log_path,
+            now_ms,
+        );
+        task.id = ticket_chat_id(repo, number);
+        task.purpose = TaskPurpose::TicketChat;
+        task
+    }
 }
 
 /// The task id for one item, per the naming rules.
 fn id_for(repo: &str, stage: Stage, kind: ItemKind, number: u64) -> String {
     format!("{}/{}-{}{}", repo, stage.as_str(), kind.as_str(), number)
+}
+
+/// The task id for one issue conversation.
+pub fn ticket_chat_id(repo: &str, number: u64) -> String {
+    format!("{repo}/ticket-i{number}")
 }
 
 /// All tasks of the daemon, in insertion order.
@@ -177,6 +214,42 @@ impl TaskTable {
         self.by_id
             .get_mut(&id)
             .ok_or_else(|| anyhow!("task \"{id}\" vanished right after insertion"))
+    }
+
+    /// Queue one issue conversation or reuse its active task.
+    pub fn upsert_ticket_chat(
+        &mut self,
+        repo: &str,
+        number: u64,
+        log_path: PathBuf,
+        now_ms: u64,
+    ) -> Result<&mut Task> {
+        let id = ticket_chat_id(repo, number);
+        if self
+            .by_id
+            .get(&id)
+            .is_some_and(|task| !task.state.is_terminal())
+        {
+            return self
+                .by_id
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("task \"{id}\" vanished before reuse"));
+        }
+        let task = Task::ticket_chat(repo, number, log_path, now_ms);
+        self.by_id.insert(id.clone(), task);
+        if let Some(position) = self.order.iter().position(|existing| existing == &id) {
+            self.order.remove(position);
+        }
+        self.order.push(id.clone());
+        self.by_id
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("task \"{id}\" vanished right after insertion"))
+    }
+
+    /// Remove one task and its insertion-order entry.
+    pub fn remove(&mut self, id: &str) -> Option<Task> {
+        self.order.retain(|existing| existing != id);
+        self.by_id.remove(id)
     }
 
     /// Move a task to the state `to`.
@@ -367,6 +440,29 @@ mod tests {
         }
         assert_eq!(table.by_id[&id].state, state);
         (table, id)
+    }
+
+    #[test]
+    fn ticket_chat_has_a_distinct_id_and_reuses_the_active_task() {
+        let mut table = TaskTable::new();
+        let first = table
+            .upsert_ticket_chat("borsuk", 42, PathBuf::from("ticket-42.jsonl"), 10)
+            .unwrap()
+            .id
+            .clone();
+        let second = table
+            .upsert_ticket_chat("borsuk", 42, PathBuf::from("ignored.jsonl"), 20)
+            .unwrap()
+            .id
+            .clone();
+
+        assert_eq!(first, "borsuk/ticket-i42");
+        assert_eq!(second, first);
+        assert_eq!(table.order, vec![first]);
+        assert_eq!(
+            table.by_id["borsuk/ticket-i42"].purpose,
+            TaskPurpose::TicketChat
+        );
     }
 
     #[test]

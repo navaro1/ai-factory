@@ -22,6 +22,7 @@ pub mod inbox;
 pub mod pipeline;
 pub mod session;
 pub mod theme;
+pub mod tickets;
 pub mod transcript;
 
 use std::io::stdout;
@@ -49,6 +50,7 @@ use crate::sock::{Action, Client, Push, StateView, TaskView};
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
 use theme::THEME;
+use tickets::Tickets;
 
 /// The view the shell shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,6 +62,8 @@ enum View {
     Session,
     /// The decisions inbox.
     Inbox,
+    /// All open GitHub issues.
+    Tickets,
 }
 
 /// What the operator has marked in the visible view.
@@ -84,6 +88,12 @@ enum Msg {
     Resize,
     /// One state push from the daemon.
     State(StateView),
+    /// Full data for one focused issue.
+    TicketDetails(crate::sock::TicketDetails),
+    /// One repository label catalog.
+    TicketLabels(crate::sock::TicketLabels),
+    /// One ticket mutation result.
+    TicketResult(crate::sock::TicketResult),
     /// The socket reader reached the daemon.
     Connected,
     /// The daemon went away, with the reason for the banner.
@@ -210,6 +220,8 @@ struct App {
     session: SessionView,
     /// The decisions inbox.
     inbox: Inbox,
+    /// The open issue list and its nested views.
+    tickets: Tickets,
     /// The task id the session view follows.
     session_task: Option<String>,
     /// The task the shell still waits for, from `r` or `n`.
@@ -241,6 +253,7 @@ impl App {
             },
         };
         self.inbox.observe(&view);
+        self.tickets.observe_state(&view);
         let wanted_task = self.wanted.as_ref().and_then(|wanted| {
             view.tasks
                 .iter()
@@ -299,6 +312,7 @@ impl App {
         match self.view {
             View::Session => true,
             View::Inbox => self.inbox.typing(),
+            View::Tickets => self.tickets.typing(),
             View::Pipeline => false,
         }
     }
@@ -390,6 +404,7 @@ impl App {
                     KeyCode::Char('1') => self.view = View::Pipeline,
                     KeyCode::Char('2') => self.view = View::Session,
                     KeyCode::Char('3') => {}
+                    KeyCode::Char('4') => self.view = View::Tickets,
                     KeyCode::Char('?') => self.help = true,
                     KeyCode::Esc => self.view = View::Pipeline,
                     _ => {
@@ -401,6 +416,7 @@ impl App {
                 KeyCode::Char('1') => {}
                 KeyCode::Char('2') => self.view = View::Session,
                 KeyCode::Char('3') => self.view = View::Inbox,
+                KeyCode::Char('4') => self.view = View::Tickets,
                 KeyCode::Char('?') => self.help = true,
                 KeyCode::Char('j') | KeyCode::Down => pipeline::move_selection(self, 1),
                 KeyCode::Char('k') | KeyCode::Up => pipeline::move_selection(self, -1),
@@ -408,6 +424,41 @@ impl App {
                 KeyCode::Char('l') | KeyCode::Right => pipeline::move_horizontal(self, 1),
                 _ => pipeline::handle_key(self, key, sink),
             },
+            View::Tickets => {
+                if !self.tickets.typing() {
+                    match key.code {
+                        KeyCode::Char('1') => {
+                            self.view = View::Pipeline;
+                            return true;
+                        }
+                        KeyCode::Char('2') => {
+                            self.view = View::Session;
+                            return true;
+                        }
+                        KeyCode::Char('3') => {
+                            self.view = View::Inbox;
+                            return true;
+                        }
+                        KeyCode::Char('4') => return true,
+                        KeyCode::Char('?') => {
+                            self.help = true;
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                let nested = self.tickets.focus_open() || self.tickets.typing();
+                if let Some(action) = self
+                    .state
+                    .as_ref()
+                    .and_then(|state| self.tickets.handle_key(state, key))
+                {
+                    emit(self, sink, action, "sent ticket request".to_string());
+                }
+                if key.code == KeyCode::Esc && !nested {
+                    self.view = View::Pipeline;
+                }
+            }
         }
         true
     }
@@ -753,6 +804,21 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::TicketDetails(details)) => {
+                                        if tx.send(Msg::TicketDetails(details)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Ok(Push::TicketLabels(labels)) => {
+                                        if tx.send(Msg::TicketLabels(labels)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Ok(Push::TicketResult(result)) => {
+                                        if tx.send(Msg::TicketResult(result)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Err(error) => {
                                         failure = Some(format!("{error:#}"));
                                         break;
@@ -787,12 +853,19 @@ fn run_loop(
     sink: &mut impl ActionSink,
 ) -> Result<()> {
     loop {
-        let msg = if app.view == View::Session {
+        let polls_log =
+            app.view == View::Session || (app.view == View::Tickets && app.tickets.needs_poll());
+        let msg = if polls_log {
             match rx.recv_timeout(session::POLL_INTERVAL) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
-                    if app.session.poll(now) {
+                    let changed = match app.view {
+                        View::Session => app.session.poll(now),
+                        View::Tickets => app.tickets.poll(now),
+                        View::Pipeline | View::Inbox => false,
+                    };
+                    if changed {
                         draw_app(surface, app, now)?;
                     }
                     continue;
@@ -820,6 +893,18 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
             app.apply_state(view);
             Ok(true)
         }
+        Msg::TicketDetails(details) => {
+            app.tickets.observe_details(details);
+            Ok(true)
+        }
+        Msg::TicketLabels(labels) => {
+            app.tickets.observe_labels(labels);
+            Ok(true)
+        }
+        Msg::TicketResult(result) => {
+            app.tickets.observe_result(result);
+            Ok(true)
+        }
         Msg::Connected => {
             app.connected = true;
             Ok(true)
@@ -837,6 +922,8 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
 fn draw_app(surface: &mut impl Surface, app: &mut App, now: Instant) -> Result<()> {
     if app.view == View::Session {
         app.session.on_redraw(now);
+    } else if app.view == View::Tickets {
+        app.tickets.on_redraw(now);
     }
     surface.draw(app)
 }
@@ -873,6 +960,10 @@ fn render_with_clock(
     clock: impl FnOnce() -> Result<u64>,
 ) -> Result<()> {
     let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().fg(THEME.text).bg(THEME.background)),
+        area,
+    );
     let (header, body, footer) = if app.connected {
         let chunks = Layout::vertical([
             Constraint::Length(1),
@@ -913,6 +1004,11 @@ fn render_with_clock(
                 inbox::draw(f, body, state, &app.inbox, now);
             }
         }
+        View::Tickets => {
+            if let Some(state) = app.state.as_ref() {
+                app.tickets.draw(f, body, state);
+            }
+        }
     }
     draw_toast(f, app, body);
     draw_footer(f, app, footer);
@@ -933,6 +1029,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     tabs.push(tab_span("1", "pipeline", app.view == View::Pipeline));
     tabs.push(tab_span("2", "session", app.view == View::Session));
     tabs.push(tab_span("3", "inbox", app.view == View::Inbox));
+    tabs.push(tab_span("4", "tickets", app.view == View::Tickets));
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
@@ -997,7 +1094,7 @@ fn banner_text(app: &App) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
     let hints = Span::styled(
-        " 1/2/3 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
+        " 1/2/3/4 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
         THEME.dim(),
     );
     f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
@@ -1063,10 +1160,10 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 25, area);
+    let panel = centered(44, 27, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 23] = [
-        ("1 2 3", "switch view"),
+    let rows: [(&str, &str); 24] = [
+        ("1 2 3 4", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
         ("j k Up Down", "move inside a lane"),
@@ -1089,6 +1186,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("End", "follow the tail"),
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
+        ("/ e l c a", "search and ticket actions"),
     ];
     let lines: Vec<Line> = rows
         .iter()
@@ -1376,6 +1474,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.view, View::Pipeline);
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('4')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Tickets);
         run_messages(
             &mut surface,
             &mut app,

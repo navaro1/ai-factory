@@ -563,7 +563,6 @@ fn prefix_at_width(text: &str, width: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
 
     /// The sum of the span widths of one rendered line.
     fn line_width(line: &Line<'_>) -> usize {
@@ -703,7 +702,7 @@ mod tests {
         let text = line_text(&lines[0]);
         assert!(text.starts_with("✗ "), "a failed result is marked: {text}");
         assert!(text.contains("boom"));
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[0].spans[0].style.fg, Some(THEME.error));
 
         // A clean result stays dim and unmarked.
         let ok_line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#;
