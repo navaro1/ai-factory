@@ -19,6 +19,7 @@
 //! chords work from every view.
 
 pub mod inbox;
+pub mod markdown;
 pub mod pipeline;
 pub mod session;
 pub mod theme;
