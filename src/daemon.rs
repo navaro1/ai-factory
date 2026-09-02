@@ -108,6 +108,9 @@ pub struct Daemon {
     config_path: PathBuf,
     /// The content revision of the active factory configuration.
     settings_revision: String,
+    /// A test hook that changes the destination after temporary-file preparation.
+    #[cfg(test)]
+    before_config_commit: Option<Box<dyn FnMut() + Send>>,
     /// The command runner; tests replace it with a scripted double.
     exec: Arc<dyn Exec>,
     /// The adapter factory for resolved execution roles.
@@ -316,6 +319,8 @@ impl Daemon {
             config,
             config_path,
             settings_revision,
+            #[cfg(test)]
+            before_config_commit: None,
             exec,
             runner_factory,
             worktrees: WorktreeManager::new(state_dir.clone()),
@@ -1972,40 +1977,45 @@ impl Daemon {
             );
             return;
         }
-        let latest_revision = match self.read_factory_file() {
-            Ok((_, revision)) => revision,
+        let prepared = match config::prepare_config_atomic(&self.config_path, &candidate_text) {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.push_settings_result(
                     request,
                     SettingsOperation::Save,
                     SettingsResultStatus::Failed,
                     current_revision,
-                    Some(format!(
-                        "cannot re-read factory.toml before save: {error:#}"
-                    )),
+                    Some(format!("cannot prepare factory.toml: {error:#}")),
                 );
                 return;
             }
         };
-        if latest_revision != base_revision {
-            self.push_settings_result(
-                request,
-                SettingsOperation::Save,
-                SettingsResultStatus::Stale,
-                latest_revision,
-                Some("the factory.toml file changed while this edit was validated".to_string()),
-            );
-            return;
+        #[cfg(test)]
+        if let Some(mut hook) = self.before_config_commit.take() {
+            hook();
         }
-        if let Err(error) = config::write_config_atomic(&self.config_path, &candidate_text) {
-            self.push_settings_result(
-                request,
-                SettingsOperation::Save,
-                SettingsResultStatus::Failed,
-                current_revision,
-                Some(format!("cannot save factory.toml: {error:#}")),
-            );
-            return;
+        match config::commit_config_atomic_checked(prepared, &base_revision) {
+            Ok(config::AtomicWrite::Written) => {}
+            Ok(config::AtomicWrite::Stale { revision }) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Stale,
+                    revision,
+                    Some("the factory.toml file changed while this edit was validated".to_string()),
+                );
+                return;
+            }
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Failed,
+                    current_revision,
+                    Some(format!("cannot save factory.toml: {error:#}")),
+                );
+                return;
+            }
         }
         let revision = config::file_revision(&candidate_text);
         self.activate_config(candidate, revision.clone());
@@ -5869,6 +5879,54 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(path).unwrap(), external);
         assert_eq!(daemon.config.roles[&ExecutionRole::Refine].model, "m");
+    }
+
+    #[test]
+    fn a_save_detects_a_change_after_temporary_file_preparation() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        let path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        let external = settings_config_text(&rig.repo, "external-after-prepare");
+        fs::write(&path, &original).unwrap();
+        let hook_path = path.clone();
+        let hook_external = external.clone();
+        rig.daemon.before_config_commit = Some(Box::new(move || {
+            fs::write(&hook_path, &hook_external).unwrap();
+        }));
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "operator-edit".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "after-prepare".to_string(),
+            base_revision: config::file_revision(&original),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(result.status, SettingsResultStatus::Stale);
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]

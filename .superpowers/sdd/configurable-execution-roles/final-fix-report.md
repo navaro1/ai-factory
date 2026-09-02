@@ -7,11 +7,15 @@ The final review findings are fixed.
 ## Changes
 
 - Added harness-specific checks for all managed argument aliases from the review.
+- Added Codex checks for hook trust, rule, user config, and added-directory bypass flags.
+- Rejected attached values for every managed short option.
 - Kept unrelated extra arguments valid.
 - Changed Codex approval configuration to `-c approval_policy=<TOML string>`.
 - Added closed value checks for Claude permissions and Codex native controls.
 - Changed the Settings editor to select closed values from fixed lists.
 - Added a second file revision check immediately before the atomic replacement.
+- Prepared and synced the temporary file before the final destination revision check.
+- Removed the prepared file when the final revision check found stale content.
 - Parsed startup configuration and its revision from the same file bytes.
 - Added `sync_all` before rename and synced the parent directory after rename.
 - Made action delivery return success or failure to the terminal caller.
@@ -30,6 +34,7 @@ Focused tests cover these areas:
 - Each closed native value and invalid values.
 - Exact fresh and resumed Codex argument vectors.
 - File changes during candidate resolution.
+- File changes after temporary-file preparation and before the checked rename.
 - Corrupt and stale persisted role bindings.
 - Failed action sends, socket disconnects, and later successful requests.
 - Claude read-only, Claude writable, OpenCode, and Codex ticket chat text.
@@ -39,7 +44,7 @@ The final `./check.sh` command passed.
 
 - Format check passed.
 - Clippy check passed.
-- 641 library tests passed.
+- 643 library tests passed.
 - 49 `aif` tests passed.
 - 4 `aifd` tests passed.
 - 9 CLI tests passed.
@@ -50,3 +55,6 @@ The final `./check.sh` command passed.
 ## Concerns
 
 No known concern remains from this review wave.
+
+An ordinary filesystem rename has no content compare-and-swap operation.
+A non-cooperating writer can still change the destination after the final comparison.

@@ -847,6 +847,10 @@ pub fn validate_extra_args(args: &[String], harness: Harness, key: &str) -> Resu
         "--yolo",
         "--dangerously-bypass-approvals-and-sandbox",
         "--full-auto",
+        "--dangerously-bypass-hook-trust",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--add-dir",
         "-c",
         "--config",
         "-s",
@@ -883,10 +887,7 @@ pub fn validate_extra_args(args: &[String], harness: Harness, key: &str) -> Resu
         if arg.trim().is_empty() {
             bail!("{key}.extra_args must not contain an empty value");
         }
-        if managed
-            .iter()
-            .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
-        {
+        if managed.iter().any(|flag| managed_arg(arg, flag)) {
             bail!("{key}.extra_args contains managed argument {arg:?}");
         }
         if harness == Harness::Opencode && (arg == "--share" || arg.starts_with("--share=")) {
@@ -899,6 +900,16 @@ pub fn validate_extra_args(args: &[String], harness: Harness, key: &str) -> Resu
         }
     }
     Ok(())
+}
+
+fn managed_arg(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || arg.starts_with(&format!("{flag}="))
+        || (flag.starts_with('-')
+            && !flag.starts_with("--")
+            && flag.len() == 2
+            && arg.starts_with(flag)
+            && arg.len() > flag.len())
 }
 fn apply_override(global: &RoleSettings, value: &RoleOverride) -> RoleSettings {
     if let Some(harness) = value.harness {
@@ -1150,8 +1161,27 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
     Ok(candidate)
 }
 
-/// Write one sibling temporary file and replace the config with one rename.
-pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
+/// A fully written and synced config file that waits for its atomic rename.
+pub(crate) struct PreparedConfig {
+    destination: PathBuf,
+    temporary: PathBuf,
+}
+
+impl Drop for PreparedConfig {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+/// The result of a revision-checked atomic config commit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AtomicWrite {
+    Written,
+    Stale { revision: String },
+}
+
+/// Write, set permissions, and sync one sibling temporary config file.
+pub(crate) fn prepare_config_atomic(path: &Path, text: &str) -> Result<PreparedConfig> {
     let permissions = match fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1175,19 +1205,55 @@ pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
     file.sync_all()
         .with_context(|| format!("cannot sync {}", temporary.display()))?;
     drop(file);
-    fs::rename(&temporary, path).with_context(|| {
+    Ok(PreparedConfig {
+        destination: path.to_path_buf(),
+        temporary,
+    })
+}
+
+/// Rename a prepared file only if the destination still has the expected revision.
+///
+/// A normal filesystem rename has no content compare-and-swap operation. A writer
+/// that changes the destination after this final comparison can still win a race.
+pub(crate) fn commit_config_atomic_checked(
+    prepared: PreparedConfig,
+    expected_revision: &str,
+) -> Result<AtomicWrite> {
+    let current = fs::read_to_string(&prepared.destination).with_context(|| {
         format!(
-            "cannot rename {} to {}",
-            temporary.display(),
-            path.display()
+            "cannot read {} before rename",
+            prepared.destination.display()
         )
     })?;
-    if let Some(parent) = path.parent() {
+    let revision = file_revision(&current);
+    if revision != expected_revision {
+        fs::remove_file(&prepared.temporary)
+            .with_context(|| format!("cannot remove stale {}", prepared.temporary.display()))?;
+        return Ok(AtomicWrite::Stale { revision });
+    }
+    finish_config_atomic(prepared)?;
+    Ok(AtomicWrite::Written)
+}
+
+fn finish_config_atomic(prepared: PreparedConfig) -> Result<()> {
+    fs::rename(&prepared.temporary, &prepared.destination).with_context(|| {
+        format!(
+            "cannot rename {} to {}",
+            prepared.temporary.display(),
+            prepared.destination.display()
+        )
+    })?;
+    if let Some(parent) = prepared.destination.parent() {
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .with_context(|| format!("cannot sync {}", parent.display()))?;
     }
     Ok(())
+}
+
+/// Write one sibling temporary file and replace the config with one rename.
+pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
+    finish_config_atomic(prepare_config_atomic(path, text)?)
 }
 
 impl Config {
@@ -1550,6 +1616,32 @@ mod lifecycle_tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_checked_commit_detects_a_change_after_temporary_file_preparation() {
+        let dir = std::env::temp_dir().join(format!(
+            "aif-config-checked-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("factory.toml");
+        fs::write(&path, "original").unwrap();
+        let prepared = prepare_config_atomic(&path, "candidate").unwrap();
+        fs::write(&path, "external").unwrap();
+
+        let outcome = commit_config_atomic_checked(prepared, &file_revision("original")).unwrap();
+
+        assert_eq!(
+            outcome,
+            AtomicWrite::Stale {
+                revision: file_revision("external")
+            }
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        assert!(!path.with_extension("toml.tmp").exists());
         let _ = fs::remove_dir_all(dir);
     }
 
