@@ -84,14 +84,63 @@ pub struct Inbox {
 /// Local navigation state for one focused decision screen.
 #[derive(Debug)]
 struct DetailState {
-    /// The stable decision id that the screen follows.
-    decision_id: String,
+    /// What the screen follows.
+    anchor: DetailAnchor,
     /// The pull request shown inside a release batch.
     item_number: Option<u64>,
     /// How many rendered lines the context screen scrolls down.
     scroll: Cell<u16>,
     /// The largest valid detail offset from the last draw.
     scroll_max: Cell<u16>,
+}
+
+/// What one detail screen follows.
+#[derive(Debug, Clone)]
+enum DetailAnchor {
+    /// One open decision row, by its stable id.
+    Decision(String),
+    /// The release train of one repository, when no gate row is open.
+    Train(String),
+}
+
+/// The anchor of a detail screen, resolved against one state push.
+#[derive(Debug, Clone)]
+enum DetailTarget {
+    /// One open decision row.
+    Decision(Decision),
+    /// One repository release train.
+    Train(crate::sock::TrainView),
+}
+
+impl DetailAnchor {
+    /// Resolve the anchor against one state push.
+    fn target(&self, state: &StateView) -> Option<DetailTarget> {
+        match self {
+            DetailAnchor::Decision(id) => state
+                .decisions
+                .iter()
+                .find(|decision| decision.id == *id)
+                .cloned()
+                .map(DetailTarget::Decision),
+            DetailAnchor::Train(repo) => state
+                .trains
+                .iter()
+                .find(|train| train.repo == *repo)
+                .cloned()
+                .map(DetailTarget::Train),
+        }
+    }
+
+    /// The pull request list that a release detail screen walks.
+    fn release_prs(&self, state: &StateView) -> Option<Vec<u64>> {
+        match self.target(state)? {
+            DetailTarget::Decision(decision) => match &decision.kind {
+                DecisionKind::ReleaseGate { prs } => Some(prs.clone()),
+                _ => None,
+            },
+            DetailTarget::Train(train) => Some(train_detail_prs(&train)),
+        }
+    }
 }
 
 /// The option picks for one exact question snapshot.
@@ -216,21 +265,15 @@ impl Inbox {
         }) {
             self.input = None;
         }
-        if self.detail.as_ref().is_some_and(|detail| {
-            !state
-                .decisions
-                .iter()
-                .any(|decision| decision.id == detail.decision_id)
-        }) {
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.anchor.target(state).is_none())
+        {
             self.detail = None;
         }
         if let Some(detail) = self.detail.as_mut() {
-            if let Some(DecisionKind::ReleaseGate { prs }) = state
-                .decisions
-                .iter()
-                .find(|decision| decision.id == detail.decision_id)
-                .map(|decision| &decision.kind)
-            {
+            if let Some(prs) = detail.anchor.release_prs(state) {
                 if detail
                     .item_number
                     .is_none_or(|number| !prs.contains(&number))
@@ -469,8 +512,46 @@ impl Inbox {
             DecisionKind::ReleaseGate { prs } => prs.first().copied(),
             _ => None,
         };
+        self.open_anchor(DetailAnchor::Decision(decision.id.clone()), item_number);
+    }
+
+    /// Open the release detail of one release-train pull request.
+    ///
+    /// The screen follows the open gate row when the repository has one
+    /// and the pull request belongs to it. Otherwise the screen follows
+    /// the release train itself. The call returns false when neither the
+    /// gate nor the train holds the pull request.
+    pub fn open_release_pr(&mut self, state: &StateView, repo: &str, pr: u64) -> bool {
+        let gate = state.decisions.iter().find(|decision| {
+            decision.repo == repo
+                && decision.id == format!("gate:{repo}")
+                && matches!(decision.kind, DecisionKind::ReleaseGate { .. })
+        });
+        if let Some(decision) = gate {
+            let DecisionKind::ReleaseGate { prs } = &decision.kind else {
+                return false;
+            };
+            if prs.contains(&pr) {
+                self.open_anchor(DetailAnchor::Decision(decision.id.clone()), Some(pr));
+                return true;
+            }
+        }
+        let in_train = state
+            .trains
+            .iter()
+            .find(|train| train.repo == repo)
+            .is_some_and(|train| train_detail_prs(train).contains(&pr));
+        if !in_train {
+            return false;
+        }
+        self.open_anchor(DetailAnchor::Train(repo.to_string()), Some(pr));
+        true
+    }
+
+    /// Show one anchor with one initial pull request and a fresh scroll.
+    fn open_anchor(&mut self, anchor: DetailAnchor, item_number: Option<u64>) {
         self.detail = Some(DetailState {
-            decision_id: decision.id.clone(),
+            anchor,
             item_number,
             scroll: Cell::new(0),
             scroll_max: Cell::new(0),
@@ -484,21 +565,18 @@ impl Inbox {
         key: KeyEvent,
         sink: &mut impl ActionSink,
     ) -> InboxOutcome {
-        let Some(id) = self
-            .detail
-            .as_ref()
-            .map(|detail| detail.decision_id.clone())
-        else {
+        let Some(anchor) = self.detail.as_ref().map(|detail| detail.anchor.clone()) else {
             return InboxOutcome::None;
         };
-        let Some(decision) = state
-            .decisions
-            .iter()
-            .find(|decision| decision.id == id)
-            .cloned()
-        else {
+        let Some(target) = anchor.target(state) else {
             self.detail = None;
             return InboxOutcome::None;
+        };
+        let is_release = match &target {
+            DetailTarget::Decision(decision) => {
+                matches!(decision.kind, DecisionKind::ReleaseGate { .. })
+            }
+            DetailTarget::Train(_) => true,
         };
         match key.code {
             KeyCode::Esc => {
@@ -521,27 +599,33 @@ impl Inbox {
                 self.scroll_detail(-i32::from(SCROLL_STEP));
                 InboxOutcome::None
             }
-            KeyCode::Left | KeyCode::Char('h')
-                if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) =>
-            {
-                self.move_detail_pr(&decision, -1);
+            KeyCode::Left | KeyCode::Char('h') if is_release => {
+                let prs = anchor.release_prs(state).unwrap_or_default();
+                self.move_detail_pr(&prs, -1);
                 InboxOutcome::None
             }
-            KeyCode::Right | KeyCode::Char('l')
-                if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) =>
-            {
-                self.move_detail_pr(&decision, 1);
+            KeyCode::Right | KeyCode::Char('l') if is_release => {
+                let prs = anchor.release_prs(state).unwrap_or_default();
+                self.move_detail_pr(&prs, 1);
                 InboxOutcome::None
             }
-            KeyCode::Char(' ') if matches!(decision.kind, DecisionKind::ReleaseGate { .. }) => {
-                self.toggle_detail_pr(&decision);
+            KeyCode::Char(' ') if is_release && matches!(target, DetailTarget::Decision(_)) => {
+                if let DetailTarget::Decision(decision) = target {
+                    self.toggle_detail_pr(&decision);
+                }
                 InboxOutcome::None
             }
-            KeyCode::Char('o') => match task_id(&decision) {
-                Some(task) => InboxOutcome::OpenSession(task.to_string()),
-                None => InboxOutcome::None,
+            KeyCode::Char('o') => match &target {
+                DetailTarget::Decision(decision) => match task_id(decision) {
+                    Some(task) => InboxOutcome::OpenSession(task.to_string()),
+                    None => InboxOutcome::None,
+                },
+                DetailTarget::Train(_) => InboxOutcome::None,
             },
-            _ => self.row_key(state, key, sink),
+            _ => match target {
+                DetailTarget::Decision(_) => self.row_key(state, key, sink),
+                DetailTarget::Train(_) => InboxOutcome::None,
+            },
         }
     }
 
@@ -557,10 +641,7 @@ impl Inbox {
     }
 
     /// Move the release detail by one pull request and clamp at both ends.
-    fn move_detail_pr(&mut self, decision: &Decision, step: isize) {
-        let DecisionKind::ReleaseGate { prs } = &decision.kind else {
-            return;
-        };
+    fn move_detail_pr(&mut self, prs: &[u64], step: isize) {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
@@ -1109,16 +1190,101 @@ fn task_id(decision: &Decision) -> Option<&str> {
 /// open. `now_ms` stamps the age column; the shell passes [`now_ms`].
 pub fn draw(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms: u64) {
     if let Some(detail) = inbox.detail.as_ref() {
-        if let Some(decision) = state
-            .decisions
-            .iter()
-            .find(|decision| decision.id == detail.decision_id)
-        {
-            draw_detail(f, area, state, inbox, decision, detail, now_ms);
-            return;
+        match detail.anchor.target(state) {
+            Some(DetailTarget::Decision(decision)) => {
+                draw_detail(f, area, state, inbox, &decision, detail, now_ms);
+                return;
+            }
+            Some(DetailTarget::Train(train)) => {
+                draw_train_detail(f, area, state, inbox, &train, detail);
+                return;
+            }
+            None => {}
         }
     }
     draw_feed(f, area, state, inbox, now_ms);
+}
+
+/// Draw a release-train detail without an open gate row.
+fn draw_train_detail(
+    f: &mut Frame,
+    area: Rect,
+    state: &StateView,
+    inbox: &Inbox,
+    train: &crate::sock::TrainView,
+    detail: &DetailState,
+) {
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let prs = train_detail_prs(train);
+    let Some(number) = detail
+        .item_number
+        .filter(|number| prs.contains(number))
+        .or_else(|| prs.first().copied())
+    else {
+        return draw_missing_item_detail(
+            f,
+            rows[0],
+            rows[1],
+            state,
+            inbox,
+            detail,
+            format!("PR · {}", train.repo),
+            "The train queue is empty.".to_string(),
+        );
+    };
+    draw_item_detail(
+        f,
+        rows[0],
+        rows[1],
+        state,
+        inbox,
+        detail,
+        &train.repo,
+        number,
+        width,
+    );
+}
+/// Draw one repository item detail, or the missing-item notice.
+#[allow(clippy::too_many_arguments)]
+fn draw_item_detail(
+    f: &mut Frame,
+    content_area: Rect,
+    footer_area: Rect,
+    state: &StateView,
+    inbox: &Inbox,
+    detail: &DetailState,
+    repo: &str,
+    number: u64,
+    width: usize,
+) {
+    let title = format!("PR #{number} · {repo}");
+    let Some((title, lines)) = item_lines(state, repo, ItemKind::Pr, number, width, &title) else {
+        return draw_missing_item_detail(
+            f,
+            content_area,
+            footer_area,
+            state,
+            inbox,
+            detail,
+            title,
+            "The pull request description is unavailable.".to_string(),
+        );
+    };
+    let scroll = clamped_detail_scroll(detail, lines.len(), content_area);
+    let content = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title(title))
+        .scroll((scroll, 0));
+    f.render_widget(content, content_area);
+    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
+}
+
+/// The pull requests of one train detail, in release lane order.
+fn train_detail_prs(train: &crate::sock::TrainView) -> Vec<u64> {
+    let batch = super::pipeline::displayed_batch(train);
+    let mut prs: Vec<u64> = batch.to_vec();
+    prs.extend(train.queue.iter().copied().filter(|pr| !batch.contains(pr)));
+    prs
 }
 
 /// Draw the oldest-first decision feed.
@@ -1309,7 +1475,9 @@ fn draw_detail(
     let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
             let title = format!("{} #{number} · {}", item_title_label(kind), decision.repo);
-            let Some(item) = find_item(state, &decision.repo, kind, number) else {
+            let Some((title, lines)) =
+                item_lines(state, &decision.repo, kind, number, width, &title)
+            else {
                 let noun = match kind {
                     ItemKind::Issue => "issue",
                     ItemKind::Pr => "pull request",
@@ -1325,25 +1493,6 @@ fn draw_detail(
                     format!("The {noun} description is unavailable."),
                 );
             };
-            let mut lines = wrapped_lines(
-                &item.title,
-                width,
-                "",
-                Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
-            );
-            lines.push(Line::from(""));
-            lines.push(Line::styled("Description", THEME.dim()));
-            let body = if item.body.trim().is_empty() {
-                "No description."
-            } else {
-                item.body.as_str()
-            };
-            lines.extend(wrapped_lines(
-                body,
-                width,
-                "",
-                Style::default().fg(THEME.text),
-            ));
             (title, lines)
         }
         None => agent_detail_lines(state, decision, now_ms, width),
@@ -1536,6 +1685,41 @@ fn find_item<'a>(
         .find(|item| item.repo == repo && item.kind == kind && item.number == number)
 }
 
+/// The bordered title and body lines of one repository item detail.
+///
+/// The call returns None when the state push carries no snapshot for the
+/// item.
+fn item_lines(
+    state: &StateView,
+    repo: &str,
+    kind: ItemKind,
+    number: u64,
+    width: usize,
+    title: &str,
+) -> Option<(String, Vec<Line<'static>>)> {
+    let item = find_item(state, repo, kind, number)?;
+    let mut lines = wrapped_lines(
+        &item.title,
+        width,
+        "",
+        Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Description", THEME.dim()));
+    let body = if item.body.trim().is_empty() {
+        "No description."
+    } else {
+        item.body.as_str()
+    };
+    lines.extend(wrapped_lines(
+        body,
+        width,
+        "",
+        Style::default().fg(THEME.text),
+    ));
+    Some((title.to_string(), lines))
+}
+
 /// Wrap text with a fixed prefix on every display line.
 fn wrapped_lines(text: &str, width: usize, prefix: &str, style: Style) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(prefix.chars().count()).max(1);
@@ -1566,29 +1750,32 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
         );
     }
     if let Some(detail) = inbox.detail.as_ref() {
-        let Some(decision) = state
-            .decisions
-            .iter()
-            .find(|decision| decision.id == detail.decision_id)
-        else {
-            return "esc back".to_string();
-        };
-        return match decision.kind {
-            DecisionKind::ReleaseGate { .. } => {
-                "esc back · j k scroll · h l pull request · space include/exclude · g release"
-                    .to_string()
-            }
-            DecisionKind::Permission { .. } => {
-                "esc back · j k scroll · y allow · n deny · o session".to_string()
-            }
-            DecisionKind::Question { .. } => {
-                "esc back · j k scroll · 1-9 pick · s submit · i write · o session".to_string()
-            }
-            DecisionKind::Stuck { .. } => {
-                "esc back · j k scroll · r retry · c cancel · o session".to_string()
-            }
-            DecisionKind::NeedsHuman { .. } => {
-                "esc back · j k scroll · t comment · c clear label".to_string()
+        return match &detail.anchor {
+            DetailAnchor::Train(_) => "esc back · j k scroll · h l pull request".to_string(),
+            DetailAnchor::Decision(id) => {
+                let Some(decision) = state.decisions.iter().find(|decision| decision.id == *id)
+                else {
+                    return "esc back".to_string();
+                };
+                match decision.kind {
+                    DecisionKind::ReleaseGate { .. } => {
+                        "esc back · j k scroll · h l pull request · space include/exclude · g release"
+                            .to_string()
+                    }
+                    DecisionKind::Permission { .. } => {
+                        "esc back · j k scroll · y allow · n deny · o session".to_string()
+                    }
+                    DecisionKind::Question { .. } => {
+                        "esc back · j k scroll · 1-9 pick · s submit · i write · o session"
+                            .to_string()
+                    }
+                    DecisionKind::Stuck { .. } => {
+                        "esc back · j k scroll · r retry · c cancel · o session".to_string()
+                    }
+                    DecisionKind::NeedsHuman { .. } => {
+                        "esc back · j k scroll · t comment · c clear label".to_string()
+                    }
+                }
             }
         };
     }
@@ -1634,8 +1821,9 @@ mod tests {
     use ratatui::Terminal;
 
     use super::*;
+    use crate::config::ReleasePolicy;
     use crate::model::Stage;
-    use crate::sock::{InputMode, PausedView, TaskView};
+    use crate::sock::{InputMode, ItemView, PausedView, RepoView, TaskView, TrainView};
     use crate::tasks::{Task, TaskState};
 
     /// The epoch time every test decision opens at.
@@ -3153,5 +3341,127 @@ mod tests {
             "screen: {}",
             render(&state, &inbox, OPENED)
         );
+    }
+
+    /// A state with one borsuk train and the content of its pull requests.
+    fn train_state(
+        decisions: Vec<Decision>,
+        queue: Vec<u64>,
+        stacked: Vec<u64>,
+        batch: Vec<u64>,
+    ) -> StateView {
+        let mut items: Vec<ItemView> = Vec::new();
+        for number in queue.iter().chain(&stacked).chain(&batch) {
+            if items.iter().any(|item| item.number == *number) {
+                continue;
+            }
+            items.push(ItemView {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Pr,
+                number: *number,
+                title: format!("pr {number}"),
+                body: format!("body {number}"),
+            });
+        }
+        StateView {
+            repos: vec![RepoView {
+                alias: "borsuk".to_string(),
+                owner_repo: String::new(),
+            }],
+            stages: Vec::new(),
+            lanes: Vec::new(),
+            tasks: Vec::new(),
+            decisions,
+            decision_items: items,
+            tickets: Vec::new(),
+            trains: vec![TrainView {
+                repo: "borsuk".to_string(),
+                queue,
+                stacked,
+                batch,
+                policy: ReleasePolicy::Manual,
+                next_fire_ms: None,
+                in_flight: None,
+            }],
+            paused: PausedView {
+                global: false,
+                overrides: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn open_release_pr_prefers_the_open_gate_row() {
+        let state = train_state(
+            vec![Decision::release_gate("borsuk", vec![7, 9], OPENED)],
+            vec![7, 9],
+            vec![7],
+            Vec::new(),
+        );
+        let mut inbox = Inbox::new();
+
+        assert!(inbox.open_release_pr(&state, "borsuk", 9));
+
+        assert!(inbox.detail_open());
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
+        assert!(screen.contains("pr 9"), "body:\n{screen}");
+        assert!(
+            screen.contains("space include/exclude · g release"),
+            "footer:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn open_release_pr_follows_the_train_without_a_gate() {
+        let state = train_state(Vec::new(), vec![7, 9], Vec::new(), Vec::new());
+        let mut inbox = Inbox::new();
+
+        assert!(inbox.open_release_pr(&state, "borsuk", 9));
+
+        assert!(inbox.detail_open());
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
+        assert!(screen.contains("h l pull request"), "footer:\n{screen}");
+
+        // Left moves through the train queue; Esc closes the detail.
+        let (mut tx, rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Left), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("PR #7 · borsuk"), "moved:\n{screen}");
+        assert!(rx.try_recv().is_err(), "a detail key sends no action");
+
+        inbox.handle_key(&state, press_code(KeyCode::Esc), &mut tx);
+        assert!(!inbox.detail_open());
+    }
+
+    #[test]
+    fn open_release_pr_refuses_a_pull_request_outside_the_release_lane() {
+        let state = train_state(Vec::new(), vec![7], Vec::new(), Vec::new());
+        let mut inbox = Inbox::new();
+
+        assert!(!inbox.open_release_pr(&state, "borsuk", 42));
+        assert!(!inbox.detail_open());
+        assert!(!inbox.open_release_pr(&state, "ryba", 7));
+        assert!(!inbox.detail_open());
+    }
+
+    #[test]
+    fn observe_reanchors_and_drops_the_train_detail() {
+        let state = train_state(Vec::new(), vec![7, 9], Vec::new(), Vec::new());
+        let mut inbox = Inbox::new();
+        assert!(inbox.open_release_pr(&state, "borsuk", 9));
+
+        // The pull request 9 leaves the queue: the detail re-anchors.
+        let shrunken = train_state(Vec::new(), vec![7], Vec::new(), Vec::new());
+        inbox.observe(&shrunken);
+        assert!(inbox.detail_open());
+        let screen = render(&shrunken, &inbox, OPENED);
+        assert!(screen.contains("PR #7 · borsuk"), "re-anchored:\n{screen}");
+
+        // The train itself leaves the state: the detail closes.
+        let bare = state_with(Vec::new());
+        inbox.observe(&bare);
+        assert!(!inbox.detail_open());
     }
 }

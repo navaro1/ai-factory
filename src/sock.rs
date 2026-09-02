@@ -234,7 +234,7 @@ impl StateInput<'_> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let trains = config
+        let trains: Vec<TrainView> = config
             .repos
             .keys()
             .map(|repo| {
@@ -261,7 +261,7 @@ impl StateInput<'_> {
                 }
             })
             .collect();
-        let decision_items = decision_items(decisions, snapshot);
+        let decision_items = decision_items(decisions, snapshot, &trains);
         let mut tickets: Vec<TicketSummary> = config
             .repos
             .keys()
@@ -330,8 +330,13 @@ impl StateInput<'_> {
     }
 }
 
-/// Build the repository item content that open decisions can display.
-fn decision_items(decisions: &Decisions, snapshot: &Snapshot) -> Vec<ItemView> {
+/// Build the repository item content that open decisions and release
+/// trains display.
+fn decision_items(
+    decisions: &Decisions,
+    snapshot: &Snapshot,
+    trains: &[TrainView],
+) -> Vec<ItemView> {
     let mut items = Vec::new();
     for decision in decisions.open() {
         match &decision.kind {
@@ -346,6 +351,11 @@ fn decision_items(decisions: &Decisions, snapshot: &Snapshot) -> Vec<ItemView> {
             crate::decisions::DecisionKind::Permission { .. }
             | crate::decisions::DecisionKind::Question { .. }
             | crate::decisions::DecisionKind::Stuck { .. } => {}
+        }
+    }
+    for train in trains {
+        for number in train.batch.iter().chain(&train.stacked).chain(&train.queue) {
+            push_item(&mut items, snapshot, &train.repo, ItemKind::Pr, *number);
         }
     }
     items
@@ -399,7 +409,7 @@ pub struct RepoView {
     pub owner_repo: String,
 }
 
-/// One repository item that an open decision references.
+/// One repository item that an open decision or a release train references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemView {
     /// The repository alias.
@@ -2426,6 +2436,89 @@ mod tests {
                     body: "Require a current release state.".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_view_carries_the_release_train_pull_request_content() {
+        use crate::model::{Pr, RepoSnapshot, Snapshot};
+
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let policies = BTreeMap::new();
+        let mut trains = BTreeMap::new();
+        let mut train = Train::new("borsuk");
+        train.enqueue(7);
+        train.enqueue(9);
+        train.stacked.push(7);
+        trains.insert("borsuk".to_string(), train);
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [
+                    (
+                        7,
+                        Pr {
+                            number: 7,
+                            node_id: "pr-node-7".to_string(),
+                            title: "Protect the release gate".to_string(),
+                            body: "Require a current release state.".to_string(),
+                            labels: Vec::new(),
+                            open: true,
+                            draft: false,
+                            head_sha: "sha-7".to_string(),
+                            head_ref: "aif/release-7".to_string(),
+                        },
+                    ),
+                    (
+                        9,
+                        Pr {
+                            number: 9,
+                            node_id: "pr-node-9".to_string(),
+                            title: "Add the train detail".to_string(),
+                            body: "Show the queued pull request.".to_string(),
+                            labels: Vec::new(),
+                            open: true,
+                            draft: false,
+                            head_sha: "sha-9".to_string(),
+                            head_ref: "aif/release-9".to_string(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            trains: &trains,
+            policies: &policies,
+            input_modes: &BTreeMap::new(),
+            snapshot: &snapshot,
+            now_ms: 3_000,
+        }
+        .build()
+        .unwrap();
+
+        // No decision is open, yet the train pull requests carry content,
+        // so the release detail can describe them.
+        assert!(view.decisions.is_empty());
+        assert_eq!(
+            view.decision_items
+                .iter()
+                .map(|item| (item.number, item.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(7, "Protect the release gate"), (9, "Add the train detail")],
         );
     }
 
