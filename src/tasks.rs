@@ -193,15 +193,11 @@ impl TaskTable {
         let id = id_for(repo, stage, kind, number);
         if let Some(existing) = self.by_id.get(&id) {
             if !existing.state.is_terminal() {
-                let what = if kind == ItemKind::Issue {
-                    "issue"
-                } else {
-                    "pull request"
-                };
                 return Err(anyhow!(
-                    "task \"{}\" ({}) already covers {repo} {stage} {what} {number}",
+                    "task \"{}\" ({}) already covers {repo} {stage} {} {number}",
                     existing.id,
                     existing.state,
+                    kind.noun(),
                 ));
             }
         }
@@ -527,6 +523,38 @@ mod tests {
             assert!(error.contains("already covers"), "message: {error}");
             assert_eq!(table.by_id.len(), 1, "the blocking task stays");
         }
+    }
+
+    #[test]
+    fn the_upsert_refusal_names_the_item_with_the_vocabulary() {
+        let (mut table, _) = table_in_state(TaskState::Queued);
+        let error = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                PathBuf::from("log"),
+                LATER,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ticket 142"), "message: {error}");
+
+        let mut table = TaskTable::new();
+        queued(&mut table, "borsuk", Stage::Review, ItemKind::Pr, 7);
+        let error = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Pr,
+                7,
+                PathBuf::from("log"),
+                LATER,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PR 7"), "message: {error}");
     }
 
     #[test]

@@ -279,13 +279,13 @@ pub fn clean(env: &DoctorEnv, yes: bool, confirm: &mut dyn FnMut() -> Result<boo
     if removals.is_empty() {
         println!(
             "nothing to clean: every worktree belongs to an open item, an \
-             unmerged pull request, or an item with unknown state"
+             unmerged PR, or an item with unknown state"
         );
         return Ok(0);
     }
     println!(
-        "The doctor removes these worktrees, because their issues are closed \
-         or their pull requests are merged:"
+        "The doctor removes these worktrees, because their tickets are closed \
+         or their PRs are merged:"
     );
     for removal in &removals {
         println!("  {}", removal.path.display());
@@ -1097,13 +1097,13 @@ impl WorktreeState {
     /// Describe the state for the report and the clean preview.
     fn detail(self, number: u64) -> String {
         match self {
-            WorktreeState::IssueOpen => format!("issue {number} is open"),
-            WorktreeState::IssueClosed => format!("issue {number} is closed"),
-            WorktreeState::PullOpen => format!("pull request {number} is open"),
+            WorktreeState::IssueOpen => format!("ticket {number} is open"),
+            WorktreeState::IssueClosed => format!("ticket {number} is closed"),
+            WorktreeState::PullOpen => format!("PR {number} is open"),
             WorktreeState::PullClosed => {
-                format!("pull request {number} is closed without a merge")
+                format!("PR {number} is closed without a merge")
             }
-            WorktreeState::PullMerged => format!("pull request {number} is merged"),
+            WorktreeState::PullMerged => format!("PR {number} is merged"),
         }
     }
 }
@@ -1926,7 +1926,7 @@ mod tests {
             .expect("the open worktree check must exist");
         assert_eq!(open.status, Status::Info);
         assert!(
-            open.detail.contains("issue 7 is open"),
+            open.detail.contains("ticket 7 is open"),
             "detail: {}",
             open.detail
         );
@@ -1935,7 +1935,7 @@ mod tests {
             .find(|check| check.label == "worktree acme issue-8")
             .expect("the closed worktree check must exist");
         assert!(
-            closed.detail.contains("issue 8 is closed"),
+            closed.detail.contains("ticket 8 is closed"),
             "detail: {}",
             closed.detail
         );

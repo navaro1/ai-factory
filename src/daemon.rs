@@ -37,6 +37,10 @@ use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
+use crate::prompts::{
+    IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT, TICKET_CHAT_PROMPT,
+    TICKET_PROMPT,
+};
 use crate::runner::claude::ClaudeRunner;
 use crate::runner::opencode::OpenCodeRunner;
 use crate::runner::{Answer, Job, RunEvent, Runner, Session};
@@ -1893,7 +1897,7 @@ impl Daemon {
                         let id = tasks::ticket_chat_id(&repo, number);
                         self.chat(
                             &id,
-                            "AIF applied the shown proposal to the GitHub issue. Continue with the confirmed content.",
+                            "AIF applied the shown proposal to the GitHub ticket. Continue with the confirmed content.",
                         );
                     }
                 }
@@ -3094,135 +3098,6 @@ fn builtin_prompt(stage: Stage) -> &'static str {
         Stage::Release => RELEASE_PROMPT,
     }
 }
-
-/// The built-in prompt of a refine run.
-///
-/// It runs in the repository checkout and never creates a worktree.
-pub const REFINE_PROMPT: &str = r#"You refine one GitHub issue in the repository {repo}
-({owner_repo}). You work in {worktree}, the repository checkout. Never create
-a git worktree; stay in this checkout.
-
-Issue #{number}: {title}
-
-{body}
-
-Read the issue and the surrounding code. Edit the issue body until it is a
-complete, testable specification: the problem, the agreed approach, the
-acceptance criteria. Write comments on the issue with `gh` when you decide
-something the body must record.
-
-When you need a human decision, add the `needs-human` label to the issue with
-`gh` and state the question in a comment. Stop after the label is on.
-
-When the specification is complete, run
-`gh issue edit {number} --remove-label to-refine --add-label refined`.
-Run this command only after the issue body is complete. Then report one line
-that says the issue is refined.
-"#;
-
-/// The built-in prompt of an implement run.
-pub const IMPLEMENT_PROMPT: &str = r#"You implement GitHub issue #{number} of {repo}
-({owner_repo}). You work in {worktree}, your own git worktree. Never create
-another git worktree; work only in this one.
-
-Issue #{number}: {title}
-
-{body}
-
-Implement the issue on the current branch. Follow its acceptance criteria.
-Run the test suite and make it pass. Commit your work in small, complete
-commits. Open a draft pull request with `gh pr create --draft` when the work is
-done. Put `Closes #{number}` in the body. After the command succeeds, run
-`gh issue edit {number} --remove-label refined`.
-
-If the specification is incomplete, or you need a human decision, add the
-`needs-human` label to issue #{number} with `gh`, write the question into a
-comment on it, and stop. Do not guess.
-
-Report one line at the end: what you did, and the pull request number.
-"#;
-
-/// The built-in prompt of a review run.
-pub const REVIEW_PROMPT: &str = r#"You review one pull request of {repo}
-({owner_repo}). You work in {worktree}, your own git worktree. Never create
-another git worktree; work only in this one.
-
-Pull request #{number}: {title}
-
-{body}
-
-Read the diff of the pull request with `gh pr diff {number}`. Review it for
-correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`. If it is correct, approve it and then run
-`gh pr ready {number}`. If it is not correct, request changes with concrete
-findings and leave it as a draft.
-
-If the change needs a human decision, add the `needs-human` label to the
-pull request with `gh`, write the question into a comment, and stop. Do not
-guess.
-
-Report one line at the end: the review verdict.
-"#;
-
-/// The built-in prompt of a release run.
-pub const RELEASE_PROMPT: &str = r#"You release the stacked pull requests of {repo}
-({owner_repo}). You work in {worktree}, the release worktree. Never create
-another git worktree; work only in this one.
-
-The batch holds {pr_count} pull request(s), in merge order:
-
-{pr_list}
-
-Merge every pull request in the listed order with `gh pr merge`, one at a
-time. Merge order is {pr_numbers}. After each merge, pull the base branch
-into this worktree so the next merge sees the updated state. If a merge
-conflicts, stop, and report the pull request number that failed.
-
-When all merges are done, report one line: the released pull requests.
-"#;
-
-/// The built-in prompt of a ticket-creation session.
-pub const TICKET_PROMPT: &str = r#"You help the operator create one GitHub issue in the
-repository {repo} ({owner_repo}). You work in {worktree}, the repository
-checkout. Never create a git worktree; stay in this checkout.
-
-Ask the operator what the ticket should say, in short questions, one topic at
-a time. When you know enough, draft the title and body, show them, and on
-approval create the issue with `gh issue create`. Report the new issue
-number.
-
-If the operator asks for something you cannot decide alone, say so plainly
-and ask again.
-"#;
-
-/// The built-in prompt of a read-only issue conversation.
-pub const TICKET_CHAT_PROMPT: &str = r#"You review GitHub issue #{number} in repository
-{repo} ({owner_repo}). The repository checkout is {worktree}.
-
-Issue title: {title}
-Issue description:
-{body}
-
-Labels: {labels}
-Author: {author}
-Assignees: {assignees}
-Updated: {updated_at}
-GitHub reference: {github_url}
-
-Start with analysis. Do not propose a title or description change unless the
-operator explicitly requests that change. You can use only Read, Glob, and
-Grep. Do not edit files. Do not use a GitHub write command.
-
-When the operator explicitly requests a title or description change, finish
-the assistant turn with exactly one complete block in this form:
-
-<aif-ticket-proposal-v1>
-{"title":"New title","body":"New description"}
-</aif-ticket-proposal-v1>
-
-Put valid JSON between the markers. Do not quote the block. Do not put the
-block in a code fence. Include no text after the closing marker.
-"#;
 
 #[cfg(test)]
 mod tests {

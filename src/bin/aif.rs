@@ -61,7 +61,7 @@ enum Command {
         /// Path to the config file. Defaults to the config directory.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Remove the worktrees of closed issues and merged pull requests.
+        /// Remove the worktrees of closed tickets and merged PRs.
         #[arg(long)]
         clean: bool,
         /// Answer the confirmation question of `--clean` with yes.

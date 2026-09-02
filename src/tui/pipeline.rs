@@ -2992,7 +2992,7 @@ mod tests {
 
         let text = render_to_string(&mut app);
         assert!(text.contains("PR #5 · borsuk"), "detail:\n{text}");
-        assert!(text.contains("h l pull request"), "train footer:\n{text}");
+        assert!(text.contains("h l PR"), "train footer:\n{text}");
     }
 
     #[test]
