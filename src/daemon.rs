@@ -3227,7 +3227,7 @@ block in a code fence. Include no text after the closing marker.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StageConfig;
+    use crate::config::{ExecutionRole, Harness, RoleSettings, StageConfig};
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use serde_json::json;
@@ -3517,6 +3517,27 @@ mod tests {
         stages.insert(Stage::Implement, stage(1));
         stages.insert(Stage::Review, stage(2));
         stages.insert(Stage::Release, stage(1));
+        let role_settings = RoleSettings {
+            harness: Harness::Claude,
+            program: "claude".to_string(),
+            model: "m".to_string(),
+            effort: None,
+            extra_args: Vec::new(),
+            agent: None,
+            profile: None,
+            permission_mode: None,
+            permission_handler: None,
+            tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            strict_mcp: None,
+            auto_approve: Some(true),
+            approval_policy: None,
+            sandbox: None,
+        };
+        let roles = ExecutionRole::ALL
+            .into_iter()
+            .map(|role| (role, role_settings.clone()))
+            .collect();
         let mut repos = BTreeMap::new();
         repos.insert(
             "borsuk".to_string(),
@@ -3526,12 +3547,17 @@ mod tests {
                 owner_repo: "acme/borsuk".to_string(),
                 lanes: BTreeMap::new(),
                 release: ReleasePolicy::Manual,
+                role_overrides: BTreeMap::new(),
             },
         );
         Config {
+            schema_version: 1,
+            roles,
             stages,
             repos,
-            ticket_chat: crate::config::TicketChatConfig::default(),
+            ticket_chat: crate::config::TicketChatConfig {
+                model: Some("m".to_string()),
+            },
         }
     }
 

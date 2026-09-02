@@ -1303,10 +1303,10 @@ mod tests {
     /// Configuration text with plain stages, optional extra lines per stage
     /// table, and the given repository tables.
     fn config_text(stage_extras: &[(&str, &str)], repos: &str) -> String {
-        let mut text = String::new();
+        let mut text = "schema_version = 1\n".to_string();
         for stage in Stage::ALL {
             text.push_str(&format!(
-                "[stage.{stage}]\nmodel = \"model\"\nrunner = \"runner\"\n"
+                "[stage.{stage}]\nmodel = \"model\"\nharness = \"claude\"\n"
             ));
             for (name, extra) in stage_extras {
                 if *name == stage.as_str() {
@@ -1315,6 +1315,8 @@ mod tests {
                 }
             }
         }
+        text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
+        text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str(repos);
         text
     }

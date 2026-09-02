@@ -2072,12 +2072,14 @@ mod tests {
 
     /// Parse text for a config with four stages and two repositories.
     fn config_text() -> String {
-        let mut text = String::new();
+        let mut text = "schema_version = 1\n".to_string();
         for stage in Stage::ALL {
             text.push_str(&format!(
-                "[stage.{stage}]\nmodel = \"model\"\nrunner = \"runner\"\nlimit = 3\n"
+                "[stage.{stage}]\nmodel = \"model\"\nharness = \"claude\"\nlimit = 3\n"
             ));
         }
+        text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
+        text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str("[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { implement = 1 }\n");
         text.push_str(
             "[repo.qubitsok]\npath = \"/tmp/q\"\nrelease = { policy = \"interval\", minutes = 30 }\n",
