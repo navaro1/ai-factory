@@ -1,4 +1,4 @@
-use aif::config::Config;
+use aif::config::{Config, Harness};
 
 const ROLES: &str = r#"
 schema_version = 1
@@ -241,19 +241,55 @@ fn rejects_empty_tool_names_and_inline_legacy_keys() {
 fn preserves_every_supported_field_and_default_program() {
     let text = ROLES
         .replace(
-            "[ticket.create]\nharness = \"opencode\"\nmodel = \"zai-coding-plan/glm-5.3-flash\"",
-            "[ticket.create]\nharness = \"opencode\"\nmodel = \"zai-coding-plan/glm-5.3-flash\"\nagent = \"creator\"\nauto_approve = true",
+            "[stage.refine]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"",
+            "[stage.refine]\nharness = \"claude\"\nprogram = \"claude-refine\"\nmodel = \"claude-refine-model\"\neffort = \"high\"\nextra_args = [\"--notice\", \"refine\"]\nagent = \"refiner\"\npermission_mode = \"manual\"\npermission_handler = \"inbox\"\ntools = [\"Read\", \"Glob\"]\ndisallowed_tools = [\"Bash\"]\nstrict_mcp = true",
         )
         .replace(
-            "tools = [\"Read\", \"Glob\", \"Grep\"]",
-            "tools = [\"Read\", \"Glob\", \"Grep\"]\ndisallowed_tools = [\"Bash\"]\nstrict_mcp = true",
+            "[stage.implement]\nharness = \"opencode\"\nmodel = \"zai-coding-plan/glm-5.3-flash\"",
+            "[stage.implement]\nharness = \"opencode\"\nprogram = \"opencode-build\"\nmodel = \"opencode-build-model\"\neffort = \"max\"\nextra_args = [\"--notice\", \"build\"]\nagent = \"builder\"\nauto_approve = false",
+        )
+        .replace(
+            "[stage.review]\nharness = \"codex\"\nmodel = \"gpt-5.6-sol\"\nprofile = \"reviewer\"\neffort = \"xhigh\"\napproval_policy = \"never\"\nsandbox = \"workspace-write\"\nextra_args = []",
+            "[stage.review]\nharness = \"codex\"\nprogram = \"codex-review\"\nmodel = \"codex-review-model\"\neffort = \"xhigh\"\nextra_args = [\"--notice\", \"review\"]\nprofile = \"reviewer\"\napproval_policy = \"never\"\nsandbox = \"workspace-write\"",
         );
     let config = Config::parse(&text).expect("every supported field must parse");
 
+    let refine = &config.resolved_role(None, "stage.refine").unwrap().settings;
+    assert_eq!(refine.harness, Harness::Claude);
+    assert_eq!(refine.program, "claude-refine");
+    assert_eq!(refine.model, "claude-refine-model");
+    assert_eq!(refine.effort.as_deref(), Some("high"));
+    assert_eq!(refine.extra_args, ["--notice", "refine"]);
+    assert_eq!(refine.agent.as_deref(), Some("refiner"));
+    assert_eq!(refine.permission_mode.as_deref(), Some("manual"));
+    assert_eq!(refine.permission_handler.as_deref(), Some("inbox"));
+    assert_eq!(refine.tools, ["Read", "Glob"]);
+    assert_eq!(refine.disallowed_tools, ["Bash"]);
+    assert_eq!(refine.strict_mcp, Some(true));
+
+    let implement = &config
+        .resolved_role(None, "stage.implement")
+        .unwrap()
+        .settings;
+    assert_eq!(implement.harness, Harness::Opencode);
+    assert_eq!(implement.program, "opencode-build");
+    assert_eq!(implement.model, "opencode-build-model");
+    assert_eq!(implement.effort.as_deref(), Some("max"));
+    assert_eq!(implement.extra_args, ["--notice", "build"]);
+    assert_eq!(implement.agent.as_deref(), Some("builder"));
+    assert_eq!(implement.auto_approve, Some(false));
+
+    let review = &config.resolved_role(None, "stage.review").unwrap().settings;
+    assert_eq!(review.harness, Harness::Codex);
+    assert_eq!(review.program, "codex-review");
+    assert_eq!(review.model, "codex-review-model");
+    assert_eq!(review.effort.as_deref(), Some("xhigh"));
+    assert_eq!(review.extra_args, ["--notice", "review"]);
+    assert_eq!(review.profile.as_deref(), Some("reviewer"));
+    assert_eq!(review.approval_policy.as_deref(), Some("never"));
+    assert_eq!(review.sandbox.as_deref(), Some("workspace-write"));
+
     for (role, program) in [
-        ("stage.refine", "claude"),
-        ("stage.implement", "opencode"),
-        ("stage.review", "codex"),
         ("stage.release", "claude"),
         ("ticket.create", "opencode"),
         ("ticket.chat", "claude"),
@@ -263,12 +299,6 @@ fn preserves_every_supported_field_and_default_program() {
             program
         );
     }
-    let create = config.resolved_role(None, "ticket.create").unwrap();
-    assert_eq!(create.settings.agent.as_deref(), Some("creator"));
-    assert_eq!(create.settings.auto_approve, Some(true));
-    let chat = config.resolved_role(None, "ticket.chat").unwrap();
-    assert_eq!(chat.settings.disallowed_tools, ["Bash"]);
-    assert_eq!(chat.settings.strict_mcp, Some(true));
 }
 
 #[test]
