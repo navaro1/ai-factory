@@ -365,7 +365,8 @@ runs the formatter, the linter, and the tests. The tests run offline. They
 use fake binaries and recorded fixtures, and never touch the network or a
 real agent.
 
-The file `docs/v0.5/SPEC.md` specifies the whole system.
+The [v0.5 specification](docs/v0.5/SPEC.md) describes the base system.
+The [v0.6 migration guide](docs/v0.6/MIGRATION.md) describes the configuration break.
 
 To release a version:
 
