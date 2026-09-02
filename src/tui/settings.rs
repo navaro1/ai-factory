@@ -333,13 +333,14 @@ impl Settings {
             }
             return;
         }
+        let mut apply = None;
         match key.code {
             KeyCode::Esc => {
-                let editor = self.list_editor.take().expect("the editor exists");
-                self.set_list(state, editor.field, editor.rows);
+                self.list_editor = None;
+                return;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                editor.selected = (editor.selected + 1).min(editor.rows.len().saturating_sub(1));
+                editor.selected = (editor.selected + 1).min(editor.rows.len());
             }
             KeyCode::Char('k') | KeyCode::Up => editor.selected = editor.selected.saturating_sub(1),
             KeyCode::Char('a') => {
@@ -353,18 +354,29 @@ impl Settings {
                 }
             }
             KeyCode::Enter => {
-                if editor.rows.is_empty() {
-                    editor.rows.push(String::new());
-                    editor.selected = 0;
+                if editor.selected == editor.rows.len() {
+                    apply = Some((editor.field, editor.rows.clone()));
+                } else {
+                    let current = editor.rows[editor.selected].clone();
+                    editor.row_editor = Some(current);
                 }
-                let current = editor.rows[editor.selected].clone();
-                editor.row_editor = Some(current);
             }
             _ => {}
+        }
+        if let Some((field, rows)) = apply {
+            self.list_editor = None;
+            self.set_list(state, field, rows);
         }
     }
 
     fn save(&mut self, state: &StateView) -> Option<Action> {
+        if self.pending_request.is_some() {
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                "a settings request is pending".to_string(),
+            ));
+            return None;
+        }
         let Some(draft) = self.draft.clone() else {
             self.status = Some((SettingsResultStatus::Failed, "no draft to save".to_string()));
             return None;
@@ -723,11 +735,7 @@ impl Settings {
         let scope = self.scope_line(state);
         let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
         frame.render_widget(Paragraph::new(scope), chunks[0]);
-        let panes = if narrow {
-            Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(chunks[1])
-        } else {
-            Layout::horizontal([Constraint::Length(22), Constraint::Min(30)]).split(chunks[1])
-        };
+        let panes = settings_panes(chunks[1], narrow);
         self.draw_roles(frame, panes[0]);
         self.draw_form(frame, panes[1], state);
         self.draw_editor(frame, area);
@@ -882,6 +890,15 @@ impl Settings {
             if editor.rows.is_empty() {
                 lines.push(Line::from(Span::styled("  (no rows)", THEME.dim())));
             }
+            let marker = if editor.selected == editor.rows.len() {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} apply list"),
+                Style::default().fg(THEME.accent),
+            )));
             if let Some(buffer) = &editor.row_editor {
                 lines.push(Line::from(format!("> edit: {buffer}")));
                 lines.push(Line::from(Span::styled(
@@ -890,7 +907,7 @@ impl Settings {
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
-                    "a add  d delete  Enter edit  Esc apply list",
+                    "j/k row  a add  d delete  Enter edit/apply  Esc cancel",
                     THEME.dim(),
                 )));
             }
@@ -905,6 +922,21 @@ impl Settings {
     fn field_source(&self, state: &StateView, field: Field) -> Option<SettingsSource> {
         if self.scope == 0 {
             return Some(SettingsSource::Global);
+        }
+        if self.draft.as_ref().is_some_and(|draft| {
+            draft.scope == self.scope
+                && draft.role == self.selected_role_for()
+                && matches!(
+                    &draft.value,
+                    DraftValue::Repository {
+                        override_settings,
+                        ..
+                    } if override_settings.harness.is_some()
+                )
+        }) {
+            return Some(SettingsSource::Repository {
+                alias: self.repositories(state).get(self.scope - 1)?.clone(),
+            });
         }
         if self.draft.as_ref().is_some_and(|draft| {
             draft.scope == self.scope
@@ -1315,6 +1347,16 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
     }
 }
 
+fn settings_panes(area: Rect, narrow: bool) -> [Rect; 2] {
+    if narrow {
+        let panes = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(area);
+        [panes[0], panes[1]]
+    } else {
+        let panes = Layout::horizontal([Constraint::Length(22), Constraint::Min(30)]).split(area);
+        [panes[0], panes[1]]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,10 +1553,32 @@ mod tests {
         settings.handle_key(&state, key(KeyCode::Enter));
         settings.handle_key(&state, key(KeyCode::Char('k')));
         settings.handle_key(&state, key(KeyCode::Char('d')));
-        settings.handle_key(&state, key(KeyCode::Esc));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
         assert_eq!(
             settings.current_settings(&state).unwrap().extra_args,
             vec!["-q"]
+        );
+    }
+
+    #[test]
+    fn escape_cancels_all_pending_list_changes() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::ExtraArgs);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('a')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('x')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let output = text(&settings, &state, 100, 28);
+        assert!(output.contains("Enter edit/apply"));
+        assert!(output.contains("Esc cancel"));
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(!settings.dirty());
+        assert_eq!(
+            settings.current_settings(&state).unwrap().extra_args,
+            Vec::<String>::new()
         );
     }
 
@@ -1653,6 +1717,39 @@ mod tests {
     }
 
     #[test]
+    fn two_quick_save_keys_send_once_and_out_of_order_results_do_not_replace_it() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "model-two");
+        let Action::SaveSettings { request, .. } = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("first save")
+        else {
+            panic!("wrong action");
+        };
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .is_none());
+        settings.observe_result(SettingsResult {
+            request: "later-unrelated-request".to_string(),
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Saved,
+            revision: "wrong-revision".to_string(),
+            message: None,
+        });
+        assert!(settings.dirty());
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Saved,
+            revision: "rev-two".to_string(),
+            message: None,
+        });
+        assert!(!settings.dirty());
+    }
+
+    #[test]
     fn escape_cancels_an_editor_then_confirms_draft_removal() {
         let state = state();
         let mut settings = Settings::default();
@@ -1747,6 +1844,78 @@ mod tests {
         assert_eq!(replacement.profile, None);
         assert_eq!(replacement.approval_policy, None);
         assert_eq!(replacement.sandbox, None);
+    }
+
+    #[test]
+    fn a_repository_harness_change_marks_the_complete_form_as_repository_owned() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        for field in settings.visible_fields(&state) {
+            assert!(matches!(
+                settings.field_source(&state, field),
+                Some(SettingsSource::Repository { .. })
+            ));
+        }
+        let output = text(&settings, &state, 100, 28);
+        assert!(!output.contains("~ program"), "{output}");
+        assert!(output.contains("+ program"), "{output}");
+    }
+
+    #[test]
+    fn narrow_layout_places_the_form_below_the_role_pane() {
+        let [roles, form] = settings_panes(Rect::new(0, 2, 50, 30), true);
+        assert!(form.y >= roles.y + roles.height);
+        assert_eq!(roles.x, form.x);
+        let [roles, form] = settings_panes(Rect::new(0, 2, 100, 24), false);
+        assert!(form.x >= roles.x + roles.width);
+        assert_eq!(roles.y, form.y);
+    }
+
+    #[test]
+    fn claude_tool_lists_keep_their_field_order_and_apply_independently() {
+        let state = state();
+        let mut settings = Settings::default();
+        let fields = settings.visible_fields(&state);
+        let tools = fields
+            .iter()
+            .position(|field| *field == Field::Tools)
+            .unwrap();
+        let denied = fields
+            .iter()
+            .position(|field| *field == Field::DisallowedTools)
+            .unwrap();
+        assert_eq!(denied, tools + 1);
+
+        settings.set_field(Field::Tools);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('a')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        for character in "Write".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.current_settings(&state).unwrap().tools,
+            vec!["Read", "Write"]
+        );
+
+        settings.set_field(Field::DisallowedTools);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('a')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        for character in "Bash".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).unwrap();
+        assert_eq!(current.tools, vec!["Read", "Write"]);
+        assert_eq!(current.disallowed_tools, vec!["Bash"]);
     }
 
     #[test]
