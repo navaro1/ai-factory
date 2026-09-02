@@ -2691,10 +2691,17 @@ impl Daemon {
             return;
         };
         let log = self.log_path(repo, Stage::Release, ItemKind::Pr, first);
-        if let Err(e) =
-            self.table
-                .upsert_queued(repo, Stage::Release, ItemKind::Pr, first, log, self.now_ms)
-        {
+        if let Err(e) = self.table.upsert_with_id(
+            crate::tasks::ScopedTask {
+                id: &id,
+                repo,
+                stage: Stage::Release,
+                kind: ItemKind::Pr,
+                number: first,
+            },
+            log,
+            self.now_ms,
+        ) {
             eprintln!("the release task {id}: {e:#}");
             self.finish_train(repo, false);
             return;
@@ -4596,9 +4603,9 @@ mod tests {
 
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
         );
-        assert_eq!(rig.task("borsuk/release-p2").state, TaskState::Queued);
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Queued);
         assert_eq!(rig.job_count(), 0);
         assert!(
             rig.exec.calls().is_empty(),
@@ -5948,34 +5955,34 @@ mod tests {
         });
         assert!(rig.job(0).prompt.contains("#2"));
 
-        rig.event(exited("borsuk/release-p2", false, "first"));
-        assert_eq!(rig.task("borsuk/release-p2").attempt, 2);
+        rig.event(exited("borsuk/release", false, "first"));
+        assert_eq!(rig.task("borsuk/release").attempt, 2);
         assert!(rig.job(1).prompt.contains("#2"));
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
         );
         assert!(rig.decision("gate:borsuk").is_none());
 
-        rig.event(exited("borsuk/release-p2", false, "second"));
-        assert_eq!(rig.task("borsuk/release-p2").attempt, 3);
+        rig.event(exited("borsuk/release", false, "second"));
+        assert_eq!(rig.task("borsuk/release").attempt, 3);
         assert!(rig.job(2).prompt.contains("#2"));
 
-        rig.event(exited("borsuk/release-p2", false, "third"));
+        rig.event(exited("borsuk/release", false, "third"));
         assert_eq!(rig.job_count(), 3);
-        assert!(rig.decision("stuck:borsuk/release-p2:3").is_some());
+        assert!(rig.decision("stuck:borsuk/release:3").is_some());
         assert!(rig.decision("gate:borsuk").is_none());
 
         rig.act(Action::Answer {
-            decision_id: "stuck:borsuk/release-p2:3".to_string(),
+            decision_id: "stuck:borsuk/release:3".to_string(),
             response: Response::Retry,
         });
         assert_eq!(rig.job_count(), 4);
         assert!(rig.job(3).prompt.contains("#2"));
-        assert_eq!(rig.task("borsuk/release-p2").attempt, 1);
+        assert_eq!(rig.task("borsuk/release").attempt, 1);
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
         );
     }
 
@@ -6010,7 +6017,87 @@ mod tests {
         );
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
+        );
+    }
+
+    #[test]
+    fn a_fired_train_reads_the_scoped_id_in_the_view() {
+        let dir = temp_root();
+        let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));
+        let (mut rig, rx) = pushed_rig(steps);
+        rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
+
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+
+        let view = last_view(&rx);
+        assert!(
+            view.tasks.iter().any(|task| task.id == "borsuk/release"),
+            "task ids: {:?}",
+            view.tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(view
+            .trains
+            .iter()
+            .any(|train| train.in_flight.as_deref() == Some("borsuk/release")));
+    }
+
+    #[test]
+    fn a_second_batch_writes_its_own_log_file() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir))
+                .into_iter()
+                .chain(vec![gh_step(
+                    &[
+                        "api",
+                        "-i",
+                        "-X",
+                        "DELETE",
+                        "repos/acme/borsuk/issues/2/labels/release-stacked",
+                    ],
+                    gh_ok(),
+                )])
+                .chain(reuse_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(
+            vec![],
+            vec![
+                pr(2, false, &["release-stacked"]),
+                pr(5, false, &["release-stacked"]),
+            ],
+        );
+
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        assert!(rig
+            .task("borsuk/release")
+            .log_path
+            .ends_with("borsuk__release-p2.jsonl"));
+
+        rig.event(turn_finished("borsuk/release", true, "released"));
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![5],
+        });
+        assert!(
+            rig.task("borsuk/release")
+                .log_path
+                .ends_with("borsuk__release-p5.jsonl"),
+            "the log keeps the batch number"
         );
     }
 
@@ -6091,16 +6178,16 @@ mod tests {
         assert_eq!(rig.job_count(), 1);
 
         rig.act(Action::Abort {
-            task: "borsuk/release-p2".to_string(),
+            task: "borsuk/release".to_string(),
         });
 
         assert_eq!(
-            rig.task("borsuk/release-p2").state,
+            rig.task("borsuk/release").state,
             TaskState::Failed("cancelled".to_string())
         );
         assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
         assert_eq!(rig.daemon.trains["borsuk"].queue, vec![2]);
-        assert!(!rig.daemon.release_batches.contains_key("borsuk/release-p2"));
+        assert!(!rig.daemon.release_batches.contains_key("borsuk/release"));
     }
 
     #[test]
@@ -6306,7 +6393,7 @@ mod tests {
         assert_eq!(rig.job_count(), 1, "release waits for the review result");
         rig.event(turn_finished("borsuk/review-p5", true, "approved"));
         assert_eq!(rig.job_count(), 2);
-        assert_eq!(rig.job(1).task, "borsuk/release-p5");
+        assert_eq!(rig.job(1).task, "borsuk/release");
     }
 
     #[test]
@@ -6340,7 +6427,7 @@ mod tests {
         rig.event(exited("borsuk/review-p5", false, "review failed"));
 
         assert_eq!(rig.job_count(), 3, "only review attempts can run");
-        let release = rig.task("borsuk/release-p5");
+        let release = rig.task("borsuk/release");
         assert_eq!(release.state, TaskState::Queued);
         assert_eq!(release.attempt, 1, "the release never reached dispatch");
         assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());

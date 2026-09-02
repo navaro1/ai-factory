@@ -200,7 +200,7 @@ Last updated: 2026-09-02
 Last updated: 2026-09-02
 
 ### C3 — Review dispatch by links
-**Status:** `[ ]` pending
+**Status:** `[x]` DONE
 **Build:** Add the `review_item` helper and route `dispatch_one`, `task_cwd`, `prior_stage_active`, and `worktree_item` through it. Replace `review_issue_numbers` with the pinned ticket set filled at admit time. Supersede an active review when the head sha or the ticket set changes. Remove the branch refusal. Extract `ensure_on` in the worktree manager; add `pr_path`, `ensure_pr` (fetch `pull/<n>/head`, reset to the head sha), and `remove_pr`. Let the doctor ask the manager for owned directories; a pr worktree is cleanable when its PR is merged or closed. Make `implementation_transitioned` query the links cache, so one branch-rule derivation stays.
 **AC:**
 - A rig test dispatches a review of a PR that closes tickets 4 and 9, and asserts the session runs in `worktrees/<repo>/pr-<n>`.
@@ -214,6 +214,12 @@ Last updated: 2026-09-02
 - A doctor test lists a stale `pr-3` worktree for removal when PR 3 closes without a merge.
 **Depends on:** C1, C2 · **Traces to:** R4, R5, R6, R10, R11
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
+✅ IMPLEMENTED
+- `ensure_pr` needs no head sha: the `pull/<n>/head` fetch brings the PR head itself, so R5 holds through FETCH_HEAD.
+- The chat-resume AC changed shape: a finished Claude review is input-closed by design, so the test proves the worktree consistency through the session marker, which the Started event writes into the PR worktree via `task_cwd`.
+- R10 needed one new guard: the sibling blocker covered only chat follow-ups, so the dispatch loop now also skips a task whose worktree a running or awaiting task owns (`worktree_holder`). The rig test covers two reviews of two PRs of one ticket.
+- The supersede check needs a gate re-open to run; both rig tests flip the draft state to re-open the gate with the same head.
+Last updated: 2026-09-02
 
 ### C4 — Stable release task id
 **Status:** `[ ]` pending

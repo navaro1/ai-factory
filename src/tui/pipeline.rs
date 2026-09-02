@@ -199,7 +199,7 @@ fn release_batch_task_id(train: &crate::sock::TrainView) -> Option<String> {
         .batch
         .iter()
         .min()
-        .map(|first| format!("{}/release-p{first}", train.repo))
+        .map(|_| crate::tasks::scoped_id(&train.repo, "release"))
 }
 
 /// True when the stage shows no repository group and no train.
@@ -1730,72 +1730,77 @@ pub(crate) fn sample_view() -> StateView {
             },
         ],
         lanes: Vec::new(),
-        tasks: vec![
-            task(
-                "borsuk",
-                Stage::Refine,
-                ItemKind::Issue,
-                142,
-                TaskState::Queued,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Refine,
-                ItemKind::Issue,
-                143,
-                TaskState::Running,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Implement,
-                ItemKind::Issue,
-                140,
-                TaskState::Running,
-                2,
-            ),
-            task(
-                "ryba",
-                Stage::Implement,
-                ItemKind::Issue,
-                7,
-                TaskState::Queued,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Review,
-                ItemKind::Pr,
-                7,
-                TaskState::Running,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Review,
-                ItemKind::Pr,
-                9,
-                TaskState::AwaitingUser,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Release,
-                ItemKind::Pr,
-                5,
-                TaskState::Running,
-                1,
-            ),
-            task(
-                "ryba",
-                Stage::Refine,
-                ItemKind::Issue,
-                9,
-                TaskState::Failed("exit 1".to_string()),
-                3,
-            ),
-        ],
+        tasks: {
+            let mut tasks = vec![
+                task(
+                    "borsuk",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    142,
+                    TaskState::Queued,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    143,
+                    TaskState::Running,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Implement,
+                    ItemKind::Issue,
+                    140,
+                    TaskState::Running,
+                    2,
+                ),
+                task(
+                    "ryba",
+                    Stage::Implement,
+                    ItemKind::Issue,
+                    7,
+                    TaskState::Queued,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Review,
+                    ItemKind::Pr,
+                    7,
+                    TaskState::Running,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Review,
+                    ItemKind::Pr,
+                    9,
+                    TaskState::AwaitingUser,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Release,
+                    ItemKind::Pr,
+                    5,
+                    TaskState::Running,
+                    1,
+                ),
+                task(
+                    "ryba",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    9,
+                    TaskState::Failed("exit 1".to_string()),
+                    3,
+                ),
+            ];
+            // The release train carries the scoped id, not the item id.
+            tasks[6].id = crate::tasks::scoped_id("borsuk", "release");
+            tasks
+        },
         decisions: Vec::new(),
         decision_items: Vec::new(),
         tickets: Vec::new(),
@@ -1807,7 +1812,7 @@ pub(crate) fn sample_view() -> StateView {
                 batch: vec![5],
                 policy: ReleasePolicy::Manual,
                 next_fire_ms: None,
-                in_flight: Some("borsuk/release-p5".to_string()),
+                in_flight: Some("borsuk/release".to_string()),
             },
             TrainView {
                 repo: "ryba".to_string(),
@@ -2528,6 +2533,26 @@ mod tests {
 
         assert!(text.contains("#7 next ← #142"), "board:\n{text}");
         assert!(text.contains("#9 new ← #142"), "board:\n{text}");
+    }
+
+    #[test]
+    fn a_saved_retry_batch_resolves_the_scoped_release_task() {
+        let mut state = sample_view();
+        // The train holds a saved retry batch and no task in flight, so
+        // the board must resolve the release task by its scoped id.
+        state.trains[0].in_flight = None;
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(
+            text.contains("p5 running"),
+            "the scoped release task must render inside the batch border:\n{text}"
+        );
     }
 
     #[test]

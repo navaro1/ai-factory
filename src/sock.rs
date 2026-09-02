@@ -1714,7 +1714,7 @@ mod tests {
             batch: vec![7],
             policy: ReleasePolicy::Manual,
             next_fire_ms: None,
-            in_flight: Some("borsuk/release-p7".to_string()),
+            in_flight: Some("borsuk/release".to_string()),
         };
         let text = serde_json::to_string(&train).unwrap();
         assert_eq!(serde_json::from_str::<TrainView>(&text).unwrap(), train);
@@ -2793,7 +2793,7 @@ mod tests {
         assert_eq!(borsuk_view.batch, vec![7]);
         assert_eq!(borsuk_view.policy, ReleasePolicy::Interval { minutes: 30 });
         assert_eq!(borsuk_view.next_fire_ms, None);
-        assert_eq!(borsuk_view.in_flight.as_deref(), Some("borsuk/release-p7"));
+        assert_eq!(borsuk_view.in_flight.as_deref(), Some("borsuk/release"));
         // A repository without a train entry gets an empty view with the
         // config policy.
         assert_eq!(view.trains[1].repo, "qubitsok");

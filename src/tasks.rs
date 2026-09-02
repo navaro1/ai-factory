@@ -148,9 +148,32 @@ impl Task {
     }
 }
 
+/// The identity of one queued task under an explicit id.
+#[derive(Debug, Clone, Copy)]
+pub struct ScopedTask<'a> {
+    /// The task id, per the naming rules.
+    pub id: &'a str,
+    /// The repository alias.
+    pub repo: &'a str,
+    /// The pipeline stage.
+    pub stage: Stage,
+    /// Whether the item is a ticket or a PR.
+    pub kind: ItemKind,
+    /// The item number.
+    pub number: u64,
+}
+
 /// The task id for one item, per the naming rules.
 fn id_for(repo: &str, stage: Stage, kind: ItemKind, number: u64) -> String {
     format!("{}/{}-{}{}", repo, stage.as_str(), kind.as_str(), number)
+}
+
+/// The task id of one repository-scoped task: `<repo>/<scope>`.
+///
+/// The release train uses this form: the train, not one PR, is the unit of
+/// work, so the id stays stable across batches.
+pub fn scoped_id(repo: &str, scope: &str) -> String {
+    format!("{repo}/{scope}")
 }
 
 /// The task id for one issue conversation.
@@ -191,7 +214,43 @@ impl TaskTable {
         now_ms: u64,
     ) -> Result<&mut Task> {
         let id = id_for(repo, stage, kind, number);
-        if let Some(existing) = self.by_id.get(&id) {
+        self.upsert_with_id(
+            ScopedTask {
+                id: &id,
+                repo,
+                stage,
+                kind,
+                number,
+            },
+            log_path,
+            now_ms,
+        )
+    }
+
+    /// Queue one task under an explicit id, or re-queue it after a terminal
+    /// state.
+    ///
+    /// The id follows the naming rules. [`TaskTable::upsert_queued`] derives
+    /// it from the item; the release train passes its scoped id. The call
+    /// refuses a second task under the same id while the existing task is
+    /// `Queued`, `Running`, or `AwaitingUser`. The error names the blocking
+    /// task. When the existing task is terminal, the call replaces it with a
+    /// fresh queued task on attempt 1, and the task moves to the back of the
+    /// insertion order.
+    pub fn upsert_with_id(
+        &mut self,
+        spec: ScopedTask<'_>,
+        log_path: PathBuf,
+        now_ms: u64,
+    ) -> Result<&mut Task> {
+        let ScopedTask {
+            id,
+            repo,
+            stage,
+            kind,
+            number,
+        } = spec;
+        if let Some(existing) = self.by_id.get(id) {
             if !existing.state.is_terminal() {
                 return Err(anyhow!(
                     "task \"{}\" ({}) already covers {repo} {stage} {} {number}",
@@ -201,7 +260,13 @@ impl TaskTable {
                 ));
             }
         }
-        let task = Task::new(repo, stage, kind, number, log_path, now_ms);
+        let mut task = Task::new(repo, stage, kind, number, log_path, now_ms);
+        task.id = id.to_string();
+        self.insert_task(id.to_string(), task)
+    }
+
+    /// Insert one task and keep the insertion order in step.
+    fn insert_task(&mut self, id: String, task: Task) -> Result<&mut Task> {
         self.by_id.insert(id.clone(), task);
         if let Some(position) = self.order.iter().position(|existing| existing == &id) {
             self.order.remove(position);
@@ -232,14 +297,7 @@ impl TaskTable {
                 .ok_or_else(|| anyhow!("task \"{id}\" vanished before reuse"));
         }
         let task = Task::ticket_chat(repo, number, log_path, now_ms);
-        self.by_id.insert(id.clone(), task);
-        if let Some(position) = self.order.iter().position(|existing| existing == &id) {
-            self.order.remove(position);
-        }
-        self.order.push(id.clone());
-        self.by_id
-            .get_mut(&id)
-            .ok_or_else(|| anyhow!("task \"{id}\" vanished right after insertion"))
+        self.insert_task(id.clone(), task)
     }
 
     /// Remove one task and its insertion-order entry.
@@ -862,6 +920,34 @@ mod tests {
         assert_eq!(counts[&("qubitsok".to_string(), Stage::Refine)], 0);
         assert_eq!(counts[&("qubitsok".to_string(), Stage::Review)], 0);
         assert_eq!(counts.len(), 8, "two repositories times four stages");
+    }
+
+    #[test]
+    fn no_literal_release_dash_p_task_id_stays_in_src() {
+        // The needle is built from parts, so this test file cannot match
+        // itself.
+        let needle: String = ["/", "release", "-", "p"].concat();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src must be readable") {
+                let entry = entry.expect("src entries must be readable");
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("source files must be readable");
+                assert!(
+                    !text.contains(&needle),
+                    "{} still names the old release task id form",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
