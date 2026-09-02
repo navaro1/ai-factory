@@ -1689,6 +1689,7 @@ mod tests {
     /// A state view that carries only `decisions`.
     fn state_with(decisions: Vec<Decision>) -> StateView {
         StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),

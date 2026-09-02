@@ -1065,6 +1065,7 @@ mod tests {
 
     fn state() -> StateView {
         StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),

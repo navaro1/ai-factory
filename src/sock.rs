@@ -41,6 +41,9 @@ use crate::trains::Train;
 /// thread sends at most one push per subscriber set in this window.
 pub const PUSH_COALESCE_MS: u64 = 50;
 
+/// The exact wire protocol revision shared by this client and daemon.
+pub const WIRE_PROTOCOL_REVISION: u32 = 1;
+
 /// How many pushes a subscriber may buffer before the server drops it.
 ///
 /// A client that stops reading fills this buffer in about one second at the
@@ -54,6 +57,9 @@ const SUBSCRIBER_CAPACITY: usize = 16;
 /// file itself, which is why [`TaskView::log_path`] is part of the view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateView {
+    /// The wire protocol revision of the daemon that built this state.
+    #[serde(default)]
+    pub protocol_revision: u32,
     /// The configured repositories, in alias order.
     pub repos: Vec<RepoView>,
     /// The four pipeline stages, in pipeline order.
@@ -288,6 +294,7 @@ impl StateInput<'_> {
                 .collect(),
         };
         Ok(StateView {
+            protocol_revision: WIRE_PROTOCOL_REVISION,
             repos,
             stages,
             lanes,
@@ -1314,6 +1321,14 @@ impl Iterator for Pushes {
             // A clean close ends the stream.
             Ok(0) => None,
             Ok(_) => match serde_json::from_str::<Push>(line.trim()) {
+                Ok(Push::State(view)) if view.protocol_revision != WIRE_PROTOCOL_REVISION => {
+                    self.failed = true;
+                    Some(Err(anyhow!(
+                        "daemon wire protocol revision {} is incompatible with client revision {}; run `aif stop`, then start `aif` again",
+                        view.protocol_revision,
+                        WIRE_PROTOCOL_REVISION
+                    )))
+                }
                 Ok(push) => Some(Ok(push)),
                 Err(error) => {
                     self.failed = true;
@@ -1368,6 +1383,7 @@ mod tests {
     /// A state view with one stage and one repository, marked by `label`.
     fn sample_view(label: usize) -> StateView {
         StateView {
+            protocol_revision: WIRE_PROTOCOL_REVISION,
             repos: vec![RepoView {
                 alias: format!("repo-{label}"),
                 owner_repo: String::new(),
@@ -1552,6 +1568,51 @@ mod tests {
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_client_rejects_a_state_from_an_older_wire_protocol() {
+        let mut old = serde_json::to_value(Push::State(sample_view(1))).unwrap();
+        old.as_object_mut().unwrap().remove("protocol_revision");
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        writeln!(daemon, "{old}").unwrap();
+        drop(daemon);
+        let mut pushes = Pushes {
+            reader: std::io::BufReader::new(client),
+            failed: false,
+        };
+
+        let error = pushes.next().unwrap().unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("daemon wire protocol revision 0"),
+            "{message}"
+        );
+        assert!(message.contains("client revision 1"), "{message}");
+        assert!(message.contains("aif stop"), "{message}");
+        assert!(
+            pushes.next().is_none(),
+            "a rejected stream must stay closed"
+        );
+    }
+
+    #[test]
+    fn a_client_accepts_a_state_from_the_current_wire_protocol() {
+        let mut current = serde_json::to_value(Push::State(sample_view(1))).unwrap();
+        current
+            .as_object_mut()
+            .unwrap()
+            .insert("protocol_revision".to_string(), serde_json::json!(1));
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        writeln!(daemon, "{current}").unwrap();
+        drop(daemon);
+        let mut pushes = Pushes {
+            reader: std::io::BufReader::new(client),
+            failed: false,
+        };
+
+        assert!(matches!(pushes.next(), Some(Ok(Push::State(_)))));
     }
 
     #[test]

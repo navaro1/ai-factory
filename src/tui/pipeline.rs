@@ -1559,6 +1559,7 @@ fn task(
 #[cfg(test)]
 pub(crate) fn sample_view() -> StateView {
     StateView {
+        protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
         repos: vec![
             RepoView {
                 alias: "borsuk".to_string(),
@@ -1749,6 +1750,7 @@ mod tests {
     /// A state view with no repositories, tasks, and trains.
     fn empty_view() -> StateView {
         StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Stage::ALL
                 .iter()
