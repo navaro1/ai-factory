@@ -541,15 +541,21 @@ pub enum StartOutcome {
     AlreadyRunning,
 }
 
+/// How long the start path waits after it resets a stale daemon unit.
+const UNIT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 /// Start the daemon detached and wait for its socket.
 ///
 /// The start goes through
 /// `systemd-run --user --collect --unit aif-daemon -- <program> run` first.
 /// A true `paused` appends `--paused`, so the daemon starts with the whole
 /// factory paused. When `systemd-run` is missing, `spawn_detached` starts
-/// the fallback. Other `systemd-run` errors propagate. The helper then waits
-/// for `socket`. The wait ends when the socket answers or when `timeout`
-/// passes. The result identifies an existing daemon without hiding it.
+/// the fallback. Other `systemd-run` errors propagate. A failure that names
+/// an existing unit gets one `systemctl --user reset-failed` and one retry,
+/// because a daemon that just stopped leaves its unit loaded for a moment.
+/// The helper then waits for `socket`. The wait ends when the socket answers
+/// or when `timeout` passes. The result identifies an existing daemon
+/// without hiding it.
 pub fn start_detached(
     socket: &Path,
     daemon_program: &Path,
@@ -562,29 +568,40 @@ pub fn start_detached(
         return Ok(StartOutcome::AlreadyRunning);
     }
     let program_text = daemon_program.to_string_lossy().into_owned();
-    let mut args = vec![
-        "--user",
-        "--collect",
-        "--unit",
-        "aif-daemon",
-        "--",
-        program_text.as_str(),
-        "run",
-    ];
-    if paused {
-        args.push("--paused");
-    }
-    match exec.run("systemd-run", &args, None) {
-        Ok(out) if out.status == 0 => {}
-        Ok(out) => {
-            let detail = out.stderr.lines().next().unwrap_or("no stderr");
-            bail!("systemd-run exited with status {}: {detail}", out.status,);
+    let mut retried = false;
+    loop {
+        let mut args = vec![
+            "--user",
+            "--collect",
+            "--unit",
+            "aif-daemon",
+            "--",
+            program_text.as_str(),
+            "run",
+        ];
+        if paused {
+            args.push("--paused");
         }
-        Err(error) if command_is_missing(&error) => {
-            eprintln!("aif: cannot run systemd-run ({error:#}); falling back to a plain spawn");
-            spawn_detached(daemon_program, paused).context("the plain detached spawn failed")?;
+        match exec.run("systemd-run", &args, None) {
+            Ok(out) if out.status == 0 => break,
+            Ok(out) if !retried && stderr_names_existing_unit(&out.stderr) => {
+                retried = true;
+                eprintln!("aif: the aif-daemon unit is still loaded; reset it and start again");
+                reset_daemon_unit(exec);
+                std::thread::sleep(UNIT_RETRY_DELAY);
+            }
+            Ok(out) => {
+                let detail = out.stderr.lines().next().unwrap_or("no stderr");
+                bail!("systemd-run exited with status {}: {detail}", out.status,);
+            }
+            Err(error) if command_is_missing(&error) => {
+                eprintln!("aif: cannot run systemd-run ({error:#}); falling back to a plain spawn");
+                spawn_detached(daemon_program, paused)
+                    .context("the plain detached spawn failed")?;
+                break;
+            }
+            Err(error) => return Err(error).context("cannot run systemd-run"),
         }
-        Err(error) => return Err(error).context("cannot run systemd-run"),
     }
     if wait_for_socket(socket, timeout) {
         Ok(StartOutcome::Started)
@@ -602,6 +619,34 @@ pub fn start_detached(
 /// Whether an external command failed because its executable is absent.
 fn command_is_missing(error: &anyhow::Error) -> bool {
     error_has_io_kind(error, &[io::ErrorKind::NotFound])
+}
+
+/// Whether `systemd-run` failed because the unit name is still loaded.
+///
+/// A daemon that just exited leaves `aif-daemon.service` loaded for a short
+/// time even with `--collect`, and `systemd-run` then rejects the name.
+fn stderr_names_existing_unit(stderr: &str) -> bool {
+    stderr.contains("already exists")
+}
+
+/// Clear the failed state of the transient daemon unit.
+///
+/// A failure stays ignored: the unit may not exist and systemd may be
+/// absent on a system that uses the plain spawn fallback.
+fn reset_daemon_unit(exec: &dyn Exec) {
+    let _ = exec.run("systemctl", &["--user", "reset-failed", "aif-daemon"], None);
+}
+
+/// Unload the transient daemon unit after a stop.
+///
+/// `aif stop` talks to the daemon over the socket, so systemd can still be
+/// finishing the unit exit when the next `aif` starts. `systemctl --user
+/// stop` waits for that exit and `reset-failed` clears a failed unit.
+/// Every failure stays ignored: the unit may not exist and systemd may be
+/// absent on a system that uses the plain spawn fallback.
+pub fn cleanup_daemon_unit(exec: &dyn Exec) {
+    let _ = exec.run("systemctl", &["--user", "stop", "aif-daemon"], None);
+    reset_daemon_unit(exec);
 }
 
 /// Whether an error chain holds one specified operating system error.
@@ -2637,6 +2682,140 @@ mod tests {
             "the spawn must have happened before the timeout"
         );
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn start_detached_resets_a_stale_unit_and_retries_systemd_run() {
+        let dir = temp_dir("stale-unit");
+        let socket = dir.join("daemon.sock");
+        fake_daemon(socket.clone(), 150);
+        let exec = ScriptExec::new()
+            .expect(
+                |call| call.program == "systemd-run",
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to start transient service unit: Unit aif-daemon.service \
+                         already exists.\n"
+                        .to_string(),
+                },
+            )
+            .expect(
+                |call| {
+                    call.program == "systemctl"
+                        && call.argv() == ["--user", "reset-failed", "aif-daemon"]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(|call| call.program == "systemd-run", CmdOut::ok(""));
+        let spawned = Cell::new(false);
+        let mut spawn = |_program: &Path, _paused: bool| {
+            spawned.set(true);
+            Ok(())
+        };
+
+        let outcome = start_detached(
+            &socket,
+            Path::new("/opt/aif/bin/aifd"),
+            &exec,
+            Duration::from_secs(5),
+            false,
+            &mut spawn,
+        )
+        .expect("the retry must start the daemon");
+
+        assert_eq!(outcome, StartOutcome::Started);
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 3, "calls: {calls:?}");
+        assert_eq!(calls[0].program, "systemd-run");
+        assert_eq!(calls[1].argv(), ["--user", "reset-failed", "aif-daemon"]);
+        assert_eq!(calls[2].program, "systemd-run");
+        assert!(
+            !spawned.get(),
+            "a stale unit must not use the plain spawn fallback"
+        );
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn start_detached_reports_a_stale_unit_that_survives_the_reset() {
+        let dir = temp_dir("stale-unit-twice");
+        let socket = dir.join("daemon.sock");
+        let exec = ScriptExec::new()
+            .expect(
+                |call| call.program == "systemd-run",
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Unit aif-daemon.service already exists.\n".to_string(),
+                },
+            )
+            .expect(|call| call.program == "systemctl", CmdOut::ok(""))
+            .expect(
+                |call| call.program == "systemd-run",
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Unit aif-daemon.service already exists again.\n".to_string(),
+                },
+            );
+        let mut spawn = |_program: &Path, _paused: bool| Ok(());
+
+        let error = start_detached(
+            &socket,
+            Path::new("/opt/aif/bin/aifd"),
+            &exec,
+            Duration::from_secs(5),
+            false,
+            &mut spawn,
+        )
+        .expect_err("a second unit failure must stop the start");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("systemd-run exited with status 1")
+                && message.contains("already exists"),
+            "error: {message}"
+        );
+        assert_eq!(exec.calls().len(), 3, "calls: {:?}", exec.calls());
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn cleanup_daemon_unit_stops_and_resets_the_unit() {
+        let exec = ScriptExec::new()
+            .expect(
+                |call| {
+                    call.program == "systemctl" && call.argv() == ["--user", "stop", "aif-daemon"]
+                },
+                CmdOut {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .expect(
+                |call| {
+                    call.program == "systemctl"
+                        && call.argv() == ["--user", "reset-failed", "aif-daemon"]
+                },
+                CmdOut::ok(""),
+            );
+
+        cleanup_daemon_unit(&exec);
+
+        assert_eq!(exec.calls().len(), 2, "calls: {:?}", exec.calls());
+    }
+
+    #[test]
+    fn cleanup_daemon_unit_ignores_every_failure() {
+        // No scripted steps: each call fails as unexpected, which the
+        // cleanup must swallow.
+        let exec = ScriptExec::new();
+
+        cleanup_daemon_unit(&exec);
+
+        assert_eq!(exec.calls().len(), 2, "calls: {:?}", exec.calls());
     }
 
     #[test]
