@@ -1162,7 +1162,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 fn draw_help(f: &mut Frame, area: Rect) {
     let panel = centered(44, 27, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 24] = [
+    let rows: [(&str, &str); 25] = [
         ("1 2 3 4", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
@@ -1187,6 +1187,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
         ("/ e l c a", "search and ticket actions"),
+        ("h l", "switch the tickets repo tab"),
     ];
     let lines: Vec<Line> = rows
         .iter()
