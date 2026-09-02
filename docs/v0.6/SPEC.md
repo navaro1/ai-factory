@@ -239,7 +239,7 @@ Last updated: 2026-09-02
 Last updated: 2026-09-02
 
 ### C5 — Review prompt shows the tickets
-**Status:** `[ ]` pending
+**Status:** `[x]` DONE
 **Build:** This chunk owns the review prompt. Reword it to the vocabulary, add the `{tickets}` placeholder — the linked ticket list as `#4, #9`, or `none` — fill it from the links cache in `render_prompt`, and write its docs copy. Extend the ban test and the docs-coupling test to the sixth const.
 **AC:**
 - A template test asserts `fill_template` accepts `{tickets}` and still rejects an unknown placeholder.
@@ -247,6 +247,10 @@ Last updated: 2026-09-02
 - The ban test and the coupling test cover all six consts and all six docs copies.
 **Depends on:** C0, C2 · **Traces to:** R12
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
+✅ IMPLEMENTED
+- The prompt line reads `Tickets this PR closes: {tickets}`; the value is `#4, #9` or `none`.
+- The ban test and the coupling test cover all six templates and all six docs copies.
+Last updated: 2026-09-02
 
 ---
 
