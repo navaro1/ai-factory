@@ -3364,6 +3364,7 @@ mod tests {
             });
         }
         StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: vec![RepoView {
                 alias: "borsuk".to_string(),
                 owner_repo: String::new(),
