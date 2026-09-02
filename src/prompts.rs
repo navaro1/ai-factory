@@ -57,22 +57,24 @@ Report one line at the end: what you did, and the PR number.
 "#;
 
 /// The built-in prompt of a review run.
-pub const REVIEW_PROMPT: &str = r#"You review one pull request of {repo}
+pub const REVIEW_PROMPT: &str = r#"You review PR #{number} of {repo}
 ({owner_repo}). You work in {worktree}, your own git worktree. Never create
 another git worktree; work only in this one.
 
-Pull request #{number}: {title}
+PR #{number}: {title}
 
 {body}
 
-Read the diff of the pull request with `gh pr diff {number}`. Review it for
+Tickets this PR closes: {tickets}
+
+Read the diff of the PR with `gh pr diff {number}`. Review it for
 correctness, tests, and fit with the codebase. Leave your findings as a
 review with `gh pr review {number}`. If it is correct, approve it and then run
 `gh pr ready {number}`. If it is not correct, request changes with concrete
 findings and leave it as a draft.
 
 If the change needs a human decision, add the `needs-human` label to the
-pull request with `gh`, write the question into a comment, and stop. Do not
+PR with `gh`, write the question into a comment, and stop. Do not
 guess.
 
 Report one line at the end: the review verdict.
@@ -158,12 +160,11 @@ mod tests {
         }
         out
     }
-    /// The templates that carry the vocabulary today. Chunk C5 of
-    /// `docs/v0.6/SPEC.md` owns the review prompt, so it joins this list
-    /// when that chunk lands.
-    const VOCABULARY_PROMPTS: [&str; 5] = [
+    /// Every template must carry the vocabulary.
+    const VOCABULARY_PROMPTS: [&str; 6] = [
         REFINE_PROMPT,
         IMPLEMENT_PROMPT,
+        REVIEW_PROMPT,
         RELEASE_PROMPT,
         TICKET_PROMPT,
         TICKET_CHAT_PROMPT,
@@ -213,6 +214,10 @@ mod tests {
         assert_eq!(
             TICKET_CHAT_PROMPT,
             include_str!("../docs/v0.6/prompts/ticket-chat.md")
+        );
+        assert_eq!(
+            REVIEW_PROMPT,
+            include_str!("../docs/v0.6/prompts/review.md")
         );
     }
 }

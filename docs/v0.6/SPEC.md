@@ -222,7 +222,7 @@ Last updated: 2026-09-02
 Last updated: 2026-09-02
 
 ### C4 — Stable release task id
-**Status:** `[ ]` pending
+**Status:** `[x]` DONE
 **Build:** `Train::fire` returns `<repo>/release`. Add the scoped-id constructor next to `id_for` in `src/tasks.rs` and one `TaskTable` upsert helper; route the ticket chat and release paths through both. `fire_train` queues the task with the overridden id and keeps the log name `logs/<repo>__release-p<lowest>.jsonl`. Replace the id that `release_batch_task_id` builds at `src/tui/pipeline.rs:194-203`. The naming rules in section 4 stay as written; no `docs/v0.5/` edit happens.
 **AC:**
 - A trains test asserts `fire` returns `borsuk/release`, and a retry of the same batch reuses the id.
@@ -232,6 +232,11 @@ Last updated: 2026-09-02
 - A scan test finds no literal `release-p` under `src/`, and the files under `docs/v0.5/` stay untouched.
 **Depends on:** — · **Traces to:** R7
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
+✅ IMPLEMENTED
+- The explicit-id upsert takes one `ScopedTask` record, because clippy caps functions at seven arguments.
+- The scan test bans the id form `/release-p`, built from parts so the test cannot match itself; the log-name form `__release-p<lowest>` stays, because the log keeps the batch number.
+- A claude release completes through `turn_finished`, not a bare exit, so the rig test ends the first batch that way.
+Last updated: 2026-09-02
 
 ### C5 — Review prompt shows the tickets
 **Status:** `[ ]` pending

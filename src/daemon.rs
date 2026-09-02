@@ -2881,6 +2881,25 @@ impl Daemon {
                 .map(|pr| (pr.title.clone(), pr.body.clone()))
                 .unwrap_or_default(),
         };
+        // The linked ticket list of the review prompt: `#4, #9`, or `none`
+        // when no ticket links.
+        let tickets = match task.stage {
+            Stage::Review => self
+                .links
+                .get(&task.repo)
+                .map(|links| links.tickets_of(task.number))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let tickets_text = if tickets.is_empty() {
+            "none".to_string()
+        } else {
+            tickets
+                .iter()
+                .map(|ticket| format!("#{ticket}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         fill_template(
             &template,
             &[
@@ -2890,6 +2909,7 @@ impl Daemon {
                 ("title", title),
                 ("body", body),
                 ("worktree", worktree.display().to_string()),
+                ("tickets", tickets_text),
                 ("pr_list", pr_list),
                 ("pr_numbers", pr_numbers),
                 ("pr_count", pr_count),
@@ -3922,6 +3942,46 @@ mod tests {
 
         assert_eq!(rig.job_count(), 1);
         assert_eq!(rig.job(0).cwd, issue_wt(&dir, 142));
+    }
+
+    #[test]
+    fn a_review_prompt_names_the_tickets_the_pr_closes() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #4 fixes #9".to_string();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            rig.job(0).prompt.contains("Tickets this PR closes: #4, #9"),
+            "prompt:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    #[test]
+    fn an_unlinked_review_prompt_says_none() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            rig.job(0).prompt.contains("Tickets this PR closes: none"),
+            "prompt:\n{}",
+            rig.job(0).prompt
+        );
     }
 
     #[test]
@@ -7563,6 +7623,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(filled, "title=keep {body} literal; body=body text");
+    }
+
+    #[test]
+    fn fill_template_fills_the_tickets_placeholder() {
+        let filled = fill_template(
+            "Tickets this PR closes: {tickets}",
+            &[("tickets", "#4, #9".to_string())],
+        )
+        .unwrap();
+        assert_eq!(filled, "Tickets this PR closes: #4, #9");
+
+        let error =
+            fill_template("hi {tickets} {nope}", &[("tickets", "none".to_string())]).unwrap_err();
+        assert!(error.to_string().contains("nope"));
     }
 
     // Path helpers that mirror the rig layout.
