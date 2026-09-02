@@ -2732,6 +2732,7 @@ mod tests {
         let (server, _actions) = Server::bind(&socket).expect("the fake daemon must bind");
         server.publish(StateView {
             protocol_revision: WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),

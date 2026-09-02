@@ -168,7 +168,7 @@ All questions are resolved. None waits for clarification.
 Last updated: 2026-09-02
 
 ### C1 — Derive ticket-PR links
-**Status:** `[ ]` pending
+**Status:** `[x]` DONE
 **Build:** Add `src/links.rs`. Parse the closing keywords per the research file. Union the branch rule. Move `issue_number_from_head` there and reuse it from the daemon. Expose `prs_of(ticket)` and `tickets_of(pr)` queries.
 **AC:**
 - Parser tests: `Fixes #10, resolves #22` yields 10 and 22; `closes: #7` yields 7; `Fixes octo-org/other#9` yields nothing; `mentioned #5` yields nothing; `CLOSES #3` yields 3.
@@ -178,6 +178,10 @@ Last updated: 2026-09-02
 - Exact query asserts, for example `prs_of(5) == [7]` and `tickets_of(7) == [5]`.
 **Depends on:** — · **Traces to:** R2, R3
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
+✅ IMPLEMENTED
+- `Links::derive(repo, snap)` unions both rules into one `BTreeSet<(ticket, pr)>`.
+- Clippy caught a first draft that collected references without a keyword; the scan now reads the armed flag before it collects.
+Last updated: 2026-09-02
 
 ### C2 — Ship links and show badges
 **Status:** `[ ]` pending

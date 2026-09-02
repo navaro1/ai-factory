@@ -1685,6 +1685,20 @@ fn item_lines(
         Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
     );
     lines.push(Line::from(""));
+    if kind == ItemKind::Pr {
+        let tickets: Vec<u64> = state
+            .links
+            .iter()
+            .filter(|link| link.repo == repo && link.pr == number)
+            .map(|link| link.ticket)
+            .collect();
+        if !tickets.is_empty() {
+            lines.push(Line::styled(
+                format!("Closes {}", pr_list(&tickets)),
+                THEME.dim(),
+            ));
+        }
+    }
     lines.push(Line::styled("Description", THEME.dim()));
     let body = if item.body.trim().is_empty() {
         "No description."
@@ -1858,6 +1872,7 @@ mod tests {
     fn state_with(decisions: Vec<Decision>) -> StateView {
         StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),
@@ -2190,6 +2205,37 @@ mod tests {
             screen.contains("The PR description is unavailable."),
             "screen: {screen}"
         );
+    }
+
+    #[test]
+    fn a_pr_detail_shows_the_tickets_it_closes() {
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items = vec![ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "First change".to_string(),
+            body: "The first pull request body.".to_string(),
+        }];
+        state.links = vec![
+            crate::sock::LinkView {
+                repo: "borsuk".to_string(),
+                ticket: 142,
+                pr: 7,
+            },
+            crate::sock::LinkView {
+                repo: "borsuk".to_string(),
+                ticket: 150,
+                pr: 7,
+            },
+        ];
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(screen.contains("Closes #142 #150"), "screen: {screen}");
     }
 
     #[test]
@@ -3342,6 +3388,7 @@ mod tests {
         }
         StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: vec![RepoView {
                 alias: "borsuk".to_string(),
                 owner_repo: String::new(),

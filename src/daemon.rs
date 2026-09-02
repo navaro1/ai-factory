@@ -35,7 +35,7 @@ use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
-use crate::links::issue_number_from_head;
+use crate::links::{issue_number_from_head, Links};
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{
@@ -143,6 +143,8 @@ pub struct Daemon {
     trains: BTreeMap<String, Train>,
     /// The pull request set of each release task, for prompt rendering.
     release_batches: BTreeMap<String, Vec<u64>>,
+    /// The ticket-PR links of each repository, rebuilt on every poll.
+    links: BTreeMap<String, Links>,
     /// The source issue worktree of each review task.
     review_issue_numbers: BTreeMap<String, u64>,
     /// The controller for every issue review and mutation action.
@@ -337,6 +339,7 @@ impl Daemon {
             decisions: Decisions::new(),
             trains,
             release_batches: BTreeMap::new(),
+            links: BTreeMap::new(),
             review_issue_numbers: BTreeMap::new(),
             ticket_controller,
             ticket_conversations,
@@ -538,6 +541,7 @@ impl Daemon {
             table: &self.table,
             decisions: &self.decisions,
             snapshot: &self.snapshot,
+            links: &self.links,
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
@@ -592,6 +596,8 @@ impl Daemon {
         let old = self.snapshot.repos.get(repo).cloned();
         let unchanged = old.as_ref() == Some(&fresh);
         self.snapshot.apply(repo, fresh.clone());
+        self.links
+            .insert(repo.to_string(), Links::derive(repo, &fresh));
         self.pending_stacked.insert(repo.to_string());
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
@@ -6852,6 +6858,27 @@ mod tests {
     // ------------------------------------------------------------------
     // The input mode
     // ------------------------------------------------------------------
+
+    #[test]
+    fn a_poll_with_closing_keywords_ships_the_links_in_the_view() {
+        let mut rig = Rig::make(vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &[])], vec![pull]);
+
+        let view = last_view(&push_rx);
+        assert!(
+            view.links
+                .iter()
+                .any(|link| link.repo == "borsuk" && link.ticket == 142 && link.pr == 7),
+            "links: {:?}",
+            view.links
+        );
+    }
 
     /// Drain the push channel and return the last view it holds.
     fn last_view(rx: &mpsc::Receiver<StateView>) -> StateView {
