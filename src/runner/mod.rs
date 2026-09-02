@@ -8,14 +8,62 @@
 //! steering with an error.
 
 pub mod claude;
+pub mod codex;
 pub mod opencode;
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 
+use crate::config::{Harness, ResolvedRoleSettings};
 use crate::model::Stage;
+
+/// Runtime actions that one harness supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    pub live_input: bool,
+    pub resume: bool,
+    pub permission_responses: bool,
+}
+
+/// Return the runtime actions of one harness.
+pub const fn capabilities(harness: Harness) -> Capabilities {
+    match harness {
+        Harness::Claude => Capabilities {
+            live_input: true,
+            resume: true,
+            permission_responses: true,
+        },
+        Harness::Opencode | Harness::Codex => Capabilities {
+            live_input: false,
+            resume: true,
+            permission_responses: false,
+        },
+    }
+}
+
+/// Build one configured runner for one resolved execution role.
+pub trait RunnerFactory: Send + Sync {
+    fn build(&self, role: &ResolvedRoleSettings) -> Box<dyn Runner>;
+}
+
+/// The factory that selects the installed harness adapter.
+pub struct DefaultRunnerFactory;
+
+impl RunnerFactory for DefaultRunnerFactory {
+    fn build(&self, role: &ResolvedRoleSettings) -> Box<dyn Runner> {
+        match role.settings.harness {
+            Harness::Claude => {
+                let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
+                Box::new(claude::ClaudeRunner::new(role.settings.clone(), sink))
+            }
+            Harness::Opencode => Box::new(opencode::OpenCodeRunner::new(role.settings.clone())),
+            Harness::Codex => Box::new(codex::CodexRunner::new(role.settings.clone())),
+        }
+    }
+}
 
 /// One unit of work a runner starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +216,7 @@ fn unsupported_steering(method: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Harness;
 
     /// A session with no steering channel; only `stop` is implemented.
     struct StopOnly;
@@ -197,5 +246,27 @@ mod tests {
             .contains("does not support steering"));
 
         session.stop().unwrap();
+    }
+
+    #[test]
+    fn harness_capabilities_control_live_input_resume_and_permission_answers() {
+        assert_eq!(
+            capabilities(Harness::Claude),
+            Capabilities {
+                live_input: true,
+                resume: true,
+                permission_responses: true,
+            }
+        );
+        for harness in [Harness::Opencode, Harness::Codex] {
+            assert_eq!(
+                capabilities(harness),
+                Capabilities {
+                    live_input: false,
+                    resume: true,
+                    permission_responses: false,
+                }
+            );
+        }
     }
 }

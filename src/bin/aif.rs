@@ -130,7 +130,9 @@ fn ensure_daemon(paused: bool) -> anyhow::Result<()> {
 
 /// Send the stop action to the daemon and wait for the socket to disappear.
 ///
-/// The exit code is 0 on success and 1 on any failure.
+/// The exit code is 0 on success and 1 on any failure. A successful stop
+/// also unloads the transient systemd unit, so a start that follows at once
+/// cannot hit a unit that systemd still holds.
 fn stop() -> i32 {
     let path = config::socket_path();
     let mut client = match Client::connect(&path) {
@@ -148,6 +150,7 @@ fn stop() -> i32 {
         return 1;
     }
     if doctor::wait_socket_gone(&path, STOP_TIMEOUT) {
+        doctor::cleanup_daemon_unit(&RealExec);
         println!("aif stop: the daemon stopped");
         0
     } else {

@@ -53,6 +53,20 @@ for file in factory.example.toml factory.toml; do
             "${file}" >&2
         exit 1
     }
+    grep -qx 'schema_version = 1' "${config_dir}/${file}" || {
+        printf 'the installed config has no schema version: %s\n' "${file}" >&2
+        exit 1
+    }
+    sed -n '/^\[stage.review\]$/,/^$/p' "${config_dir}/${file}" \
+        | grep -qx 'harness = "opencode"' || {
+        printf 'the installed config changed the default review harness: %s\n' "${file}" >&2
+        exit 1
+    }
+    sed -n '/^\[ticket.chat\]$/,/^$/p' "${config_dir}/${file}" \
+        | grep -qx 'tools = \["Read", "Glob", "Grep"\]' || {
+        printf 'the installed ticket chat is not read-only: %s\n' "${file}" >&2
+        exit 1
+    }
 done
 
 printf 'keep factory\n' >"${config_dir}/factory.toml"

@@ -111,7 +111,7 @@ If the operator asks for something you cannot decide alone, say so plainly
 and ask again.
 "#;
 
-/// The built-in prompt of a read-only ticket conversation.
+/// The built-in prompt of a ticket conversation.
 pub const TICKET_CHAT_PROMPT: &str = r#"You review ticket #{number} in repository
 {repo} ({owner_repo}). The repository checkout is {worktree}.
 
@@ -126,8 +126,7 @@ Updated: {updated_at}
 GitHub reference: {github_url}
 
 Start with analysis. Do not propose a title or description change unless the
-operator explicitly requests that change. You can use only Read, Glob, and
-Grep. Do not edit files. Do not use a GitHub write command.
+operator explicitly requests that change.
 
 When the operator explicitly requests a title or description change, finish
 the assistant turn with exactly one complete block in this form:

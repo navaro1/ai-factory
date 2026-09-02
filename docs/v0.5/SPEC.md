@@ -1129,8 +1129,13 @@ loop {
   starts one first with
   `systemd-run --user --collect --unit aif-daemon -- aifd run`, falling back to
   a plain detached spawn when `systemd-run` is missing, then waits up to 10 s
-  for the socket.
-- `aif stop` sends `Action::Stop` and waits for the socket to disappear.
+  for the socket. A `systemd-run` failure that names an existing unit gets one
+  `systemctl --user reset-failed aif-daemon` and one retry, because a daemon
+  that just stopped leaves its unit loaded for a moment.
+- `aif stop` sends `Action::Stop` and waits for the socket to disappear. A
+  successful stop also unloads the transient unit with `systemctl --user stop
+  aif-daemon` and `systemctl --user reset-failed aif-daemon`; both ignore
+  every error, so the stop works without systemd too.
 - `aif doctor` reports, without changing anything: config path and validity,
   every repository with its resolved `owner/repo` and whether the path is a git
   repository, the versions of `gh`, `git`, `claude`, and `opencode`, whether

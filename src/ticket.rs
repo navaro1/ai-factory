@@ -688,12 +688,14 @@ mod tests {
     use crate::sock::{TicketContent, TicketContentSource, TicketResultKind};
 
     fn config() -> Config {
-        let mut text = String::new();
+        let mut text = "schema_version = 1\n".to_string();
         for stage in crate::model::Stage::ALL {
             text.push_str(&format!(
-                "[stage.{stage}]\nmodel = \"model\"\nrunner = \"claude\"\n"
+                "[stage.{stage}]\nmodel = \"model\"\nharness = \"claude\"\n"
             ));
         }
+        text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
+        text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str("[repo.borsuk]\npath = \"/tmp/borsuk\"\n");
         let mut config = Config::parse(&text).unwrap();
         config.repos.get_mut("borsuk").unwrap().owner_repo = "acme/borsuk".to_string();
@@ -1265,7 +1267,7 @@ mod tests {
         assert!(details
             .chat_error
             .as_deref()
-            .is_some_and(|error| error.contains("ticket_chat.model")));
+            .is_some_and(|error| error.contains("ticket.chat.model")));
     }
 
     #[test]

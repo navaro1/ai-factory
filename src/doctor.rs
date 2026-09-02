@@ -7,6 +7,7 @@
 //! Every diagnostic command uses [`Exec`]. Tests inject
 //! [`aif::exec::ScriptExec`] and do not run a diagnostic tool.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
-use aif::config::{parse_owner_repo, Config, RepoConfig};
+use aif::config::{parse_owner_repo, Config, ExecutionRole, Harness, RepoConfig};
 use aif::exec::Exec;
 use aif::sched::{self, Limits};
 use aif::sock::{Client, PauseScope, PausedView, Push};
@@ -34,8 +35,8 @@ pub const CLAUDE_FLOOR: Version = Version {
     patch: 223,
 };
 
-/// The tools whose versions the doctor reports.
-const TOOLS: [&str; 4] = ["gh", "git", "claude", "opencode"];
+/// The tools that every factory installation needs.
+const CORE_TOOLS: [&str; 2] = ["gh", "git"];
 
 /// A semantic version triple parsed out of a tool version line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,7 +179,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             });
             let facts = repo_facts(env.exec, &config);
             checks.extend(repo_checks(&config, &facts));
-            checks.extend(tool_checks(env.exec));
+            checks.extend(tool_checks(env.exec, Some(&config)));
             checks.push(gh_auth_check(env.exec));
             checks.extend(daemon_checks(env.socket));
             checks.extend(scheduler_checks(&config));
@@ -190,7 +191,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
                 status: Status::Fail,
                 detail: format!("{error:#}"),
             });
-            checks.extend(tool_checks(env.exec));
+            checks.extend(tool_checks(env.exec, None));
             checks.push(gh_auth_check(env.exec));
             checks.extend(daemon_checks(env.socket));
         }
@@ -552,15 +553,21 @@ pub enum StartOutcome {
     AlreadyRunning,
 }
 
+/// How long the start path waits after it resets a stale daemon unit.
+const UNIT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 /// Start the daemon detached and wait for its socket.
 ///
 /// The start goes through
 /// `systemd-run --user --collect --unit aif-daemon -- <program> run` first.
 /// A true `paused` appends `--paused`, so the daemon starts with the whole
 /// factory paused. When `systemd-run` is missing, `spawn_detached` starts
-/// the fallback. Other `systemd-run` errors propagate. The helper then waits
-/// for `socket`. The wait ends when the socket answers or when `timeout`
-/// passes. The result identifies an existing daemon without hiding it.
+/// the fallback. Other `systemd-run` errors propagate. A failure that names
+/// an existing unit gets one `systemctl --user reset-failed` and one retry,
+/// because a daemon that just stopped leaves its unit loaded for a moment.
+/// The helper then waits for `socket`. The wait ends when the socket answers
+/// or when `timeout` passes. The result identifies an existing daemon
+/// without hiding it.
 pub fn start_detached(
     socket: &Path,
     daemon_program: &Path,
@@ -573,29 +580,40 @@ pub fn start_detached(
         return Ok(StartOutcome::AlreadyRunning);
     }
     let program_text = daemon_program.to_string_lossy().into_owned();
-    let mut args = vec![
-        "--user",
-        "--collect",
-        "--unit",
-        "aif-daemon",
-        "--",
-        program_text.as_str(),
-        "run",
-    ];
-    if paused {
-        args.push("--paused");
-    }
-    match exec.run("systemd-run", &args, None) {
-        Ok(out) if out.status == 0 => {}
-        Ok(out) => {
-            let detail = out.stderr.lines().next().unwrap_or("no stderr");
-            bail!("systemd-run exited with status {}: {detail}", out.status,);
+    let mut retried = false;
+    loop {
+        let mut args = vec![
+            "--user",
+            "--collect",
+            "--unit",
+            "aif-daemon",
+            "--",
+            program_text.as_str(),
+            "run",
+        ];
+        if paused {
+            args.push("--paused");
         }
-        Err(error) if command_is_missing(&error) => {
-            eprintln!("aif: cannot run systemd-run ({error:#}); falling back to a plain spawn");
-            spawn_detached(daemon_program, paused).context("the plain detached spawn failed")?;
+        match exec.run("systemd-run", &args, None) {
+            Ok(out) if out.status == 0 => break,
+            Ok(out) if !retried && stderr_names_existing_unit(&out.stderr) => {
+                retried = true;
+                eprintln!("aif: the aif-daemon unit is still loaded; reset it and start again");
+                reset_daemon_unit(exec);
+                std::thread::sleep(UNIT_RETRY_DELAY);
+            }
+            Ok(out) => {
+                let detail = out.stderr.lines().next().unwrap_or("no stderr");
+                bail!("systemd-run exited with status {}: {detail}", out.status,);
+            }
+            Err(error) if command_is_missing(&error) => {
+                eprintln!("aif: cannot run systemd-run ({error:#}); falling back to a plain spawn");
+                spawn_detached(daemon_program, paused)
+                    .context("the plain detached spawn failed")?;
+                break;
+            }
+            Err(error) => return Err(error).context("cannot run systemd-run"),
         }
-        Err(error) => return Err(error).context("cannot run systemd-run"),
     }
     if wait_for_socket(socket, timeout) {
         Ok(StartOutcome::Started)
@@ -613,6 +631,34 @@ pub fn start_detached(
 /// Whether an external command failed because its executable is absent.
 fn command_is_missing(error: &anyhow::Error) -> bool {
     error_has_io_kind(error, &[io::ErrorKind::NotFound])
+}
+
+/// Whether `systemd-run` failed because the unit name is still loaded.
+///
+/// A daemon that just exited leaves `aif-daemon.service` loaded for a short
+/// time even with `--collect`, and `systemd-run` then rejects the name.
+fn stderr_names_existing_unit(stderr: &str) -> bool {
+    stderr.contains("already exists")
+}
+
+/// Clear the failed state of the transient daemon unit.
+///
+/// A failure stays ignored: the unit may not exist and systemd may be
+/// absent on a system that uses the plain spawn fallback.
+fn reset_daemon_unit(exec: &dyn Exec) {
+    let _ = exec.run("systemctl", &["--user", "reset-failed", "aif-daemon"], None);
+}
+
+/// Unload the transient daemon unit after a stop.
+///
+/// `aif stop` talks to the daemon over the socket, so systemd can still be
+/// finishing the unit exit when the next `aif` starts. `systemctl --user
+/// stop` waits for that exit and `reset-failed` clears a failed unit.
+/// Every failure stays ignored: the unit may not exist and systemd may be
+/// absent on a system that uses the plain spawn fallback.
+pub fn cleanup_daemon_unit(exec: &dyn Exec) {
+    let _ = exec.run("systemctl", &["--user", "stop", "aif-daemon"], None);
+    reset_daemon_unit(exec);
 }
 
 /// Whether an error chain holds one specified operating system error.
@@ -683,7 +729,7 @@ fn read_config(env: &DoctorEnv) -> Result<Config> {
 }
 
 /// Check the version of one tool.
-fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
+fn tool_check(exec: &dyn Exec, tool: &str, requires_claude_floor: bool) -> Check {
     let label = tool.to_string();
     let out = match exec.run(tool, &["--version"], None) {
         Ok(out) => out,
@@ -714,11 +760,11 @@ fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
             detail: format!("cannot parse a version from {first_line:?}"),
         };
     };
-    if tool == "claude" && !version.at_least(&CLAUDE_FLOOR) {
+    if requires_claude_floor && !version.at_least(&CLAUDE_FLOOR) {
         return Check {
             label,
             status: Status::Fail,
-            detail: format!("claude {version} is older than the required floor {CLAUDE_FLOOR}"),
+            detail: format!("{tool} {version} is older than the required floor {CLAUDE_FLOOR}"),
         };
     }
     Check {
@@ -728,9 +774,45 @@ fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
     }
 }
 
-/// Check the versions of every tool the factory runs.
-fn tool_checks(exec: &dyn Exec) -> Vec<Check> {
-    TOOLS.iter().map(|tool| tool_check(exec, tool)).collect()
+/// Check the core tools and each configured harness program once.
+fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
+    let mut programs = BTreeMap::<String, bool>::new();
+    if let Some(config) = config {
+        for settings in config.roles.values() {
+            programs
+                .entry(settings.program.clone())
+                .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
+                .or_insert(settings.harness == Harness::Claude);
+        }
+        for alias in config.repos.keys() {
+            for role in ExecutionRole::ALL {
+                let settings = config
+                    .resolved_role(Some(alias), role.table_name())
+                    .expect("a parsed configuration has valid role settings")
+                    .settings;
+                programs
+                    .entry(settings.program)
+                    .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
+                    .or_insert(settings.harness == Harness::Claude);
+            }
+        }
+    }
+    for tool in CORE_TOOLS {
+        programs.entry(tool.to_string()).or_insert(false);
+    }
+    let mut checks = Vec::new();
+    for tool in CORE_TOOLS {
+        let claude = programs
+            .remove(tool)
+            .expect("each core program was inserted");
+        checks.push(tool_check(exec, tool, claude));
+    }
+    checks.extend(
+        programs
+            .into_iter()
+            .map(|(program, claude)| tool_check(exec, &program, claude)),
+    );
+    checks
 }
 
 /// Check that `gh` is authenticated.
@@ -839,7 +921,12 @@ fn paused_check(client: &Client) -> Check {
     loop {
         match pushes.next() {
             Some(Ok(Push::State(view))) => return paused_check_from_view(&view.paused),
-            Some(Ok(Push::TicketDetails(_) | Push::TicketLabels(_) | Push::TicketResult(_))) => {}
+            Some(Ok(
+                Push::TicketDetails(_)
+                | Push::TicketLabels(_)
+                | Push::TicketResult(_)
+                | Push::SettingsResult(_),
+            )) => {}
             Some(Err(error)) => return no_state_check(error),
             None => {
                 return no_state_check(anyhow!(
@@ -1260,7 +1347,7 @@ mod tests {
     use super::*;
     use aif::exec::{CmdOut, ScriptExec};
     use aif::model::Stage;
-    use aif::sock::{Action, Server, StateView, WIRE_PROTOCOL_REVISION};
+    use aif::sock::{Action, Server, SettingsView, StateView, WIRE_PROTOCOL_REVISION};
     use std::cell::{Cell, RefCell};
     use std::fs::Permissions;
     use std::io::{BufRead, BufReader};
@@ -1330,10 +1417,10 @@ mod tests {
     /// Configuration text with plain stages, optional extra lines per stage
     /// table, and the given repository tables.
     fn config_text(stage_extras: &[(&str, &str)], repos: &str) -> String {
-        let mut text = String::new();
+        let mut text = "schema_version = 1\n".to_string();
         for stage in Stage::ALL {
             text.push_str(&format!(
-                "[stage.{stage}]\nmodel = \"model\"\nrunner = \"runner\"\n"
+                "[stage.{stage}]\nmodel = \"model\"\nharness = \"claude\"\n"
             ));
             for (name, extra) in stage_extras {
                 if *name == stage.as_str() {
@@ -1342,6 +1429,8 @@ mod tests {
                 }
             }
         }
+        text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
+        text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str(repos);
         text
     }
@@ -1520,10 +1609,172 @@ mod tests {
             ),
         );
 
-        let check = tool_check(&exec, "gh");
+        let check = tool_check(&exec, "gh", false);
 
         assert_eq!(check.status, Status::Pass);
         assert_eq!(check.detail, "gh 2.74.0");
+    }
+
+    #[test]
+    fn tool_checks_use_each_configured_program_once() {
+        let text = config_text(
+            &[
+                ("refine", "program = \"shared-agent\""),
+                ("implement", "program = \"shared-agent\""),
+                ("review", "program = \"review-agent\""),
+            ],
+            "[repo.demo]\npath = \"/tmp/demo\"\n\
+             [repo.demo.stage.review]\nprogram = \"repo-review\"\n",
+        );
+        let config = Config::parse(&text).expect("the role configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            )
+            .expect(
+                |call| call.program == "repo-review",
+                CmdOut::ok("repo-review 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "review-agent",
+                CmdOut::ok("review-agent 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "shared-agent",
+                CmdOut::ok("shared-agent 2.1.251\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        assert_eq!(checks.len(), 7, "checks: {checks:?}");
+        let programs: Vec<_> = exec.calls().into_iter().map(|call| call.program).collect();
+        assert_eq!(
+            programs,
+            [
+                "gh",
+                "git",
+                "claude",
+                "opencode",
+                "repo-review",
+                "review-agent",
+                "shared-agent"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_floor_applies_only_to_claude_role_programs() {
+        let text = "schema_version = 1\n\
+            [stage.refine]\nharness = \"claude\"\nprogram = \"claude-wrapper\"\nmodel = \"m\"\n\
+            [stage.implement]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [stage.review]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [stage.release]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [ticket.create]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [ticket.chat]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n";
+        let config = Config::parse(text).expect("the role configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude-wrapper",
+                CmdOut::ok("Claude Code 2.1.100\n"),
+            )
+            .expect(
+                |call| call.program == "shared",
+                CmdOut::ok("shared 1.0.0\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        let claude = checks
+            .iter()
+            .find(|check| check.label == "claude-wrapper")
+            .expect("the Claude program must be checked");
+        assert_eq!(claude.status, Status::Fail);
+        assert!(claude.detail.contains("required floor 2.1.223"));
+        let shared = checks
+            .iter()
+            .find(|check| check.label == "shared")
+            .expect("the OpenCode program must be checked");
+        assert_eq!(shared.status, Status::Pass);
+    }
+
+    #[test]
+    fn a_missing_configured_codex_program_is_a_failure() {
+        let text = config_text(
+            &[(
+                "review",
+                "harness = \"codex\"\nprogram = \"missing-codex\"\nprofile = \"reviewer\"",
+            )],
+            "",
+        )
+        .replacen(
+            "harness = \"claude\"\nharness = \"codex\"",
+            "harness = \"codex\"",
+            1,
+        );
+        let config = Config::parse(&text).expect("the Codex role configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        let codex = checks
+            .iter()
+            .find(|check| check.label == "missing-codex")
+            .expect("the Codex program must be checked");
+        assert_eq!(codex.status, Status::Fail);
+        assert!(codex.detail.contains("cannot run missing-codex"));
+        assert!(exec
+            .calls()
+            .iter()
+            .any(|call| call.program == "missing-codex" && call.args == ["--version"]));
+    }
+
+    #[test]
+    fn a_configured_program_remains_one_direct_executable_string() {
+        let text = config_text(&[("review", "program = \"review-wrapper --strict\"")], "");
+        let config = Config::parse(&text).expect("the custom program must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            )
+            .expect(
+                |call| call.program == "review-wrapper --strict",
+                CmdOut::ok("review-wrapper 1.0.0\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        assert!(checks
+            .iter()
+            .any(|check| check.label == "review-wrapper --strict"));
+        assert!(exec.calls().iter().any(|call| {
+            call.program == "review-wrapper --strict" && call.args == ["--version"]
+        }));
     }
 
     // --- gh authentication. ---
@@ -1741,7 +1992,7 @@ mod tests {
             },
         );
 
-        let check = tool_check(&exec, "gh");
+        let check = tool_check(&exec, "gh", false);
 
         assert_eq!(check.status, Status::Fail);
         assert!(
@@ -1827,7 +2078,7 @@ mod tests {
         );
         assert!(config.detail.contains("factory.example.toml"));
         assert!(!checks.iter().any(|check| check.label.starts_with("repo ")));
-        for tool in TOOLS {
+        for tool in CORE_TOOLS {
             let check = checks
                 .iter()
                 .find(|check| check.label == tool)
@@ -1929,7 +2180,7 @@ mod tests {
             "detail: {}",
             acme.detail
         );
-        for tool in TOOLS {
+        for tool in ["gh", "git", "claude", "opencode"] {
             let check = checks
                 .iter()
                 .find(|check| check.label == tool)
@@ -2718,6 +2969,140 @@ mod tests {
     }
 
     #[test]
+    fn start_detached_resets_a_stale_unit_and_retries_systemd_run() {
+        let dir = temp_dir("stale-unit");
+        let socket = dir.join("daemon.sock");
+        fake_daemon(socket.clone(), 150);
+        let exec = ScriptExec::new()
+            .expect(
+                |call| call.program == "systemd-run",
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to start transient service unit: Unit aif-daemon.service \
+                         already exists.\n"
+                        .to_string(),
+                },
+            )
+            .expect(
+                |call| {
+                    call.program == "systemctl"
+                        && call.argv() == ["--user", "reset-failed", "aif-daemon"]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(|call| call.program == "systemd-run", CmdOut::ok(""));
+        let spawned = Cell::new(false);
+        let mut spawn = |_program: &Path, _paused: bool| {
+            spawned.set(true);
+            Ok(())
+        };
+
+        let outcome = start_detached(
+            &socket,
+            Path::new("/opt/aif/bin/aifd"),
+            &exec,
+            Duration::from_secs(5),
+            false,
+            &mut spawn,
+        )
+        .expect("the retry must start the daemon");
+
+        assert_eq!(outcome, StartOutcome::Started);
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 3, "calls: {calls:?}");
+        assert_eq!(calls[0].program, "systemd-run");
+        assert_eq!(calls[1].argv(), ["--user", "reset-failed", "aif-daemon"]);
+        assert_eq!(calls[2].program, "systemd-run");
+        assert!(
+            !spawned.get(),
+            "a stale unit must not use the plain spawn fallback"
+        );
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn start_detached_reports_a_stale_unit_that_survives_the_reset() {
+        let dir = temp_dir("stale-unit-twice");
+        let socket = dir.join("daemon.sock");
+        let exec = ScriptExec::new()
+            .expect(
+                |call| call.program == "systemd-run",
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Unit aif-daemon.service already exists.\n".to_string(),
+                },
+            )
+            .expect(|call| call.program == "systemctl", CmdOut::ok(""))
+            .expect(
+                |call| call.program == "systemd-run",
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Unit aif-daemon.service already exists again.\n".to_string(),
+                },
+            );
+        let mut spawn = |_program: &Path, _paused: bool| Ok(());
+
+        let error = start_detached(
+            &socket,
+            Path::new("/opt/aif/bin/aifd"),
+            &exec,
+            Duration::from_secs(5),
+            false,
+            &mut spawn,
+        )
+        .expect_err("a second unit failure must stop the start");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("systemd-run exited with status 1")
+                && message.contains("already exists"),
+            "error: {message}"
+        );
+        assert_eq!(exec.calls().len(), 3, "calls: {:?}", exec.calls());
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn cleanup_daemon_unit_stops_and_resets_the_unit() {
+        let exec = ScriptExec::new()
+            .expect(
+                |call| {
+                    call.program == "systemctl" && call.argv() == ["--user", "stop", "aif-daemon"]
+                },
+                CmdOut {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .expect(
+                |call| {
+                    call.program == "systemctl"
+                        && call.argv() == ["--user", "reset-failed", "aif-daemon"]
+                },
+                CmdOut::ok(""),
+            );
+
+        cleanup_daemon_unit(&exec);
+
+        assert_eq!(exec.calls().len(), 2, "calls: {:?}", exec.calls());
+    }
+
+    #[test]
+    fn cleanup_daemon_unit_ignores_every_failure() {
+        // No scripted steps: each call fails as unexpected, which the
+        // cleanup must swallow.
+        let exec = ScriptExec::new();
+
+        cleanup_daemon_unit(&exec);
+
+        assert_eq!(exec.calls().len(), 2, "calls: {:?}", exec.calls());
+    }
+
+    #[test]
     fn spawn_detached_passes_the_paused_flag_to_a_fake_child() {
         let dir = temp_dir("real-spawn");
         let marker = dir.join("marker");
@@ -2823,6 +3208,7 @@ mod tests {
                 global: true,
                 overrides: Vec::new(),
             },
+            settings: SettingsView::default(),
         });
         let missing_config = dir.join("factory.toml");
         let exec = ScriptExec::new();

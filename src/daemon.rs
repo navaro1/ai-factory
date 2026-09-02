@@ -30,7 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::config::{self, Config, ReleasePolicy, RepoConfig};
+use crate::config::{
+    self, Config, ExecutionRole, ReleasePolicy, RepoConfig, ResolvedRoleSettings, SettingsEdit,
+};
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
@@ -42,13 +44,15 @@ use crate::prompts::{
     IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT, TICKET_CHAT_PROMPT,
     TICKET_PROMPT,
 };
-use crate::runner::claude::ClaudeRunner;
-use crate::runner::opencode::OpenCodeRunner;
-use crate::runner::{Answer, Job, RunEvent, Runner, Session};
+#[cfg(test)]
+use crate::runner::Runner;
+use crate::runner::{
+    capabilities, Answer, DefaultRunnerFactory, Job, RunEvent, RunnerFactory, Session,
+};
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, InputMode, PauseScope, Push, StateInput, StateView, TicketAction, TicketDetails,
-    TicketProposal,
+    Action, InputMode, PauseScope, Push, SettingsOperation, SettingsResult, SettingsResultStatus,
+    StateInput, StateView, TicketAction, TicketDetails, TicketProposal,
 };
 use crate::state::{DaemonState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
@@ -89,7 +93,7 @@ pub enum Inbound {
     /// One event from a runner.
     Run(RunEvent),
     /// One operator action from the control socket.
-    Act(Action),
+    Act(Box<Action>),
 }
 
 /// The assistant text data needed for one strict proposal parse.
@@ -105,12 +109,17 @@ struct TicketTurnText {
 pub struct Daemon {
     /// The parsed factory configuration.
     config: Config,
+    /// The absolute `factory.toml` path that this daemon owns.
+    config_path: PathBuf,
+    /// The content revision of the active factory configuration.
+    settings_revision: String,
+    /// A test hook that changes the destination after temporary-file preparation.
+    #[cfg(test)]
+    before_config_commit: Option<Box<dyn FnMut() + Send>>,
     /// The command runner; tests replace it with a scripted double.
     exec: Arc<dyn Exec>,
-    /// One runner per stage, in stage order.
-    runners: BTreeMap<Stage, Box<dyn Runner>>,
-    /// The interactive Claude runner used only for ticket creation.
-    ticket_runner: Box<dyn Runner>,
+    /// The adapter factory for resolved execution roles.
+    runner_factory: Arc<dyn RunnerFactory>,
     /// The worktree manager; it owns the naming rules for worktrees.
     worktrees: WorktreeManager,
     /// The path of `state.json`.
@@ -137,6 +146,8 @@ pub struct Daemon {
     pending_stacked: BTreeSet<String>,
     /// All tasks, in insertion order.
     table: TaskTable,
+    /// The immutable resolved role of each task that started at least once.
+    role_bindings: BTreeMap<String, ResolvedRoleSettings>,
     /// The decisions that wait for a human.
     decisions: Decisions,
     /// One release train per repository alias.
@@ -204,29 +215,23 @@ pub struct Daemon {
 impl Daemon {
     /// Build a daemon with the real runners and the real command runner.
     ///
-    /// The runner of each stage comes from the stage's config: `opencode`
-    /// selects the one-shot opencode runner, and every other value selects
-    /// the interactive claude runner. A true `paused` starts the whole
-    /// factory paused: the daemon polls and reports, but dispatches nothing
+    /// Each execution role selects a configured runner. A repository can
+    /// override the global role settings. A true `paused` starts the whole
+    /// factory paused. The daemon polls and reports, but dispatches nothing
     /// until the operator resumes.
+    // The revision must travel with the parsed bytes. The remaining values
+    // are daemon-owned dependencies and cannot be derived from that pair.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
+        config_path: PathBuf,
+        settings_revision: String,
         prompts_dir: PathBuf,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
         paused: bool,
     ) -> Result<Self> {
-        let mut runners: BTreeMap<Stage, Box<dyn Runner>> = BTreeMap::new();
-        for stage in Stage::ALL {
-            let runner: Box<dyn Runner> = if config.stage(stage).runner == "opencode" {
-                Box::new(OpenCodeRunner::new())
-            } else {
-                let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_session_id: &str| {});
-                Box::new(ClaudeRunner::new(sink))
-            };
-            runners.insert(stage, runner);
-        }
         let state_dir = config::state_dir();
         let exec: Arc<dyn Exec> = Arc::new(RealExec);
         let worktrees = WorktreeManager::new(state_dir.clone());
@@ -235,18 +240,17 @@ impl Daemon {
                 .prepare_checkout(&*exec, &repo.path)
                 .with_context(|| format!("cannot prepare repository {}", repo.alias))?;
         }
-        let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_session_id: &str| {});
-        let ticket_runner: Box<dyn Runner> = Box::new(ClaudeRunner::new(sink));
-        Ok(Self::with_runners(
+        Ok(Self::with_runner_factory(
             config,
+            config_path,
+            settings_revision,
             exec,
             state_dir,
             prompts_dir,
             poll_rx,
             wake,
             action_rx,
-            runners,
-            ticket_runner,
+            Arc::new(DefaultRunnerFactory),
             paused,
         ))
     }
@@ -261,16 +265,17 @@ impl Daemon {
     // Each argument is one daemon-owned dependency. A bundle would hide the
     // ownership boundary without reducing it.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_runners(
+    pub fn with_runner_factory(
         config: Config,
+        config_path: PathBuf,
+        settings_revision: String,
         exec: Arc<dyn Exec>,
         state_dir: PathBuf,
         prompts_dir: PathBuf,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
-        runners: BTreeMap<Stage, Box<dyn Runner>>,
-        ticket_runner: Box<dyn Runner>,
+        runner_factory: Arc<dyn RunnerFactory>,
         paused: bool,
     ) -> Self {
         let state_path = state_dir.join("state.json");
@@ -292,6 +297,7 @@ impl Daemon {
             }
         }
         let policies = stored.policies;
+        let role_bindings = stored.role_bindings;
         let ticket_conversations = stored
             .ticket_conversations
             .into_iter()
@@ -320,9 +326,12 @@ impl Daemon {
         let ticket_controller = TicketController::new(exec.clone());
         let mut daemon = Daemon {
             config,
+            config_path,
+            settings_revision,
+            #[cfg(test)]
+            before_config_commit: None,
             exec,
-            runners,
-            ticket_runner,
+            runner_factory,
             worktrees: WorktreeManager::new(state_dir.clone()),
             state_path: state_path.clone(),
             prompts_dir,
@@ -338,6 +347,7 @@ impl Daemon {
             pending_ready: Vec::new(),
             pending_stacked: BTreeSet::new(),
             table: TaskTable::new(),
+            role_bindings,
             decisions: Decisions::new(),
             trains,
             release_batches: BTreeMap::new(),
@@ -393,7 +403,7 @@ impl Daemon {
         let _forwarders = [
             forwarder("aif-poll", poll_rx, in_tx.clone(), Inbound::Poll)?,
             forwarder("aif-run", run_rx, in_tx.clone(), Inbound::Run)?,
-            forwarder("aif-act", action_rx, in_tx, Inbound::Act)?,
+            forwarder("aif-act", action_rx, in_tx, inbound_action)?,
         ];
 
         self.now_ms = (self.clock)();
@@ -432,7 +442,7 @@ impl Daemon {
         match message {
             Inbound::Poll(message) => self.on_poll(message),
             Inbound::Run(event) => self.on_run_event(event),
-            Inbound::Act(action) => self.on_action(action),
+            Inbound::Act(action) => self.on_action(*action),
         }
         self.drive();
     }
@@ -538,6 +548,7 @@ impl Daemon {
             .collect();
         let input = StateInput {
             config: &self.config,
+            settings_revision: &self.settings_revision,
             limits: &self.limits,
             paused: &self.paused,
             table: &self.table,
@@ -831,6 +842,13 @@ impl Daemon {
                 }
             }
             let log = self.log_path(&work.repo, work.stage, work.kind, work.number);
+            let replaces_task = self.table.by_id.values().any(|task| {
+                task.repo == work.repo
+                    && task.stage == work.stage
+                    && task.kind == work.kind
+                    && task.number == work.number
+                    && task.state.is_terminal()
+            });
             match self.table.upsert_queued(
                 &work.repo,
                 work.stage,
@@ -840,6 +858,9 @@ impl Daemon {
                 self.now_ms,
             ) {
                 Ok(task) => {
+                    if replaces_task {
+                        self.role_bindings.remove(&task.id);
+                    }
                     if work.stage == Stage::Review {
                         task.head_sha = work.head_sha.clone();
                         self.review_tickets.insert(task.id.clone(), review_tickets);
@@ -888,7 +909,7 @@ impl Daemon {
             let policy = self.active_policy(&alias).clone();
             let due = self.trains[&alias].should_fire(&policy, self.now_ms);
             if let Some(prs) = due {
-                self.fire_train(&alias, &prs);
+                self.fire_train(&alias, &prs, true);
             }
         }
     }
@@ -1035,7 +1056,7 @@ impl Daemon {
                 continue;
             };
             // Scheduler capacity counts running tasks. The separate live
-            // process limit also counts parked Claude sessions.
+            // process limit also counts parked live-input sessions.
             if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
                 continue;
             }
@@ -1063,7 +1084,7 @@ impl Daemon {
                 self.pending_chats.insert(id, messages);
                 continue;
             }
-            if !self.task_uses_claude(&task) {
+            if !self.task_capabilities(&task).live_input {
                 let leftover: Vec<String> = messages.into_iter().skip(1).collect();
                 if !leftover.is_empty() {
                     self.pending_chats.insert(id, leftover);
@@ -1255,7 +1276,7 @@ impl Daemon {
                 return Err(e);
             }
         };
-        let resume = if self.task_uses_claude(&task) {
+        let resume = if self.task_capabilities(&task).resume {
             match task.session_id.clone().map_or_else(
                 || self.worktrees.read_task_session(&cwd, &task.id),
                 |id| Ok(Some(id)),
@@ -1283,29 +1304,8 @@ impl Daemon {
     /// Both fresh dispatches and chat resumes of parked tasks come through
     /// here; a resume carries the session id to continue.
     fn launch_task(&mut self, task: &Task, prompt: String, resume: Option<String>) -> Result<()> {
-        let stage_cfg = self.config.stage(task.stage);
-        let (model, variant, yolo, allowed_tools) = if Self::is_ticket_chat(task) {
-            (
-                self.config
-                    .ticket_chat_model()
-                    .map_err(|error| anyhow!(error))?
-                    .to_string(),
-                None,
-                true,
-                Some(vec![
-                    "Read".to_string(),
-                    "Glob".to_string(),
-                    "Grep".to_string(),
-                ]),
-            )
-        } else {
-            (
-                stage_cfg.model.clone(),
-                stage_cfg.variant.clone(),
-                stage_cfg.yolo,
-                None,
-            )
-        };
+        let role = self.bind_task_role(task)?;
+        let settings = &role.settings;
         let cwd = self
             .task_cwd(&task.id)
             .ok_or_else(|| anyhow!("repository {} left the config", task.repo))?;
@@ -1313,23 +1313,18 @@ impl Daemon {
             task: task.id.clone(),
             stage: task.stage,
             repo: task.repo.clone(),
-            model,
-            variant,
+            model: settings.model.clone(),
+            variant: settings.effort.clone(),
             prompt,
             cwd,
             log: task.log_path.clone(),
             resume,
-            yolo,
-            allowed_tools,
+            yolo: settings.auto_approve == Some(true)
+                || settings.permission_mode.as_deref() == Some("bypassPermissions"),
+            allowed_tools: (!settings.tools.is_empty()).then(|| settings.tools.clone()),
         };
-        let session = if Self::is_ticket_task(task) {
-            self.ticket_runner.start(&job, self.run_tx.clone())?
-        } else {
-            self.runners
-                .get_mut(&task.stage)
-                .ok_or_else(|| anyhow!("no runner for the {} stage", task.stage))?
-                .start(&job, self.run_tx.clone())?
-        };
+        let mut runner = self.runner_factory.build(&role);
+        let session = runner.start(&job, self.run_tx.clone())?;
         self.sessions.insert(task.id.clone(), session);
         self.last_event_ms.insert(task.id.clone(), self.now_ms);
         if let Err(e) = self
@@ -1512,14 +1507,14 @@ impl Daemon {
 
     /// Apply one turn end.
     ///
-    /// Completion differs per runner. A claude refine task waits for a user.
-    /// Another claude task completes or fails from the turn result.
-    /// An opencode turn is only a step boundary.
+    /// A live-input refine task waits for a user. Another live-input task
+    /// completes or fails from the turn result. A one-shot turn is only a
+    /// step boundary.
     fn on_turn_end(&mut self, id: &str, ok: bool, summary: &str) {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
-        if task.state != TaskState::Running || !self.task_uses_claude(&task) {
+        if task.state != TaskState::Running || !self.task_capabilities(&task).live_input {
             return;
         }
         if task.stage == Stage::Refine {
@@ -1545,7 +1540,7 @@ impl Daemon {
             self.complete_task(&task);
         } else {
             let reason = if summary.is_empty() {
-                "the claude turn failed"
+                "the agent turn failed"
             } else {
                 summary
             };
@@ -1556,8 +1551,8 @@ impl Daemon {
     /// Apply one run exit.
     ///
     /// A terminal task ignores the exit. A parked task stays resumable.
-    /// An opencode exit supplies the task result.
-    /// A claude exit without a prior result fails the active task.
+    /// A one-shot exit supplies the task result.
+    /// A live-input exit without a prior result fails the active task.
     /// After the terminal state is set, a queued chat message reopens the
     /// task for its follow-up turn.
     fn on_exit_event(&mut self, id: &str, ok: bool, detail: &str) {
@@ -1575,12 +1570,12 @@ impl Daemon {
         if task.state == TaskState::AwaitingUser {
             return;
         }
-        if self.task_uses_claude(&task) {
+        if self.task_capabilities(&task).live_input {
             if task.state == TaskState::Queued {
                 return;
             }
             let reason = if ok {
-                format!("claude exited before it reported a turn result: {detail}")
+                format!("the live-input runner exited before a turn result: {detail}")
             } else {
                 detail.to_string()
             };
@@ -1610,10 +1605,10 @@ impl Daemon {
             return;
         }
         self.changed = true;
-        // A Claude task without a saved message loses its restart data at
-        // `Done`. A saved message keeps the marker until its next turn.
-        // An OpenCode task always keeps the marker for later follow-ups.
-        if self.task_uses_claude(task) && !self.pending_chats.contains_key(&task.id) {
+        // A live-input task without a saved message loses its restart data
+        // at `Done`. A saved message keeps the marker until its next turn.
+        // A resumable one-shot task keeps the marker for later follow-ups.
+        if self.task_capabilities(task).live_input && !self.pending_chats.contains_key(&task.id) {
             self.remove_task_session_marker(task);
         }
         self.decisions.drop_for_task(&task.id);
@@ -1660,11 +1655,23 @@ impl Daemon {
                     return;
                 }
                 let log = self.log_path(&repo, Stage::Refine, kind, number);
+                let replaces_task = self.table.by_id.values().any(|task| {
+                    task.repo == repo
+                        && task.stage == Stage::Refine
+                        && task.kind == kind
+                        && task.number == number
+                        && task.state.is_terminal()
+                });
                 match self
                     .table
                     .upsert_queued(&repo, Stage::Refine, kind, number, log, self.now_ms)
                 {
-                    Ok(_) => self.changed = true,
+                    Ok(task) => {
+                        if replaces_task {
+                            self.role_bindings.remove(&task.id);
+                        }
+                        self.changed = true;
+                    }
                     Err(e) => eprintln!(
                         "the refine request for {repo} {} {number}: {e:#}",
                         kind.as_str()
@@ -1698,7 +1705,7 @@ impl Daemon {
             }
             Action::Go { repo, prs } => {
                 self.decisions.take(&format!("gate:{repo}"));
-                self.fire_train(&repo, &prs);
+                self.fire_train(&repo, &prs, true);
             }
             Action::Policy { repo, policy } => {
                 if !self.config.repos.contains_key(&repo) {
@@ -1905,14 +1912,221 @@ impl Daemon {
                     }
                 }
             }
+            Action::SaveSettings {
+                request,
+                base_revision,
+                edit,
+            } => self.save_settings(request, base_revision, edit),
+            Action::ReloadSettings { request } => self.reload_settings(request),
             Action::Reconcile { repo } => self.reconcile(repo.as_deref()),
             Action::Stop => self.shutdown = true,
         }
     }
 
+    /// Save one comment-preserving role edit and activate the valid result.
+    fn save_settings(&mut self, request: String, base_revision: String, edit: SettingsEdit) {
+        let (current, current_revision) = match self.read_factory_file() {
+            Ok(value) => value,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Failed,
+                    self.settings_revision.clone(),
+                    Some(format!("cannot read factory.toml: {error:#}")),
+                );
+                return;
+            }
+        };
+        if base_revision != current_revision {
+            self.push_settings_result(
+                request,
+                SettingsOperation::Save,
+                SettingsResultStatus::Stale,
+                current_revision,
+                Some("the factory.toml file changed after this edit started".to_string()),
+            );
+            return;
+        }
+        let candidate_text = match config::edit_config_text(&current, &edit) {
+            Ok(text) => text,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Invalid,
+                    current_revision,
+                    Some(format!("the settings edit is invalid: {error:#}")),
+                );
+                return;
+            }
+        };
+        let candidate = match Config::parse_resolved(&candidate_text, &*self.exec) {
+            Ok(config) => config,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Invalid,
+                    current_revision,
+                    Some(format!("the settings edit is invalid: {error:#}")),
+                );
+                return;
+            }
+        };
+        if !self.config.has_same_topology(&candidate) {
+            self.push_settings_result(
+                request,
+                SettingsOperation::Save,
+                SettingsResultStatus::RestartRequired,
+                current_revision,
+                Some("repository topology changes require a daemon restart".to_string()),
+            );
+            return;
+        }
+        let prepared = match config::prepare_config_atomic(&self.config_path, &candidate_text) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Failed,
+                    current_revision,
+                    Some(format!("cannot prepare factory.toml: {error:#}")),
+                );
+                return;
+            }
+        };
+        #[cfg(test)]
+        if let Some(mut hook) = self.before_config_commit.take() {
+            hook();
+        }
+        match config::commit_config_atomic_checked(prepared, &base_revision) {
+            Ok(config::AtomicWrite::Written) => {}
+            Ok(config::AtomicWrite::Stale { revision }) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Stale,
+                    revision,
+                    Some("the factory.toml file changed while this edit was validated".to_string()),
+                );
+                return;
+            }
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Failed,
+                    current_revision,
+                    Some(format!("cannot save factory.toml: {error:#}")),
+                );
+                return;
+            }
+        }
+        let revision = config::file_revision(&candidate_text);
+        self.activate_config(candidate, revision.clone());
+        self.push_settings_result(
+            request,
+            SettingsOperation::Save,
+            SettingsResultStatus::Saved,
+            revision,
+            None,
+        );
+    }
+
+    /// Reload the factory file without changing it on disk.
+    fn reload_settings(&mut self, request: String) {
+        let (text, revision) = match self.read_factory_file() {
+            Ok(value) => value,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Reload,
+                    SettingsResultStatus::Failed,
+                    self.settings_revision.clone(),
+                    Some(format!("cannot read factory.toml: {error:#}")),
+                );
+                return;
+            }
+        };
+        let candidate = match Config::parse_resolved(&text, &*self.exec) {
+            Ok(config) => config,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Reload,
+                    SettingsResultStatus::Invalid,
+                    revision,
+                    Some(format!("the factory configuration is invalid: {error:#}")),
+                );
+                return;
+            }
+        };
+        if !self.config.has_same_topology(&candidate) {
+            self.push_settings_result(
+                request,
+                SettingsOperation::Reload,
+                SettingsResultStatus::RestartRequired,
+                revision,
+                Some("repository topology changes require a daemon restart".to_string()),
+            );
+            return;
+        }
+        self.activate_config(candidate, revision.clone());
+        self.push_settings_result(
+            request,
+            SettingsOperation::Reload,
+            SettingsResultStatus::Reloaded,
+            revision,
+            None,
+        );
+    }
+
+    /// Read the complete config and compute its compare-and-save revision.
+    fn read_factory_file(&self) -> Result<(String, String)> {
+        let text = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("cannot read {}", self.config_path.display()))?;
+        let revision = config::file_revision(&text);
+        Ok((text, revision))
+    }
+
+    /// Install a validated non-topology configuration in the running daemon.
+    fn activate_config(&mut self, config: Config, revision: String) {
+        for stage in Stage::ALL {
+            let old_limit = self.config.stage(stage).limit;
+            if self.limits.limit(stage) == old_limit {
+                self.limits.stage.insert(stage, config.stage(stage).limit);
+            }
+        }
+        self.config = config;
+        self.settings_revision = revision;
+        self.changed = true;
+    }
+
+    /// Send one non-state settings result to each connected client.
+    fn push_settings_result(
+        &self,
+        request: String,
+        operation: SettingsOperation,
+        status: SettingsResultStatus,
+        revision: String,
+        message: Option<String>,
+    ) {
+        if let Some(pusher) = self.ticket_pusher.as_ref() {
+            pusher(Push::SettingsResult(SettingsResult {
+                request,
+                operation,
+                status,
+                revision,
+                message,
+            }));
+        }
+    }
+
     /// Send a chat message to one task.
     ///
-    /// A live claude session receives the message at once. Every other case
+    /// A live-input session receives the message at once. Every other case
     /// queues the message as the next turn: the daemon reopens a terminal
     /// task, and `resume_pending_chats` starts a run whose prompt is the
     /// message and whose session continues the old one. A failed live send
@@ -1929,9 +2143,8 @@ impl Daemon {
             eprintln!("{refusal}");
             return false;
         }
-        // Never steer an opencode session: the one-shot runner has no
-        // steering channel, so only a claude task may receive a live send.
-        if self.task_uses_claude(&task) {
+        // Only a runner with live-input support receives a steering message.
+        if self.task_capabilities(&task).live_input {
             if let Some(session) = self.sessions.get_mut(id) {
                 match session.send_user(text) {
                     Ok(()) => {
@@ -2079,8 +2292,8 @@ impl Daemon {
     /// The session id that a follow-up turn continues.
     ///
     /// The id comes from the task, and else from the session marker in the
-    /// task's workspace. The marker lets a human converse with an OpenCode
-    /// task after a daemon restart. `None` means no session exists.
+    /// task's workspace. The marker lets a human continue a resumable task
+    /// after a daemon restart. `None` means no session exists.
     fn followup_session_id(&self, task: &Task) -> Result<Option<String>> {
         if let Some(session_id) = task.session_id.as_deref() {
             return Ok(Some(session_id.to_string()));
@@ -2094,18 +2307,17 @@ impl Daemon {
     /// Decide what the session view's input bar does for one task.
     ///
     /// The sibling guard decides first: a blocked task is closed whatever
-    /// else is true. A live Claude session takes a steering message at
-    /// once. A parked Claude task relaunches its session on the next
-    /// message. A running OpenCode task with a recorded session turns the
-    /// message into its next turn. A terminal OpenCode task queues a
-    /// follow-up turn. Every other
+    /// else is true. A live-input session takes a steering message at once.
+    /// A parked task relaunches its session on the next message. A running
+    /// one-shot task with a recorded session uses the message for its next
+    /// turn. A terminal one-shot task queues a follow-up turn. Every other
     /// task takes no message. The close reason says why.
     fn input_mode(&self, task: &Task) -> InputMode {
         if let Some(reason) = self.sibling_refusal(task) {
             return InputMode::Closed { reason };
         }
-        let uses_claude = self.task_uses_claude(task);
-        if self.sessions.contains_key(&task.id) && uses_claude {
+        let live_input = self.task_capabilities(task).live_input;
+        if self.sessions.contains_key(&task.id) && live_input {
             return InputMode::Live;
         }
         let session = match self.followup_session_id(task) {
@@ -2121,7 +2333,7 @@ impl Daemon {
                 };
             }
         };
-        if uses_claude {
+        if live_input {
             if task.state == TaskState::AwaitingUser && session.is_some() {
                 return InputMode::Resume;
             }
@@ -2286,7 +2498,7 @@ impl Daemon {
                     self.decisions.push(decision.clone());
                     return;
                 }
-                self.fire_train(&decision.repo, prs);
+                self.fire_train(&decision.repo, prs, true);
             }
             _ => eprintln!(
                 "the answer for {}: the response does not fit the decision",
@@ -2298,6 +2510,14 @@ impl Daemon {
 
     /// Forward an answer to the live session of one task.
     fn answer_session(&mut self, task: &str, request_id: &str, answer: Answer) -> Result<()> {
+        let task_value = self
+            .table
+            .by_id
+            .get(task)
+            .ok_or_else(|| anyhow!("no task holds this answer"))?;
+        if !self.task_capabilities(task_value).permission_responses {
+            bail!("the task runner does not support permission responses");
+        }
         let session = self
             .sessions
             .get_mut(task)
@@ -2307,6 +2527,14 @@ impl Daemon {
 
     /// Forward a chat line to the live session of one task.
     fn send_to_session(&mut self, task: &str, text: &str) -> Result<()> {
+        let task_value = self
+            .table
+            .by_id
+            .get(task)
+            .ok_or_else(|| anyhow!("no task holds this message"))?;
+        if !self.task_capabilities(task_value).live_input {
+            bail!("the task runner does not support live input");
+        }
         let session = self
             .sessions
             .get_mut(task)
@@ -2393,7 +2621,7 @@ impl Daemon {
                 eprintln!("the retry of {id}: the release batch is empty");
                 return;
             }
-            self.fire_train(&task.repo, &prs);
+            self.fire_train(&task.repo, &prs, false);
             let queued = self
                 .table
                 .by_id
@@ -2465,6 +2693,13 @@ impl Daemon {
             return;
         }
         let log = self.log_path(repo, Stage::Refine, ItemKind::Issue, TICKET_NUMBER);
+        let replaces_task = self.table.by_id.values().any(|task| {
+            task.repo == repo
+                && task.stage == Stage::Refine
+                && task.kind == ItemKind::Issue
+                && task.number == TICKET_NUMBER
+                && task.state.is_terminal()
+        });
         match self.table.upsert_queued(
             repo,
             Stage::Refine,
@@ -2475,13 +2710,16 @@ impl Daemon {
         ) {
             Ok(task) => {
                 task.purpose = TaskPurpose::TicketCreate;
+                if replaces_task {
+                    self.role_bindings.remove(&task.id);
+                }
                 self.changed = true;
             }
             Err(e) => eprintln!("the ticket session for {repo}: {e:#}"),
         }
     }
 
-    /// Queue or reuse one read-only issue conversation.
+    /// Queue or reuse one issue conversation.
     fn ticket_chat(&mut self, repo: &str, number: u64) {
         let handoff_active = self
             .snapshot
@@ -2590,6 +2828,7 @@ impl Daemon {
             self.cancel_task(&id, false);
             self.table.remove(&id);
         }
+        self.role_bindings.remove(&id);
         if self.ticket_conversations.remove(key).is_some() {
             self.changed = true;
         }
@@ -2673,7 +2912,7 @@ impl Daemon {
     // ------------------------------------------------------------------
 
     /// Fire one train with an explicit batch and queue its release task.
-    fn fire_train(&mut self, repo: &str, prs: &[u64]) {
+    fn fire_train(&mut self, repo: &str, prs: &[u64], replace_binding: bool) {
         let Some(train) = self.trains.get_mut(repo) else {
             eprintln!("cannot fire the train of {repo}: no such repository");
             return;
@@ -2705,6 +2944,9 @@ impl Daemon {
             eprintln!("the release task {id}: {e:#}");
             self.finish_train(repo, false);
             return;
+        }
+        if replace_binding {
+            self.role_bindings.remove(&id);
         }
         self.changed = true;
     }
@@ -2771,19 +3013,67 @@ impl Daemon {
                 && task.number == TICKET_NUMBER)
     }
 
-    /// True when the task is a read-only issue conversation.
+    /// True when the task is an issue conversation.
     fn is_ticket_chat(task: &Task) -> bool {
         task.purpose == TaskPurpose::TicketChat
     }
 
-    /// True when the task uses the dedicated ticket runner.
-    fn is_ticket_task(task: &Task) -> bool {
-        Self::is_ticket_creation(task) || Self::is_ticket_chat(task)
+    /// Select the execution role for one task purpose.
+    fn execution_role(task: &Task) -> ExecutionRole {
+        if Self::is_ticket_creation(task) {
+            ExecutionRole::TicketCreate
+        } else if Self::is_ticket_chat(task) {
+            ExecutionRole::TicketChat
+        } else {
+            match task.stage {
+                Stage::Refine => ExecutionRole::Refine,
+                Stage::Implement => ExecutionRole::Implement,
+                Stage::Review => ExecutionRole::Review,
+                Stage::Release => ExecutionRole::Release,
+            }
+        }
     }
 
-    /// True when this task uses the interactive Claude protocol.
-    fn task_uses_claude(&self, task: &Task) -> bool {
-        Self::is_ticket_task(task) || self.config.stage(task.stage).runner == "claude"
+    /// Resolve the current typed settings for one task.
+    fn resolved_task_role(&self, task: &Task) -> Result<ResolvedRoleSettings> {
+        self.role_bindings.get(&task.id).cloned().map_or_else(
+            || {
+                self.config
+                    .resolved_role(Some(&task.repo), Self::execution_role(task).table_name())
+            },
+            Ok,
+        )
+    }
+
+    /// Resolve and persist the immutable settings before one first run.
+    fn bind_task_role(&mut self, task: &Task) -> Result<ResolvedRoleSettings> {
+        if let Some(binding) = self.role_bindings.get(&task.id) {
+            return Ok(binding.clone());
+        }
+        let binding = self
+            .config
+            .resolved_role(Some(&task.repo), Self::execution_role(task).table_name())?;
+        self.role_bindings.insert(task.id.clone(), binding.clone());
+        let state = self.collect_state();
+        let text = state.to_json()?;
+        if let Err(error) = state.save(&self.state_path) {
+            self.role_bindings.remove(&task.id);
+            return Err(error.context("cannot persist the task role binding"));
+        }
+        self.saved = Some(text);
+        self.changed = true;
+        Ok(binding)
+    }
+
+    /// Return the runtime actions of the task's resolved harness.
+    fn task_capabilities(&self, task: &Task) -> crate::runner::Capabilities {
+        self.resolved_task_role(task)
+            .map(|role| capabilities(role.settings.harness))
+            .unwrap_or(crate::runner::Capabilities {
+                live_input: false,
+                resume: false,
+                permission_responses: false,
+            })
     }
 
     /// The task log path: `<state_dir>/logs/<repo>__<stage>-<kind><n>.jsonl`.
@@ -2973,6 +3263,17 @@ impl Daemon {
             policies: self.policies.clone(),
             last_fire_ms,
             ticket_conversations: self.ticket_conversations.values().cloned().collect(),
+            role_bindings: self
+                .role_bindings
+                .iter()
+                .filter(|(id, _)| {
+                    self.table
+                        .by_id
+                        .get(*id)
+                        .is_none_or(|task| task.state != TaskState::Done)
+                })
+                .map(|(id, binding)| (id.clone(), binding.clone()))
+                .collect(),
         }
     }
 
@@ -3130,6 +3431,11 @@ fn forwarder<T: Send + 'static>(
         .map_err(|e| anyhow!("cannot spawn the {name} forwarder: {e}"))
 }
 
+/// Pack one control action for the shared inbound queue.
+fn inbound_action(action: Action) -> Inbound {
+    Inbound::Act(Box::new(action))
+}
+
 /// The current time in milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -3151,7 +3457,7 @@ fn builtin_prompt(stage: Stage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StageConfig;
+    use crate::config::{ExecutionRole, Harness, RoleSettings, StageConfig};
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use serde_json::json;
@@ -3439,6 +3745,20 @@ mod tests {
         }
     }
 
+    /// A factory that records resolved roles and returns fake sessions.
+    struct FakeRunnerFactory {
+        jobs: Arc<Mutex<Vec<Job>>>,
+        sessions: Arc<Mutex<Vec<SessionHandle>>>,
+        roles: Arc<Mutex<Vec<ResolvedRoleSettings>>>,
+    }
+
+    impl RunnerFactory for FakeRunnerFactory {
+        fn build(&self, role: &ResolvedRoleSettings) -> Box<dyn Runner> {
+            self.roles.lock().unwrap().push(role.clone());
+            Box::new(FakeRunner::new(self.jobs.clone(), self.sessions.clone()))
+        }
+    }
+
     // ------------------------------------------------------------------
     // The rig
     // ------------------------------------------------------------------
@@ -3490,6 +3810,36 @@ mod tests {
         stages.insert(Stage::Implement, stage(1));
         stages.insert(Stage::Review, stage(2));
         stages.insert(Stage::Release, stage(1));
+        let role_settings = RoleSettings {
+            harness: Harness::Claude,
+            program: "claude".to_string(),
+            model: "m".to_string(),
+            effort: None,
+            extra_args: Vec::new(),
+            agent: None,
+            profile: None,
+            permission_mode: Some("bypassPermissions".to_string()),
+            permission_handler: None,
+            tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            strict_mcp: None,
+            auto_approve: None,
+            approval_policy: None,
+            sandbox: None,
+        };
+        let roles = ExecutionRole::ALL
+            .into_iter()
+            .map(|role| {
+                let mut settings = role_settings.clone();
+                if role == ExecutionRole::TicketChat {
+                    settings.permission_mode = Some("manual".to_string());
+                    settings.permission_handler = Some("inbox".to_string());
+                    settings.tools =
+                        vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+                }
+                (role, settings)
+            })
+            .collect();
         let mut repos = BTreeMap::new();
         repos.insert(
             "borsuk".to_string(),
@@ -3499,13 +3849,49 @@ mod tests {
                 owner_repo: "acme/borsuk".to_string(),
                 lanes: BTreeMap::new(),
                 release: ReleasePolicy::Manual,
+                role_overrides: BTreeMap::new(),
             },
         );
         Config {
+            schema_version: 1,
+            roles,
             stages,
             repos,
-            ticket_chat: crate::config::TicketChatConfig::default(),
+            ticket_chat: crate::config::TicketChatConfig {
+                model: Some("m".to_string()),
+            },
         }
+    }
+
+    /// A valid editable config with the same repository layout as a rig.
+    fn settings_config_text(repo: &Path, model: &str) -> String {
+        format!(
+            "schema_version = 1\n\
+             \n[stage.refine]\nharness = \"claude\"\nmodel = \"{model}\"\nlimit = 2\n\
+             \n[stage.implement]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
+             \n[stage.review]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 2\n\
+             \n[stage.release]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
+             \n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
+             \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\npermission_mode = \"manual\"\npermission_handler = \"inbox\"\ntools = [\"Read\", \"Glob\", \"Grep\"]\n\
+             \n[repo.borsuk]\npath = \"{}\"\n",
+            repo.display()
+        )
+    }
+
+    fn set_role_harness(config: &mut Config, role: ExecutionRole, harness: Harness) {
+        let settings = config.roles.get_mut(&role).unwrap();
+        settings.harness = harness;
+        settings.program = harness.program().to_string();
+        settings.agent = (harness == Harness::Opencode).then(|| "build".to_string());
+        settings.profile = None;
+        settings.permission_mode = None;
+        settings.permission_handler = None;
+        settings.tools.clear();
+        settings.disallowed_tools.clear();
+        settings.strict_mcp = None;
+        settings.auto_approve = (harness == Harness::Opencode).then_some(true);
+        settings.approval_policy = None;
+        settings.sandbox = None;
     }
 
     /// One open issue.
@@ -3546,6 +3932,7 @@ mod tests {
         exec: Arc<ScriptExec>,
         jobs: Arc<Mutex<Vec<Job>>>,
         sessions: Arc<Mutex<Vec<SessionHandle>>>,
+        roles: Arc<Mutex<Vec<ResolvedRoleSettings>>>,
         t: Arc<Mutex<u64>>,
         repo: PathBuf,
         prompts: PathBuf,
@@ -3583,29 +3970,29 @@ mod tests {
             let exec = scripted(steps);
             let jobs = Arc::new(Mutex::new(Vec::new()));
             let sessions = Arc::new(Mutex::new(Vec::new()));
-            let mut runners: BTreeMap<Stage, Box<dyn Runner>> = BTreeMap::new();
-            for stage in Stage::ALL {
-                runners.insert(
-                    stage,
-                    Box::new(FakeRunner::new(jobs.clone(), sessions.clone())),
-                );
-            }
+            let roles = Arc::new(Mutex::new(Vec::new()));
             let (_poll_tx, poll_rx) = mpsc::channel::<DaemonMsg>();
             let (wake_tx, _wake_rx) = mpsc::channel::<()>();
             let mut wake = BTreeMap::new();
             wake.insert("borsuk".to_string(), wake_tx);
             let (_action_tx, action_rx) = mpsc::channel();
             let t = Arc::new(Mutex::new(T0));
-            let mut daemon = Daemon::with_runners(
+            let runner_factory = Arc::new(FakeRunnerFactory {
+                jobs: jobs.clone(),
+                sessions: sessions.clone(),
+                roles: roles.clone(),
+            });
+            let mut daemon = Daemon::with_runner_factory(
                 config,
+                dir.join("factory.toml"),
+                String::new(),
                 exec.clone(),
                 state.clone(),
                 prompts.clone(),
                 poll_rx,
                 wake,
                 action_rx,
-                runners,
-                Box::new(FakeRunner::new(jobs.clone(), sessions.clone())),
+                runner_factory,
                 paused,
             );
             let clock_t = t.clone();
@@ -3615,6 +4002,7 @@ mod tests {
                 exec,
                 jobs,
                 sessions,
+                roles,
                 t,
                 repo: dir.join("repo"),
                 prompts,
@@ -3656,7 +4044,7 @@ mod tests {
         }
 
         fn act(&mut self, action: Action) {
-            self.daemon.handle(Inbound::Act(action));
+            self.daemon.handle(Inbound::Act(Box::new(action)));
         }
 
         fn drive(&mut self) {
@@ -5077,7 +5465,7 @@ mod tests {
             .chain(reuse_issue_steps(&repo, &worktree, &gitdir))
             .collect();
         let mut rig = Rig::make_in(dir, steps, |config| {
-            config.stages.get_mut(&Stage::Implement).unwrap().runner = "claude".to_string();
+            set_role_harness(config, ExecutionRole::Implement, Harness::Claude);
         });
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "sid-142"));
@@ -5242,34 +5630,581 @@ mod tests {
     }
 
     #[test]
-    fn ticket_create_uses_the_interactive_runner() {
+    fn ticket_create_uses_its_own_execution_role() {
         let mut rig = Rig::make_with(vec![], |config| {
-            config.stages.get_mut(&Stage::Refine).unwrap().runner = "opencode".to_string();
+            let settings = config.roles.get_mut(&ExecutionRole::Refine).unwrap();
+            settings.harness = Harness::Opencode;
+            settings.program = "opencode-refine".to_string();
+            settings.auto_approve = Some(true);
         });
-        let ticket_jobs = Arc::new(Mutex::new(Vec::new()));
-        let ticket_sessions = Arc::new(Mutex::new(Vec::new()));
-        rig.daemon.ticket_runner = Box::new(FakeRunner::new(ticket_jobs.clone(), ticket_sessions));
 
         rig.act(Action::TicketCreate {
             repo: "borsuk".to_string(),
         });
 
-        assert!(rig.jobs.lock().unwrap().is_empty());
-        let jobs = ticket_jobs.lock().unwrap();
+        let jobs = rig.jobs.lock().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].task, "borsuk/refine-i0");
         assert!(jobs[0].prompt.contains("gh issue create"));
         drop(jobs);
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, ExecutionRole::TicketCreate);
+        assert_eq!(roles[0].settings.harness, Harness::Claude);
+        drop(roles);
         let task = rig.task("borsuk/refine-i0");
         assert_eq!(
             rig.daemon.input_mode(&task),
             InputMode::Live,
-            "a ticket task uses Claude despite the raw stage runner"
+            "a ticket task uses the live-input capability of its own role"
         );
 
         rig.event(turn_ended("borsuk/refine-i0"));
 
         assert_eq!(rig.task("borsuk/refine-i0").state, TaskState::AwaitingUser);
+    }
+
+    #[test]
+    fn repository_role_override_selects_the_runner_and_all_settings() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config
+                .repos
+                .get_mut("borsuk")
+                .unwrap()
+                .role_overrides
+                .insert(
+                    ExecutionRole::Implement,
+                    crate::config::RoleOverride {
+                        harness: Some(Harness::Codex),
+                        program: Some("codex-local".to_string()),
+                        model: Some("gpt-local".to_string()),
+                        effort: Some("high".to_string()),
+                        extra_args: Some(vec!["--notice".to_string(), "local".to_string()]),
+                        profile: Some("repository".to_string()),
+                        approval_policy: Some("never".to_string()),
+                        sandbox: Some("workspace-write".to_string()),
+                        ..crate::config::RoleOverride::default()
+                    },
+                );
+        });
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, ExecutionRole::Implement);
+        assert_eq!(
+            roles[0].source,
+            crate::config::SettingsSource::Repository {
+                alias: "borsuk".to_string(),
+            }
+        );
+        assert_eq!(roles[0].settings.harness, Harness::Codex);
+        assert_eq!(roles[0].settings.program, "codex-local");
+        assert_eq!(roles[0].settings.model, "gpt-local");
+        assert_eq!(roles[0].settings.effort.as_deref(), Some("high"));
+        assert_eq!(roles[0].settings.extra_args, ["--notice", "local"]);
+        assert_eq!(roles[0].settings.profile.as_deref(), Some("repository"));
+        assert_eq!(roles[0].settings.approval_policy.as_deref(), Some("never"));
+        assert_eq!(
+            roles[0].settings.sandbox.as_deref(),
+            Some("workspace-write")
+        );
+    }
+
+    #[test]
+    fn an_automatic_retry_keeps_the_first_role_binding() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.daemon
+            .config
+            .roles
+            .get_mut(&ExecutionRole::Refine)
+            .unwrap()
+            .model = "changed-after-start".to_string();
+
+        rig.event(exited("borsuk/refine-i142", false, "failed"));
+
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0], roles[1]);
+        assert_eq!(roles[1].settings.model, "m");
+    }
+
+    #[test]
+    fn a_parked_follow_up_keeps_the_first_role_binding() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "session-142"));
+        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.event(exited("borsuk/refine-i142", true, "parked"));
+        rig.daemon
+            .config
+            .roles
+            .get_mut(&ExecutionRole::Refine)
+            .unwrap()
+            .model = "changed-after-park".to_string();
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "continue".to_string(),
+        });
+
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0], roles[1]);
+        assert_eq!(roles[1].settings.model, "m");
+    }
+
+    #[test]
+    fn a_daemon_restart_keeps_the_first_role_binding() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            first.poll(vec![issue(142, &["to-refine"])], vec![]);
+            assert_eq!(first.roles.lock().unwrap()[0].settings.model, "m");
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |config| {
+            config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
+                "changed-after-restart".to_string();
+        });
+        second.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        let roles = second.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].settings.model, "m");
+    }
+
+    #[test]
+    fn a_restart_drops_a_completed_binding_before_a_new_logical_task() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            first.poll(vec![issue(142, &["to-refine"])], vec![]);
+            first.daemon.sessions.remove("borsuk/refine-i142");
+            first
+                .daemon
+                .table
+                .by_id
+                .get_mut("borsuk/refine-i142")
+                .unwrap()
+                .state = TaskState::Done;
+            first.daemon.changed = true;
+            first.daemon.save_state();
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |config| {
+            config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
+                "new-task-after-restart".to_string();
+        });
+        second.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        let roles = second.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].settings.model, "new-task-after-restart");
+    }
+
+    #[test]
+    fn a_daemon_restart_keeps_a_failed_task_binding_for_retry() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            first.poll(vec![issue(142, &["to-refine"])], vec![]);
+            for attempt in 0..tasks::MAX_ATTEMPTS {
+                first.event(exited(
+                    "borsuk/refine-i142",
+                    false,
+                    &format!("failed attempt {attempt}"),
+                ));
+            }
+            assert!(matches!(
+                first.task("borsuk/refine-i142").state,
+                TaskState::Failed(_)
+            ));
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |config| {
+            config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
+                "changed-after-failure".to_string();
+        });
+        second.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        let roles = second.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].settings.model, "m");
+    }
+
+    #[test]
+    fn a_logically_new_task_replaces_a_stale_role_binding() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.daemon.sessions.remove("borsuk/refine-i142");
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/refine-i142")
+            .unwrap()
+            .state = TaskState::Done;
+        rig.daemon
+            .config
+            .roles
+            .get_mut(&ExecutionRole::Refine)
+            .unwrap()
+            .model = "new-task-model".to_string();
+
+        rig.act(Action::Refine {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+        });
+
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[1].settings.model, "new-task-model");
+    }
+
+    #[test]
+    fn a_settings_save_updates_the_file_live_config_and_result_push() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        fs::write(&config_path, &original).unwrap();
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "after-save".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "save-42".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: crate::sock::SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the save must push a settings result");
+        };
+        assert_eq!(result.request, "save-42");
+        assert_eq!(result.status, crate::sock::SettingsResultStatus::Saved);
+        assert_eq!(
+            rig.daemon.config.roles[&ExecutionRole::Refine].model,
+            "after-save"
+        );
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains("model = \"after-save\""));
+    }
+
+    #[test]
+    fn a_stale_settings_save_changes_neither_the_file_nor_live_config() {
+        let mut rig = Rig::make(vec![]);
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        let original = settings_config_text(&rig.repo, "m");
+        let newer = settings_config_text(&rig.repo, "changed-on-disk");
+        fs::write(&config_path, &newer).unwrap();
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "operator-edit".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "save-stale".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: crate::sock::SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the stale save must push a settings result");
+        };
+        assert_eq!(result.request, "save-stale");
+        assert_eq!(result.status, crate::sock::SettingsResultStatus::Stale);
+        assert_eq!(result.revision, crate::config::file_revision(&newer));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), newer);
+        assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
+    }
+
+    #[test]
+    fn a_save_detects_a_file_change_during_candidate_resolution() {
+        struct MutatingExec {
+            path: PathBuf,
+            replacement: String,
+            changed: AtomicBool,
+        }
+        impl Exec for MutatingExec {
+            fn run(&self, program: &str, args: &[&str], _cwd: Option<&Path>) -> Result<CmdOut> {
+                if program == "git" && args.ends_with(&["remote", "get-url", "origin"]) {
+                    if !self.changed.swap(true, Ordering::SeqCst) {
+                        fs::write(&self.path, &self.replacement)?;
+                    }
+                    return Ok(CmdOut::ok("git@github.com:acme/borsuk.git\n"));
+                }
+                bail!("unexpected command")
+            }
+        }
+
+        let dir = temp_root();
+        fs::create_dir_all(dir.join("repo")).unwrap();
+        fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        let path = dir.join("factory.toml");
+        let original = settings_config_text(&dir.join("repo"), "m");
+        let external = settings_config_text(&dir.join("repo"), "external-change");
+        fs::write(&path, &original).unwrap();
+        let exec: Arc<dyn Exec> = Arc::new(MutatingExec {
+            path: path.clone(),
+            replacement: external.clone(),
+            changed: AtomicBool::new(false),
+        });
+        let (_poll_tx, poll_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let roles = Arc::new(Mutex::new(Vec::new()));
+        let mut daemon = Daemon::with_runner_factory(
+            test_config(&dir),
+            path.clone(),
+            config::file_revision(&original),
+            exec,
+            dir.join("state"),
+            dir.join("prompts"),
+            poll_rx,
+            BTreeMap::new(),
+            action_rx,
+            Arc::new(FakeRunnerFactory {
+                jobs,
+                sessions,
+                roles,
+            }),
+            false,
+        );
+        let (tx, rx) = mpsc::channel();
+        daemon.set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "operator-edit".to_string();
+        daemon.handle(Inbound::Act(Box::new(Action::SaveSettings {
+            request: "race".to_string(),
+            base_revision: config::file_revision(&original),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        })));
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            result.status,
+            SettingsResultStatus::Stale,
+            "{:?}",
+            result.message
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), external);
+        assert_eq!(daemon.config.roles[&ExecutionRole::Refine].model, "m");
+    }
+
+    #[test]
+    fn a_save_detects_a_change_after_temporary_file_preparation() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        let path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        let external = settings_config_text(&rig.repo, "external-after-prepare");
+        fs::write(&path, &original).unwrap();
+        let hook_path = path.clone();
+        let hook_external = external.clone();
+        rig.daemon.before_config_commit = Some(Box::new(move || {
+            fs::write(&hook_path, &hook_external).unwrap();
+        }));
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "operator-edit".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "after-prepare".to_string(),
+            base_revision: config::file_revision(&original),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(result.status, SettingsResultStatus::Stale);
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn an_invalid_reload_keeps_the_live_config() {
+        let mut rig = Rig::make(vec![]);
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let invalid = "schema_version = 1\n[stage.refine]\nharness = \"claude\"\n";
+        fs::write(&config_path, invalid).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::ReloadSettings {
+            request: "reload-invalid".to_string(),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the invalid reload must push a settings result");
+        };
+        assert_eq!(result.request, "reload-invalid");
+        assert_eq!(result.status, crate::sock::SettingsResultStatus::Invalid);
+        assert_eq!(fs::read_to_string(config_path).unwrap(), invalid);
+        assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
+    }
+
+    #[test]
+    fn a_topology_reload_keeps_the_old_live_topology() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let added = dir.join("second-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(added.join(".git")).unwrap();
+        let mut rig = Rig::make_in(
+            dir,
+            vec![
+                git_step(
+                    &repo,
+                    &["remote", "get-url", "origin"],
+                    CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+                ),
+                git_step(
+                    &added,
+                    &["remote", "get-url", "origin"],
+                    CmdOut::ok("git@github.com:acme/second.git\n"),
+                ),
+            ],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let topology = format!(
+            "{}\n[repo.second]\npath = \"{}\"\n",
+            settings_config_text(&rig.repo, "m"),
+            added.display()
+        );
+        fs::write(&config_path, &topology).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::ReloadSettings {
+            request: "reload-topology".to_string(),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the topology reload must push a settings result");
+        };
+        assert_eq!(
+            result.status,
+            crate::sock::SettingsResultStatus::RestartRequired
+        );
+        assert_eq!(result.revision, crate::config::file_revision(&topology));
+        assert_eq!(rig.daemon.config.repos.len(), 1);
+        assert!(rig.daemon.config.repos.contains_key("borsuk"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), topology);
+    }
+
+    #[test]
+    fn a_reloaded_role_applies_to_a_logically_new_task_only() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        fs::write(
+            &config_path,
+            settings_config_text(&rig.repo, "after-reload"),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::ReloadSettings {
+            request: "reload-new-task".to_string(),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the valid reload must push a settings result");
+        };
+        assert_eq!(result.status, crate::sock::SettingsResultStatus::Reloaded);
+        assert_eq!(rig.roles.lock().unwrap()[0].settings.model, "m");
+        rig.daemon.sessions.remove("borsuk/refine-i142");
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/refine-i142")
+            .unwrap()
+            .state = TaskState::Done;
+
+        rig.act(Action::Refine {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+        });
+
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0].settings.model, "m");
+        assert_eq!(roles[1].settings.model, "after-reload");
     }
 
     #[test]
@@ -5299,6 +6234,7 @@ mod tests {
         assert!(job.prompt.contains("issue 7"));
         assert!(job.prompt.contains("body 7"));
         assert!(job.prompt.contains("Start with analysis"));
+        assert!(!job.prompt.contains("Do not edit files"));
         assert!(job.prompt.contains("<aif-ticket-proposal-v1>"));
         assert_eq!(
             rig.task("borsuk/ticket-i7").purpose,
@@ -6680,7 +7616,7 @@ mod tests {
             &rig_gitdir(&dir),
         );
         let mut rig = Rig::make_in(dir, steps, |config| {
-            config.stages.get_mut(&Stage::Implement).unwrap().runner = "opencode".to_string();
+            set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
         });
         rig.poll(vec![issue(142, &["refined"])], vec![]);
 
@@ -6708,7 +7644,7 @@ mod tests {
             steps.extend(reuse_issue_steps(&repo, &worktree, &gitdir));
         }
         Rig::make_in(dir.to_path_buf(), steps, |config| {
-            config.stages.get_mut(&Stage::Implement).unwrap().runner = "opencode".to_string();
+            set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
         })
     }
 
@@ -6935,7 +7871,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opencode_retry_starts_fresh_without_a_session() {
+    fn an_opencode_retry_resumes_when_the_adapter_supports_resume() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
@@ -6946,7 +7882,7 @@ mod tests {
 
         assert_eq!(rig.task("borsuk/implement-i142").attempt, 2);
         assert_eq!(rig.job_count(), 2);
-        assert_eq!(rig.job(1).resume, None, "a retry never resumes");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
         assert!(
             rig.job(1).prompt.contains("142"),
             "the retry reruns the stage prompt, not a chat message"

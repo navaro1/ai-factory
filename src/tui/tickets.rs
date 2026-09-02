@@ -713,7 +713,7 @@ impl Tickets {
     /// Draw the list or the focused issue.
     pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         if self.focus {
-            self.draw_focus(frame, area);
+            self.draw_focus(frame, area, state);
         } else {
             self.draw_list(frame, area, state);
         }
@@ -822,8 +822,8 @@ impl Tickets {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Draw the issue data and the reserved Claude pane.
-    fn draw_focus(&self, frame: &mut Frame<'_>, area: Rect) {
+    /// Draw the issue data and the configured ticket chat pane.
+    fn draw_focus(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         if self.conflict_open {
             self.draw_conflict(frame, area);
             return;
@@ -845,6 +845,11 @@ impl Tickets {
         } else {
             Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area)
         };
+        let repo = self
+            .focus_key
+            .as_ref()
+            .map_or("", |(repo, _)| repo.as_str());
+        let harness = ticket_chat_harness(state, repo);
         let details = match self.details.as_ref() {
             Some(details) => {
                 let issue = &details.issue;
@@ -882,7 +887,7 @@ impl Tickets {
                     lines.extend([
                         Line::from(""),
                         Line::from(Span::styled(
-                            "◇ Claude proposal · a apply",
+                            format!("◇ {harness} proposal · a apply"),
                             Style::default()
                                 .fg(THEME.accent)
                                 .add_modifier(Modifier::BOLD),
@@ -905,7 +910,8 @@ impl Tickets {
                 .block(Block::bordered().title(" ticket // esc back ")),
             panes[0],
         );
-        let chat_block = Block::bordered().title(" claude // read-only ");
+        let (chat_title, chat_ready) = ticket_chat_identity(state, repo);
+        let chat_block = Block::bordered().title(format!(" {chat_title} "));
         let chat_inner = chat_block.inner(panes[1]);
         frame.render_widget(chat_block, panes[1]);
         if self.chat.task_id().is_some() {
@@ -918,10 +924,9 @@ impl Tickets {
                 .map_or_else(
                     || {
                         if self.chat_active {
-                            "… pending: Claude session starts.".to_string()
+                            "… pending: the configured chat session starts.".to_string()
                         } else {
-                            "Claude is ready for ticket analysis.\n\nc  start or resume chat"
-                                .to_string()
+                            format!("{chat_ready}\n\nc  start or resume chat")
                         }
                     },
                     |error| format!("× chat needs configuration.\n\n{error}"),
@@ -1154,6 +1159,34 @@ fn result_line(result: Option<&TicketResult>) -> Line<'static> {
     ])
 }
 
+fn ticket_chat_identity(state: &StateView, repo: &str) -> (String, String) {
+    let harness = ticket_chat_harness(state, repo);
+    (
+        format!("{harness} // configured access"),
+        format!("The configured {harness} role is ready for ticket analysis."),
+    )
+}
+
+fn ticket_chat_harness<'a>(state: &'a StateView, repo: &str) -> &'a str {
+    let settings = state
+        .settings
+        .repositories
+        .iter()
+        .find(|value| {
+            value.repository == repo && value.role == crate::config::ExecutionRole::TicketChat
+        })
+        .map(|value| &value.settings)
+        .or_else(|| {
+            state
+                .settings
+                .global
+                .iter()
+                .find(|value| value.role == crate::config::ExecutionRole::TicketChat)
+                .map(|value| &value.settings)
+        });
+    settings.map_or("chat", |settings| settings.harness.program())
+}
+
 /// The word and symbol for one workflow group.
 fn group_line(group: TicketGroup) -> Line<'static> {
     let (symbol, word, color) = match group {
@@ -1181,7 +1214,7 @@ mod tests {
     use ratatui::Terminal;
 
     fn state() -> StateView {
-        StateView {
+        let mut state = StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             links: Vec::new(),
             repos: Vec::new(),
@@ -1213,6 +1246,41 @@ mod tests {
                 global: false,
                 overrides: Vec::new(),
             },
+            settings: crate::sock::SettingsView::default(),
+        };
+        state
+            .settings
+            .global
+            .push(ticket_chat_role(crate::config::Harness::Claude));
+        state
+    }
+
+    fn ticket_chat_role(harness: crate::config::Harness) -> crate::sock::GlobalRoleSettingsView {
+        crate::sock::GlobalRoleSettingsView {
+            role: crate::config::ExecutionRole::TicketChat,
+            settings: crate::config::RoleSettings {
+                harness,
+                program: harness.program().to_string(),
+                model: "model".to_string(),
+                effort: None,
+                extra_args: Vec::new(),
+                agent: None,
+                profile: None,
+                permission_mode: (harness == crate::config::Harness::Claude)
+                    .then(|| "manual".to_string()),
+                permission_handler: None,
+                tools: if harness == crate::config::Harness::Claude {
+                    vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()]
+                } else {
+                    Vec::new()
+                },
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: None,
+                sandbox: None,
+            },
+            limit: None,
         }
     }
 
@@ -1454,14 +1522,35 @@ mod tests {
         }
         let wide_chat_row = wide
             .iter()
-            .position(|row| row.contains("claude // read-only"))
+            .position(|row| row.contains("claude // configured access"))
             .unwrap();
         let narrow_chat_row = narrow
             .iter()
-            .position(|row| row.contains("claude // read-only"))
+            .position(|row| row.contains("claude // configured access"))
             .unwrap();
         assert_eq!(wide_chat_row, 0, "the wide view splits side by side");
         assert!(narrow_chat_row > 10, "the narrow view stacks the chat pane");
+    }
+
+    #[test]
+    fn ticket_chat_titles_follow_each_selected_harness() {
+        for harness in [
+            crate::config::Harness::Claude,
+            crate::config::Harness::Opencode,
+            crate::config::Harness::Codex,
+        ] {
+            let mut state = state();
+            state.settings.global = vec![ticket_chat_role(harness)];
+            let (title, message) = ticket_chat_identity(&state, "borsuk");
+            assert_eq!(title, format!("{} // configured access", harness.program()));
+            assert!(message.contains(harness.program()));
+            assert!(!message.contains("read-only"));
+        }
+        let mut writable = state();
+        writable.settings.global[0].settings.tools = vec!["Read".to_string(), "Bash".to_string()];
+        let (title, message) = ticket_chat_identity(&writable, "borsuk");
+        assert_eq!(title, "claude // configured access");
+        assert!(!message.contains("read-only"));
     }
 
     #[test]

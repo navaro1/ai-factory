@@ -1828,6 +1828,7 @@ pub(crate) fn sample_view() -> StateView {
             global: false,
             overrides: Vec::new(),
         },
+        settings: crate::sock::SettingsView::default(),
     }
 }
 
@@ -1905,6 +1906,7 @@ mod tests {
                 global: false,
                 overrides: Vec::new(),
             },
+            settings: crate::sock::SettingsView::default(),
         }
     }
 
@@ -2619,8 +2621,9 @@ mod tests {
     struct FakeSink(Vec<Action>);
 
     impl ActionSink for FakeSink {
-        fn send_action(&mut self, action: Action) {
+        fn send_action(&mut self, action: Action) -> bool {
             self.0.push(action);
+            true
         }
     }
 

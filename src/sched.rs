@@ -650,10 +650,13 @@ mod tests {
     #[test]
     fn limits_build_from_a_config() {
         let text = concat!(
-            "[stage.refine]\nmodel = \"m\"\nrunner = \"claude\"\n",
-            "[stage.implement]\nmodel = \"m\"\nrunner = \"opencode\"\nlimit = 3\n",
-            "[stage.review]\nmodel = \"m\"\nrunner = \"opencode\"\n",
-            "[stage.release]\nmodel = \"m\"\nrunner = \"claude\"\nlimit = 1\n",
+            "schema_version = 1\n",
+            "[stage.refine]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[stage.implement]\nmodel = \"m\"\nharness = \"opencode\"\nlimit = 3\n",
+            "[stage.review]\nmodel = \"m\"\nharness = \"opencode\"\n",
+            "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 1\n",
+            "[ticket.create]\nmodel = \"m\"\nharness = \"opencode\"\n",
+            "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { implement = 1 }\n",
             "[repo.qubitsok]\npath = \"/tmp/q\"\n",
         );
