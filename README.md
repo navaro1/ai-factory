@@ -14,12 +14,12 @@ An issue moves through four fixed stages:
 refine ──▶ implement ──▶ review ──▶ release
 ```
 
-| Stage | Agent and model | Result |
+| Stage | Default harness and model | Result |
 |---|---|---|
-| refine | claude Opus, one interactive chat | You shape the ticket. The issue gets the label `refined`. |
-| implement | opencode, model glm-5.3-flash | The agent writes the change and opens a draft pull request. |
-| review | opencode, model gpt-5.6-sol | The agent reviews the change and marks the pull request ready. |
-| release | claude Opus | Release trains merge the ready pull requests. |
+| refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
+| implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
+| review | OpenCode, GPT-5.6 | The agent reviews the change and marks the pull request ready. |
+| release | Claude, Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
 the pull requests in order.
@@ -44,8 +44,9 @@ You need:
   `cargo`.
 - `git`
 - the GitHub command-line interface (`gh`), with an active login
-- the `claude` command-line interface for Claude Code, version 2.1.223 or later
-- the `opencode` command-line interface, with an active login
+- each harness program that your six roles select
+
+AI Factory supports Claude, OpenCode, and Codex. Claude roles require Claude Code 2.1.223 or later.
 
 Run:
 
@@ -70,61 +71,82 @@ The installer never overwrites a file that exists. Edit
 
 ## Configure
 
-`factory.toml` sets the agent and the concurrency limit of every stage, and
-the repositories:
+`factory.toml` uses configuration schema version 1. It requires all six global role tables.
 
 ```toml
+schema_version = 1
+
 [stage.refine]
+harness = "claude"
 model = "claude-opus-5[1m]"
-runner = "claude"
 limit = 3
-yolo = true
 
 [stage.implement]
+harness = "opencode"
 model = "zai-coding-plan/glm-5.3-flash"
-runner = "opencode"
 limit = 3
 
 [stage.review]
+harness = "opencode"
 model = "openai/gpt-5.6-sol"
-runner = "opencode"
-variant = "xhigh"
+effort = "xhigh"
+extra_args = []
 limit = 7
 
 [stage.release]
+harness = "claude"
 model = "claude-opus-5[1m]"
-runner = "claude"
 limit = 1
 
-[ticket_chat]
+[ticket.create]
+harness = "claude"
 model = "claude-opus-5[1m]"
+
+[ticket.chat]
+harness = "claude"
+model = "claude-opus-5[1m]"
+permission_mode = "manual"
+permission_handler = "inbox"
+tools = ["Read", "Glob", "Grep"]
+extra_args = []
 
 [repo.borsuk]
 path = "/home/you/Workplace/borsuk"
 lanes = { implement = 1 }
 release = { policy = "manual" }
 
-[repo.qubitsok]
-path = "/home/you/Workplace/qubitsok"
-release = { policy = "threshold", count = 3 }
+[repo.borsuk.stage.review]
+effort = "max"
 ```
 
-- `model` sets the model identifier that the runner receives.
-- `runner` selects the `claude` or `opencode` command.
-- `variant` sets the optional effort level for `opencode`.
-- `limit` caps the concurrent tasks of a stage.
-- `yolo` auto-approves the ordinary tool permissions of a stage. The default
-  is `true`. A real question always reaches the inbox.
+- `harness` selects Claude, OpenCode, or Codex.
+- `program` defaults to the selected harness command. AI Factory executes this string directly.
+- `model`, `agent`, `profile`, and `effort` accept nonempty harness values.
+- `effort` maps to the native effort or variant option of each harness.
+- `extra_args` adds arguments that do not replace managed protocol options.
+- `limit` caps concurrent tasks for one global pipeline stage.
 - `path` sets the absolute path of one repository checkout.
 - `lanes` reserves stage slots for one repository.
 - `release.policy` is `manual`, `interval` with `minutes`, or `threshold`
   with `count`.
-- `ticket_chat.model` selects the Claude model for read-only issue review.
-- The Claude refine model supplies the default when Claude runs refinement.
 
-`yolo` is not `--dangerously-skip-permissions`. That flag closes the control
-channel, and then the agent can not ask you anything. AI Factory never
-passes it.
+Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
+OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
+
+A repository role table can override individual fields. A harness change requires a complete role block.
+The Settings view marks inherited repository values with `~`.
+
+The example keeps ticket chat read-only through the exact Claude tool list.
+You can configure a different tool list to permit write access.
+Real Claude questions always reach the inbox in every permission mode.
+
+AI Factory rejects managed, sharing, and combined bypass arguments in `extra_args`.
+Use only the typed permission fields for dangerous native modes. The Settings view shows a warning.
+
+A task binds its resolved settings when it starts. Retries, parked sessions, and restarts keep that binding.
+Later configuration changes apply only to tasks without a binding.
+
+Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` for migration steps.
 
 ## Commands
 
@@ -135,6 +157,8 @@ passes it.
 | `aif stop` | Stops the daemon. |
 | `aif doctor` | Reports on the installation and the configuration. |
 | `aif doctor --clean` | Removes the worktrees of closed issues and merged pull requests. |
+
+`aif doctor` checks each configured harness program once. It applies the Claude version floor only to Claude roles.
 
 ### Start paused
 
@@ -154,9 +178,9 @@ in the header and marks every stage row. An exact stage, lane, or task state
 marks its scope. A resumed item under a broader pause shows `resumed`.
 A queued ticket that a pause blocks shows `paused` instead of `queued`.
 
-## The four views
+## The five views
 
-Keys `1`, `2`, `3`, and `4` switch the views. `!` opens the oldest inbox row.
+Keys `1` through `5` switch the views. `!` opens the oldest inbox row.
 `?` opens the help overlay. `q` quits the UI.
 The status bar of every view shows the open decision count.
 
@@ -229,7 +253,7 @@ its earlier work.
 The inbox is the core of the product. Everything that an agent cannot
 decide alone arrives in one place:
 
-- a tool permission, when `yolo` is off,
+- a tool permission that requires an operator response,
 - a real question from an agent,
 - a stuck task, after three failed attempts,
 - an issue or pull request with the `needs-human` label,
@@ -274,8 +298,8 @@ issues.
 | List | `enter` | Open the selected issue. |
 | Issue | `e` | Edit the title and description. |
 | Issue | `l` | Open the repository label picker. |
-| Issue | `c` | Start or resume the read-only Claude chat. |
-| Issue | `a` | Apply the latest shown Claude proposal. |
+| Issue | `c` | Start or resume the configured ticket chat. |
+| Issue | `a` | Apply the latest shown agent proposal. |
 | Editor | `ctrl-s` | Save the content edit. |
 | Label picker | Space | Apply one label change. |
 | Label picker | `n` | Create and attach a repository label. |
@@ -287,8 +311,28 @@ The issue focus shows all issue details and the GitHub reference.
 Wide terminals put the details and chat beside each other.
 Narrow terminals put the chat below the details.
 
-Claude starts with analysis. Claude can use only `Read`, `Glob`, and `Grep`.
-Claude cannot change GitHub. AIF applies a shown proposal only after key `a`.
+The example uses Claude with only `Read`, `Glob`, and `Grep`.
+A different ticket chat role can permit repository changes.
+AIF applies a shown proposal only after key `a`.
+
+### Settings, view 5
+
+The Settings view edits all six execution roles. It supports global and repository scopes.
+
+| Key | Action |
+|---|---|
+| `h` / `l` | Select the global or repository scope. |
+| `j` / `k` | Select a role. |
+| `Tab` | Select a field. |
+| `Enter` | Edit text or select a value. |
+| `d` | Remove the selected repository override. |
+| `s` | Save the draft. |
+| `r` | Reload the file. |
+| `Esc` | Cancel an edit or confirm draft removal. |
+
+Argument and tool lists use a row editor. Narrow terminals stack the role list above the form.
+The daemon rejects a stale save if the file changed after the draft loaded.
+Repository topology changes require a daemon restart.
 
 ## How state survives
 
@@ -296,8 +340,8 @@ Claude cannot change GitHub. AIF applies a shown proposal only after key `a`.
   record.
 - The worktree of each issue carries the agent session id and the last
   reviewed commit as marker files.
-- `state.json` holds runtime overrides, release times, and active ticket chat
-  metadata. Task logs hold the full transcripts.
+- `state.json` holds runtime overrides, role bindings, release times, and ticket chat metadata.
+- Task logs hold the full transcripts.
 - After a restart, the first poll rebuilds everything. Work resumes in
   place.
 

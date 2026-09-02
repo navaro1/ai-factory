@@ -7,6 +7,7 @@
 //! Every diagnostic command uses [`Exec`]. Tests inject
 //! [`aif::exec::ScriptExec`] and do not run a diagnostic tool.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
-use aif::config::{parse_owner_repo, Config, RepoConfig};
+use aif::config::{parse_owner_repo, Config, ExecutionRole, Harness, RepoConfig};
 use aif::exec::Exec;
 use aif::sched::{self, Limits};
 use aif::sock::{Client, PauseScope, PausedView, Push};
@@ -34,8 +35,8 @@ pub const CLAUDE_FLOOR: Version = Version {
     patch: 223,
 };
 
-/// The tools whose versions the doctor reports.
-const TOOLS: [&str; 4] = ["gh", "git", "claude", "opencode"];
+/// The tools that every factory installation needs.
+const CORE_TOOLS: [&str; 2] = ["gh", "git"];
 
 /// A semantic version triple parsed out of a tool version line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,7 +179,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             });
             let facts = repo_facts(env.exec, &config);
             checks.extend(repo_checks(&config, &facts));
-            checks.extend(tool_checks(env.exec));
+            checks.extend(tool_checks(env.exec, Some(&config)));
             checks.push(gh_auth_check(env.exec));
             checks.extend(daemon_checks(env.socket));
             checks.extend(scheduler_checks(&config));
@@ -190,7 +191,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
                 status: Status::Fail,
                 detail: format!("{error:#}"),
             });
-            checks.extend(tool_checks(env.exec));
+            checks.extend(tool_checks(env.exec, None));
             checks.push(gh_auth_check(env.exec));
             checks.extend(daemon_checks(env.socket));
         }
@@ -672,7 +673,7 @@ fn read_config(env: &DoctorEnv) -> Result<Config> {
 }
 
 /// Check the version of one tool.
-fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
+fn tool_check(exec: &dyn Exec, tool: &str, requires_claude_floor: bool) -> Check {
     let label = tool.to_string();
     let out = match exec.run(tool, &["--version"], None) {
         Ok(out) => out,
@@ -703,11 +704,11 @@ fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
             detail: format!("cannot parse a version from {first_line:?}"),
         };
     };
-    if tool == "claude" && !version.at_least(&CLAUDE_FLOOR) {
+    if requires_claude_floor && !version.at_least(&CLAUDE_FLOOR) {
         return Check {
             label,
             status: Status::Fail,
-            detail: format!("claude {version} is older than the required floor {CLAUDE_FLOOR}"),
+            detail: format!("{tool} {version} is older than the required floor {CLAUDE_FLOOR}"),
         };
     }
     Check {
@@ -717,9 +718,45 @@ fn tool_check(exec: &dyn Exec, tool: &str) -> Check {
     }
 }
 
-/// Check the versions of every tool the factory runs.
-fn tool_checks(exec: &dyn Exec) -> Vec<Check> {
-    TOOLS.iter().map(|tool| tool_check(exec, tool)).collect()
+/// Check the core tools and each configured harness program once.
+fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
+    let mut programs = BTreeMap::<String, bool>::new();
+    if let Some(config) = config {
+        for settings in config.roles.values() {
+            programs
+                .entry(settings.program.clone())
+                .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
+                .or_insert(settings.harness == Harness::Claude);
+        }
+        for alias in config.repos.keys() {
+            for role in ExecutionRole::ALL {
+                let settings = config
+                    .resolved_role(Some(alias), role.table_name())
+                    .expect("a parsed configuration has valid role settings")
+                    .settings;
+                programs
+                    .entry(settings.program)
+                    .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
+                    .or_insert(settings.harness == Harness::Claude);
+            }
+        }
+    }
+    for tool in CORE_TOOLS {
+        programs.entry(tool.to_string()).or_insert(false);
+    }
+    let mut checks = Vec::new();
+    for tool in CORE_TOOLS {
+        let claude = programs
+            .remove(tool)
+            .expect("each core program was inserted");
+        checks.push(tool_check(exec, tool, claude));
+    }
+    checks.extend(
+        programs
+            .into_iter()
+            .map(|(program, claude)| tool_check(exec, &program, claude)),
+    );
+    checks
 }
 
 /// Check that `gh` is authenticated.
@@ -1500,10 +1537,172 @@ mod tests {
             ),
         );
 
-        let check = tool_check(&exec, "gh");
+        let check = tool_check(&exec, "gh", false);
 
         assert_eq!(check.status, Status::Pass);
         assert_eq!(check.detail, "gh 2.74.0");
+    }
+
+    #[test]
+    fn tool_checks_use_each_configured_program_once() {
+        let text = config_text(
+            &[
+                ("refine", "program = \"shared-agent\""),
+                ("implement", "program = \"shared-agent\""),
+                ("review", "program = \"review-agent\""),
+            ],
+            "[repo.demo]\npath = \"/tmp/demo\"\n\
+             [repo.demo.stage.review]\nprogram = \"repo-review\"\n",
+        );
+        let config = Config::parse(&text).expect("the role configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            )
+            .expect(
+                |call| call.program == "repo-review",
+                CmdOut::ok("repo-review 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "review-agent",
+                CmdOut::ok("review-agent 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "shared-agent",
+                CmdOut::ok("shared-agent 2.1.251\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        assert_eq!(checks.len(), 7, "checks: {checks:?}");
+        let programs: Vec<_> = exec.calls().into_iter().map(|call| call.program).collect();
+        assert_eq!(
+            programs,
+            [
+                "gh",
+                "git",
+                "claude",
+                "opencode",
+                "repo-review",
+                "review-agent",
+                "shared-agent"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_floor_applies_only_to_claude_role_programs() {
+        let text = "schema_version = 1\n\
+            [stage.refine]\nharness = \"claude\"\nprogram = \"claude-wrapper\"\nmodel = \"m\"\n\
+            [stage.implement]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [stage.review]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [stage.release]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [ticket.create]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [ticket.chat]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n";
+        let config = Config::parse(text).expect("the role configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude-wrapper",
+                CmdOut::ok("Claude Code 2.1.100\n"),
+            )
+            .expect(
+                |call| call.program == "shared",
+                CmdOut::ok("shared 1.0.0\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        let claude = checks
+            .iter()
+            .find(|check| check.label == "claude-wrapper")
+            .expect("the Claude program must be checked");
+        assert_eq!(claude.status, Status::Fail);
+        assert!(claude.detail.contains("required floor 2.1.223"));
+        let shared = checks
+            .iter()
+            .find(|check| check.label == "shared")
+            .expect("the OpenCode program must be checked");
+        assert_eq!(shared.status, Status::Pass);
+    }
+
+    #[test]
+    fn a_missing_configured_codex_program_is_a_failure() {
+        let text = config_text(
+            &[(
+                "review",
+                "harness = \"codex\"\nprogram = \"missing-codex\"\nprofile = \"reviewer\"",
+            )],
+            "",
+        )
+        .replacen(
+            "harness = \"claude\"\nharness = \"codex\"",
+            "harness = \"codex\"",
+            1,
+        );
+        let config = Config::parse(&text).expect("the Codex role configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        let codex = checks
+            .iter()
+            .find(|check| check.label == "missing-codex")
+            .expect("the Codex program must be checked");
+        assert_eq!(codex.status, Status::Fail);
+        assert!(codex.detail.contains("cannot run missing-codex"));
+        assert!(exec
+            .calls()
+            .iter()
+            .any(|call| call.program == "missing-codex" && call.args == ["--version"]));
+    }
+
+    #[test]
+    fn a_configured_program_remains_one_direct_executable_string() {
+        let text = config_text(&[("review", "program = \"review-wrapper --strict\"")], "");
+        let config = Config::parse(&text).expect("the custom program must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            )
+            .expect(
+                |call| call.program == "review-wrapper --strict",
+                CmdOut::ok("review-wrapper 1.0.0\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        assert!(checks
+            .iter()
+            .any(|check| check.label == "review-wrapper --strict"));
+        assert!(exec.calls().iter().any(|call| {
+            call.program == "review-wrapper --strict" && call.args == ["--version"]
+        }));
     }
 
     // --- gh authentication. ---
@@ -1721,7 +1920,7 @@ mod tests {
             },
         );
 
-        let check = tool_check(&exec, "gh");
+        let check = tool_check(&exec, "gh", false);
 
         assert_eq!(check.status, Status::Fail);
         assert!(
@@ -1807,7 +2006,7 @@ mod tests {
         );
         assert!(config.detail.contains("factory.example.toml"));
         assert!(!checks.iter().any(|check| check.label.starts_with("repo ")));
-        for tool in TOOLS {
+        for tool in CORE_TOOLS {
             let check = checks
                 .iter()
                 .find(|check| check.label == tool)
@@ -1909,7 +2108,7 @@ mod tests {
             "detail: {}",
             acme.detail
         );
-        for tool in TOOLS {
+        for tool in ["gh", "git", "claude", "opencode"] {
             let check = checks
                 .iter()
                 .find(|check| check.label == tool)

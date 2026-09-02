@@ -1,4 +1,4 @@
-//! AI Factory v0.5: a daemon and a terminal UI that drive AI coding agents
+//! AI Factory v0.6: a daemon and a terminal UI that drive AI coding agents
 //! against GitHub issues.
 //!
 //! The modules below mirror the source layout in `docs/v0.5/SPEC.md`.

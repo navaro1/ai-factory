@@ -1,4 +1,4 @@
-use aif::config::{Config, Harness};
+use aif::config::{Config, ExecutionRole, Harness};
 
 const ROLES: &str = r#"
 schema_version = 1
@@ -43,6 +43,23 @@ path = "/tmp/demo"
 [repo.demo.stage.review]
 model = "gpt-5.6-sol-custom"
 "#;
+
+#[test]
+fn the_installer_example_keeps_the_six_roles_and_read_only_ticket_chat() {
+    let config = Config::parse(include_str!("../docs/v0.5/factory.example.toml"))
+        .expect("the installer example must parse");
+
+    assert_eq!(config.schema_version, 1);
+    assert_eq!(config.roles.len(), 6);
+    assert_eq!(
+        config.roles[&ExecutionRole::Review].harness,
+        Harness::Opencode
+    );
+    assert_eq!(
+        config.roles[&ExecutionRole::TicketChat].tools,
+        ["Read", "Glob", "Grep"]
+    );
+}
 
 #[test]
 fn parses_six_global_roles_and_applies_one_repository_override() {

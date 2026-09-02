@@ -1229,7 +1229,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, panel);
     let rows: [(&str, &str); 30] = [
         ("1 2 3 4 5", "switch view"),
-        ("esc", "home view"),
+        ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
         ("j k Up Down", "move inside a lane"),
         ("h l Left Right", "move between lanes"),
@@ -2589,6 +2589,7 @@ mod tests {
             "edit settings value",
             "save / reload settings",
             "remove repository override",
+            "home / cancel settings edit",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
