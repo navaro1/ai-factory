@@ -12,10 +12,6 @@ use crate::runner::{Job, RunEvent, Runner, Session};
 
 fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
-    if let Some(session_id) = job.resume.as_ref() {
-        args.push("resume".to_string());
-        args.push(session_id.clone());
-    }
     args.push("--json".to_string());
     if let Some(profile) = settings.profile.as_ref() {
         args.push("--profile".to_string());
@@ -41,6 +37,10 @@ fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     args.push("--cd".to_string());
     args.push(job.cwd.display().to_string());
     args.extend(settings.extra_args.iter().cloned());
+    if let Some(session_id) = job.resume.as_ref() {
+        args.push("resume".to_string());
+        args.push(session_id.clone());
+    }
     args.push(job.prompt.clone());
     args
 }
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_arguments_keep_json_lines_after_the_session_identity() {
+    fn resume_arguments_put_all_exec_options_before_the_nested_subcommand() {
         assert_eq!(
             build_args(
                 &job(Some("019d1c0a-0137-73f3-bf4a-88c90739150c")),
@@ -384,8 +384,6 @@ mod tests {
             ),
             vec![
                 "exec",
-                "resume",
-                "019d1c0a-0137-73f3-bf4a-88c90739150c",
                 "--json",
                 "--profile",
                 "reviewer",
@@ -401,6 +399,8 @@ mod tests {
                 "/state/worktrees/borsuk/issue-142",
                 "--notice",
                 "review",
+                "resume",
+                "019d1c0a-0137-73f3-bf4a-88c90739150c",
                 "Review pull request 142.",
             ]
         );
