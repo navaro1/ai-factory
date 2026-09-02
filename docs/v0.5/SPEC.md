@@ -1077,6 +1077,11 @@ loop {
 **Files.** `src/sock.rs`, plus the `stop` path in `src/bin/aif.rs`.
 
 **Detail.**
+- The wire protocol is the JSON message format between the daemon and client.
+- Every state push carries `protocol_revision`. Revision `1` is current.
+- A missing revision decodes as legacy revision `0`.
+- The client rejects a different revision. The TUI restores the terminal and prints the complete recovery command.
+- The client does not restart the daemon automatically. The operator runs `aif stop`, then starts `aif` again.
 - Wire format is one JSON object per line over a Unix socket.
 - Out: `Push::State(StateView)`. `StateView` carries the repositories, the
   stages with their limit, override flag, running count, and queued count, the
