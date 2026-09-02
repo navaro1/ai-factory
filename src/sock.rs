@@ -42,7 +42,29 @@ use crate::trains::Train;
 pub const PUSH_COALESCE_MS: u64 = 50;
 
 /// The exact wire protocol revision shared by this client and daemon.
+///
+/// Increment this value when an older peer cannot safely provide a new wire
+/// behavior. A missing revision identifies the legacy protocol as revision 0.
 pub const WIRE_PROTOCOL_REVISION: u32 = 1;
+
+/// A permanent mismatch between the connected daemon and client protocols.
+#[derive(Debug)]
+pub struct WireProtocolMismatch {
+    daemon: u32,
+    client: u32,
+}
+
+impl std::fmt::Display for WireProtocolMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon wire protocol revision {} is incompatible with client revision {}; run `aif stop`, then start `aif` again",
+            self.daemon, self.client
+        )
+    }
+}
+
+impl std::error::Error for WireProtocolMismatch {}
 
 /// How many pushes a subscriber may buffer before the server drops it.
 ///
@@ -1323,11 +1345,10 @@ impl Iterator for Pushes {
             Ok(_) => match serde_json::from_str::<Push>(line.trim()) {
                 Ok(Push::State(view)) if view.protocol_revision != WIRE_PROTOCOL_REVISION => {
                     self.failed = true;
-                    Some(Err(anyhow!(
-                        "daemon wire protocol revision {} is incompatible with client revision {}; run `aif stop`, then start `aif` again",
-                        view.protocol_revision,
-                        WIRE_PROTOCOL_REVISION
-                    )))
+                    Some(Err(anyhow::Error::new(WireProtocolMismatch {
+                        daemon: view.protocol_revision,
+                        client: WIRE_PROTOCOL_REVISION,
+                    })))
                 }
                 Ok(push) => Some(Ok(push)),
                 Err(error) => {
