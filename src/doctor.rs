@@ -828,7 +828,12 @@ fn paused_check(client: &Client) -> Check {
     loop {
         match pushes.next() {
             Some(Ok(Push::State(view))) => return paused_check_from_view(&view.paused),
-            Some(Ok(Push::TicketDetails(_) | Push::TicketLabels(_) | Push::TicketResult(_))) => {}
+            Some(Ok(
+                Push::TicketDetails(_)
+                | Push::TicketLabels(_)
+                | Push::TicketResult(_)
+                | Push::SettingsResult(_),
+            )) => {}
             Some(Err(error)) => return no_state_check(error),
             None => {
                 return no_state_check(anyhow!(
@@ -1233,7 +1238,7 @@ mod tests {
     use super::*;
     use aif::exec::{CmdOut, ScriptExec};
     use aif::model::Stage;
-    use aif::sock::{Action, Server, StateView};
+    use aif::sock::{Action, Server, SettingsView, StateView};
     use std::cell::{Cell, RefCell};
     use std::fs::Permissions;
     use std::io::{BufRead, BufReader};
@@ -2745,6 +2750,7 @@ mod tests {
                 global: true,
                 overrides: Vec::new(),
             },
+            settings: SettingsView::default(),
         });
         let missing_config = dir.join("factory.toml");
         let exec = ScriptExec::new();

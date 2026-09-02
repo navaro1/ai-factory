@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ReleasePolicy};
+pub use crate::config::SettingsEdit;
+use crate::config::{
+    Config, ExecutionRole, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
+};
 use crate::decisions::{Decision, Decisions};
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::sched::{Limits, Paused};
@@ -74,6 +77,174 @@ pub struct StateView {
     pub trains: Vec<TrainView>,
     /// What the operator paused.
     pub paused: PausedView,
+    /// The editable role configuration.
+    pub settings: SettingsView,
+}
+
+/// The editable factory settings and their current file revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsView {
+    /// A stable digest of the complete `factory.toml` content.
+    pub revision: String,
+    /// The six global role settings, in role order.
+    pub global: Vec<GlobalRoleSettingsView>,
+    /// Every repository role, in repository and role order.
+    pub repositories: Vec<RepositoryRoleSettingsView>,
+}
+
+impl SettingsView {
+    /// Build the socket view from one validated configuration.
+    pub fn from_config(config: &Config, revision: &str) -> Result<Self> {
+        let global = ExecutionRole::ALL
+            .into_iter()
+            .map(|role| GlobalRoleSettingsView {
+                role,
+                settings: config.roles[&role].clone(),
+                limit: role.stage().map(|stage| config.stage(stage).limit),
+            })
+            .collect();
+        let mut repositories = Vec::new();
+        for (alias, repo) in &config.repos {
+            for role in ExecutionRole::ALL {
+                let resolved = config.resolved_role(Some(alias), role.table_name())?;
+                let override_settings = repo.role_overrides.get(&role);
+                repositories.push(RepositoryRoleSettingsView {
+                    repository: alias.clone(),
+                    role,
+                    settings: resolved.settings,
+                    sources: RoleFieldSources::for_override(alias, override_settings),
+                    overridden: override_settings.is_some(),
+                });
+            }
+        }
+        Ok(Self {
+            revision: revision.to_string(),
+            global,
+            repositories,
+        })
+    }
+}
+
+/// One complete global role form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalRoleSettingsView {
+    /// The role identity.
+    pub role: ExecutionRole,
+    /// The complete global settings.
+    pub settings: RoleSettings,
+    /// The stage limit. Ticket roles have no limit.
+    pub limit: Option<usize>,
+}
+
+/// One complete effective repository role form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRoleSettingsView {
+    /// The repository alias.
+    pub repository: String,
+    /// The role identity.
+    pub role: ExecutionRole,
+    /// The effective settings after the repository override.
+    pub settings: RoleSettings,
+    /// The source of each effective field.
+    pub sources: RoleFieldSources,
+    /// True when the repository has a role override table.
+    pub overridden: bool,
+}
+
+/// The source of every field in one effective role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleFieldSources {
+    /// The harness source.
+    pub harness: SettingsSource,
+    /// The executable program source.
+    pub program: SettingsSource,
+    /// The model source.
+    pub model: SettingsSource,
+    /// The reasoning effort source.
+    pub effort: SettingsSource,
+    /// The extra argument list source.
+    pub extra_args: SettingsSource,
+    /// The OpenCode or Claude agent source.
+    pub agent: SettingsSource,
+    /// The Codex profile source.
+    pub profile: SettingsSource,
+    /// The Claude permission mode source.
+    pub permission_mode: SettingsSource,
+    /// The Claude permission handler source.
+    pub permission_handler: SettingsSource,
+    /// The Claude tool list source.
+    pub tools: SettingsSource,
+    /// The Claude denied tool list source.
+    pub disallowed_tools: SettingsSource,
+    /// The strict MCP setting source.
+    pub strict_mcp: SettingsSource,
+    /// The OpenCode automatic approval source.
+    pub auto_approve: SettingsSource,
+    /// The Codex approval policy source.
+    pub approval_policy: SettingsSource,
+    /// The Codex sandbox source.
+    pub sandbox: SettingsSource,
+}
+
+impl RoleFieldSources {
+    /// Mark fields from a partial override. A harness replacement owns all fields.
+    fn for_override(alias: &str, value: Option<&RoleOverride>) -> Self {
+        let global = SettingsSource::Global;
+        let repository = SettingsSource::Repository {
+            alias: alias.to_string(),
+        };
+        let Some(value) = value else {
+            return Self::all(global);
+        };
+        if value.harness.is_some() {
+            return Self::all(repository);
+        }
+        let source = |present: bool| {
+            if present {
+                repository.clone()
+            } else {
+                global.clone()
+            }
+        };
+        Self {
+            harness: global.clone(),
+            program: source(value.program.is_some()),
+            model: source(value.model.is_some()),
+            effort: source(value.effort.is_some()),
+            extra_args: source(value.extra_args.is_some()),
+            agent: source(value.agent.is_some()),
+            profile: source(value.profile.is_some()),
+            permission_mode: source(value.permission_mode.is_some()),
+            permission_handler: source(value.permission_handler.is_some()),
+            tools: source(value.tools.is_some()),
+            disallowed_tools: source(value.disallowed_tools.is_some()),
+            strict_mcp: source(value.strict_mcp.is_some()),
+            auto_approve: source(value.auto_approve.is_some()),
+            approval_policy: source(value.approval_policy.is_some()),
+            sandbox: source(value.sandbox.is_some()),
+        }
+    }
+
+    /// Give every field one source.
+    fn all(source: SettingsSource) -> Self {
+        Self {
+            harness: source.clone(),
+            program: source.clone(),
+            model: source.clone(),
+            effort: source.clone(),
+            extra_args: source.clone(),
+            agent: source.clone(),
+            profile: source.clone(),
+            permission_mode: source.clone(),
+            permission_handler: source.clone(),
+            tools: source.clone(),
+            disallowed_tools: source.clone(),
+            strict_mcp: source.clone(),
+            auto_approve: source.clone(),
+            approval_policy: source.clone(),
+            sandbox: source,
+        }
+    }
 }
 
 /// What the session view's input bar does for one task.
@@ -110,6 +281,8 @@ pub enum InputMode {
 pub struct StateInput<'a> {
     /// The loaded configuration file.
     pub config: &'a Config,
+    /// The content revision of the loaded configuration file.
+    pub settings_revision: &'a str,
     /// The stage limits and lane reservations, with runtime overrides.
     pub limits: &'a Limits,
     /// What the operator paused.
@@ -136,6 +309,7 @@ impl StateInput<'_> {
     pub fn build(&self) -> Result<StateView> {
         let Self {
             config,
+            settings_revision,
             limits,
             paused,
             table,
@@ -297,6 +471,7 @@ impl StateInput<'_> {
             tickets,
             trains,
             paused,
+            settings: SettingsView::from_config(config, settings_revision)?,
         })
     }
 }
@@ -711,6 +886,49 @@ pub struct PauseOverrideView {
     pub paused: bool,
 }
 
+/// The settings operation that produced one result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsOperation {
+    /// A save request.
+    Save,
+    /// A reload request.
+    Reload,
+}
+
+/// The typed outcome of one settings operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsResultStatus {
+    /// The daemon saved and activated the candidate.
+    Saved,
+    /// The daemon reloaded and activated the file.
+    Reloaded,
+    /// The request used an old file revision.
+    Stale,
+    /// The candidate configuration was invalid.
+    Invalid,
+    /// Repository topology changed and requires a daemon restart.
+    RestartRequired,
+    /// A file operation failed.
+    Failed,
+}
+
+/// The result of one settings save or reload request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsResult {
+    /// The request identity supplied by the UI.
+    pub request: String,
+    /// The operation that completed.
+    pub operation: SettingsOperation,
+    /// The typed outcome.
+    pub status: SettingsResultStatus,
+    /// The current file revision after the operation.
+    pub revision: String,
+    /// A diagnostic for an unsuccessful operation.
+    pub message: Option<String>,
+}
+
 /// One message from the daemon to a UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -723,6 +941,8 @@ pub enum Push {
     TicketLabels(TicketLabels),
     /// One ticket mutation state.
     TicketResult(TicketResult),
+    /// One settings save or reload result.
+    SettingsResult(SettingsResult),
 }
 
 /// One command from a UI or from `aif stop` to the daemon.
@@ -818,6 +1038,20 @@ pub enum Action {
     },
     /// Perform one ticket review or mutation action.
     Ticket(TicketAction),
+    /// Save one role edit against an exact file revision.
+    SaveSettings {
+        /// The request identity from the UI.
+        request: String,
+        /// The revision that the edit started from.
+        base_revision: String,
+        /// The typed role edit.
+        edit: SettingsEdit,
+    },
+    /// Reload the current file from disk.
+    ReloadSettings {
+        /// The request identity from the UI.
+        request: String,
+    },
     /// Force an early poll of one repository, or of all when None.
     Reconcile {
         /// The repository alias, or None for every repository.
@@ -1389,6 +1623,7 @@ mod tests {
                 global: false,
                 overrides: Vec::new(),
             },
+            settings: SettingsView::default(),
         }
     }
 
@@ -1463,6 +1698,92 @@ mod tests {
                 "line: {text}"
             );
         }
+    }
+
+    #[test]
+    fn settings_actions_and_results_keep_the_request_identity() {
+        let config = Config::parse(&config_text()).unwrap();
+        let settings = config.roles[&crate::config::ExecutionRole::Review].clone();
+        let save = Action::SaveSettings {
+            request: "save-17".to_string(),
+            base_revision: "rev-old".to_string(),
+            edit: SettingsEdit::Global {
+                role: crate::config::ExecutionRole::Review,
+                settings,
+                limit: Some(9),
+            },
+        };
+        let reload = Action::ReloadSettings {
+            request: "reload-18".to_string(),
+        };
+        for action in [save, reload] {
+            let text = serde_json::to_string(&action).unwrap();
+            assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
+        }
+
+        let push = Push::SettingsResult(SettingsResult {
+            request: "save-17".to_string(),
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Stale,
+            revision: "rev-current".to_string(),
+            message: Some("the file changed".to_string()),
+        });
+        let text = serde_json::to_string(&push).unwrap();
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn settings_state_marks_each_repository_field_source() {
+        let text = format!(
+            "{}\n[repo.borsuk.stage.implement]\nmodel = \"repo-model\"\nextra_args = []\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+
+        let view = SettingsView::from_config(&config, "content-revision").unwrap();
+
+        assert_eq!(view.revision, "content-revision");
+        assert_eq!(view.global.len(), 6);
+        assert_eq!(view.repositories.len(), 12);
+        let role = view
+            .repositories
+            .iter()
+            .find(|entry| {
+                entry.repository == "borsuk"
+                    && entry.role == crate::config::ExecutionRole::Implement
+            })
+            .unwrap();
+        assert_eq!(role.settings.model, "repo-model");
+        assert_eq!(
+            role.sources.model,
+            crate::config::SettingsSource::Repository {
+                alias: "borsuk".to_string()
+            }
+        );
+        assert_eq!(
+            role.sources.extra_args,
+            crate::config::SettingsSource::Repository {
+                alias: "borsuk".to_string()
+            }
+        );
+        assert_eq!(role.sources.harness, crate::config::SettingsSource::Global);
+
+        let state = StateInput {
+            config: &config,
+            settings_revision: "content-revision",
+            limits: &Limits::from_config(&config),
+            paused: &Paused::default(),
+            table: &TaskTable::new(),
+            decisions: &Decisions::new(),
+            snapshot: &Snapshot::default(),
+            trains: &BTreeMap::new(),
+            policies: &BTreeMap::new(),
+            input_modes: &BTreeMap::new(),
+            now_ms: 0,
+        }
+        .build()
+        .unwrap();
+        assert_eq!(state.settings, view);
     }
 
     #[test]
@@ -1678,6 +1999,7 @@ mod tests {
 
         let error = StateInput {
             config: &config,
+            settings_revision: "test-revision",
             limits: &limits,
             paused: &paused,
             table: &table,
@@ -2146,6 +2468,7 @@ mod tests {
 
         let view = StateInput {
             config: &config,
+            settings_revision: "test-revision",
             limits: &limits,
             paused: &paused,
             table: &table,
@@ -2209,6 +2532,7 @@ mod tests {
 
         let view = StateInput {
             config: &config,
+            settings_revision: "test-revision",
             limits: &limits,
             paused: &paused,
             table: &table,
@@ -2315,6 +2639,7 @@ mod tests {
 
         let view = StateInput {
             config: &config,
+            settings_revision: "test-revision",
             limits: &limits,
             paused: &paused,
             table: &table,
@@ -2362,6 +2687,7 @@ mod tests {
 
         let error = StateInput {
             config: &config,
+            settings_revision: "test-revision",
             limits: &limits,
             paused: &paused,
             table: &table,
@@ -2454,6 +2780,7 @@ mod tests {
         );
         let view = StateInput {
             config: &config,
+            settings_revision: "test-revision",
             limits: &limits,
             paused: &paused,
             table: &table,

@@ -1701,6 +1701,7 @@ mod tests {
                 global: false,
                 overrides: Vec::new(),
             },
+            settings: crate::sock::SettingsView::default(),
         }
     }
 

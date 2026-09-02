@@ -131,6 +131,30 @@ pub struct ResolvedRoleSettings {
     pub settings: RoleSettings,
 }
 
+/// One role edit that can be saved to `factory.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum SettingsEdit {
+    /// Replace one complete global role.
+    Global {
+        /// The role identity.
+        role: ExecutionRole,
+        /// The complete global settings.
+        settings: RoleSettings,
+        /// The stage limit. Ticket roles require `None`.
+        limit: Option<usize>,
+    },
+    /// Replace or remove one repository override.
+    Repository {
+        /// The repository alias.
+        repository: String,
+        /// The role identity.
+        role: ExecutionRole,
+        /// The partial override. `None` removes the override table.
+        settings: Option<RoleOverride>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "lowercase")]
 pub enum ReleasePolicy {
@@ -915,6 +939,317 @@ pub fn parse_owner_repo(url: &str) -> Option<String> {
     (!owner.is_empty() && !name.is_empty() && parts.next().is_none())
         .then(|| format!("{owner}/{name}"))
 }
+
+/// Return one stable revision from the complete file content.
+pub fn file_revision(text: &str) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let hash = text.as_bytes().iter().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    });
+    format!("{:x}-{hash:016x}", text.len())
+}
+
+/// Select an absolute, canonical config path when the file exists.
+pub fn resolved_config_path(path: Option<&Path>) -> Result<PathBuf> {
+    let selected = path.map_or_else(default_config_path, Path::to_path_buf);
+    let absolute = if selected.is_absolute() {
+        selected
+    } else {
+        std::env::current_dir()
+            .context("cannot read the current directory")?
+            .join(selected)
+    };
+    match fs::canonicalize(&absolute) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
+        Err(error) => Err(error).with_context(|| format!("cannot resolve {}", absolute.display())),
+    }
+}
+
+/// Apply one typed role edit while the document retains unrelated content.
+pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .context("invalid TOML")?;
+    match edit {
+        SettingsEdit::Global {
+            role,
+            settings,
+            limit,
+        } => {
+            if role.stage().is_none() && limit.is_some() {
+                bail!("{role}.limit is allowed only on a global stage table");
+            }
+            let table = global_role_table_mut(&mut document, *role)?;
+            write_role_settings(table, settings);
+            set_usize(table, "limit", *limit)?;
+        }
+        SettingsEdit::Repository {
+            repository,
+            role,
+            settings,
+        } => {
+            if !valid_alias(repository) {
+                bail!("repo.\"{repository}\": alias must match [a-z0-9._-]+");
+            }
+            if !document
+                .get("repo")
+                .and_then(toml_edit::Item::as_table)
+                .is_some_and(|repos| repos.contains_key(repository))
+            {
+                bail!("repo.{repository}: no configured repository");
+            }
+            if let Some(settings) = settings {
+                let table = repository_role_table_mut(&mut document, repository, *role)?;
+                write_role_override(table, settings);
+            } else if let Some(table) =
+                existing_repository_role_parent_mut(&mut document, repository, *role)?
+            {
+                table.remove(role_name(*role));
+            }
+        }
+    }
+    let candidate = document.to_string();
+    Config::parse(&candidate).context("the edited factory configuration is invalid")?;
+    Ok(candidate)
+}
+
+/// Write one sibling temporary file and replace the config with one rename.
+pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map_or_else(|| "tmp".to_string(), |value| format!("{value}.tmp"));
+    let temporary = path.with_extension(extension);
+    fs::write(&temporary, text).with_context(|| format!("cannot write {}", temporary.display()))?;
+    fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "cannot rename {} to {}",
+            temporary.display(),
+            path.display()
+        )
+    })
+}
+
+impl Config {
+    /// Parse and resolve a candidate through an injected command runner.
+    pub(crate) fn parse_resolved(text: &str, exec: &dyn Exec) -> Result<Self> {
+        let mut config = Self::parse(text)?;
+        config.resolve(exec)?;
+        Ok(config)
+    }
+
+    /// True when a reload can retain every live repository controller.
+    pub fn has_same_topology(&self, other: &Self) -> bool {
+        self.repos.len() == other.repos.len()
+            && self.repos.iter().all(|(alias, repo)| {
+                other.repos.get(alias).is_some_and(|candidate| {
+                    repo.alias == candidate.alias
+                        && repo.path == candidate.path
+                        && repo.owner_repo == candidate.owner_repo
+                        && repo.lanes == candidate.lanes
+                        && repo.release == candidate.release
+                })
+            })
+    }
+}
+
+fn role_parts(role: ExecutionRole) -> (&'static str, &'static str) {
+    match role {
+        ExecutionRole::Refine => ("stage", "refine"),
+        ExecutionRole::Implement => ("stage", "implement"),
+        ExecutionRole::Review => ("stage", "review"),
+        ExecutionRole::Release => ("stage", "release"),
+        ExecutionRole::TicketCreate => ("ticket", "create"),
+        ExecutionRole::TicketChat => ("ticket", "chat"),
+    }
+}
+
+fn role_name(role: ExecutionRole) -> &'static str {
+    role_parts(role).1
+}
+
+fn global_role_table_mut(
+    document: &mut toml_edit::DocumentMut,
+    role: ExecutionRole,
+) -> Result<&mut toml_edit::Table> {
+    let (section, name) = role_parts(role);
+    document
+        .get_mut(section)
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|table| table.get_mut(name))
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("{role} is required"))
+}
+
+fn existing_repository_role_parent_mut<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    repository: &str,
+    role: ExecutionRole,
+) -> Result<Option<&'a mut toml_edit::Table>> {
+    let (section, _) = role_parts(role);
+    let repo = document
+        .get_mut("repo")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|repos| repos.get_mut(repository))
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("repo.{repository}: no configured repository"))?;
+    Ok(repo
+        .get_mut(section)
+        .and_then(toml_edit::Item::as_table_mut))
+}
+
+fn repository_role_table_mut<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    repository: &str,
+    role: ExecutionRole,
+) -> Result<&'a mut toml_edit::Table> {
+    let (section, name) = role_parts(role);
+    let repo = document
+        .get_mut("repo")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|repos| repos.get_mut(repository))
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("repo.{repository}: no configured repository"))?;
+    if !repo.contains_key(section) {
+        repo.insert(section, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let parent = repo
+        .get_mut(section)
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("repo.{repository}.{section} must be a table"))?;
+    if !parent.contains_key(name) {
+        parent.insert(name, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    parent
+        .get_mut(name)
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("repo.{repository}.{section}.{name} must be a table"))
+}
+
+fn write_role_settings(table: &mut toml_edit::Table, settings: &RoleSettings) {
+    set_string(table, "harness", Some(harness_name(settings.harness)));
+    set_string(table, "program", Some(&settings.program));
+    set_string(table, "model", Some(&settings.model));
+    set_string(table, "effort", settings.effort.as_deref());
+    set_strings(table, "extra_args", Some(&settings.extra_args));
+    set_string(table, "agent", settings.agent.as_deref());
+    set_string(table, "profile", settings.profile.as_deref());
+    set_string(
+        table,
+        "permission_mode",
+        settings.permission_mode.as_deref(),
+    );
+    set_string(
+        table,
+        "permission_handler",
+        settings.permission_handler.as_deref(),
+    );
+    set_strings(table, "tools", Some(&settings.tools));
+    set_strings(table, "disallowed_tools", Some(&settings.disallowed_tools));
+    set_bool(table, "strict_mcp", settings.strict_mcp);
+    set_bool(table, "auto_approve", settings.auto_approve);
+    set_string(
+        table,
+        "approval_policy",
+        settings.approval_policy.as_deref(),
+    );
+    set_string(table, "sandbox", settings.sandbox.as_deref());
+}
+
+fn write_role_override(table: &mut toml_edit::Table, settings: &RoleOverride) {
+    set_string(table, "harness", settings.harness.map(harness_name));
+    set_string(table, "program", settings.program.as_deref());
+    set_string(table, "model", settings.model.as_deref());
+    set_string(table, "effort", settings.effort.as_deref());
+    set_strings(table, "extra_args", settings.extra_args.as_deref());
+    set_string(table, "agent", settings.agent.as_deref());
+    set_string(table, "profile", settings.profile.as_deref());
+    set_string(
+        table,
+        "permission_mode",
+        settings.permission_mode.as_deref(),
+    );
+    set_string(
+        table,
+        "permission_handler",
+        settings.permission_handler.as_deref(),
+    );
+    set_strings(table, "tools", settings.tools.as_deref());
+    set_strings(
+        table,
+        "disallowed_tools",
+        settings.disallowed_tools.as_deref(),
+    );
+    set_bool(table, "strict_mcp", settings.strict_mcp);
+    set_bool(table, "auto_approve", settings.auto_approve);
+    set_string(
+        table,
+        "approval_policy",
+        settings.approval_policy.as_deref(),
+    );
+    set_string(table, "sandbox", settings.sandbox.as_deref());
+}
+
+fn harness_name(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Claude => "claude",
+        Harness::Opencode => "opencode",
+        Harness::Codex => "codex",
+    }
+}
+
+fn set_string(table: &mut toml_edit::Table, key: &str, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            table.insert(key, toml_edit::value(value));
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_strings(table: &mut toml_edit::Table, key: &str, values: Option<&[String]>) {
+    match values {
+        Some(values) => {
+            let mut array = toml_edit::Array::new();
+            for value in values {
+                array.push(value.as_str());
+            }
+            table.insert(key, toml_edit::value(array));
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_bool(table: &mut toml_edit::Table, key: &str, value: Option<bool>) {
+    match value {
+        Some(value) => {
+            table.insert(key, toml_edit::value(value));
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_usize(table: &mut toml_edit::Table, key: &str, value: Option<usize>) -> Result<()> {
+    match value {
+        Some(value) => {
+            let value = i64::try_from(value).context("the stage limit is too large")?;
+            table.insert(key, toml_edit::value(value));
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+    Ok(())
+}
+
 pub fn state_dir() -> PathBuf {
     xdg_dir("XDG_STATE_HOME", ".local/state").join("aif")
 }
@@ -940,4 +1275,78 @@ fn xdg_dir(variable: &str, fallback: &str) -> PathBuf {
                 .map(|home| PathBuf::from(home).join(fallback))
         })
         .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn config_text() -> String {
+        let mut text = "# keep this factory comment\nschema_version = 1\n".to_string();
+        for stage in Stage::ALL {
+            text.push_str(&format!(
+                "\n# keep the {stage} comment\n[stage.{stage}]\nharness = \"claude\"\nmodel = \"old-{stage}\"\nlimit = 3\n"
+            ));
+        }
+        text.push_str("\n[ticket.create]\nharness = \"opencode\"\nmodel = \"create\"\n");
+        text.push_str("\n[ticket.chat]\nharness = \"claude\"\nmodel = \"chat\"\n");
+        text.push_str("\n[repo.demo]\npath = \"/tmp/demo\"\n");
+        text.push_str("\n[repo.demo.stage.review]\nmodel = \"repo-review\"\n");
+        text
+    }
+
+    #[test]
+    fn a_global_role_edit_preserves_comments_and_unrelated_structure() {
+        let text = config_text();
+        let config = Config::parse(&text).unwrap();
+        let mut settings = config.roles[&ExecutionRole::Review].clone();
+        settings.model = "new-review".to_string();
+        settings.effort = Some("high".to_string());
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::Global {
+                role: ExecutionRole::Review,
+                settings,
+                limit: Some(8),
+            },
+        )
+        .unwrap();
+
+        assert!(edited.contains("# keep this factory comment"));
+        assert!(edited.contains("# keep the refine comment"));
+        assert!(edited.contains("[repo.demo.stage.review]"));
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(parsed.roles[&ExecutionRole::Review].model, "new-review");
+        assert_eq!(
+            parsed.roles[&ExecutionRole::Review].effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(parsed.stage(Stage::Review).limit, 8);
+    }
+
+    #[test]
+    fn an_atomic_config_write_replaces_the_file_and_removes_its_temporary_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "aif-config-atomic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("factory.toml");
+        fs::write(&path, "old").unwrap();
+
+        write_config_atomic(&path, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_file_revision_depends_only_on_complete_content() {
+        assert_eq!(file_revision("same"), file_revision("same"));
+        assert_ne!(file_revision("same"), file_revision("same\n"));
+        assert_ne!(file_revision("same"), file_revision("other"));
+    }
 }

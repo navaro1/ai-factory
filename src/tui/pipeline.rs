@@ -1693,6 +1693,7 @@ pub(crate) fn sample_view() -> StateView {
             global: false,
             overrides: Vec::new(),
         },
+        settings: crate::sock::SettingsView::default(),
     }
 }
 
@@ -1770,6 +1771,7 @@ mod tests {
                 global: false,
                 overrides: Vec::new(),
             },
+            settings: crate::sock::SettingsView::default(),
         }
     }
 

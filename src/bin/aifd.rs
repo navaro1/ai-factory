@@ -73,7 +73,9 @@ fn exit_code(result: anyhow::Result<()>) -> i32 {
 /// inside `run` ends the pollers, because the daemon owns their wake
 /// senders.
 fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::Result<()> {
-    let config = Config::load(config_path).context("cannot load the factory config")?;
+    let config_path = config::resolved_config_path(config_path)
+        .context("cannot resolve the factory config path")?;
+    let config = Config::load(Some(&config_path)).context("cannot load the factory config")?;
     let (server, action_rx) = sock::Server::bind(socket_path)?;
     eprintln!("aifd: listening on {}", socket_path.display());
     if paused {
@@ -83,7 +85,8 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
     let pollers = poll::spawn_pollers(&config, poll_tx);
     let mut daemon = Daemon::new(
         config,
-        prompts_dir(config_path),
+        config_path.clone(),
+        prompts_dir(Some(&config_path)),
         poll_rx,
         pollers.wake,
         action_rx,

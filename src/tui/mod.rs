@@ -819,6 +819,7 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::SettingsResult(_)) => {}
                                     Err(error) => {
                                         failure = Some(format!("{error:#}"));
                                         break;
