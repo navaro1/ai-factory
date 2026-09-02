@@ -21,6 +21,7 @@
 pub mod inbox;
 pub mod pipeline;
 pub mod session;
+pub mod settings;
 pub mod theme;
 pub mod tickets;
 pub mod transcript;
@@ -49,6 +50,7 @@ use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView};
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
+use settings::Settings;
 use theme::THEME;
 use tickets::Tickets;
 
@@ -64,6 +66,8 @@ enum View {
     Inbox,
     /// All open GitHub issues.
     Tickets,
+    /// The execution role settings editor.
+    Settings,
 }
 
 /// What the operator has marked in the visible view.
@@ -94,6 +98,8 @@ enum Msg {
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
     TicketResult(crate::sock::TicketResult),
+    /// One settings save or reload result.
+    SettingsResult(crate::sock::SettingsResult),
     /// The socket reader reached the daemon.
     Connected,
     /// The daemon went away, with the reason for the banner.
@@ -222,6 +228,8 @@ struct App {
     inbox: Inbox,
     /// The open issue list and its nested views.
     tickets: Tickets,
+    /// The execution role settings editor.
+    settings: Settings,
     /// The task id the session view follows.
     session_task: Option<String>,
     /// The task the shell still waits for, from `r` or `n`.
@@ -313,6 +321,7 @@ impl App {
             View::Session => true,
             View::Inbox => self.inbox.typing(),
             View::Tickets => self.tickets.typing(),
+            View::Settings => self.settings.typing(),
             View::Pipeline => false,
         }
     }
@@ -405,6 +414,7 @@ impl App {
                     KeyCode::Char('2') => self.view = View::Session,
                     KeyCode::Char('3') => {}
                     KeyCode::Char('4') => self.view = View::Tickets,
+                    KeyCode::Char('5') => self.view = View::Settings,
                     KeyCode::Char('?') => self.help = true,
                     KeyCode::Esc => self.view = View::Pipeline,
                     _ => {
@@ -417,6 +427,7 @@ impl App {
                 KeyCode::Char('2') => self.view = View::Session,
                 KeyCode::Char('3') => self.view = View::Inbox,
                 KeyCode::Char('4') => self.view = View::Tickets,
+                KeyCode::Char('5') => self.view = View::Settings,
                 KeyCode::Char('?') => self.help = true,
                 KeyCode::Char('j') | KeyCode::Down => pipeline::move_selection(self, 1),
                 KeyCode::Char('k') | KeyCode::Up => pipeline::move_selection(self, -1),
@@ -440,6 +451,10 @@ impl App {
                             return true;
                         }
                         KeyCode::Char('4') => return true,
+                        KeyCode::Char('5') => {
+                            self.view = View::Settings;
+                            return true;
+                        }
                         KeyCode::Char('?') => {
                             self.help = true;
                             return true;
@@ -457,6 +472,41 @@ impl App {
                 }
                 if key.code == KeyCode::Esc && !nested {
                     self.view = View::Pipeline;
+                }
+            }
+            View::Settings => {
+                if !self.settings.typing() {
+                    match key.code {
+                        KeyCode::Char('1') => {
+                            self.view = View::Pipeline;
+                            return true;
+                        }
+                        KeyCode::Char('2') => {
+                            self.view = View::Session;
+                            return true;
+                        }
+                        KeyCode::Char('3') => {
+                            self.view = View::Inbox;
+                            return true;
+                        }
+                        KeyCode::Char('4') => {
+                            self.view = View::Tickets;
+                            return true;
+                        }
+                        KeyCode::Char('5') => return true,
+                        KeyCode::Char('?') => {
+                            self.help = true;
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(action) = self
+                    .state
+                    .as_ref()
+                    .and_then(|state| self.settings.handle_key(state, key))
+                {
+                    emit(self, sink, action, "sent settings request".to_string());
                 }
             }
         }
@@ -819,7 +869,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
-                                    Ok(Push::SettingsResult(_)) => {}
+                                    Ok(Push::SettingsResult(result)) => {
+                                        if tx.send(Msg::SettingsResult(result)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Err(error) => {
                                         failure = Some(format!("{error:#}"));
                                         break;
@@ -864,7 +918,7 @@ fn run_loop(
                     let changed = match app.view {
                         View::Session => app.session.poll(now),
                         View::Tickets => app.tickets.poll(now),
-                        View::Pipeline | View::Inbox => false,
+                        View::Pipeline | View::Inbox | View::Settings => false,
                     };
                     if changed {
                         draw_app(surface, app, now)?;
@@ -904,6 +958,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::TicketResult(result) => {
             app.tickets.observe_result(result);
+            Ok(true)
+        }
+        Msg::SettingsResult(result) => {
+            app.settings.observe_result(result);
             Ok(true)
         }
         Msg::Connected => {
@@ -1010,6 +1068,11 @@ fn render_with_clock(
                 app.tickets.draw(f, body, state);
             }
         }
+        View::Settings => {
+            if let Some(state) = app.state.as_ref() {
+                app.settings.draw(f, body, state);
+            }
+        }
     }
     draw_toast(f, app, body);
     draw_footer(f, app, footer);
@@ -1022,7 +1085,7 @@ fn render_with_clock(
 
 /// Draw the title row: app name, view tabs, pause flag, and socket state.
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(26)]).split(area);
+    let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
     let title = Style::default()
         .fg(THEME.accent)
         .add_modifier(Modifier::BOLD);
@@ -1031,6 +1094,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     tabs.push(tab_span("2", "session", app.view == View::Session));
     tabs.push(tab_span("3", "inbox", app.view == View::Inbox));
     tabs.push(tab_span("4", "tickets", app.view == View::Tickets));
+    tabs.push(tab_span("5", "settings", app.view == View::Settings));
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
@@ -1095,7 +1159,7 @@ fn banner_text(app: &App) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
     let hints = Span::styled(
-        " 1/2/3/4 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
+        " 1/2/3/4/5 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
         THEME.dim(),
     );
     f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
@@ -1161,10 +1225,10 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 27, area);
+    let panel = centered(78, 17, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 24] = [
-        ("1 2 3 4", "switch view"),
+    let rows: [(&str, &str); 30] = [
+        ("1 2 3 4 5", "switch view"),
         ("esc", "home view"),
         ("!", "inbox, oldest decision"),
         ("j k Up Down", "move inside a lane"),
@@ -1188,21 +1252,33 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
         ("/ e l c a", "search and ticket actions"),
+        ("h l", "settings scope"),
+        ("j k", "settings role"),
+        ("Tab", "select settings field"),
+        ("Enter", "edit settings value"),
+        ("s r", "save / reload settings"),
+        ("d", "remove repository override"),
     ];
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(key, text)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {key} "),
-                    Style::default()
-                        .fg(THEME.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {text}")),
-            ])
-        })
-        .collect();
+    let mut sorted = rows.to_vec();
+    sorted.sort_by_key(|(key, text)| std::cmp::Reverse(key.len() + text.len()));
+    let mut lines = Vec::new();
+    for row in 0..15 {
+        let mut spans = Vec::new();
+        for (column, index) in [row, 29 - row].into_iter().enumerate() {
+            let (key, text) = sorted[index];
+            if column > 0 {
+                spans.push(Span::raw("    "));
+            }
+            spans.push(Span::styled(
+                format!(" {key}  "),
+                Style::default()
+                    .fg(THEME.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(text));
+        }
+        lines.push(Line::from(spans));
+    }
     let block = Paragraph::new(lines).block(Block::bordered().title(" keys "));
     f.render_widget(block, panel);
 }
@@ -2481,5 +2557,40 @@ mod tests {
         assert!(disabled.get());
         assert!(message.contains("leave failed"));
         assert!(message.contains("disable failed"));
+    }
+
+    #[test]
+    fn key_five_opens_the_settings_view_and_updates_the_shell_text() {
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        assert!(app.handle_key(
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            &mut sink
+        ));
+
+        assert_eq!(app.view, View::Settings);
+        let text = render_to_string(&mut app);
+        assert!(text.contains("5 settings"));
+        assert!(text.contains("1/2/3/4/5 views"));
+    }
+
+    #[test]
+    fn the_help_overlay_lists_settings_actions() {
+        let mut app = App {
+            help: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        for entry in [
+            "settings scope",
+            "settings role",
+            "select settings field",
+            "edit settings value",
+            "save / reload settings",
+            "remove repository override",
+        ] {
+            assert!(text.contains(entry), "the help misses {entry}");
+        }
     }
 }
