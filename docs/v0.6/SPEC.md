@@ -184,7 +184,7 @@ Last updated: 2026-09-02
 Last updated: 2026-09-02
 
 ### C2 — Ship links and show badges
-**Status:** `[ ]` pending
+**Status:** `[x]` DONE
 **Build:** Add the per-repository links cache to the daemon, rebuilt by one `Links::derive` call per poll. Add `LinkView { repo, ticket, pr }` and `StateView.links` with `#[serde(default)]`; the wire revision stays 1. Extend the existing number-list helper for the badge text and the Closes line, and state the cap for long lists. Add badge spans to the board task rows and release PR rows, in dim style after the title; plain-string rows in the nested release border append the badge text.
 **AC:**
 - A daemon rig test polls a PR body `Closes #142` and asserts the pushed view carries the pair `(borsuk, 142, 7)`.
@@ -194,6 +194,10 @@ Last updated: 2026-09-02
 - A serde test parses a state view JSON without the `links` field into an empty list.
 **Depends on:** C1 · **Traces to:** R8
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
+✅ IMPLEMENTED
+- The board caps badges at three numbers, then `+n`.
+- The badge tests render at 200 columns; the 80-column default truncates them.
+Last updated: 2026-09-02
 
 ### C3 — Review dispatch by links
 **Status:** `[ ]` pending

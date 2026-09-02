@@ -35,7 +35,7 @@ use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
-use crate::links::{issue_number_from_head, Links};
+use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{
@@ -146,7 +146,9 @@ pub struct Daemon {
     /// The ticket-PR links of each repository, rebuilt on every poll.
     links: BTreeMap<String, Links>,
     /// The source issue worktree of each review task.
-    review_issue_numbers: BTreeMap<String, u64>,
+    /// The ticket set of each review task, pinned at admit time. The
+    /// supersede check compares it against the fresh poll.
+    review_tickets: BTreeMap<String, BTreeSet<u64>>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
     /// Active issue conversations, keyed by repository and issue number.
@@ -340,7 +342,7 @@ impl Daemon {
             trains,
             release_batches: BTreeMap::new(),
             links: BTreeMap::new(),
-            review_issue_numbers: BTreeMap::new(),
+            review_tickets: BTreeMap::new(),
             ticket_controller,
             ticket_conversations,
             ticket_turn_text: BTreeMap::new(),
@@ -683,6 +685,7 @@ impl Daemon {
 
     /// Cancel active implement and review tasks whose gates closed.
     fn reconcile_unready(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let links = self.links.get(repo).cloned().unwrap_or_default();
         let ids: Vec<String> = self
             .table
             .active()
@@ -695,7 +698,7 @@ impl Daemon {
                         .get(&task.number)
                         .is_none_or(|issue| !implement_ready(fresh, issue))
                         && !(task.state == TaskState::Running
-                            && implementation_transitioned(fresh, repo, task.number))
+                            && implementation_transitioned(fresh, &links, task.number))
                 }
                 Stage::Review => {
                     fresh
@@ -796,15 +799,14 @@ impl Daemon {
                 }
                 continue;
             }
-            let review_issue_number = (work.stage == Stage::Review)
+            let review_tickets: BTreeSet<u64> = (work.stage == Stage::Review)
                 .then(|| {
-                    self.snapshot
-                        .repos
+                    self.links
                         .get(&work.repo)
-                        .and_then(|snapshot| snapshot.prs.get(&work.number))
-                        .and_then(|pr| issue_number_from_head(&work.repo, &pr.head_ref))
+                        .map(|links| links.tickets_of(work.number).into_iter().collect())
                 })
-                .flatten();
+                .flatten()
+                .unwrap_or_default();
             if work.stage == Stage::Review {
                 let superseded = self
                     .table
@@ -816,8 +818,12 @@ impl Daemon {
                             && task.kind == work.kind
                             && task.number == work.number
                             && (task.head_sha != work.head_sha
-                                || self.review_issue_numbers.get(&task.id).copied()
-                                    != review_issue_number)
+                                || self
+                                    .review_tickets
+                                    .get(&task.id)
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    != review_tickets)
                     })
                     .map(|task| task.id.clone());
                 if let Some(id) = superseded {
@@ -836,11 +842,7 @@ impl Daemon {
                 Ok(task) => {
                     if work.stage == Stage::Review {
                         task.head_sha = work.head_sha.clone();
-                        if let Some(number) = review_issue_number {
-                            self.review_issue_numbers.insert(task.id.clone(), number);
-                        } else {
-                            self.review_issue_numbers.remove(&task.id);
-                        }
+                        self.review_tickets.insert(task.id.clone(), review_tickets);
                     }
                     self.changed = true;
                 }
@@ -1139,6 +1141,7 @@ impl Daemon {
                 || self.sessions.contains_key(&task.id)
                 || self.pending_chats.contains_key(&task.id)
                 || self.prior_stage_active(task)
+                || self.worktree_holder(task).is_some()
             {
                 continue;
             }
@@ -1178,8 +1181,10 @@ impl Daemon {
                     Stage::Review => {
                         prior.repo == task.repo
                             && prior.stage == Stage::Implement
-                            && self.review_issue_numbers.get(&task.id).copied()
-                                == Some(prior.number)
+                            && self
+                                .review_tickets
+                                .get(&task.id)
+                                .is_some_and(|tickets| tickets.contains(&prior.number))
                     }
                     Stage::Release => {
                         prior.repo == task.repo
@@ -1226,21 +1231,12 @@ impl Daemon {
             Stage::Implement => self
                 .worktrees
                 .ensure_issue(&*self.exec, &repo_cfg, task.number),
-            Stage::Review => {
-                let issue_number = self
-                    .review_issue_numbers
-                    .get(&task.id)
-                    .copied()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "pull request #{} does not use branch aif/{}/issue-<n>",
-                            task.number,
-                            task.repo
-                        )
-                    })?;
-                self.worktrees
-                    .ensure_issue(&*self.exec, &repo_cfg, issue_number)
-            }
+            Stage::Review => match self.review_item(&task) {
+                (ItemKind::Issue, number) => {
+                    self.worktrees.ensure_issue(&*self.exec, &repo_cfg, number)
+                }
+                (ItemKind::Pr, number) => self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number),
+            },
             Stage::Release => self.worktrees.ensure_train(&*self.exec, &repo_cfg),
         };
         let cwd = match cwd {
@@ -2005,22 +2001,50 @@ impl Daemon {
         true
     }
 
+    /// The item whose workspace a review task runs in.
+    ///
+    /// One linked ticket runs the review in that ticket's worktree. Zero or
+    /// several links run it in the PR worktree. Every consumer of the
+    /// review workspace goes through this one helper, so no site drifts.
+    fn review_item(&self, task: &Task) -> (ItemKind, u64) {
+        let tickets = self.review_tickets.get(&task.id);
+        match tickets
+            .filter(|tickets| tickets.len() == 1)
+            .and_then(|tickets| tickets.iter().next())
+        {
+            Some(&ticket) => (ItemKind::Issue, ticket),
+            None => (ItemKind::Pr, task.number),
+        }
+    }
+
     /// The item whose workspace the task runs in.
     ///
-    /// A review task carries the pull request number, but it runs in the
-    /// worktree of its source issue. The comparison of two tasks uses this
-    /// item, so two agents never share one worktree.
+    /// The comparison of two tasks uses this item, so two agents never
+    /// share one worktree.
     fn worktree_item(&self, task: &Task) -> (ItemKind, u64) {
         match task.stage {
-            Stage::Review => (
-                ItemKind::Issue,
-                self.review_issue_numbers
-                    .get(&task.id)
-                    .copied()
-                    .unwrap_or(task.number),
-            ),
+            Stage::Review => self.review_item(task),
             _ => (task.kind, task.number),
         }
+    }
+
+    /// The running or awaiting task that holds the worktree of `task`.
+    ///
+    /// A running or awaiting task owns its worktree process; a queued task
+    /// does not. The dispatch loop skips a task whose worktree is held, so
+    /// two agents never share one worktree.
+    fn worktree_holder(&self, task: &Task) -> Option<String> {
+        let item = self.worktree_item(task);
+        self.table
+            .by_id
+            .values()
+            .find(|other| {
+                other.id != task.id
+                    && other.repo == task.repo
+                    && matches!(other.state, TaskState::Running | TaskState::AwaitingUser)
+                    && self.worktree_item(other) == item
+            })
+            .map(|other| other.id.clone())
     }
 
     /// The active task that blocks a follow-up to `task`, if one exists.
@@ -2724,9 +2748,10 @@ impl Daemon {
         Some(match task.stage {
             Stage::Refine => repo.path.clone(),
             Stage::Implement => self.worktrees.issue_path(repo, task.number),
-            Stage::Review => self
-                .worktrees
-                .issue_path(repo, *self.review_issue_numbers.get(id)?),
+            Stage::Review => match self.review_item(task) {
+                (ItemKind::Issue, number) => self.worktrees.issue_path(repo, number),
+                (ItemKind::Pr, number) => self.worktrees.pr_path(repo, number),
+            },
             Stage::Release => self.worktrees.train_path(repo),
         })
     }
@@ -2980,16 +3005,16 @@ fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
     })
 }
 
-/// True when GitHub shows a pull request for the implemented issue.
-fn implementation_transitioned(fresh: &RepoSnapshot, repo: &str, number: u64) -> bool {
+/// True when GitHub shows a pull request for the implemented ticket.
+///
+/// The links table holds the open pull requests of the last poll, so the
+/// branch rule and the body rule both count here.
+fn implementation_transitioned(fresh: &RepoSnapshot, links: &Links, number: u64) -> bool {
     fresh.issues.get(&number).is_some_and(|issue| {
         issue.open
             && !issue.labels.iter().any(|label| label == "refined")
             && !issue.labels.iter().any(|label| label == "to-refine")
-    }) && fresh
-        .prs
-        .values()
-        .any(|pr| pr.open && issue_number_from_head(repo, &pr.head_ref) == Some(number))
+    }) && !links.prs_of(number).is_empty()
 }
 
 /// True when GitHub shows the completed review transition.
@@ -3200,6 +3225,47 @@ mod tests {
         ]
     }
 
+    /// The git calls of a first dispatch into a PR worktree: cut the branch
+    /// from `HEAD`, prepare the markers, then fetch the GitHub pull ref and
+    /// reset the branch hard to it.
+    fn fresh_pr_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
+        let reference = format!("refs/heads/aif/borsuk/pr-{number}");
+        let branch = format!("aif/borsuk/pr-{number}");
+        let pull_ref = format!("pull/{number}/head");
+        let wt_text = worktree.to_string_lossy().into_owned();
+        vec![
+            git_step(
+                repo,
+                &["rev-parse", "--verify", "--quiet", reference.as_str()],
+                refused(),
+            ),
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                refused(),
+            ),
+            git_step(
+                repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch.as_str(),
+                    wt_text.as_str(),
+                    "HEAD",
+                ],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(worktree, gitdir),
+            git_step(
+                repo,
+                &["fetch", "origin", pull_ref.as_str()],
+                CmdOut::ok(""),
+            ),
+            git_step(worktree, &["reset", "--hard", "FETCH_HEAD"], CmdOut::ok("")),
+        ]
+    }
+
     /// The two git calls of a reused issue worktree.
     fn reuse_issue_steps(repo: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
         let listed = format!("worktree {}\n", worktree.display());
@@ -3365,6 +3431,14 @@ mod tests {
             .join("worktrees")
             .join("borsuk")
             .join(format!("issue-{number}"))
+    }
+
+    /// The worktree path of one PR inside a rig root.
+    fn pr_wt(dir: &Path, number: u64) -> PathBuf {
+        dir.join("state")
+            .join("worktrees")
+            .join("borsuk")
+            .join(format!("pr-{number}"))
     }
 
     /// The worktree path of the train inside a rig root.
@@ -3841,6 +3915,146 @@ mod tests {
 
         assert_eq!(rig.job_count(), 1);
         assert_eq!(rig.job(0).cwd, issue_wt(&dir, 142));
+    }
+
+    #[test]
+    fn a_review_of_a_multi_ticket_pr_runs_in_the_pr_worktree() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #4 and fixes #9".to_string();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert_eq!(rig.job(0).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn a_review_of_a_foreign_branch_pr_starts_without_a_refusal() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+
+        rig.poll(vec![], vec![pull]);
+
+        // The old daemon refused this PR for its branch. The task starts now.
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert_eq!(rig.job(0).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn a_review_waits_while_a_linked_ticket_still_implements() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "aif/borsuk/issue-142".to_string();
+        pull.body = "Closes #142".to_string();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Queued);
+    }
+
+    #[test]
+    fn a_review_without_links_never_waits_on_a_prior_stage() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps: Vec<Step> = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        )
+        .into_iter()
+        .chain(fresh_pr_steps(
+            &rig_repo(&dir),
+            &pr_worktree,
+            7,
+            &rig_gitdir(&dir),
+        ))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+
+        assert_eq!(
+            rig.job_count(),
+            2,
+            "the zero-link review starts beside the implement"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert_eq!(rig.job(1).task, "borsuk/review-p7");
+        assert_eq!(rig.job(1).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn two_reviews_of_prs_of_one_ticket_share_one_worktree_serially() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut first = pr(7, true, &[]);
+        first.head_ref = "aif/borsuk/issue-5".to_string();
+        first.body = "Closes #5".to_string();
+        let mut second = pr(9, true, &[]);
+        second.head_ref = "aif/borsuk/issue-5".to_string();
+        second.body = "Closes #5".to_string();
+
+        rig.poll(vec![], vec![first, second]);
+
+        // Both PRs link only ticket 5, so both reviews map to the ticket
+        // worktree. One runs; the other waits for the worktree.
+        assert_eq!(rig.job_count(), 1);
+        let running = rig.job(0).task.clone();
+        let waiting = if running == "borsuk/review-p7" {
+            "borsuk/review-p9"
+        } else {
+            "borsuk/review-p7"
+        };
+        assert_eq!(rig.task(waiting).state, TaskState::Queued);
+    }
+
+    #[test]
+    fn a_pr_worktree_review_writes_its_session_marker_in_place() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #4 fixes #9".to_string();
+
+        rig.poll(vec![], vec![pull]);
+        rig.event(started("borsuk/review-p7", "sid-1"));
+
+        // The Started event writes the marker through task_cwd, so the
+        // marker proves the daemon resolved the PR worktree for the review.
+        assert_eq!(
+            rig.daemon
+                .worktrees
+                .read_task_session(&pr_worktree, "borsuk/review-p7")
+                .unwrap()
+                .as_deref(),
+            Some("sid-1")
+        );
     }
 
     #[test]
@@ -6204,6 +6418,76 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_set_change_supersedes_the_review() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 5);
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_pr_steps(
+                    &rig_repo(&dir),
+                    &pr_worktree,
+                    5,
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(5, true, &[]);
+        pull.body = "Closes #5".to_string();
+        rig.poll(vec![], vec![pull]);
+        let first = rig.session(0);
+
+        // The PR leaves the draft state, so the gate closes. It returns to
+        // draft with a body that now closes ticket 9 too, so the gate
+        // re-opens with the same head and a changed ticket set.
+        let mut updated = pr(5, false, &[]);
+        updated.body = "Closes #5".to_string();
+        rig.poll(vec![], vec![updated.clone()]);
+        updated.draft = true;
+        updated.body = "Closes #5, fixes #9".to_string();
+        rig.poll(vec![], vec![updated]);
+
+        assert!(
+            first.stopped.load(Ordering::SeqCst),
+            "the ticket set change must supersede the running review"
+        );
+        rig.event(exited(
+            "borsuk/review-p5",
+            false,
+            "the superseded process exited",
+        ));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/review-p5");
+        assert_eq!(rig.job(1).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn an_unchanged_ticket_set_and_head_supersedes_nothing() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        let first = rig.session(0);
+
+        // The PR leaves the draft state, so the gate closes; the running
+        // review survives. The PR returns to draft with the same head, so
+        // the gate re-opens and the daemon compares the ticket set.
+        let mut ready = pr(5, false, &[]);
+        rig.poll(vec![], vec![ready.clone()]);
+        ready.draft = true;
+        rig.poll(vec![], vec![ready]);
+
+        assert!(
+            !first.stopped.load(Ordering::SeqCst),
+            "an unchanged ticket set must not supersede the review"
+        );
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
+    }
+
+    #[test]
     fn a_claude_turn_completes_a_one_shot_task_before_process_exit() {
         let dir = temp_root();
         let steps: Vec<Step> = fresh_issue_steps(
@@ -6487,8 +6771,8 @@ mod tests {
             .id
             .clone();
         rig.daemon
-            .review_issue_numbers
-            .insert(review_id.clone(), 142);
+            .review_tickets
+            .insert(review_id.clone(), BTreeSet::from([142]));
 
         rig.act(Action::Pause {
             scope: PauseScope::Stage {
