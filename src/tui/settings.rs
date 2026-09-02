@@ -236,7 +236,7 @@ impl Settings {
             }
             KeyCode::Enter => self.enter_field(state),
             KeyCode::Char('s') => return self.save(state),
-            KeyCode::Char('r') => return Some(self.reload()),
+            KeyCode::Char('r') => return self.reload(),
             KeyCode::Char('d') if self.scope > 0 => return self.remove_override(state),
             KeyCode::Esc if self.draft.is_some() => {
                 if self.discard_confirm {
@@ -370,11 +370,7 @@ impl Settings {
     }
 
     fn save(&mut self, state: &StateView) -> Option<Action> {
-        if self.pending_request.is_some() {
-            self.status = Some((
-                SettingsResultStatus::Failed,
-                "a settings request is pending".to_string(),
-            ));
+        if self.request_pending() {
             return None;
         }
         let Some(draft) = self.draft.clone() else {
@@ -412,13 +408,19 @@ impl Settings {
         })
     }
 
-    fn reload(&mut self) -> Action {
+    fn reload(&mut self) -> Option<Action> {
+        if self.request_pending() {
+            return None;
+        }
         let request = request_code();
         self.pending_request = Some(request.clone());
-        Action::ReloadSettings { request }
+        Some(Action::ReloadSettings { request })
     }
 
     fn remove_override(&mut self, state: &StateView) -> Option<Action> {
+        if self.request_pending() {
+            return None;
+        }
         let repository = self.repositories(state).get(self.scope - 1)?.clone();
         let request = request_code();
         self.pending_request = Some(request.clone());
@@ -431,6 +433,17 @@ impl Settings {
                 settings: None,
             },
         })
+    }
+
+    fn request_pending(&mut self) -> bool {
+        if self.pending_request.is_none() {
+            return false;
+        }
+        self.status = Some((
+            SettingsResultStatus::Failed,
+            "a settings request is pending".to_string(),
+        ));
+        true
     }
 
     fn cycle_choice(&mut self, state: &StateView, field: Field) {
@@ -1687,6 +1700,13 @@ mod tests {
         };
         assert!(!request.is_empty());
         assert_eq!(base_revision, "rev-one");
+        settings.observe_result(SettingsResult {
+            request: request.clone(),
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Failed,
+            revision: "rev-one".to_string(),
+            message: None,
+        });
 
         let reload = settings
             .handle_key(&state, key(KeyCode::Char('r')))
@@ -1731,6 +1751,9 @@ mod tests {
         assert!(settings
             .handle_key(&state, key(KeyCode::Char('s')))
             .is_none());
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('r')))
+            .is_none());
         settings.observe_result(SettingsResult {
             request: "later-unrelated-request".to_string(),
             operation: SettingsOperation::Save,
@@ -1747,6 +1770,136 @@ mod tests {
             message: None,
         });
         assert!(!settings.dirty());
+    }
+
+    #[test]
+    fn a_pending_save_blocks_override_removal_until_its_result_arrives() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "model-two");
+        let Action::SaveSettings { request, .. } = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("save action")
+        else {
+            panic!("wrong action");
+        };
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        settings.observe_result(SettingsResult {
+            request: "unrelated".to_string(),
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Failed,
+            revision: "rev-one".to_string(),
+            message: None,
+        });
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Failed,
+            revision: "rev-one".to_string(),
+            message: None,
+        });
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_some());
+    }
+
+    #[test]
+    fn a_pending_save_blocks_reload_until_its_result_arrives() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "model-two");
+        let Action::SaveSettings { request, .. } = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("save action")
+        else {
+            panic!("wrong action");
+        };
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('r')))
+            .is_none());
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Failed,
+            revision: "rev-one".to_string(),
+            message: None,
+        });
+        assert!(matches!(
+            settings.handle_key(&state, key(KeyCode::Char('r'))),
+            Some(Action::ReloadSettings { .. })
+        ));
+    }
+
+    #[test]
+    fn a_pending_override_removal_blocks_save_until_its_result_arrives() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "model-two");
+        let Action::SaveSettings { request, .. } = settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .expect("remove action")
+        else {
+            panic!("wrong action");
+        };
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .is_none());
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('r')))
+            .is_none());
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Failed,
+            revision: "rev-one".to_string(),
+            message: None,
+        });
+        assert!(matches!(
+            settings.handle_key(&state, key(KeyCode::Char('s'))),
+            Some(Action::SaveSettings { .. })
+        ));
+    }
+
+    #[test]
+    fn a_pending_reload_blocks_every_other_settings_request() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "model-two");
+        let Action::ReloadSettings { request } = settings
+            .handle_key(&state, key(KeyCode::Char('r')))
+            .expect("reload action")
+        else {
+            panic!("wrong action");
+        };
+        for code in [KeyCode::Char('s'), KeyCode::Char('r'), KeyCode::Char('d')] {
+            assert!(settings.handle_key(&state, key(code)).is_none());
+        }
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::Reload,
+            status: SettingsResultStatus::Failed,
+            revision: "rev-one".to_string(),
+            message: None,
+        });
+        assert!(matches!(
+            settings.handle_key(&state, key(KeyCode::Char('s'))),
+            Some(Action::SaveSettings { .. })
+        ));
     }
 
     #[test]
