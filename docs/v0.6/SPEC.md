@@ -150,7 +150,7 @@ All questions are resolved. None waits for clarification.
 ## 7. Chunks and Acceptance Criteria
 
 ### C0 — One item vocabulary everywhere
-**Status:** `[ ]` pending
+**Status:** `[x]` DONE
 **Build:** Add `ItemKind::noun()` returning "ticket" and "PR", and make every kind-to-noun site consume it: delete or delegate `item_label`, `item_title_label`, and the local match in the inbox. Move the six prompt consts to new `src/prompts.rs`. Reword five prompts (refine, implement, release, ticket creation, ticket chat) to the vocabulary; chunk C5 owns the review prompt. Reword the tickets view strings, the inbox confirmations and footers, the decision titles, the doctor report lines, the help text, and the upsert error. Write the five docs copies to `docs/v0.6/prompts/`. Add the ban test and the docs-coupling test.
 **AC:**
 - The noun test matches over every `ItemKind` arm and asserts "ticket" and "PR"; a new arm fails the test until it gains a noun.
@@ -160,6 +160,12 @@ All questions are resolved. None waits for clarification.
 - A test asserts the upsert error names "ticket" and "PR".
 **Depends on:** — · **Traces to:** R1, R9
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
+✅ IMPLEMENTED
+- `ItemKind::noun()` and `title_noun()` live in `src/model.rs`; the inbox label functions and the local noun match are gone.
+- The six prompts moved to `src/prompts.rs`; the daemon imports them; five carry the vocabulary.
+- `docs/v0.6/prompts/` holds the five copies, pinned by the coupling test.
+- The commit also repairs the train-state test helper at `src/tui/inbox.rs`, which missed `protocol_revision` before this work started.
+Last updated: 2026-09-02
 
 ### C1 — Derive ticket-PR links
 **Status:** `[ ]` pending

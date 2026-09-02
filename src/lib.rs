@@ -10,6 +10,7 @@ pub mod decisions;
 pub mod exec;
 pub mod gates;
 pub mod gh;
+pub mod links;
 pub mod model;
 pub mod poll;
 pub mod proc;

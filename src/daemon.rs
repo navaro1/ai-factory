@@ -35,6 +35,7 @@ use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
+use crate::links::issue_number_from_head;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{
@@ -2962,16 +2963,6 @@ fn event_task(event: &RunEvent) -> &str {
 /// True when assistant text contains a full or partial proposal marker.
 fn proposal_marker_text(text: &str) -> bool {
     text.contains("<aif") || text.contains("</aif") || text.contains("aif-ticket")
-}
-
-/// Extract the issue number from one factory pull request branch.
-fn issue_number_from_head(repo: &str, head_ref: &str) -> Option<u64> {
-    let prefix = format!("aif/{repo}/issue-");
-    head_ref
-        .strip_prefix(&prefix)?
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
 }
 
 /// True when GitHub shows the completed refine transition.
