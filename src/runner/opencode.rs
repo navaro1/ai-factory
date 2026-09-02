@@ -14,10 +14,14 @@ use std::thread;
 
 use serde_json::Value;
 
+#[cfg(test)]
+use crate::config::Harness;
+use crate::config::RoleSettings;
 use crate::proc::{self, ProcEvent, ProcHandle, RunSpec};
 use crate::runner::{Job, RunEvent, Runner, Session};
 
 /// The program the runner starts.
+#[cfg(test)]
 const PROGRAM: &str = "opencode";
 
 /// The summary length limit for a tool part without a usable title.
@@ -25,23 +29,26 @@ const SUMMARY_CHARS: usize = 120;
 
 /// Build the exact argument vector for one factory task.
 ///
-/// The shape is the verified invocation: `run --format json --auto --agent
-/// build -m <model> [--variant <v>] [--session <id>] --dir <cwd> <prompt>`.
-/// `--auto` is always present, because yolo is the factory policy and the
-/// run is one-shot. A `Some` `job.resume` adds `--session <id>`, so the
-/// child continues that opencode conversation. `None` starts a fresh one.
-fn build_args(job: &Job) -> Vec<String> {
+/// The shape is `run --format json [--auto] [--agent <agent>] -m <model>
+/// [--variant <v>] [--session <id>] --dir <cwd> [extra args] <prompt>`.
+/// A configured automatic approval adds `--auto`. A resume adds the known
+/// session identity. Every configured extra argument stays one argument.
+fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--format".to_string(),
         "json".to_string(),
-        "--auto".to_string(),
-        "--agent".to_string(),
-        "build".to_string(),
-        "-m".to_string(),
-        job.model.clone(),
     ];
-    if let Some(variant) = &job.variant {
+    if settings.auto_approve == Some(true) {
+        args.push("--auto".to_string());
+    }
+    if let Some(agent) = settings.agent.as_ref() {
+        args.push("--agent".to_string());
+        args.push(agent.clone());
+    }
+    args.push("-m".to_string());
+    args.push(settings.model.clone());
+    if let Some(variant) = &settings.effort {
         args.push("--variant".to_string());
         args.push(variant.clone());
     }
@@ -51,27 +58,45 @@ fn build_args(job: &Job) -> Vec<String> {
     }
     args.push("--dir".to_string());
     args.push(job.cwd.display().to_string());
+    args.extend(settings.extra_args.iter().cloned());
     args.push(job.prompt.clone());
     args
 }
 
-/// The runner for the implement and review stages.
-///
-/// Every [`Runner::start`] spawns one short-lived child that runs the whole
-/// task and exits on its own.
-#[derive(Debug, Clone, Copy)]
-pub struct OpenCodeRunner;
-
-impl OpenCodeRunner {
-    /// A runner that starts the real `opencode` program.
-    pub fn new() -> Self {
-        Self
+#[cfg(test)]
+fn legacy_settings(job: &Job) -> RoleSettings {
+    RoleSettings {
+        harness: Harness::Opencode,
+        program: PROGRAM.to_string(),
+        model: job.model.clone(),
+        effort: job.variant.clone(),
+        extra_args: Vec::new(),
+        agent: Some("build".to_string()),
+        profile: None,
+        permission_mode: None,
+        permission_handler: None,
+        tools: Vec::new(),
+        disallowed_tools: Vec::new(),
+        strict_mcp: None,
+        auto_approve: Some(job.yolo),
+        approval_policy: None,
+        sandbox: None,
     }
 }
 
-impl Default for OpenCodeRunner {
-    fn default() -> Self {
-        Self::new()
+/// One configured OpenCode runner.
+///
+/// Every [`Runner::start`] spawns one short-lived child that runs the whole
+/// task and exits on its own.
+#[derive(Debug, Clone)]
+pub struct OpenCodeRunner {
+    settings: RoleSettings,
+}
+
+impl OpenCodeRunner {
+    /// A runner that starts the real `opencode` program.
+    pub fn new(settings: RoleSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -80,8 +105,8 @@ impl Runner for OpenCodeRunner {
         let spec = RunSpec {
             task: job.task.clone(),
             cwd: job.cwd.clone(),
-            program: PROGRAM.to_string(),
-            args: build_args(job),
+            program: self.settings.program.clone(),
+            args: build_args(job, &self.settings),
             env: Vec::new(),
             log: job.log.clone(),
         };
@@ -327,6 +352,7 @@ fn truncate(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Harness, RoleSettings};
     use std::env;
     use std::ffi::OsString;
     use std::fs;
@@ -427,6 +453,26 @@ not json at all
         }
     }
 
+    fn complete_settings() -> RoleSettings {
+        RoleSettings {
+            harness: Harness::Opencode,
+            program: "opencode-build".to_string(),
+            model: "opencode-build-model".to_string(),
+            effort: Some("max".to_string()),
+            extra_args: vec!["--notice".to_string(), "build".to_string()],
+            agent: Some("builder".to_string()),
+            profile: None,
+            permission_mode: None,
+            permission_handler: None,
+            tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            strict_mcp: None,
+            auto_approve: Some(false),
+            approval_policy: None,
+            sandbox: None,
+        }
+    }
+
     /// Collect run events until [`RunEvent::Exit`] arrives.
     fn collect_until_exit(rx: &Receiver<RunEvent>) -> Vec<RunEvent> {
         let deadline = Instant::now() + std::time::Duration::from_secs(TEST_TIMEOUT);
@@ -449,20 +495,26 @@ not json at all
 
     #[test]
     fn the_argument_vector_matches_the_verified_invocation() {
-        let args = build_args(&job(Path::new("/state/worktrees/borsuk/issue-142"), None));
+        let args = build_args(
+            &job(Path::new("/state/worktrees/borsuk/issue-142"), None),
+            &complete_settings(),
+        );
         assert_eq!(
             args,
             vec![
                 "run",
                 "--format",
                 "json",
-                "--auto",
                 "--agent",
-                "build",
+                "builder",
                 "-m",
-                "zai-coding-plan/glm-5.3-flash",
+                "opencode-build-model",
+                "--variant",
+                "max",
                 "--dir",
                 "/state/worktrees/borsuk/issue-142",
+                "--notice",
+                "build",
                 "Fix issue 142.",
             ]
         );
@@ -470,10 +522,11 @@ not json at all
 
     #[test]
     fn the_argument_vector_carries_the_variant_when_set() {
-        let args = build_args(&job(
+        let job = job(
             Path::new("/state/worktrees/borsuk/train"),
             Some("xhigh".to_string()),
-        ));
+        );
+        let args = build_args(&job, &legacy_settings(&job));
         assert_eq!(
             args,
             vec![
@@ -497,26 +550,29 @@ not json at all
     #[test]
     fn the_argument_vector_carries_the_session_of_a_resume() {
         let dir = Path::new("/state/worktrees/borsuk/issue-142");
-        let fresh = build_args(&job(dir, None));
+        let fresh = build_args(&job(dir, None), &complete_settings());
         assert!(!fresh.contains(&"--session".to_string()));
 
         let mut resumed = job(dir, None);
         resumed.resume = Some("ses_fix01".to_string());
         assert_eq!(
-            build_args(&resumed),
+            build_args(&resumed, &complete_settings()),
             vec![
                 "run",
                 "--format",
                 "json",
-                "--auto",
                 "--agent",
-                "build",
+                "builder",
                 "-m",
-                "zai-coding-plan/glm-5.3-flash",
+                "opencode-build-model",
+                "--variant",
+                "max",
                 "--session",
                 "ses_fix01",
                 "--dir",
                 "/state/worktrees/borsuk/issue-142",
+                "--notice",
+                "build",
                 "Fix issue 142.",
             ]
         );
@@ -747,8 +803,9 @@ not json at all
             ),
         );
         let job = job(&dir, None);
-        let path = PathGuard::prepend(&dir);
-        let mut runner = OpenCodeRunner::new();
+        let mut settings = legacy_settings(&job);
+        settings.program = dir.join(PROGRAM).display().to_string();
+        let mut runner = OpenCodeRunner::new(settings.clone());
 
         let (mut session, rx) = start_with_retry(&mut runner, &job);
         let events = collect_until_exit(&rx);
@@ -796,11 +853,10 @@ not json at all
             .lines()
             .map(String::from)
             .collect();
-        assert_eq!(child_args, build_args(&job));
+        assert_eq!(child_args, build_args(&job, &settings));
 
         // Every raw line, the malformed one included, reached the log.
         assert_eq!(fs::read_to_string(job.log).unwrap(), FIXTURE);
-        drop(path);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -819,7 +875,7 @@ not json at all
         );
         let job = job(&dir, None);
         let path = PathGuard::prepend(&dir);
-        let mut runner = OpenCodeRunner::new();
+        let mut runner = OpenCodeRunner::new(legacy_settings(&job));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job);
         let deadline = Instant::now() + std::time::Duration::from_secs(TEST_TIMEOUT);
@@ -845,7 +901,7 @@ not json at all
         script(&dir, PROGRAM, "#!/bin/sh\nsleep 0.3\nexit 0\n");
         let job = job(&dir, None);
         let path = PathGuard::prepend(&dir);
-        let mut runner = OpenCodeRunner::new();
+        let mut runner = OpenCodeRunner::new(legacy_settings(&job));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job);
         session.stop().unwrap();

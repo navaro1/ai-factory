@@ -30,10 +30,14 @@ use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::config::Harness;
+use crate::config::RoleSettings;
 use crate::proc::{self, ProcEvent, ProcHandle, RunSpec, StopOutcome};
 use crate::runner::{Answer, Job, RunEvent, Runner, Session};
 
 /// The program the runner starts.
+#[cfg(test)]
 const PROGRAM: &str = "claude";
 
 /// The request id of the initialize handshake, per the verified protocol.
@@ -59,7 +63,7 @@ const SUMMARY_CHARS: usize = 120;
 /// hidden but required flag; without it the CLI denies tools by itself and no
 /// request ever reaches this runner. A resume run omits `--session-id` and
 /// appends `--resume <id>` after the permission flag.
-fn build_args(job: &Job, session_id: &str) -> Vec<String> {
+fn build_args(job: &Job, settings: &RoleSettings, session_id: &str) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         "--input-format".to_string(),
@@ -68,24 +72,71 @@ fn build_args(job: &Job, session_id: &str) -> Vec<String> {
         "stream-json".to_string(),
         "--verbose".to_string(),
         "--model".to_string(),
-        job.model.clone(),
+        settings.model.clone(),
     ];
+    if let Some(effort) = settings.effort.as_ref() {
+        args.push("--effort".to_string());
+        args.push(effort.clone());
+    }
+    if let Some(agent) = settings.agent.as_ref() {
+        args.push("--agent".to_string());
+        args.push(agent.clone());
+    }
+    if let Some(mode) = settings.permission_mode.as_ref() {
+        args.push("--permission-mode".to_string());
+        args.push(mode.clone());
+    }
     if job.resume.is_none() {
         args.push("--session-id".to_string());
         args.push(session_id.to_string());
     }
     args.push("--permission-prompt-tool".to_string());
-    args.push("stdio".to_string());
-    if let Some(tools) = job.allowed_tools.as_ref() {
+    args.push(
+        settings
+            .permission_handler
+            .as_deref()
+            .filter(|handler| *handler != "inbox")
+            .unwrap_or("stdio")
+            .to_string(),
+    );
+    if !settings.tools.is_empty() {
         args.push("--tools".to_string());
-        args.push(tools.join(","));
+        args.push(settings.tools.join(","));
+    }
+    if !settings.disallowed_tools.is_empty() {
+        args.push("--disallowed-tools".to_string());
+        args.push(settings.disallowed_tools.join(","));
+    }
+    if settings.strict_mcp == Some(true) {
         args.push("--strict-mcp-config".to_string());
     }
     if let Some(resume_id) = job.resume.as_deref() {
         args.push("--resume".to_string());
         args.push(resume_id.to_string());
     }
+    args.extend(settings.extra_args.iter().cloned());
     args
+}
+
+#[cfg(test)]
+fn legacy_settings(job: &Job) -> RoleSettings {
+    RoleSettings {
+        harness: Harness::Claude,
+        program: PROGRAM.to_string(),
+        model: job.model.clone(),
+        effort: job.variant.clone(),
+        extra_args: Vec::new(),
+        agent: None,
+        profile: None,
+        permission_mode: None,
+        permission_handler: Some("inbox".to_string()),
+        tools: job.allowed_tools.clone().unwrap_or_default(),
+        disallowed_tools: Vec::new(),
+        strict_mcp: job.allowed_tools.as_ref().map(|_| true),
+        auto_approve: None,
+        approval_policy: None,
+        sandbox: None,
+    }
 }
 
 /// Build one user message line in the verified wire shape.
@@ -320,7 +371,7 @@ pub type SessionIdSink = Arc<dyn Fn(&str) + Send + Sync>;
 /// the initialize handshake, and hands back a [`ClaudeSession`]. The runner
 /// can start many sessions in sequence.
 pub struct ClaudeRunner {
-    program: String,
+    settings: RoleSettings,
     handshake_timeout: Duration,
     sink: SessionIdSink,
 }
@@ -328,9 +379,9 @@ pub struct ClaudeRunner {
 impl ClaudeRunner {
     /// A runner that starts the real `claude` program and reports each
     /// session id to `sink` exactly once, as soon as it is known.
-    pub fn new(sink: SessionIdSink) -> Self {
+    pub fn new(settings: RoleSettings, sink: SessionIdSink) -> Self {
         Self {
-            program: PROGRAM.to_string(),
+            settings,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             sink,
         }
@@ -339,7 +390,7 @@ impl ClaudeRunner {
     /// Set the fake claude program for an offline test.
     #[cfg(test)]
     fn with_program(mut self, program: &std::path::Path) -> Self {
-        self.program = program.to_string_lossy().into_owned();
+        self.settings.program = program.to_string_lossy().into_owned();
         self
     }
 
@@ -364,13 +415,13 @@ impl ClaudeRunner {
             Some(resume_id) => resume_id.to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let args = build_args(job, &session_id);
+        let args = build_args(job, &self.settings, &session_id);
         let (cmd_tx, cmd_rx) = channel::<WorkerMsg>();
         let (proc_tx, proc_rx) = channel::<ProcEvent>();
         let spec = RunSpec {
             task: job.task.clone(),
             cwd: job.cwd.clone(),
-            program: self.program.clone(),
+            program: self.settings.program.clone(),
             args,
             env: Vec::new(),
             log: job.log.clone(),
@@ -378,7 +429,7 @@ impl ClaudeRunner {
         let handle = proc::spawn(spec, proc_tx).with_context(|| {
             format!(
                 "task {}: failed to start the claude program {}",
-                job.task, self.program
+                job.task, self.settings.program
             )
         })?;
         (self.sink)(&session_id);
@@ -921,6 +972,7 @@ impl SessionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Harness, RoleSettings};
     use crate::model::Stage;
     use std::fs;
     use std::io::Write;
@@ -993,9 +1045,30 @@ not json at all
         }
     }
 
+    fn complete_settings() -> RoleSettings {
+        RoleSettings {
+            harness: Harness::Claude,
+            program: "claude-refine".to_string(),
+            model: "claude-refine-model".to_string(),
+            effort: Some("high".to_string()),
+            extra_args: vec!["--notice".to_string(), "refine".to_string()],
+            agent: Some("refiner".to_string()),
+            profile: None,
+            permission_mode: Some("manual".to_string()),
+            permission_handler: Some("inbox".to_string()),
+            tools: vec!["Read".to_string(), "Glob".to_string()],
+            disallowed_tools: vec!["Bash".to_string()],
+            strict_mcp: Some(true),
+            auto_approve: None,
+            approval_policy: None,
+            sandbox: None,
+        }
+    }
+
     /// Build a runner that starts this test's fake program by absolute path.
     fn test_runner(dir: &Path, sink: SessionIdSink) -> ClaudeRunner {
-        ClaudeRunner::new(sink).with_program(&dir.join(PROGRAM))
+        let settings = legacy_settings(&job(dir, None, false));
+        ClaudeRunner::new(settings, sink).with_program(&dir.join(PROGRAM))
     }
 
     /// Start the run, retrying the transient `Text file busy` race.
@@ -1238,6 +1311,7 @@ cat > /dev/null
     fn the_argument_vector_matches_the_verified_invocation() {
         let args = build_args(
             &job(Path::new("/w"), None, true),
+            &complete_settings(),
             "11111111-2222-4333-8444-555555555555",
         );
         assert_eq!(
@@ -1250,11 +1324,24 @@ cat > /dev/null
                 "stream-json",
                 "--verbose",
                 "--model",
-                "claude-opus-5[1m]",
+                "claude-refine-model",
+                "--effort",
+                "high",
+                "--agent",
+                "refiner",
+                "--permission-mode",
+                "manual",
                 "--session-id",
                 "11111111-2222-4333-8444-555555555555",
                 "--permission-prompt-tool",
                 "stdio",
+                "--tools",
+                "Read,Glob",
+                "--disallowed-tools",
+                "Bash",
+                "--strict-mcp-config",
+                "--notice",
+                "refine",
             ]
         );
     }
@@ -1266,7 +1353,11 @@ cat > /dev/null
             Some("11111111-2222-4333-8444-555555555555"),
             true,
         );
-        let args = build_args(&job, "99999999-8888-4777-8666-555555555555");
+        let args = build_args(
+            &job,
+            &complete_settings(),
+            "99999999-8888-4777-8666-555555555555",
+        );
         assert_eq!(
             args,
             vec![
@@ -1277,11 +1368,24 @@ cat > /dev/null
                 "stream-json",
                 "--verbose",
                 "--model",
-                "claude-opus-5[1m]",
+                "claude-refine-model",
+                "--effort",
+                "high",
+                "--agent",
+                "refiner",
+                "--permission-mode",
+                "manual",
                 "--permission-prompt-tool",
                 "stdio",
+                "--tools",
+                "Read,Glob",
+                "--disallowed-tools",
+                "Bash",
+                "--strict-mcp-config",
                 "--resume",
                 "11111111-2222-4333-8444-555555555555",
+                "--notice",
+                "refine",
             ]
         );
     }
@@ -1294,13 +1398,50 @@ cat > /dev/null
             "Glob".to_string(),
             "Grep".to_string(),
         ]);
-        let args = build_args(&job, "11111111-2222-4333-8444-555555555555");
+        let args = build_args(
+            &job,
+            &legacy_settings(&job),
+            "11111111-2222-4333-8444-555555555555",
+        );
 
         let tools = args.iter().position(|arg| arg == "--tools").unwrap();
         assert_eq!(args[tools + 1], "Read,Glob,Grep");
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         for forbidden in ["Write", "Edit", "Bash", "WebFetch", "WebSearch"] {
             assert!(!args.iter().any(|arg| arg.contains(forbidden)));
+        }
+    }
+
+    #[test]
+    fn every_permission_mode_keeps_the_real_question_channel() {
+        for mode in [
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan",
+        ] {
+            let mut settings = complete_settings();
+            settings.permission_mode = Some(mode.to_string());
+            let args = build_args(
+                &job(Path::new("/w"), None, mode == "bypassPermissions"),
+                &settings,
+                "11111111-2222-4333-8444-555555555555",
+            );
+            let permission_mode = args
+                .windows(2)
+                .find(|pair| pair[0] == "--permission-mode")
+                .unwrap();
+            assert_eq!(permission_mode[1], mode);
+            let handler = args
+                .windows(2)
+                .find(|pair| pair[0] == "--permission-prompt-tool")
+                .unwrap();
+            assert_eq!(handler[1], "stdio");
+            assert!(!args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"));
         }
     }
 
@@ -1482,7 +1623,11 @@ cat > /dev/null
 
         // The child saw the minted id in its exact argument vector.
         let child_args: Vec<String> = wait_for_file(&argv).lines().map(String::from).collect();
-        assert_eq!(child_args, build_args(&job(&dir, None, true), &minted));
+        let expected_job = job(&dir, None, true);
+        assert_eq!(
+            child_args,
+            build_args(&expected_job, &legacy_settings(&expected_job), &minted)
+        );
 
         drop(session);
         fs::remove_dir_all(dir).unwrap();
@@ -1513,9 +1658,10 @@ cat > /dev/null
         assert_eq!(called, vec![resume_id.to_string()]);
 
         let child_args: Vec<String> = wait_for_file(&argv).lines().map(String::from).collect();
+        let expected_job = job(&dir, Some(resume_id), true);
         assert_eq!(
             child_args,
-            build_args(&job(&dir, Some(resume_id), true), resume_id)
+            build_args(&expected_job, &legacy_settings(&expected_job), resume_id)
         );
         assert!(!child_args.contains(&"--session-id".to_string()));
 

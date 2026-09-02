@@ -12,8 +12,7 @@ Updated: {updated_at}
 GitHub reference: {github_url}
 
 Start with analysis. Do not propose a title or description change unless the
-operator explicitly requests that change. You can use only Read, Glob, and
-Grep. Do not edit files. Do not use a GitHub write command.
+operator explicitly requests that change.
 
 When the operator explicitly requests a title or description change, finish
 the assistant turn with exactly one complete block in this form:

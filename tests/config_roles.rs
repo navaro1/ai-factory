@@ -188,6 +188,14 @@ fn rejects_each_new_managed_argument_form() {
         "--dir=value",
         "--tools=value",
         "--strict-mcp-config=value",
+        "--ask-for-approval",
+        "--ask-for-approval=never",
+        "-a",
+        "-a=never",
+        "--cd",
+        "--cd=/tmp/worktree",
+        "-C",
+        "-C=/tmp/worktree",
     ] {
         let text = ROLES.replacen(
             "extra_args = []",

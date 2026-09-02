@@ -696,6 +696,7 @@ fn validate_args(args: &[String], key: &str) -> Result<()> {
         "--model",
         "-m",
         "--cwd",
+        "--cd",
         "-C",
         "--resume",
         "--session",
@@ -715,6 +716,8 @@ fn validate_args(args: &[String], key: &str) -> Result<()> {
         "--effort",
         "--variant",
         "--approval-policy",
+        "--ask-for-approval",
+        "-a",
         "--sandbox",
     ];
     for arg in args {
