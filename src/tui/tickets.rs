@@ -13,6 +13,7 @@ use crate::sock::{
     TicketDetails, TicketGroup, TicketLabels, TicketResult, TicketResultKind, TicketSummary,
 };
 
+use super::markdown::markdown_lines;
 use super::session::SessionView;
 use super::theme::THEME;
 
@@ -103,6 +104,10 @@ pub struct Tickets {
     chat_active: bool,
     /// The current request that applies a shown proposal.
     proposal_request: Option<String>,
+    /// The focused issue body, rendered once per update.
+    body_lines: Vec<Line<'static>>,
+    /// The focused proposal body, rendered once per update.
+    proposal_lines: Vec<Line<'static>>,
 }
 
 impl Tickets {
@@ -157,7 +162,23 @@ impl Tickets {
             .is_some_and(|(repo, number)| repo == &details.repo && *number == details.issue.number);
         if current {
             self.details = Some(details);
+            self.refresh_body_render();
         }
+    }
+
+    /// Rebuild the rendered markdown caches from the current details.
+    fn refresh_body_render(&mut self) {
+        let Some(details) = self.details.as_ref() else {
+            self.body_lines.clear();
+            self.proposal_lines.clear();
+            return;
+        };
+        self.body_lines = markdown_lines(&details.issue.body);
+        self.proposal_lines = details
+            .proposal
+            .as_ref()
+            .map(|proposal| markdown_lines(&proposal.body))
+            .unwrap_or_default();
     }
 
     /// Apply one label catalog response.
@@ -187,6 +208,7 @@ impl Tickets {
             if let Some(details) = self.details.as_mut() {
                 details.issue = issue.clone();
             }
+            self.refresh_body_render();
         }
         match result.kind {
             TicketResultKind::Conflict => {
@@ -210,6 +232,7 @@ impl Tickets {
                     if let Some(details) = self.details.as_mut() {
                         details.proposal = None;
                     }
+                    self.refresh_body_render();
                     self.proposal_request = None;
                 }
                 self.editor = None;
@@ -467,6 +490,8 @@ impl Tickets {
         self.chat.clear();
         self.chat_active = false;
         self.proposal_request = None;
+        self.body_lines.clear();
+        self.proposal_lines.clear();
     }
 
     /// Apply one key inside the direct editor.
@@ -528,6 +553,7 @@ impl Tickets {
                 if let Some(details) = self.details.as_mut() {
                     details.issue = conflict.remote;
                 }
+                self.refresh_body_render();
                 self.editor = None;
                 self.conflict = None;
                 self.conflict_open = false;
@@ -842,14 +868,16 @@ impl Tickets {
                         Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
-                    Line::from(issue.body.clone()),
+                ];
+                lines.extend(self.body_lines.iter().cloned());
+                lines.extend([
                     Line::from(""),
                     Line::from(format!("Labels: {labels}")),
                     Line::from(format!("Author: {}", issue.author)),
                     Line::from(format!("Assignees: {assignees}")),
                     Line::from(format!("Updated: {}", issue.updated_at)),
                     Line::from(format!("GitHub: {}", issue.github_url)),
-                ];
+                ]);
                 if let Some(proposal) = details.proposal.as_ref() {
                     lines.extend([
                         Line::from(""),
@@ -860,8 +888,8 @@ impl Tickets {
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Line::from(format!("Title: {}", proposal.title)),
-                        Line::from(format!("Description: {}", proposal.body)),
                     ]);
+                    lines.extend(self.proposal_lines.iter().cloned());
                 }
                 lines.push(result_line(self.result.as_ref()));
                 lines
@@ -1154,6 +1182,7 @@ mod tests {
 
     fn state() -> StateView {
         StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),
@@ -1352,6 +1381,56 @@ mod tests {
         tickets.handle_key(&state, key(KeyCode::Char('l')));
         assert_eq!(tickets.query, "analysis");
         assert_eq!(tickets.filtered(&state).len(), 1);
+    }
+
+    #[test]
+    fn body_render_renders_markdown_once_per_update() {
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state(), key(KeyCode::Enter));
+
+        let mut incoming = details();
+        incoming.issue.body = "## Heading\n\n- [ ] step".to_string();
+        incoming.proposal = Some(crate::sock::TicketProposal {
+            id: "proposal-1".to_string(),
+            title: "Rename".to_string(),
+            body: "**bold** plan".to_string(),
+            original_title: "Improve the ticket list".to_string(),
+            original_body: "Show every issue without leaving the terminal.".to_string(),
+        });
+        tickets.observe_details(incoming);
+
+        let text_of = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text_of(&tickets.body_lines[0]), "Heading");
+        assert!(tickets.body_lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(text_of(&tickets.proposal_lines[0]), "bold plan");
+        assert!(tickets.proposal_lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+
+        let mut updated = details();
+        updated.issue.body = "Replaced body".to_string();
+        tickets.observe_result(TicketResult {
+            request: "request-1".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: TicketResultKind::Success,
+            message: "saved".to_string(),
+            issue: Some(updated.issue),
+            conflict: None,
+        });
+        assert_eq!(
+            tickets.body_lines.iter().map(text_of).collect::<Vec<_>>(),
+            vec!["Replaced body".to_string()]
+        );
     }
 
     #[test]

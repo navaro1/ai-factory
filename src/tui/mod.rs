@@ -19,6 +19,7 @@
 //! chords work from every view.
 
 pub mod inbox;
+pub mod markdown;
 pub mod pipeline;
 pub mod session;
 pub mod theme;
@@ -46,7 +47,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::decisions::DecisionKind;
 use crate::model::{ItemKind, Stage};
-use crate::sock::{Action, Client, Push, StateView, TaskView};
+use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
 use theme::THEME;
@@ -98,6 +99,8 @@ enum Msg {
     Connected,
     /// The daemon went away, with the reason for the banner.
     Disconnected(String),
+    /// A permanent background failure that must leave the terminal UI.
+    Fatal(String),
     /// The key reader died, so the UI cannot see input anymore.
     Input(String),
 }
@@ -820,6 +823,12 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                         }
                                     }
                                     Err(error) => {
+                                        if error.downcast_ref::<WireProtocolMismatch>().is_some() {
+                                            if tx.send(Msg::Fatal(format!("{error:#}"))).is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
                                         failure = Some(format!("{error:#}"));
                                         break;
                                     }
@@ -913,6 +922,7 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
             app.mark_disconnected(reason);
             Ok(true)
         }
+        Msg::Fatal(reason) => Err(anyhow!(reason)),
         Msg::Input(reason) => Err(anyhow!("terminal input stopped: {reason}")),
         Msg::Resize => Ok(true),
     }
@@ -1336,6 +1346,46 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)),
             Ok(Msg::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn an_incompatible_daemon_exits_an_eighty_column_tui_with_full_recovery_text() {
+        let socket =
+            std::env::temp_dir().join(format!("aif-old-daemon-{}.sock", uuid::Uuid::new_v4()));
+        let (server, _actions) = crate::sock::Server::bind(&socket).unwrap();
+        let mut old = crate::tui::pipeline::sample_view();
+        old.protocol_revision = 0;
+        server.publish(old);
+        let (tx, rx) = channel();
+        spawn_socket_thread(tx, socket);
+
+        let connected = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let incompatible = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        assert!(handle_message(&mut app, connected, &mut sink).unwrap());
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app).unwrap())
+            .unwrap();
+
+        let error = handle_message(&mut app, incompatible, &mut sink).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("daemon wire protocol revision 0"),
+            "{message}"
+        );
+        assert!(message.contains("aif stop"), "{message}");
+        assert!(message.contains("start `aif` again"), "{message}");
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "a permanent mismatch must stop its socket thread"
+        );
     }
 
     #[test]

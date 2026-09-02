@@ -182,7 +182,7 @@ fn row_key(state: &StateView, row: &Row) -> Option<RowKey> {
 }
 
 /// The pull requests shown inside the release batch border.
-fn displayed_batch(train: &crate::sock::TrainView) -> &[u64] {
+pub(super) fn displayed_batch(train: &crate::sock::TrainView) -> &[u64] {
     if train.batch.is_empty() {
         &train.stacked
     } else {
@@ -444,28 +444,61 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
     }
 }
 
-/// Open the session of the selected ticket.
+/// Open the details of the selected row.
 ///
 /// A ticket in any state opens its session: a done or failed task keeps
-/// its log file, so its transcript stays readable. A stage, repository,
-/// or train row opens nothing.
+/// its log file, so its transcript stays readable. A release pull request
+/// opens the release detail of the inbox, as the inbox gate row does.
+/// A stage, repository, or train row opens nothing.
 fn open_selected_task(app: &mut App) {
-    let task = {
+    let target = {
         let Some(state) = app.state.as_ref() else {
             return;
         };
-        let Some(Row::Ticket { index }) = selected_row(app) else {
+        let Some(row) = selected_row(app) else {
             return;
         };
-        let Some(task) = state.tasks.get(index) else {
-            return;
-        };
-        task.id.clone()
+        match row {
+            Row::Ticket { index } => {
+                let Some(task) = state.tasks.get(index) else {
+                    return;
+                };
+                OpenTarget::Ticket(task.id.clone())
+            }
+            Row::ReleasePr { repo, pr } => OpenTarget::Release { repo, pr },
+            Row::Stage { .. } | Row::Repo { .. } | Row::Train { .. } => return,
+        }
     };
-    app.session_task = Some(task);
-    app.wanted = None;
-    app.view = View::Session;
-    app.show_session_task();
+    match target {
+        OpenTarget::Ticket(task) => {
+            app.session_task = Some(task);
+            app.wanted = None;
+            app.view = View::Session;
+            app.show_session_task();
+        }
+        OpenTarget::Release { repo, pr } => {
+            let opened = match app.state.as_ref() {
+                Some(state) => app.inbox.open_release_pr(state, &repo, pr),
+                None => false,
+            };
+            if opened {
+                app.view = View::Inbox;
+            }
+        }
+    }
+}
+
+/// What the Enter key asks the shell to open.
+enum OpenTarget {
+    /// The session view of one task id.
+    Ticket(String),
+    /// The release detail of one release pull request.
+    Release {
+        /// The repository alias.
+        repo: String,
+        /// The pull request number.
+        pr: u64,
+    },
 }
 
 /// The row the operator selected, cloned out of the row list.
@@ -1385,13 +1418,40 @@ fn release_repo_spans(
     spans
 }
 
+/// The largest title character count on one board row.
+const TITLE_CHARS: usize = 32;
+
+/// Cut `text` to at most [`TITLE_CHARS`] characters.
+fn truncate(text: &str) -> String {
+    if text.chars().count() <= TITLE_CHARS {
+        text.to_string()
+    } else {
+        text.chars().take(TITLE_CHARS).collect()
+    }
+}
+
+/// The GitHub number and title of the task's ticket, when the state view
+/// knows one.
+///
+/// The tickets list holds open issues only, so a pull request task finds
+/// nothing and its row keeps the bare item label.
+fn ticket_label(state: &StateView, task: &TaskView) -> Option<String> {
+    let number = task.number;
+    state
+        .tickets
+        .iter()
+        .find(|ticket| ticket.repo == task.repo && ticket.number == number)
+        .map(|ticket| format!("#{number} {}", truncate(&ticket.title)))
+}
+
 /// The spans of one ticket row: item, state, attempt, and queued messages.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
 /// state, because it cannot start. A task in any other state keeps its true
 /// state: a pause blocks starts, it does not stop running tasks. A count
 /// above zero of queued messages adds a badge, so a waiting message stays
-/// visible from the board.
+/// visible from the board. A matching open issue adds its number and title,
+/// so the row names the ticket as the Tickets view does.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
@@ -1416,6 +1476,9 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     if task.attempt > 1 {
         spans.push(Span::styled(format!(" a{}", task.attempt), THEME.dim()));
     }
+    if let Some(ticket) = ticket_label(state, task) {
+        spans.push(Span::styled(format!(" · {ticket}"), THEME.dim()));
+    }
     spans
 }
 
@@ -1436,6 +1499,9 @@ fn task_label(state: &StateView, task: &TaskView) -> String {
     }
     if task.attempt > 1 {
         label.push_str(&format!(" a{}", task.attempt));
+    }
+    if let Some(ticket) = ticket_label(state, task) {
+        label.push_str(&format!(" · {ticket}"));
     }
     label
 }
@@ -1559,6 +1625,7 @@ fn task(
 #[cfg(test)]
 pub(crate) fn sample_view() -> StateView {
     StateView {
+        protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
         repos: vec![
             RepoView {
                 alias: "borsuk".to_string(),
@@ -1749,6 +1816,7 @@ mod tests {
     /// A state view with no repositories, tasks, and trains.
     fn empty_view() -> StateView {
         StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Stage::ALL
                 .iter()
@@ -2283,6 +2351,85 @@ mod tests {
     }
 
     #[test]
+    fn a_matching_open_issue_shows_its_number_and_title_on_the_board() {
+        let mut state = sample_view();
+        state.tickets.push(crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "Fix the flaky retry".to_string(),
+            labels: vec!["bug".to_string()],
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Refined,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(
+            text.contains("i140 running a2 · #140 Fix the flaky retry"),
+            "board:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_task_without_a_matching_issue_keeps_the_bare_row() {
+        let mut state = sample_view();
+        state.tickets.push(crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "Fix the flaky retry".to_string(),
+            labels: Vec::new(),
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Refined,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+
+        // Only issue 140 of borsuk carries a title; the rest stay bare.
+        assert!(!text.contains("i142 queued ·"));
+        assert!(!text.contains("i7 queued ·"));
+        assert!(!text.contains("p7 running ·"));
+    }
+
+    #[test]
+    fn a_long_title_is_cut_to_the_row_budget() {
+        let mut state = sample_view();
+        state.tickets.push(crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "a".repeat(60),
+            labels: Vec::new(),
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Refined,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 240, 24);
+
+        assert!(text.contains(&format!("· #140 {}", "a".repeat(32))));
+        assert!(!text.contains(&format!("· #140 {}", "a".repeat(33))));
+    }
+
+    #[test]
+    fn truncate_cuts_at_the_character_budget() {
+        assert_eq!(truncate("short"), "short");
+        assert_eq!(truncate(&"x".repeat(40)), "x".repeat(32));
+    }
+
+    #[test]
     fn policy_label_covers_every_policy() {
         assert_eq!(policy_label(&ReleasePolicy::Manual), "manual");
         assert_eq!(
@@ -2326,6 +2473,11 @@ mod tests {
     /// A plain press of the Enter key.
     fn pressed_enter() -> KeyEvent {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    /// A plain press of the Escape key.
+    fn pressed_esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
     }
 
     /// The sample app with one selected row.
@@ -2800,10 +2952,6 @@ mod tests {
             Row::Train {
                 repo: "borsuk".to_string(),
             },
-            Row::ReleasePr {
-                repo: "borsuk".to_string(),
-                pr: 5,
-            },
         ];
         for row in non_ticket_rows {
             let mut app = app_with_row(row.clone());
@@ -2825,6 +2973,137 @@ mod tests {
         handle_key(&mut app, pressed_enter(), &mut sink);
         assert_eq!(app.view, View::Pipeline);
         assert!(app.session_task.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_release_pr_opens_the_inbox_release_detail() {
+        // An active batch pull request without an open gate row follows
+        // the release train.
+        let mut app = app_with_row(Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 5,
+        });
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert!(sink.0.is_empty(), "enter must not send an action");
+        assert_eq!(app.view, View::Inbox);
+        assert!(app.inbox.detail_open());
+        assert_eq!(app.session_task, None);
+
+        let text = render_to_string(&mut app);
+        assert!(text.contains("PR #5 · borsuk"), "detail:\n{text}");
+        assert!(text.contains("h l pull request"), "train footer:\n{text}");
+    }
+
+    #[test]
+    fn enter_on_a_waiting_pr_prefers_the_open_gate_row() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked = vec![7];
+        state
+            .decisions
+            .push(crate::decisions::Decision::release_gate(
+                "borsuk",
+                vec![7],
+                1_000,
+            ));
+        let mut app = app_with_state_and_row(
+            state,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 7,
+            },
+        );
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed_enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "enter must not send an action");
+        assert_eq!(app.view, View::Inbox);
+        assert!(app.inbox.detail_open());
+        let text = render_to_string(&mut app);
+        assert!(text.contains("PR #7 · borsuk"), "detail:\n{text}");
+        assert!(
+            text.contains("space include/exclude"),
+            "gate footer:\n{text}"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_gated_pr_shows_that_pull_request_first() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked = vec![7, 9];
+        state
+            .decisions
+            .push(crate::decisions::Decision::release_gate(
+                "borsuk",
+                vec![7, 9],
+                1_000,
+            ));
+        let mut app = app_with_state_and_row(
+            state,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 9,
+            },
+        );
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed_enter(), &mut sink);
+
+        assert!(app.inbox.detail_open());
+        let text = render_to_string(&mut app);
+        assert!(text.contains("PR #9 · borsuk"), "detail:\n{text}");
+
+        // Left moves to the previous pull request, as the gate detail does.
+        app.handle_key(pressed('h'), &mut sink);
+        let text = render_to_string(&mut app);
+        assert!(text.contains("PR #7 · borsuk"), "moved detail:\n{text}");
+    }
+
+    #[test]
+    fn enter_on_a_queue_pr_without_a_gate_follows_the_train() {
+        let mut state = sample_view();
+        state.trains[0].in_flight = None;
+        state.trains[0].batch.clear();
+        state.trains[0].stacked.clear();
+        let mut app = app_with_state_and_row(
+            state,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 9,
+            },
+        );
+        let mut sink = FakeSink::default();
+
+        handle_key(&mut app, pressed_enter(), &mut sink);
+
+        assert!(sink.0.is_empty());
+        assert_eq!(app.view, View::Inbox);
+        let text = render_to_string(&mut app);
+        assert!(text.contains("PR #9 · borsuk"), "detail:\n{text}");
+    }
+
+    #[test]
+    fn esc_from_the_release_detail_returns_through_the_inbox() {
+        let mut app = app_with_row(Row::ReleasePr {
+            repo: "borsuk".to_string(),
+            pr: 5,
+        });
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed_enter(), &mut sink);
+        assert_eq!(app.view, View::Inbox);
+
+        // Esc closes the detail first; the feed stays, as in the inbox.
+        app.handle_key(pressed_esc(), &mut sink);
+        assert_eq!(app.view, View::Inbox);
+        assert!(!app.inbox.detail_open());
+
+        app.handle_key(pressed_esc(), &mut sink);
+        assert_eq!(app.view, View::Pipeline);
     }
 
     #[test]

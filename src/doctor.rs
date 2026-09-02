@@ -1233,7 +1233,7 @@ mod tests {
     use super::*;
     use aif::exec::{CmdOut, ScriptExec};
     use aif::model::Stage;
-    use aif::sock::{Action, Server, StateView};
+    use aif::sock::{Action, Server, StateView, WIRE_PROTOCOL_REVISION};
     use std::cell::{Cell, RefCell};
     use std::fs::Permissions;
     use std::io::{BufRead, BufReader};
@@ -2731,6 +2731,7 @@ mod tests {
         let socket = dir.join("daemon.sock");
         let (server, _actions) = Server::bind(&socket).expect("the fake daemon must bind");
         server.publish(StateView {
+            protocol_revision: WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),

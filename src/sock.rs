@@ -41,6 +41,31 @@ use crate::trains::Train;
 /// thread sends at most one push per subscriber set in this window.
 pub const PUSH_COALESCE_MS: u64 = 50;
 
+/// The exact wire protocol revision shared by this client and daemon.
+///
+/// Increment this value when an older peer cannot safely provide a new wire
+/// behavior. A missing revision identifies the legacy protocol as revision 0.
+pub const WIRE_PROTOCOL_REVISION: u32 = 1;
+
+/// A permanent mismatch between the connected daemon and client protocols.
+#[derive(Debug)]
+pub struct WireProtocolMismatch {
+    daemon: u32,
+    client: u32,
+}
+
+impl std::fmt::Display for WireProtocolMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon wire protocol revision {} is incompatible with client revision {}; run `aif stop`, then start `aif` again",
+            self.daemon, self.client
+        )
+    }
+}
+
+impl std::error::Error for WireProtocolMismatch {}
+
 /// How many pushes a subscriber may buffer before the server drops it.
 ///
 /// A client that stops reading fills this buffer in about one second at the
@@ -54,6 +79,9 @@ const SUBSCRIBER_CAPACITY: usize = 16;
 /// file itself, which is why [`TaskView::log_path`] is part of the view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateView {
+    /// The wire protocol revision of the daemon that built this state.
+    #[serde(default)]
+    pub protocol_revision: u32,
     /// The configured repositories, in alias order.
     pub repos: Vec<RepoView>,
     /// The four pipeline stages, in pipeline order.
@@ -206,7 +234,7 @@ impl StateInput<'_> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let trains = config
+        let trains: Vec<TrainView> = config
             .repos
             .keys()
             .map(|repo| {
@@ -233,7 +261,7 @@ impl StateInput<'_> {
                 }
             })
             .collect();
-        let decision_items = decision_items(decisions, snapshot);
+        let decision_items = decision_items(decisions, snapshot, &trains);
         let mut tickets: Vec<TicketSummary> = config
             .repos
             .keys()
@@ -288,6 +316,7 @@ impl StateInput<'_> {
                 .collect(),
         };
         Ok(StateView {
+            protocol_revision: WIRE_PROTOCOL_REVISION,
             repos,
             stages,
             lanes,
@@ -301,8 +330,13 @@ impl StateInput<'_> {
     }
 }
 
-/// Build the repository item content that open decisions can display.
-fn decision_items(decisions: &Decisions, snapshot: &Snapshot) -> Vec<ItemView> {
+/// Build the repository item content that open decisions and release
+/// trains display.
+fn decision_items(
+    decisions: &Decisions,
+    snapshot: &Snapshot,
+    trains: &[TrainView],
+) -> Vec<ItemView> {
     let mut items = Vec::new();
     for decision in decisions.open() {
         match &decision.kind {
@@ -317,6 +351,11 @@ fn decision_items(decisions: &Decisions, snapshot: &Snapshot) -> Vec<ItemView> {
             crate::decisions::DecisionKind::Permission { .. }
             | crate::decisions::DecisionKind::Question { .. }
             | crate::decisions::DecisionKind::Stuck { .. } => {}
+        }
+    }
+    for train in trains {
+        for number in train.batch.iter().chain(&train.stacked).chain(&train.queue) {
+            push_item(&mut items, snapshot, &train.repo, ItemKind::Pr, *number);
         }
     }
     items
@@ -370,7 +409,7 @@ pub struct RepoView {
     pub owner_repo: String,
 }
 
-/// One repository item that an open decision references.
+/// One repository item that an open decision or a release train references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemView {
     /// The repository alias.
@@ -1314,6 +1353,13 @@ impl Iterator for Pushes {
             // A clean close ends the stream.
             Ok(0) => None,
             Ok(_) => match serde_json::from_str::<Push>(line.trim()) {
+                Ok(Push::State(view)) if view.protocol_revision != WIRE_PROTOCOL_REVISION => {
+                    self.failed = true;
+                    Some(Err(anyhow::Error::new(WireProtocolMismatch {
+                        daemon: view.protocol_revision,
+                        client: WIRE_PROTOCOL_REVISION,
+                    })))
+                }
                 Ok(push) => Some(Ok(push)),
                 Err(error) => {
                     self.failed = true;
@@ -1368,6 +1414,7 @@ mod tests {
     /// A state view with one stage and one repository, marked by `label`.
     fn sample_view(label: usize) -> StateView {
         StateView {
+            protocol_revision: WIRE_PROTOCOL_REVISION,
             repos: vec![RepoView {
                 alias: format!("repo-{label}"),
                 owner_repo: String::new(),
@@ -1552,6 +1599,51 @@ mod tests {
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_client_rejects_a_state_from_an_older_wire_protocol() {
+        let mut old = serde_json::to_value(Push::State(sample_view(1))).unwrap();
+        old.as_object_mut().unwrap().remove("protocol_revision");
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        writeln!(daemon, "{old}").unwrap();
+        drop(daemon);
+        let mut pushes = Pushes {
+            reader: std::io::BufReader::new(client),
+            failed: false,
+        };
+
+        let error = pushes.next().unwrap().unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("daemon wire protocol revision 0"),
+            "{message}"
+        );
+        assert!(message.contains("client revision 1"), "{message}");
+        assert!(message.contains("aif stop"), "{message}");
+        assert!(
+            pushes.next().is_none(),
+            "a rejected stream must stay closed"
+        );
+    }
+
+    #[test]
+    fn a_client_accepts_a_state_from_the_current_wire_protocol() {
+        let mut current = serde_json::to_value(Push::State(sample_view(1))).unwrap();
+        current
+            .as_object_mut()
+            .unwrap()
+            .insert("protocol_revision".to_string(), serde_json::json!(1));
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        writeln!(daemon, "{current}").unwrap();
+        drop(daemon);
+        let mut pushes = Pushes {
+            reader: std::io::BufReader::new(client),
+            failed: false,
+        };
+
+        assert!(matches!(pushes.next(), Some(Ok(Push::State(_)))));
     }
 
     #[test]
@@ -2344,6 +2436,89 @@ mod tests {
                     body: "Require a current release state.".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_view_carries_the_release_train_pull_request_content() {
+        use crate::model::{Pr, RepoSnapshot, Snapshot};
+
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let policies = BTreeMap::new();
+        let mut trains = BTreeMap::new();
+        let mut train = Train::new("borsuk");
+        train.enqueue(7);
+        train.enqueue(9);
+        train.stacked.push(7);
+        trains.insert("borsuk".to_string(), train);
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [
+                    (
+                        7,
+                        Pr {
+                            number: 7,
+                            node_id: "pr-node-7".to_string(),
+                            title: "Protect the release gate".to_string(),
+                            body: "Require a current release state.".to_string(),
+                            labels: Vec::new(),
+                            open: true,
+                            draft: false,
+                            head_sha: "sha-7".to_string(),
+                            head_ref: "aif/release-7".to_string(),
+                        },
+                    ),
+                    (
+                        9,
+                        Pr {
+                            number: 9,
+                            node_id: "pr-node-9".to_string(),
+                            title: "Add the train detail".to_string(),
+                            body: "Show the queued pull request.".to_string(),
+                            labels: Vec::new(),
+                            open: true,
+                            draft: false,
+                            head_sha: "sha-9".to_string(),
+                            head_ref: "aif/release-9".to_string(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            trains: &trains,
+            policies: &policies,
+            input_modes: &BTreeMap::new(),
+            snapshot: &snapshot,
+            now_ms: 3_000,
+        }
+        .build()
+        .unwrap();
+
+        // No decision is open, yet the train pull requests carry content,
+        // so the release detail can describe them.
+        assert!(view.decisions.is_empty());
+        assert_eq!(
+            view.decision_items
+                .iter()
+                .map(|item| (item.number, item.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(7, "Protect the release gate"), (9, "Add the train detail")],
         );
     }
 
