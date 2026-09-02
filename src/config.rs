@@ -321,14 +321,8 @@ impl Config {
                 if let Some(raw_override) = raw_override {
                     let key = format!("repo.{alias}.{role}");
                     let override_settings = raw_override.into_override(&key)?;
-                    if let Some(harness) = override_settings.harness {
-                        if override_settings.model.is_none() {
-                            bail!(
-                                "{key}.model is required when {key}.harness changes to {}",
-                                harness.program()
-                            );
-                        }
-                    }
+                    let harness = override_settings.harness.unwrap_or(roles[&role].harness);
+                    validate_override_for_harness(&override_settings, harness, &key)?;
                     let effective = apply_override(&roles[&role], &override_settings);
                     validate_settings(&effective, &key)?;
                     role_overrides.insert(role, override_settings);
@@ -455,6 +449,7 @@ impl RawRole {
         let harness = self
             .harness
             .ok_or_else(|| anyhow!("{key}.harness is required"))?;
+        validate_raw_harness_fields(&self, harness, key)?;
         let program = self
             .program
             .unwrap_or_else(|| harness.program().to_string());
@@ -593,6 +588,8 @@ fn validate_settings(value: &RoleSettings, key: &str) -> Result<()> {
         value.approval_policy.is_some() || value.sandbox.is_some(),
         key,
     )?;
+    validate_tool_names(&value.tools, &format!("{key}.tools"))?;
+    validate_tool_names(&value.disallowed_tools, &format!("{key}.disallowed_tools"))?;
     validate_args(&value.extra_args, key)
 }
 fn validate_override(value: &RoleOverride, key: &str) -> Result<()> {
@@ -638,6 +635,62 @@ fn validate_fields(
     }
     Ok(())
 }
+fn validate_raw_harness_fields(value: &RawRole, harness: Harness, key: &str) -> Result<()> {
+    validate_fields(
+        harness,
+        value.agent.is_some(),
+        value.profile.is_some(),
+        value.permission_mode.is_some()
+            || value.permission_handler.is_some()
+            || value.tools.is_some()
+            || value.disallowed_tools.is_some()
+            || value.strict_mcp.is_some(),
+        value.auto_approve.is_some(),
+        value.approval_policy.is_some() || value.sandbox.is_some(),
+        key,
+    )?;
+    if let Some(tools) = &value.tools {
+        validate_tool_names(tools, &format!("{key}.tools"))?;
+    }
+    if let Some(tools) = &value.disallowed_tools {
+        validate_tool_names(tools, &format!("{key}.disallowed_tools"))?;
+    }
+    Ok(())
+}
+fn validate_override_for_harness(value: &RoleOverride, harness: Harness, key: &str) -> Result<()> {
+    validate_fields(
+        harness,
+        value.agent.is_some(),
+        value.profile.is_some(),
+        value.permission_mode.is_some()
+            || value.permission_handler.is_some()
+            || value.tools.is_some()
+            || value.disallowed_tools.is_some()
+            || value.strict_mcp.is_some(),
+        value.auto_approve.is_some(),
+        value.approval_policy.is_some() || value.sandbox.is_some(),
+        key,
+    )?;
+    if let Some(tools) = &value.tools {
+        validate_tool_names(tools, &format!("{key}.tools"))?;
+    }
+    if let Some(tools) = &value.disallowed_tools {
+        validate_tool_names(tools, &format!("{key}.disallowed_tools"))?;
+    }
+    if value.harness.is_some() && value.model.is_none() {
+        bail!(
+            "{key}.model is required when {key}.harness changes to {}",
+            harness.program()
+        );
+    }
+    Ok(())
+}
+fn validate_tool_names(tools: &[String], key: &str) -> Result<()> {
+    for tool in tools {
+        nonempty(tool, key)?;
+    }
+    Ok(())
+}
 fn validate_args(args: &[String], key: &str) -> Result<()> {
     const MANAGED: &[&str] = &[
         "--model",
@@ -646,6 +699,12 @@ fn validate_args(args: &[String], key: &str) -> Result<()> {
         "-C",
         "--resume",
         "--session",
+        "--session-id",
+        "--format",
+        "--auto",
+        "--dir",
+        "--tools",
+        "--strict-mcp-config",
         "--permission-mode",
         "--permission-prompt-tool",
         "--output-format",
@@ -680,8 +739,33 @@ fn validate_args(args: &[String], key: &str) -> Result<()> {
     Ok(())
 }
 fn apply_override(global: &RoleSettings, value: &RoleOverride) -> RoleSettings {
+    if let Some(harness) = value.harness {
+        return RoleSettings {
+            harness,
+            program: value
+                .program
+                .clone()
+                .unwrap_or_else(|| harness.program().to_string()),
+            model: value
+                .model
+                .clone()
+                .expect("validated harness replacement model"),
+            effort: value.effort.clone(),
+            extra_args: value.extra_args.clone().unwrap_or_default(),
+            agent: value.agent.clone(),
+            profile: value.profile.clone(),
+            permission_mode: value.permission_mode.clone(),
+            permission_handler: value.permission_handler.clone(),
+            tools: value.tools.clone().unwrap_or_default(),
+            disallowed_tools: value.disallowed_tools.clone().unwrap_or_default(),
+            strict_mcp: value.strict_mcp,
+            auto_approve: value.auto_approve,
+            approval_policy: value.approval_policy.clone(),
+            sandbox: value.sandbox.clone(),
+        };
+    }
     RoleSettings {
-        harness: value.harness.unwrap_or(global.harness),
+        harness: global.harness,
         program: value
             .program
             .clone()
@@ -789,6 +873,22 @@ fn check_legacy_table(table: &toml_edit::Table, prefix: &str) -> Result<()> {
         }
         if let Some(child) = item.as_table() {
             check_legacy_table(child, &path)?;
+        }
+        if let Some(child) = item.as_inline_table() {
+            check_legacy_inline_table(child, &path)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_legacy_inline_table(table: &toml_edit::InlineTable, prefix: &str) -> Result<()> {
+    for (key, value) in table.iter() {
+        let path = format!("{prefix}.{key}");
+        if matches!(key, "runner" | "variant" | "yolo") {
+            bail!("{path} is no longer supported; use the typed role settings");
+        }
+        if let Some(child) = value.as_inline_table() {
+            check_legacy_inline_table(child, &path)?;
         }
     }
     Ok(())

@@ -28,8 +28,8 @@ model = "claude-opus-5[1m]"
 limit = 1
 
 [ticket.create]
-harness = "opencode"
-model = "zai-coding-plan/glm-5.3-flash"
+harness = "claude"
+model = "claude-opus-5[1m]"
 
 [ticket.chat]
 harness = "claude"
