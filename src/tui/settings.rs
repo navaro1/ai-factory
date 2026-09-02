@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::config::{
-    ExecutionRole, Harness, RoleOverride, RoleSettings, SettingsEdit, SettingsSource,
+    validate_extra_args, ExecutionRole, Harness, RoleOverride, RoleSettings, SettingsEdit,
+    SettingsSource, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES,
 };
 use crate::sock::{Action, RoleFieldSources, SettingsResult, SettingsResultStatus, StateView};
 
@@ -64,7 +65,15 @@ impl Field {
     }
 
     fn is_choice(self) -> bool {
-        matches!(self, Self::Harness | Self::StrictMcp | Self::AutoApprove)
+        matches!(
+            self,
+            Self::Harness
+                | Self::StrictMcp
+                | Self::AutoApprove
+                | Self::PermissionMode
+                | Self::ApprovalPolicy
+                | Self::Sandbox
+        )
     }
 }
 
@@ -140,6 +149,24 @@ impl Settings {
     /// True while the settings view owns typed characters.
     pub fn typing(&self) -> bool {
         self.text_editor.is_some() || self.list_editor.is_some()
+    }
+
+    /// Unlock a settings request after a failed send or socket disconnect.
+    pub fn delivery_failed(&mut self, action: Option<&Action>) {
+        let matches = match action {
+            Some(Action::SaveSettings { request, .. } | Action::ReloadSettings { request }) => {
+                self.pending_request.as_deref() == Some(request.as_str())
+            }
+            Some(_) => false,
+            None => self.pending_request.is_some(),
+        };
+        if matches {
+            self.pending_request = None;
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                "the settings request was not delivered".to_string(),
+            ));
+        }
     }
 
     /// Apply a daemon response only when its request matches the active request.
@@ -484,6 +511,27 @@ impl Settings {
             Field::AutoApprove => {
                 let settings = draft.settings_mut();
                 settings.auto_approve = Some(!settings.auto_approve.unwrap_or(false));
+                sync_override(draft, field);
+            }
+            Field::PermissionMode => {
+                let settings = draft.settings_mut();
+                settings.permission_mode = Some(next_choice(
+                    settings.permission_mode.as_deref(),
+                    CLAUDE_PERMISSION_MODES,
+                ));
+                sync_override(draft, field);
+            }
+            Field::ApprovalPolicy => {
+                let settings = draft.settings_mut();
+                settings.approval_policy = Some(next_choice(
+                    settings.approval_policy.as_deref(),
+                    CODEX_APPROVAL_POLICIES,
+                ));
+                sync_override(draft, field);
+            }
+            Field::Sandbox => {
+                let settings = draft.settings_mut();
+                settings.sandbox = Some(next_choice(settings.sandbox.as_deref(), CODEX_SANDBOXES));
                 sync_override(draft, field);
             }
             _ => {}
@@ -1250,12 +1298,25 @@ fn validate_draft(draft: &Draft) -> BTreeMap<Field, String> {
             errors.insert(field, "rows must not be empty".to_string());
         }
     }
-    if let Some(arg) = settings
-        .extra_args
-        .iter()
-        .find(|arg| invalid_extra_arg(arg))
-    {
-        errors.insert(Field::ExtraArgs, format!("unsupported argument {arg:?}"));
+    if let Err(error) = validate_extra_args(&settings.extra_args, settings.harness, "settings") {
+        errors.insert(Field::ExtraArgs, format!("unsupported argument: {error}"));
+    }
+    for (field, value, choices) in [
+        (
+            Field::PermissionMode,
+            settings.permission_mode.as_deref(),
+            CLAUDE_PERMISSION_MODES,
+        ),
+        (
+            Field::ApprovalPolicy,
+            settings.approval_policy.as_deref(),
+            CODEX_APPROVAL_POLICIES,
+        ),
+        (Field::Sandbox, settings.sandbox.as_deref(), CODEX_SANDBOXES),
+    ] {
+        if value.is_some_and(|value| !choices.contains(&value)) {
+            errors.insert(field, format!("must be one of {}", choices.join(", ")));
+        }
     }
     if let DraftValue::Global { limit, .. } = draft.value {
         if draft.role.stage().is_some() && limit.unwrap_or(0) == 0 {
@@ -1265,43 +1326,11 @@ fn validate_draft(draft: &Draft) -> BTreeMap<Field, String> {
     errors
 }
 
-fn invalid_extra_arg(arg: &str) -> bool {
-    const MANAGED: &[&str] = &[
-        "--model",
-        "-m",
-        "--cwd",
-        "--cd",
-        "-C",
-        "--resume",
-        "--session",
-        "--session-id",
-        "--format",
-        "--auto",
-        "--dir",
-        "--tools",
-        "--strict-mcp-config",
-        "--permission-mode",
-        "--permission-prompt-tool",
-        "--output-format",
-        "--json",
-        "--jsonl",
-        "--profile",
-        "--agent",
-        "--effort",
-        "--variant",
-        "--approval-policy",
-        "--ask-for-approval",
-        "-a",
-        "--sandbox",
-    ];
-    arg.trim().is_empty()
-        || MANAGED
-            .iter()
-            .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
-        || arg == "--share"
-        || arg.starts_with("--share=")
-        || arg.contains("dangerously-bypass-approvals-and-sandbox")
-        || arg.contains("dangerously-skip-permissions")
+fn next_choice(current: Option<&str>, choices: &[&str]) -> String {
+    let index = current
+        .and_then(|value| choices.iter().position(|choice| *choice == value))
+        .map_or(0, |index| (index + 1) % choices.len());
+    choices[index].to_string()
 }
 
 fn source_for_field(sources: &RoleFieldSources, field: Field) -> &SettingsSource {
@@ -1545,6 +1574,64 @@ mod tests {
     }
 
     #[test]
+    fn closed_native_values_use_value_selection() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::PermissionMode);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(!settings.typing());
+        assert_eq!(
+            settings
+                .current_settings(&state)
+                .unwrap()
+                .permission_mode
+                .as_deref(),
+            Some("dontAsk")
+        );
+
+        settings.set_role(ExecutionRole::Review);
+        settings.set_field(Field::ApprovalPolicy);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings
+                .current_settings(&state)
+                .unwrap()
+                .approval_policy
+                .as_deref(),
+            Some("never")
+        );
+        settings.set_field(Field::Sandbox);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings
+                .current_settings(&state)
+                .unwrap()
+                .sandbox
+                .as_deref(),
+            Some("danger-full-access")
+        );
+    }
+
+    #[test]
+    fn settings_reject_the_same_managed_aliases_as_config() {
+        let state = state();
+        let cases = [
+            (ExecutionRole::Refine, "--allowedTools=Read"),
+            (ExecutionRole::Implement, "-s"),
+            (ExecutionRole::Review, "--full-auto"),
+        ];
+        for (role, argument) in cases {
+            let mut settings = Settings::default();
+            settings.set_role(role);
+            settings.set_list(&state, Field::ExtraArgs, vec![argument.to_string()]);
+            assert!(settings
+                .handle_key(&state, key(KeyCode::Char('s')))
+                .is_none());
+            assert!(settings.field_error(Field::ExtraArgs).is_some());
+        }
+    }
+
+    #[test]
     fn list_fields_use_a_row_editor() {
         let state = state();
         let mut settings = Settings::default();
@@ -1734,6 +1821,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_failed_delivery_unlocks_a_later_settings_action() {
+        let mut settings = Settings::default();
+        let first = settings.reload().expect("the first reload starts");
+        assert!(settings.reload().is_none());
+        settings.delivery_failed(Some(&first));
+        assert!(settings.reload().is_some());
+    }
+
+    #[test]
+    fn a_socket_disconnect_clears_any_pending_settings_action() {
+        let mut settings = Settings::default();
+        settings.reload().unwrap();
+        settings.delivery_failed(None);
+        assert!(settings.reload().is_some());
     }
 
     #[test]

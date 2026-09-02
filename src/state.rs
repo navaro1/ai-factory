@@ -210,6 +210,14 @@ fn invalid_state(file: &StateFile) -> Option<String> {
             | ReleasePolicy::Threshold { .. } => {}
         }
     }
+    for (task, binding) in &file.role_bindings {
+        if let Err(error) = crate::config::validate_persisted_settings(
+            &binding.settings,
+            &format!("role binding {task}"),
+        ) {
+            return Some(error.to_string());
+        }
+    }
     None
 }
 
@@ -358,5 +366,56 @@ mod tests {
 
         assert!(DaemonState::load(&path).role_bindings.is_empty());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_corrupt_role_binding_discards_the_complete_state() {
+        let dir = temp_dir("corrupt-role-binding");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        let mut binding = valid_binding();
+        binding.settings.model.clear();
+        state.role_bindings.insert("task".to_string(), binding);
+        state.stage_limits.insert(Stage::Review, 9);
+        state.save(&path).unwrap();
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stale_unsafe_role_binding_discards_the_complete_state() {
+        let dir = temp_dir("unsafe-role-binding");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        let mut binding = valid_binding();
+        binding.settings.extra_args = vec!["--yolo".to_string()];
+        state.role_bindings.insert("task".to_string(), binding);
+        state.save(&path).unwrap();
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn valid_binding() -> ResolvedRoleSettings {
+        ResolvedRoleSettings {
+            role: ExecutionRole::Review,
+            source: SettingsSource::Global,
+            settings: RoleSettings {
+                harness: Harness::Codex,
+                program: "codex".to_string(),
+                model: "gpt-test".to_string(),
+                effort: None,
+                extra_args: Vec::new(),
+                agent: None,
+                profile: None,
+                permission_mode: None,
+                permission_handler: None,
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: Some("never".to_string()),
+                sandbox: Some("workspace-write".to_string()),
+            },
+        }
     }
 }

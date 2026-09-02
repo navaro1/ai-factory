@@ -207,9 +207,13 @@ impl Daemon {
     /// override the global role settings. A true `paused` starts the whole
     /// factory paused. The daemon polls and reports, but dispatches nothing
     /// until the operator resumes.
+    // The revision must travel with the parsed bytes. The remaining values
+    // are daemon-owned dependencies and cannot be derived from that pair.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         config_path: PathBuf,
+        settings_revision: String,
         prompts_dir: PathBuf,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
@@ -227,6 +231,7 @@ impl Daemon {
         Ok(Self::with_runner_factory(
             config,
             config_path,
+            settings_revision,
             exec,
             state_dir,
             prompts_dir,
@@ -251,6 +256,7 @@ impl Daemon {
     pub fn with_runner_factory(
         config: Config,
         config_path: PathBuf,
+        settings_revision: String,
         exec: Arc<dyn Exec>,
         state_dir: PathBuf,
         prompts_dir: PathBuf,
@@ -261,9 +267,6 @@ impl Daemon {
         paused: bool,
     ) -> Self {
         let state_path = state_dir.join("state.json");
-        let settings_revision = fs::read_to_string(&config_path)
-            .map(|text| config::file_revision(&text))
-            .unwrap_or_default();
         let stored = DaemonState::load(&state_path);
 
         let mut limits = Limits::from_config(&config);
@@ -1966,6 +1969,31 @@ impl Daemon {
                 SettingsResultStatus::RestartRequired,
                 current_revision,
                 Some("repository topology changes require a daemon restart".to_string()),
+            );
+            return;
+        }
+        let latest_revision = match self.read_factory_file() {
+            Ok((_, revision)) => revision,
+            Err(error) => {
+                self.push_settings_result(
+                    request,
+                    SettingsOperation::Save,
+                    SettingsResultStatus::Failed,
+                    current_revision,
+                    Some(format!(
+                        "cannot re-read factory.toml before save: {error:#}"
+                    )),
+                );
+                return;
+            }
+        };
+        if latest_revision != base_revision {
+            self.push_settings_result(
+                request,
+                SettingsOperation::Save,
+                SettingsResultStatus::Stale,
+                latest_revision,
+                Some("the factory.toml file changed while this edit was validated".to_string()),
             );
             return;
         }
@@ -3810,12 +3838,12 @@ mod tests {
             extra_args: Vec::new(),
             agent: None,
             profile: None,
-            permission_mode: None,
+            permission_mode: Some("bypassPermissions".to_string()),
             permission_handler: None,
             tools: Vec::new(),
             disallowed_tools: Vec::new(),
             strict_mcp: None,
-            auto_approve: Some(true),
+            auto_approve: None,
             approval_policy: None,
             sandbox: None,
         };
@@ -3977,6 +4005,7 @@ mod tests {
             let mut daemon = Daemon::with_runner_factory(
                 config,
                 dir.join("factory.toml"),
+                String::new(),
                 exec.clone(),
                 state.clone(),
                 prompts.clone(),
@@ -5761,6 +5790,85 @@ mod tests {
         assert_eq!(result.revision, crate::config::file_revision(&newer));
         assert_eq!(fs::read_to_string(config_path).unwrap(), newer);
         assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
+    }
+
+    #[test]
+    fn a_save_detects_a_file_change_during_candidate_resolution() {
+        struct MutatingExec {
+            path: PathBuf,
+            replacement: String,
+            changed: AtomicBool,
+        }
+        impl Exec for MutatingExec {
+            fn run(&self, program: &str, args: &[&str], _cwd: Option<&Path>) -> Result<CmdOut> {
+                if program == "git" && args.ends_with(&["remote", "get-url", "origin"]) {
+                    if !self.changed.swap(true, Ordering::SeqCst) {
+                        fs::write(&self.path, &self.replacement)?;
+                    }
+                    return Ok(CmdOut::ok("git@github.com:acme/borsuk.git\n"));
+                }
+                bail!("unexpected command")
+            }
+        }
+
+        let dir = temp_root();
+        fs::create_dir_all(dir.join("repo")).unwrap();
+        fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        let path = dir.join("factory.toml");
+        let original = settings_config_text(&dir.join("repo"), "m");
+        let external = settings_config_text(&dir.join("repo"), "external-change");
+        fs::write(&path, &original).unwrap();
+        let exec: Arc<dyn Exec> = Arc::new(MutatingExec {
+            path: path.clone(),
+            replacement: external.clone(),
+            changed: AtomicBool::new(false),
+        });
+        let (_poll_tx, poll_rx) = mpsc::channel();
+        let (_action_tx, action_rx) = mpsc::channel();
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let roles = Arc::new(Mutex::new(Vec::new()));
+        let mut daemon = Daemon::with_runner_factory(
+            test_config(&dir),
+            path.clone(),
+            config::file_revision(&original),
+            exec,
+            dir.join("state"),
+            dir.join("prompts"),
+            poll_rx,
+            BTreeMap::new(),
+            action_rx,
+            Arc::new(FakeRunnerFactory {
+                jobs,
+                sessions,
+                roles,
+            }),
+            false,
+        );
+        let (tx, rx) = mpsc::channel();
+        daemon.set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "operator-edit".to_string();
+        daemon.handle(Inbound::Act(Box::new(Action::SaveSettings {
+            request: "race".to_string(),
+            base_revision: config::file_revision(&original),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        })));
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            result.status,
+            SettingsResultStatus::Stale,
+            "{:?}",
+            result.message
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), external);
+        assert_eq!(daemon.config.roles[&ExecutionRole::Refine].model, "m");
     }
 
     #[test]

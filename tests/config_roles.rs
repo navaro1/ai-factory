@@ -228,6 +228,139 @@ fn rejects_each_new_managed_argument_form() {
 }
 
 #[test]
+fn rejects_every_harness_managed_argument_alias() {
+    let cases = [
+        (
+            "claude",
+            vec![
+                "-p",
+                "--print",
+                "-c",
+                "--continue",
+                "-r",
+                "--resume",
+                "--session-id=x",
+                "--model=x",
+                "--permission-mode=x",
+                "--permission-prompt-tool=x",
+                "--tools=x",
+                "--allowedTools=x",
+                "--disallowedTools=x",
+                "--output-format=x",
+                "--input-format=x",
+                "--verbose",
+                "--json-schema=x",
+                "--strict-mcp-config",
+            ],
+        ),
+        (
+            "opencode",
+            vec![
+                "-c",
+                "--continue",
+                "-s",
+                "--session=x",
+                "-m",
+                "--model=x",
+                "--agent=x",
+                "--format=x",
+                "--dir=x",
+                "--variant=x",
+                "--auto",
+                "--share",
+            ],
+        ),
+        (
+            "codex",
+            vec![
+                "--yolo",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--full-auto",
+                "-c",
+                "--config=x",
+                "-s",
+                "--sandbox=x",
+                "-p",
+                "--profile=x",
+                "-m",
+                "--model=x",
+                "-C",
+                "--cd=x",
+                "-o",
+                "--output-last-message=x",
+                "--output-schema=x",
+                "--json",
+                "--experimental-json",
+                "--resume=x",
+                "--session-id=x",
+            ],
+        ),
+    ];
+    for (harness, arguments) in cases {
+        let (base, marker) = match harness {
+            "claude" => (ROLES.to_string(), "model = \"claude-opus-5[1m]\""),
+            "opencode" => (ROLES.replacen("[stage.refine]\nharness = \"claude\"", "[stage.refine]\nharness = \"opencode\"\nauto_approve = false", 1), "model = \"claude-opus-5[1m]\""),
+            "codex" => (ROLES.replacen("[stage.refine]\nharness = \"claude\"", "[stage.refine]\nharness = \"codex\"\nprofile = \"p\"\napproval_policy = \"never\"\nsandbox = \"workspace-write\"", 1), "model = \"claude-opus-5[1m]\""),
+            _ => unreachable!(),
+        };
+        for argument in arguments {
+            let text = base.replacen(
+                marker,
+                &format!("{marker}\nextra_args = [\"{argument}\"]"),
+                1,
+            );
+            let error = Config::parse(&text).expect_err("the managed alias must fail");
+            assert!(
+                format!("{error:#}").contains("managed argument"),
+                "{harness} {argument}: {error:#}"
+            );
+        }
+    }
+    Config::parse(&ROLES.replacen("extra_args = []", "extra_args = [\"--notice\"]", 1))
+        .expect("an unrelated argument must remain valid");
+}
+
+#[test]
+fn validates_closed_native_permission_values() {
+    for mode in [
+        "acceptEdits",
+        "auto",
+        "bypassPermissions",
+        "manual",
+        "dontAsk",
+        "plan",
+    ] {
+        Config::parse(&ROLES.replacen(
+            "permission_mode = \"manual\"",
+            &format!("permission_mode = \"{mode}\""),
+            1,
+        ))
+        .unwrap();
+    }
+    for (old, new, field) in [
+        (
+            "permission_mode = \"manual\"",
+            "permission_mode = \"invalid\"",
+            "permission_mode",
+        ),
+        (
+            "approval_policy = \"never\"",
+            "approval_policy = \"sometimes\"",
+            "approval_policy",
+        ),
+        (
+            "sandbox = \"workspace-write\"",
+            "sandbox = \"host\"",
+            "sandbox",
+        ),
+    ] {
+        let error =
+            Config::parse(&ROLES.replacen(old, new, 1)).expect_err("the closed value must fail");
+        assert!(format!("{error:#}").contains(field));
+    }
+}
+
+#[test]
 fn rejects_an_empty_foreign_tool_list() {
     let text = ROLES.replace(
         "[ticket.create]\nharness = \"opencode\"",
@@ -347,5 +480,18 @@ fn every_removed_name_has_a_direct_migration_error() {
             format!("{error:#}").contains(expected),
             "error was: {error:#}"
         );
+    }
+}
+
+#[test]
+fn legacy_field_names_are_valid_repository_aliases() {
+    for alias in ["runner", "variant", "yolo"] {
+        let text = ROLES
+            .replace("[repo.demo]", &format!("[repo.{alias}]"))
+            .replace(
+                "[repo.demo.stage.review]",
+                &format!("[repo.{alias}.stage.review]"),
+            );
+        Config::parse(&text).expect("a repository alias must not be read as a legacy field");
     }
 }

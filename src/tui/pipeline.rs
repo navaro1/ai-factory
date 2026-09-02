@@ -2312,8 +2312,9 @@ mod tests {
     struct FakeSink(Vec<Action>);
 
     impl ActionSink for FakeSink {
-        fn send_action(&mut self, action: Action) {
+        fn send_action(&mut self, action: Action) -> bool {
             self.0.push(action);
+            true
         }
     }
 

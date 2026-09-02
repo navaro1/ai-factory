@@ -153,22 +153,26 @@ pub enum InboxOutcome {
 /// The shell passes its daemon client; the tests pass a fake sender.
 pub trait ActionSink {
     /// Send one action to the daemon.
-    fn send_action(&mut self, action: Action);
+    fn send_action(&mut self, action: Action) -> bool;
 }
 
 impl ActionSink for Sender<Action> {
-    fn send_action(&mut self, action: Action) {
+    fn send_action(&mut self, action: Action) -> bool {
         if let Err(error) = self.send(action) {
             eprintln!("inbox: the action receiver is gone: {error}");
+            return false;
         }
+        true
     }
 }
 
 impl ActionSink for Client {
-    fn send_action(&mut self, action: Action) {
+    fn send_action(&mut self, action: Action) -> bool {
         if let Err(error) = self.send(&action) {
             eprintln!("inbox: cannot send the action to the daemon: {error}");
+            return false;
         }
+        true
     }
 }
 

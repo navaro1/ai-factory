@@ -615,7 +615,27 @@ fn validate_settings(value: &RoleSettings, key: &str) -> Result<()> {
     )?;
     validate_tool_names(&value.tools, &format!("{key}.tools"))?;
     validate_tool_names(&value.disallowed_tools, &format!("{key}.disallowed_tools"))?;
-    validate_args(&value.extra_args, key)
+    validate_native_values(value, key)?;
+    validate_extra_args(&value.extra_args, value.harness, key)
+}
+
+/// Validate one complete role setting from a persisted execution binding.
+pub(crate) fn validate_persisted_settings(value: &RoleSettings, key: &str) -> Result<()> {
+    nonempty(&value.program, &format!("{key}.program"))?;
+    nonempty(&value.model, &format!("{key}.model"))?;
+    if let Some(value) = value.effort.as_deref() {
+        nonempty(value, &format!("{key}.effort"))?;
+    }
+    if let Some(value) = value.agent.as_deref() {
+        nonempty(value, &format!("{key}.agent"))?;
+    }
+    if let Some(value) = value.profile.as_deref() {
+        nonempty(value, &format!("{key}.profile"))?;
+    }
+    if let Some(value) = value.permission_handler.as_deref() {
+        nonempty(value, &format!("{key}.permission_handler"))?;
+    }
+    validate_settings(value, key)
 }
 fn validate_override(value: &RoleOverride, key: &str) -> Result<()> {
     if let Some(harness) = value.harness {
@@ -633,10 +653,14 @@ fn validate_override(value: &RoleOverride, key: &str) -> Result<()> {
             key,
         )?;
     }
-    value
-        .extra_args
-        .as_deref()
-        .map_or(Ok(()), |args| validate_args(args, key))
+    if let Some(args) = value.extra_args.as_deref() {
+        for arg in args {
+            if arg.trim().is_empty() {
+                bail!("{key}.extra_args must not contain an empty value");
+            }
+        }
+    }
+    Ok(())
 }
 fn validate_fields(
     harness: Harness,
@@ -708,6 +732,26 @@ fn validate_override_for_harness(value: &RoleOverride, harness: Harness, key: &s
             harness.program()
         );
     }
+    if let Some(mode) = value.permission_mode.as_deref() {
+        validate_choice(
+            mode,
+            CLAUDE_PERMISSION_MODES,
+            &format!("{key}.permission_mode"),
+        )?;
+    }
+    if let Some(policy) = value.approval_policy.as_deref() {
+        validate_choice(
+            policy,
+            CODEX_APPROVAL_POLICIES,
+            &format!("{key}.approval_policy"),
+        )?;
+    }
+    if let Some(sandbox) = value.sandbox.as_deref() {
+        validate_choice(sandbox, CODEX_SANDBOXES, &format!("{key}.sandbox"))?;
+    }
+    if let Some(args) = value.extra_args.as_deref() {
+        validate_extra_args(args, harness, key)?;
+    }
     Ok(())
 }
 fn validate_tool_names(tools: &[String], key: &str) -> Result<()> {
@@ -716,46 +760,136 @@ fn validate_tool_names(tools: &[String], key: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_args(args: &[String], key: &str) -> Result<()> {
-    const MANAGED: &[&str] = &[
+pub const CLAUDE_PERMISSION_MODES: &[&str] = &[
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "manual",
+    "dontAsk",
+    "plan",
+];
+pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never"];
+pub const CODEX_SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+
+fn validate_native_values(value: &RoleSettings, key: &str) -> Result<()> {
+    if let Some(mode) = value.permission_mode.as_deref() {
+        validate_choice(
+            mode,
+            CLAUDE_PERMISSION_MODES,
+            &format!("{key}.permission_mode"),
+        )?;
+    }
+    if let Some(policy) = value.approval_policy.as_deref() {
+        validate_choice(
+            policy,
+            CODEX_APPROVAL_POLICIES,
+            &format!("{key}.approval_policy"),
+        )?;
+    }
+    if let Some(sandbox) = value.sandbox.as_deref() {
+        validate_choice(sandbox, CODEX_SANDBOXES, &format!("{key}.sandbox"))?;
+    }
+    Ok(())
+}
+
+fn validate_choice(value: &str, choices: &[&str], key: &str) -> Result<()> {
+    if !choices.contains(&value) {
+        bail!("{key} must be one of {}", choices.join(", "));
+    }
+    Ok(())
+}
+
+/// Reject arguments that replace fields managed by the selected adapter.
+pub fn validate_extra_args(args: &[String], harness: Harness, key: &str) -> Result<()> {
+    const CLAUDE: &[&str] = &[
+        "-p",
+        "--print",
+        "-c",
+        "--continue",
+        "-r",
+        "--resume",
+        "--session-id",
+        "--fork-session",
         "--model",
+        "--fallback-model",
+        "--effort",
+        "--agent",
+        "--agents",
+        "--permission-mode",
+        "--permission-prompt-tool",
+        "--tools",
+        "--allowedTools",
+        "--allowed-tools",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--strict-mcp-config",
+        "--output-format",
+        "--input-format",
+        "--verbose",
+        "--json-schema",
+        "--add-dir",
+    ];
+    const OPENCODE: &[&str] = &[
+        "-c",
+        "--continue",
+        "-s",
+        "--session",
         "-m",
-        "--cwd",
-        "--cd",
+        "--model",
+        "--agent",
+        "--format",
+        "--dir",
+        "--variant",
+        "--auto",
+        "--share",
+    ];
+    const CODEX: &[&str] = &[
+        "--yolo",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--full-auto",
+        "-c",
+        "--config",
+        "-s",
+        "--sandbox",
+        "-p",
+        "--profile",
+        "-m",
+        "--model",
         "-C",
+        "--cd",
+        "-o",
+        "--output-last-message",
+        "--output-schema",
+        "--json",
+        "--experimental-json",
         "--resume",
         "--session",
         "--session-id",
+        "--ask-for-approval",
+        "--approval-policy",
         "--format",
         "--auto",
         "--dir",
         "--tools",
         "--strict-mcp-config",
-        "--permission-mode",
-        "--permission-prompt-tool",
-        "--output-format",
-        "--json",
-        "--jsonl",
-        "--profile",
-        "--agent",
-        "--effort",
-        "--variant",
-        "--approval-policy",
-        "--ask-for-approval",
         "-a",
-        "--sandbox",
     ];
+    let managed = match harness {
+        Harness::Claude => CLAUDE,
+        Harness::Opencode => OPENCODE,
+        Harness::Codex => CODEX,
+    };
     for arg in args {
         if arg.trim().is_empty() {
             bail!("{key}.extra_args must not contain an empty value");
         }
-        if MANAGED
+        if managed
             .iter()
             .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
         {
             bail!("{key}.extra_args contains managed argument {arg:?}");
         }
-        if arg == "--share" || arg.starts_with("--share=") {
+        if harness == Harness::Opencode && (arg == "--share" || arg.starts_with("--share=")) {
             bail!("{key}.extra_args must not enable OpenCode sharing");
         }
         if arg.contains("dangerously-bypass-approvals-and-sandbox")
@@ -896,7 +1030,7 @@ fn check_legacy_table(table: &toml_edit::Table, prefix: &str) -> Result<()> {
         } else {
             format!("{prefix}.{key}")
         };
-        if matches!(key, "runner" | "variant" | "yolo") {
+        if prefix != "repo" && matches!(key, "runner" | "variant" | "yolo") {
             bail!("{path} is no longer supported; use the typed role settings");
         }
         if let Some(child) = item.as_table() {
@@ -912,7 +1046,7 @@ fn check_legacy_table(table: &toml_edit::Table, prefix: &str) -> Result<()> {
 fn check_legacy_inline_table(table: &toml_edit::InlineTable, prefix: &str) -> Result<()> {
     for (key, value) in table.iter() {
         let path = format!("{prefix}.{key}");
-        if matches!(key, "runner" | "variant" | "yolo") {
+        if prefix != "repo" && matches!(key, "runner" | "variant" | "yolo") {
             bail!("{path} is no longer supported; use the typed role settings");
         }
         if let Some(child) = value.as_inline_table() {
@@ -1038,6 +1172,8 @@ pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
     }
     file.write_all(text.as_bytes())
         .with_context(|| format!("cannot write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("cannot sync {}", temporary.display()))?;
     drop(file);
     fs::rename(&temporary, path).with_context(|| {
         format!(
@@ -1045,12 +1181,18 @@ pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
             temporary.display(),
             path.display()
         )
-    })
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("cannot sync {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 impl Config {
     /// Parse and resolve a candidate through an injected command runner.
-    pub(crate) fn parse_resolved(text: &str, exec: &dyn Exec) -> Result<Self> {
+    pub fn parse_resolved(text: &str, exec: &dyn Exec) -> Result<Self> {
         let mut config = Self::parse(text)?;
         config.resolve(exec)?;
         Ok(config)

@@ -20,8 +20,11 @@ fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     args.push("--model".to_string());
     args.push(settings.model.clone());
     if let Some(policy) = settings.approval_policy.as_ref() {
-        args.push("--ask-for-approval".to_string());
-        args.push(policy.clone());
+        args.push("-c".to_string());
+        args.push(format!(
+            "approval_policy={}",
+            toml::Value::String(policy.clone())
+        ));
     }
     if let Some(sandbox) = settings.sandbox.as_ref() {
         args.push("--sandbox".to_string());
@@ -360,8 +363,8 @@ mod tests {
                 "reviewer",
                 "--model",
                 "codex-review-model",
-                "--ask-for-approval",
-                "never",
+                "-c",
+                "approval_policy=\"never\"",
                 "--sandbox",
                 "workspace-write",
                 "-c",
@@ -389,8 +392,8 @@ mod tests {
                 "reviewer",
                 "--model",
                 "codex-review-model",
-                "--ask-for-approval",
-                "never",
+                "-c",
+                "approval_policy=\"never\"",
                 "--sandbox",
                 "workspace-write",
                 "-c",

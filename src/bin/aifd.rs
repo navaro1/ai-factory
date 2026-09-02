@@ -1,11 +1,12 @@
 //! The daemon binary: `aifd run` starts the factory event loop.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 
 use aif::config::{self, Config};
@@ -75,7 +76,18 @@ fn exit_code(result: anyhow::Result<()>) -> i32 {
 fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::Result<()> {
     let config_path = config::resolved_config_path(config_path)
         .context("cannot resolve the factory config path")?;
-    let config = Config::load(Some(&config_path)).context("cannot load the factory config")?;
+    let config_text = fs::read_to_string(&config_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow!("no config file at {}", config_path.display())
+            } else {
+                anyhow!(error).context(format!("cannot read {}", config_path.display()))
+            }
+        })
+        .context("cannot load the factory config")?;
+    let revision = config::file_revision(&config_text);
+    let config = Config::parse_resolved(&config_text, &aif::exec::RealExec)
+        .context("cannot load the factory config")?;
     let (server, action_rx) = sock::Server::bind(socket_path)?;
     eprintln!("aifd: listening on {}", socket_path.display());
     if paused {
@@ -86,6 +98,7 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
     let mut daemon = Daemon::new(
         config,
         config_path.clone(),
+        revision,
         prompts_dir(Some(&config_path)),
         poll_rx,
         pollers.wake,

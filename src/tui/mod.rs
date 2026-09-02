@@ -169,12 +169,14 @@ impl Confirm {
     /// Send the confirmed action and toast what was sent.
     fn send(self, app: &mut App, sink: &mut impl ActionSink) {
         match self {
-            Confirm::Abort { task } => emit(
-                app,
-                sink,
-                Action::Abort { task: task.clone() },
-                format!("sent abort {task}"),
-            ),
+            Confirm::Abort { task } => {
+                emit(
+                    app,
+                    sink,
+                    Action::Abort { task: task.clone() },
+                    format!("sent abort {task}"),
+                );
+            }
             Confirm::Go { repo, prs } => {
                 let current = app.state.as_ref().is_some_and(|state| {
                     state.trains.iter().any(|train| {
@@ -299,6 +301,7 @@ impl App {
     fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
+        self.settings.delivery_failed(None);
     }
 
     /// The toast text while it is still fresh.
@@ -506,7 +509,10 @@ impl App {
                     .as_ref()
                     .and_then(|state| self.settings.handle_key(state, key))
                 {
-                    emit(self, sink, action, "sent settings request".to_string());
+                    let copy = action.clone();
+                    if !emit(self, sink, action, "sent settings request".to_string()) {
+                        self.settings.delivery_failed(Some(&copy));
+                    }
                 }
             }
         }
@@ -601,9 +607,12 @@ fn digit_key(key: KeyEvent) -> bool {
 }
 
 /// Send one action to the sink and toast what was sent.
-fn emit(app: &mut App, sink: &mut impl ActionSink, action: Action, toast: String) {
-    sink.send_action(action);
-    app.show_toast(&toast);
+fn emit(app: &mut App, sink: &mut impl ActionSink, action: Action, toast: String) -> bool {
+    let sent = sink.send_action(action);
+    if sent {
+        app.show_toast(&toast);
+    }
+    sent
 }
 
 /// The pull request numbers as `#3 #7`.
@@ -623,9 +632,10 @@ struct CountingSink<'a, S: ActionSink> {
 }
 
 impl<S: ActionSink> ActionSink for CountingSink<'_, S> {
-    fn send_action(&mut self, action: Action) {
-        self.sent += 1;
-        self.inner.send_action(action);
+    fn send_action(&mut self, action: Action) -> bool {
+        let sent = self.inner.send_action(action);
+        self.sent += usize::from(sent);
+        sent
     }
 }
 
@@ -684,23 +694,26 @@ struct DaemonLink {
 }
 
 impl ActionSink for DaemonLink {
-    fn send_action(&mut self, action: Action) {
+    fn send_action(&mut self, action: Action) -> bool {
         if self.client.is_none() {
             self.client = self.connect();
         }
         let Some(client) = self.client.as_mut() else {
-            return;
+            return false;
         };
         if client.send(&action).is_ok() {
-            return;
+            return true;
         }
         // The daemon went away. One fresh connection gets one new try.
         self.client = self.connect();
         if let Some(client) = self.client.as_mut() {
             if let Err(error) = client.send(&action) {
                 eprintln!("tui: cannot send the action to the daemon: {error:#}");
+                return false;
             }
+            return true;
         }
+        false
     }
 }
 
@@ -1351,8 +1364,17 @@ mod tests {
     struct FakeSink(Vec<Action>);
 
     impl ActionSink for FakeSink {
-        fn send_action(&mut self, action: Action) {
+        fn send_action(&mut self, action: Action) -> bool {
             self.0.push(action);
+            true
+        }
+    }
+
+    struct FailSink;
+
+    impl ActionSink for FailSink {
+        fn send_action(&mut self, _action: Action) -> bool {
+            false
         }
     }
 
@@ -2573,6 +2595,45 @@ mod tests {
         let text = render_to_string(&mut app);
         assert!(text.contains("5 settings"));
         assert!(text.contains("1/2/3/4/5 views"));
+    }
+
+    #[test]
+    fn a_failed_settings_send_allows_a_later_successful_action() {
+        let mut app = App {
+            view: View::Settings,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        let mut sink = FakeSink::default();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert_eq!(sink.0.len(), 1);
+    }
+
+    #[test]
+    fn a_disconnect_allows_a_later_settings_action() {
+        let mut app = App {
+            view: View::Settings,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.mark_disconnected("lost".to_string());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert_eq!(sink.0.len(), 2);
     }
 
     #[test]
