@@ -35,6 +35,19 @@ Focused tests passed after the implementation:
 
 `./check.sh` passed. It ran format, Clippy, all tests, and the installer test.
 
+## Review fixes
+
+The review found three defects. This change fixes each defect.
+
+- A completed task no longer keeps its binding in the saved state.
+- A failed task keeps its binding for a retry after a daemon restart.
+- A rowless binding stays safe during the first poll after a restart.
+- A role edit keeps field comments and inline comments on changed values.
+- An atomic save gives the new file the permissions of the old file.
+
+The new tests failed before these fixes. All new tests pass after the fixes.
+The final `./check.sh` run passed 605 library tests and the installer test.
+
 ## Self review
 
 - The binding save occurs before `RunnerFactory::build` and `Runner::start`.

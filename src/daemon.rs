@@ -3166,7 +3166,17 @@ impl Daemon {
             policies: self.policies.clone(),
             last_fire_ms,
             ticket_conversations: self.ticket_conversations.values().cloned().collect(),
-            role_bindings: self.role_bindings.clone(),
+            role_bindings: self
+                .role_bindings
+                .iter()
+                .filter(|(id, _)| {
+                    self.table
+                        .by_id
+                        .get(*id)
+                        .is_none_or(|task| task.state != TaskState::Done)
+                })
+                .map(|(id, binding)| (id.clone(), binding.clone()))
+                .collect(),
         }
     }
 
@@ -5576,6 +5586,65 @@ mod tests {
         let mut second = Rig::make_in(dir, vec![], |config| {
             config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
                 "changed-after-restart".to_string();
+        });
+        second.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        let roles = second.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].settings.model, "m");
+    }
+
+    #[test]
+    fn a_restart_drops_a_completed_binding_before_a_new_logical_task() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            first.poll(vec![issue(142, &["to-refine"])], vec![]);
+            first.daemon.sessions.remove("borsuk/refine-i142");
+            first
+                .daemon
+                .table
+                .by_id
+                .get_mut("borsuk/refine-i142")
+                .unwrap()
+                .state = TaskState::Done;
+            first.daemon.changed = true;
+            first.daemon.save_state();
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |config| {
+            config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
+                "new-task-after-restart".to_string();
+        });
+        second.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        let roles = second.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].settings.model, "new-task-after-restart");
+    }
+
+    #[test]
+    fn a_daemon_restart_keeps_a_failed_task_binding_for_retry() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            first.poll(vec![issue(142, &["to-refine"])], vec![]);
+            for attempt in 0..tasks::MAX_ATTEMPTS {
+                first.event(exited(
+                    "borsuk/refine-i142",
+                    false,
+                    &format!("failed attempt {attempt}"),
+                ));
+            }
+            assert!(matches!(
+                first.task("borsuk/refine-i142").state,
+                TaskState::Failed(_)
+            ));
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |config| {
+            config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
+                "changed-after-failure".to_string();
         });
         second.poll(vec![issue(142, &["to-refine"])], vec![]);
 

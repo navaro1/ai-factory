@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -1017,12 +1018,27 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
 
 /// Write one sibling temporary file and replace the config with one rename.
 pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    };
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map_or_else(|| "tmp".to_string(), |value| format!("{value}.tmp"));
     let temporary = path.with_extension(extension);
-    fs::write(&temporary, text).with_context(|| format!("cannot write {}", temporary.display()))?;
+    let mut file = fs::File::create(&temporary)
+        .with_context(|| format!("cannot create {}", temporary.display()))?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)
+            .with_context(|| format!("cannot set permissions on {}", temporary.display()))?;
+    }
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    drop(file);
     fs::rename(&temporary, path).with_context(|| {
         format!(
             "cannot rename {} to {}",
@@ -1203,7 +1219,7 @@ fn harness_name(harness: Harness) -> &'static str {
 fn set_string(table: &mut toml_edit::Table, key: &str, value: Option<&str>) {
     match value {
         Some(value) => {
-            table.insert(key, toml_edit::value(value));
+            insert_value_preserving_decor(table, key, toml_edit::Value::from(value));
         }
         None => {
             table.remove(key);
@@ -1218,7 +1234,7 @@ fn set_strings(table: &mut toml_edit::Table, key: &str, values: Option<&[String]
             for value in values {
                 array.push(value.as_str());
             }
-            table.insert(key, toml_edit::value(array));
+            insert_value_preserving_decor(table, key, toml_edit::Value::Array(array));
         }
         None => {
             table.remove(key);
@@ -1229,7 +1245,7 @@ fn set_strings(table: &mut toml_edit::Table, key: &str, values: Option<&[String]
 fn set_bool(table: &mut toml_edit::Table, key: &str, value: Option<bool>) {
     match value {
         Some(value) => {
-            table.insert(key, toml_edit::value(value));
+            insert_value_preserving_decor(table, key, toml_edit::Value::from(value));
         }
         None => {
             table.remove(key);
@@ -1241,13 +1257,35 @@ fn set_usize(table: &mut toml_edit::Table, key: &str, value: Option<usize>) -> R
     match value {
         Some(value) => {
             let value = i64::try_from(value).context("the stage limit is too large")?;
-            table.insert(key, toml_edit::value(value));
+            insert_value_preserving_decor(table, key, toml_edit::Value::from(value));
         }
         None => {
             table.remove(key);
         }
     }
     Ok(())
+}
+
+fn insert_value_preserving_decor(
+    table: &mut toml_edit::Table,
+    key: &str,
+    mut value: toml_edit::Value,
+) {
+    let existing = table.get_key_value(key).map(|(key, item)| {
+        (
+            key.clone(),
+            item.as_value().map(|value| value.decor().clone()),
+        )
+    });
+    if let Some(decor) = existing.as_ref().and_then(|(_, decor)| decor.clone()) {
+        *value.decor_mut() = decor;
+    }
+    let item = toml_edit::Item::Value(value);
+    if let Some((key, _)) = existing {
+        table.insert_formatted(&key, item);
+    } else {
+        table.insert(key, item);
+    }
 }
 
 pub fn state_dir() -> PathBuf {
@@ -1297,7 +1335,10 @@ mod lifecycle_tests {
 
     #[test]
     fn a_global_role_edit_preserves_comments_and_unrelated_structure() {
-        let text = config_text();
+        let text = config_text().replace(
+            "model = \"old-review\"\nlimit = 3",
+            "# keep the model field comment\nmodel = \"old-review\" # keep the model inline comment\nlimit = 3 # keep the limit inline comment",
+        );
         let config = Config::parse(&text).unwrap();
         let mut settings = config.roles[&ExecutionRole::Review].clone();
         settings.model = "new-review".to_string();
@@ -1315,6 +1356,9 @@ mod lifecycle_tests {
 
         assert!(edited.contains("# keep this factory comment"));
         assert!(edited.contains("# keep the refine comment"));
+        assert!(edited.contains("# keep the model field comment"));
+        assert!(edited.contains("model = \"new-review\" # keep the model inline comment"));
+        assert!(edited.contains("limit = 8 # keep the limit inline comment"));
         assert!(edited.contains("[repo.demo.stage.review]"));
         let parsed = Config::parse(&edited).unwrap();
         assert_eq!(parsed.roles[&ExecutionRole::Review].model, "new-review");
@@ -1340,6 +1384,30 @@ mod lifecycle_tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_config_write_preserves_the_original_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aif-config-permissions-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("factory.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_config_atomic(&path, "new").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
