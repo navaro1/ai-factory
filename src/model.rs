@@ -77,6 +77,25 @@ impl ItemKind {
             ItemKind::Pr => "p",
         }
     }
+
+    /// The noun from the vocabulary table: `ticket` or `PR`.
+    ///
+    /// Every user-visible string that names a repository item takes its
+    /// noun from here, so one table serves the whole crate.
+    pub fn noun(self) -> &'static str {
+        match self {
+            ItemKind::Issue => "ticket",
+            ItemKind::Pr => "PR",
+        }
+    }
+
+    /// The title-case noun from the vocabulary table: `Ticket` or `PR`.
+    pub fn title_noun(self) -> &'static str {
+        match self {
+            ItemKind::Issue => "Ticket",
+            ItemKind::Pr => "PR",
+        }
+    }
 }
 
 /// One open GitHub issue, as the poller saw it.
@@ -339,6 +358,16 @@ mod tests {
     fn item_kind_gives_task_id_names() {
         assert_eq!(ItemKind::Issue.as_str(), "i");
         assert_eq!(ItemKind::Pr.as_str(), "p");
+    }
+
+    #[test]
+    fn item_kind_gives_the_vocabulary_nouns() {
+        // The match arms of `noun` and `title_noun` name every kind, so the
+        // compiler fails a new kind until it gains a noun.
+        assert_eq!(ItemKind::Issue.noun(), "ticket");
+        assert_eq!(ItemKind::Issue.title_noun(), "Ticket");
+        assert_eq!(ItemKind::Pr.noun(), "PR");
+        assert_eq!(ItemKind::Pr.title_noun(), "PR");
     }
 
     #[test]

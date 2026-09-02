@@ -927,7 +927,7 @@ impl Inbox {
     fn fire_gate(&mut self, decision: &Decision, sink: &mut impl ActionSink) {
         let checked = self.checked_prs(decision);
         if checked.is_empty() {
-            self.hint = Some("select at least one pull request");
+            self.hint = Some("select at least one PR");
             return;
         }
         self.answer(&decision.id, Response::Go { prs: checked }, sink);
@@ -1091,12 +1091,12 @@ fn feed_message(decision: &Decision) -> String {
             kind,
             number,
             title,
-        } => format!("{} #{number} needs a decision: {title}", item_label(*kind)),
+        } => format!("{} #{number} needs a decision: {title}", kind.title_noun()),
         DecisionKind::ReleaseGate { prs } if prs.len() == 1 => {
-            format!("Release pull request #{}?", prs[0])
+            format!("Release PR #{}?", prs[0])
         }
         DecisionKind::ReleaseGate { prs } => {
-            format!("Release {} pull requests: {}?", prs.len(), pr_list(prs))
+            format!("Release {} PRs: {}?", prs.len(), pr_list(prs))
         }
     };
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -1123,22 +1123,6 @@ fn question_message(questions: &serde_json::Value) -> String {
         first.text.clone()
     } else {
         format!("{} questions, starting with: {}", parsed.len(), first.text)
-    }
-}
-
-/// The title-case word for one repository item kind.
-fn item_label(kind: ItemKind) -> &'static str {
-    match kind {
-        ItemKind::Issue => "Issue",
-        ItemKind::Pr => "Pull request",
-    }
-}
-
-/// The compact title label for one repository item kind.
-fn item_title_label(kind: ItemKind) -> &'static str {
-    match kind {
-        ItemKind::Issue => "Issue",
-        ItemKind::Pr => "PR",
     }
 }
 
@@ -1272,7 +1256,7 @@ fn draw_item_detail(
             inbox,
             detail,
             title,
-            "The pull request description is unavailable.".to_string(),
+            "The PR description is unavailable.".to_string(),
         );
     };
     let scroll = clamped_detail_scroll(detail, lines.len(), content_area);
@@ -1478,14 +1462,10 @@ fn draw_detail(
     let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
     let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
-            let title = format!("{} #{number} · {}", item_title_label(kind), decision.repo);
+            let title = format!("{} #{number} · {}", kind.title_noun(), decision.repo);
             let Some((title, lines)) =
                 item_lines(state, &decision.repo, kind, number, width, &title)
             else {
-                let noun = match kind {
-                    ItemKind::Issue => "issue",
-                    ItemKind::Pr => "pull request",
-                };
                 return draw_missing_item_detail(
                     f,
                     rows[0],
@@ -1494,7 +1474,7 @@ fn draw_detail(
                     inbox,
                     detail,
                     title,
-                    format!("The {noun} description is unavailable."),
+                    format!("The {} description is unavailable.", kind.noun()),
                 );
             };
             (title, lines)
@@ -1709,6 +1689,20 @@ fn item_lines(
         Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
     );
     lines.push(Line::from(""));
+    if kind == ItemKind::Pr {
+        let tickets: Vec<u64> = state
+            .links
+            .iter()
+            .filter(|link| link.repo == repo && link.pr == number)
+            .map(|link| link.ticket)
+            .collect();
+        if !tickets.is_empty() {
+            lines.push(Line::styled(
+                format!("Closes {}", pr_list(&tickets)),
+                THEME.dim(),
+            ));
+        }
+    }
     lines.push(Line::styled("Description", THEME.dim()));
     let body = if item.body.trim().is_empty() {
         "No description."
@@ -1755,7 +1749,7 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
     }
     if let Some(detail) = inbox.detail.as_ref() {
         return match &detail.anchor {
-            DetailAnchor::Train(_) => "esc back · j k scroll · h l pull request".to_string(),
+            DetailAnchor::Train(_) => "esc back · j k scroll · h l PR".to_string(),
             DetailAnchor::Decision(id) => {
                 let Some(decision) = state.decisions.iter().find(|decision| decision.id == *id)
                 else {
@@ -1763,7 +1757,7 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
                 };
                 match decision.kind {
                     DecisionKind::ReleaseGate { .. } => {
-                        "esc back · j k scroll · h l pull request · space include/exclude · g release"
+                        "esc back · j k scroll · h l PR · space include/exclude · g release"
                             .to_string()
                     }
                     DecisionKind::Permission { .. } => {
@@ -1882,6 +1876,7 @@ mod tests {
     fn state_with(decisions: Vec<Decision>) -> StateView {
         StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),
@@ -2035,11 +2030,11 @@ mod tests {
             "message: {screen}"
         );
         assert!(
-            screen.contains("Issue #142 needs a decision: Fix the flake"),
+            screen.contains("Ticket #142 needs a decision: Fix the flake"),
             "message: {screen}"
         );
         assert!(
-            screen.contains("Release 2 pull requests: #7 #9?"),
+            screen.contains("Release 2 PRs: #7 #9?"),
             "message: {screen}"
         );
     }
@@ -2071,10 +2066,10 @@ mod tests {
         let screen = render(&state, &inbox, OPENED + 4_000);
 
         let release = screen
-            .find("Release pull request #7?")
+            .find("Release PR #7?")
             .expect("the oldest release decision is absent");
         let human = screen
-            .find("Issue #142 needs a decision: Choose the storage")
+            .find("Ticket #142 needs a decision: Choose the storage")
             .expect("the middle decision is absent");
         let permission = screen
             .find("Allow Write for src/main.rs?")
@@ -2212,9 +2207,40 @@ mod tests {
 
         assert!(screen.contains("PR #7"), "screen: {screen}");
         assert!(
-            screen.contains("The pull request description is unavailable."),
+            screen.contains("The PR description is unavailable."),
             "screen: {screen}"
         );
+    }
+
+    #[test]
+    fn a_pr_detail_shows_the_tickets_it_closes() {
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items = vec![ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "First change".to_string(),
+            body: "The first pull request body.".to_string(),
+        }];
+        state.links = vec![
+            crate::sock::LinkView {
+                repo: "borsuk".to_string(),
+                ticket: 142,
+                pr: 7,
+            },
+            crate::sock::LinkView {
+                repo: "borsuk".to_string(),
+                ticket: 150,
+                pr: 7,
+            },
+        ];
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(screen.contains("Closes #142 #150"), "screen: {screen}");
     }
 
     #[test]
@@ -2323,7 +2349,7 @@ mod tests {
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
         let screen = render(&state, &inbox, OPENED);
 
-        assert!(screen.contains("Issue #142"), "screen: {screen}");
+        assert!(screen.contains("Ticket #142"), "screen: {screen}");
         assert!(
             screen.contains("Compare the operational cost of both storage options."),
             "screen: {screen}"
@@ -2948,10 +2974,7 @@ mod tests {
         inbox.handle_key(&state, press('g'), &mut tx);
         assert!(rx.try_recv().is_err());
         let screen = render(&state, &inbox, OPENED);
-        assert!(
-            screen.contains("select at least one pull request"),
-            "hint: {screen}"
-        );
+        assert!(screen.contains("select at least one PR"), "hint: {screen}");
 
         // Space brings the whole batch back.
         inbox.handle_key(&state, press(' '), &mut tx);
@@ -3370,6 +3393,7 @@ mod tests {
         }
         StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: vec![RepoView {
                 alias: "borsuk".to_string(),
                 owner_repo: String::new(),
@@ -3429,7 +3453,7 @@ mod tests {
         assert!(inbox.detail_open());
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
-        assert!(screen.contains("h l pull request"), "footer:\n{screen}");
+        assert!(screen.contains("h l PR"), "footer:\n{screen}");
 
         // Left moves through the train queue; Esc closes the detail.
         let (mut tx, rx) = fake_sink();

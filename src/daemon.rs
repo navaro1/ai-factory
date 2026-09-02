@@ -37,8 +37,13 @@ use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
+use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
+use crate::prompts::{
+    IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT, TICKET_CHAT_PROMPT,
+    TICKET_PROMPT,
+};
 #[cfg(test)]
 use crate::runner::Runner;
 use crate::runner::{
@@ -149,8 +154,12 @@ pub struct Daemon {
     trains: BTreeMap<String, Train>,
     /// The pull request set of each release task, for prompt rendering.
     release_batches: BTreeMap<String, Vec<u64>>,
+    /// The ticket-PR links of each repository, rebuilt on every poll.
+    links: BTreeMap<String, Links>,
     /// The source issue worktree of each review task.
-    review_issue_numbers: BTreeMap<String, u64>,
+    /// The ticket set of each review task, pinned at admit time. The
+    /// supersede check compares it against the fresh poll.
+    review_tickets: BTreeMap<String, BTreeSet<u64>>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
     /// Active issue conversations, keyed by repository and issue number.
@@ -342,7 +351,8 @@ impl Daemon {
             decisions: Decisions::new(),
             trains,
             release_batches: BTreeMap::new(),
-            review_issue_numbers: BTreeMap::new(),
+            links: BTreeMap::new(),
+            review_tickets: BTreeMap::new(),
             ticket_controller,
             ticket_conversations,
             ticket_turn_text: BTreeMap::new(),
@@ -544,6 +554,7 @@ impl Daemon {
             table: &self.table,
             decisions: &self.decisions,
             snapshot: &self.snapshot,
+            links: &self.links,
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
@@ -598,6 +609,8 @@ impl Daemon {
         let old = self.snapshot.repos.get(repo).cloned();
         let unchanged = old.as_ref() == Some(&fresh);
         self.snapshot.apply(repo, fresh.clone());
+        self.links
+            .insert(repo.to_string(), Links::derive(repo, &fresh));
         self.pending_stacked.insert(repo.to_string());
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
@@ -683,6 +696,7 @@ impl Daemon {
 
     /// Cancel active implement and review tasks whose gates closed.
     fn reconcile_unready(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let links = self.links.get(repo).cloned().unwrap_or_default();
         let ids: Vec<String> = self
             .table
             .active()
@@ -695,7 +709,7 @@ impl Daemon {
                         .get(&task.number)
                         .is_none_or(|issue| !implement_ready(fresh, issue))
                         && !(task.state == TaskState::Running
-                            && implementation_transitioned(fresh, repo, task.number))
+                            && implementation_transitioned(fresh, &links, task.number))
                 }
                 Stage::Review => {
                     fresh
@@ -796,15 +810,14 @@ impl Daemon {
                 }
                 continue;
             }
-            let review_issue_number = (work.stage == Stage::Review)
+            let review_tickets: BTreeSet<u64> = (work.stage == Stage::Review)
                 .then(|| {
-                    self.snapshot
-                        .repos
+                    self.links
                         .get(&work.repo)
-                        .and_then(|snapshot| snapshot.prs.get(&work.number))
-                        .and_then(|pr| issue_number_from_head(&work.repo, &pr.head_ref))
+                        .map(|links| links.tickets_of(work.number).into_iter().collect())
                 })
-                .flatten();
+                .flatten()
+                .unwrap_or_default();
             if work.stage == Stage::Review {
                 let superseded = self
                     .table
@@ -816,8 +829,12 @@ impl Daemon {
                             && task.kind == work.kind
                             && task.number == work.number
                             && (task.head_sha != work.head_sha
-                                || self.review_issue_numbers.get(&task.id).copied()
-                                    != review_issue_number)
+                                || self
+                                    .review_tickets
+                                    .get(&task.id)
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    != review_tickets)
                     })
                     .map(|task| task.id.clone());
                 if let Some(id) = superseded {
@@ -846,11 +863,7 @@ impl Daemon {
                     }
                     if work.stage == Stage::Review {
                         task.head_sha = work.head_sha.clone();
-                        if let Some(number) = review_issue_number {
-                            self.review_issue_numbers.insert(task.id.clone(), number);
-                        } else {
-                            self.review_issue_numbers.remove(&task.id);
-                        }
+                        self.review_tickets.insert(task.id.clone(), review_tickets);
                     }
                     self.changed = true;
                 }
@@ -1149,6 +1162,7 @@ impl Daemon {
                 || self.sessions.contains_key(&task.id)
                 || self.pending_chats.contains_key(&task.id)
                 || self.prior_stage_active(task)
+                || self.worktree_holder(task).is_some()
             {
                 continue;
             }
@@ -1188,8 +1202,10 @@ impl Daemon {
                     Stage::Review => {
                         prior.repo == task.repo
                             && prior.stage == Stage::Implement
-                            && self.review_issue_numbers.get(&task.id).copied()
-                                == Some(prior.number)
+                            && self
+                                .review_tickets
+                                .get(&task.id)
+                                .is_some_and(|tickets| tickets.contains(&prior.number))
                     }
                     Stage::Release => {
                         prior.repo == task.repo
@@ -1236,21 +1252,12 @@ impl Daemon {
             Stage::Implement => self
                 .worktrees
                 .ensure_issue(&*self.exec, &repo_cfg, task.number),
-            Stage::Review => {
-                let issue_number = self
-                    .review_issue_numbers
-                    .get(&task.id)
-                    .copied()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "pull request #{} does not use branch aif/{}/issue-<n>",
-                            task.number,
-                            task.repo
-                        )
-                    })?;
-                self.worktrees
-                    .ensure_issue(&*self.exec, &repo_cfg, issue_number)
-            }
+            Stage::Review => match self.review_item(&task) {
+                (ItemKind::Issue, number) => {
+                    self.worktrees.ensure_issue(&*self.exec, &repo_cfg, number)
+                }
+                (ItemKind::Pr, number) => self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number),
+            },
             Stage::Release => self.worktrees.ensure_train(&*self.exec, &repo_cfg),
         };
         let cwd = match cwd {
@@ -1900,7 +1907,7 @@ impl Daemon {
                         let id = tasks::ticket_chat_id(&repo, number);
                         self.chat(
                             &id,
-                            "AIF applied the shown proposal to the GitHub issue. Continue with the confirmed content.",
+                            "AIF applied the shown proposal to the GitHub ticket. Continue with the confirmed content.",
                         );
                     }
                 }
@@ -2207,22 +2214,50 @@ impl Daemon {
         true
     }
 
+    /// The item whose workspace a review task runs in.
+    ///
+    /// One linked ticket runs the review in that ticket's worktree. Zero or
+    /// several links run it in the PR worktree. Every consumer of the
+    /// review workspace goes through this one helper, so no site drifts.
+    fn review_item(&self, task: &Task) -> (ItemKind, u64) {
+        let tickets = self.review_tickets.get(&task.id);
+        match tickets
+            .filter(|tickets| tickets.len() == 1)
+            .and_then(|tickets| tickets.iter().next())
+        {
+            Some(&ticket) => (ItemKind::Issue, ticket),
+            None => (ItemKind::Pr, task.number),
+        }
+    }
+
     /// The item whose workspace the task runs in.
     ///
-    /// A review task carries the pull request number, but it runs in the
-    /// worktree of its source issue. The comparison of two tasks uses this
-    /// item, so two agents never share one worktree.
+    /// The comparison of two tasks uses this item, so two agents never
+    /// share one worktree.
     fn worktree_item(&self, task: &Task) -> (ItemKind, u64) {
         match task.stage {
-            Stage::Review => (
-                ItemKind::Issue,
-                self.review_issue_numbers
-                    .get(&task.id)
-                    .copied()
-                    .unwrap_or(task.number),
-            ),
+            Stage::Review => self.review_item(task),
             _ => (task.kind, task.number),
         }
+    }
+
+    /// The running or awaiting task that holds the worktree of `task`.
+    ///
+    /// A running or awaiting task owns its worktree process; a queued task
+    /// does not. The dispatch loop skips a task whose worktree is held, so
+    /// two agents never share one worktree.
+    fn worktree_holder(&self, task: &Task) -> Option<String> {
+        let item = self.worktree_item(task);
+        self.table
+            .by_id
+            .values()
+            .find(|other| {
+                other.id != task.id
+                    && other.repo == task.repo
+                    && matches!(other.state, TaskState::Running | TaskState::AwaitingUser)
+                    && self.worktree_item(other) == item
+            })
+            .map(|other| other.id.clone())
     }
 
     /// The active task that blocks a follow-up to `task`, if one exists.
@@ -2895,20 +2930,23 @@ impl Daemon {
             return;
         };
         let log = self.log_path(repo, Stage::Release, ItemKind::Pr, first);
-        match self
-            .table
-            .upsert_queued(repo, Stage::Release, ItemKind::Pr, first, log, self.now_ms)
-        {
-            Ok(task) => {
-                if replace_binding {
-                    self.role_bindings.remove(&task.id);
-                }
-            }
-            Err(e) => {
-                eprintln!("the release task {id}: {e:#}");
-                self.finish_train(repo, false);
-                return;
-            }
+        if let Err(e) = self.table.upsert_with_id(
+            crate::tasks::ScopedTask {
+                id: &id,
+                repo,
+                stage: Stage::Release,
+                kind: ItemKind::Pr,
+                number: first,
+            },
+            log,
+            self.now_ms,
+        ) {
+            eprintln!("the release task {id}: {e:#}");
+            self.finish_train(repo, false);
+            return;
+        }
+        if replace_binding {
+            self.role_bindings.remove(&id);
         }
         self.changed = true;
     }
@@ -2959,9 +2997,10 @@ impl Daemon {
         Some(match task.stage {
             Stage::Refine => repo.path.clone(),
             Stage::Implement => self.worktrees.issue_path(repo, task.number),
-            Stage::Review => self
-                .worktrees
-                .issue_path(repo, *self.review_issue_numbers.get(id)?),
+            Stage::Review => match self.review_item(task) {
+                (ItemKind::Issue, number) => self.worktrees.issue_path(repo, number),
+                (ItemKind::Pr, number) => self.worktrees.pr_path(repo, number),
+            },
             Stage::Release => self.worktrees.train_path(repo),
         })
     }
@@ -3132,6 +3171,25 @@ impl Daemon {
                 .map(|pr| (pr.title.clone(), pr.body.clone()))
                 .unwrap_or_default(),
         };
+        // The linked ticket list of the review prompt: `#4, #9`, or `none`
+        // when no ticket links.
+        let tickets = match task.stage {
+            Stage::Review => self
+                .links
+                .get(&task.repo)
+                .map(|links| links.tickets_of(task.number))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let tickets_text = if tickets.is_empty() {
+            "none".to_string()
+        } else {
+            tickets
+                .iter()
+                .map(|ticket| format!("#{ticket}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         fill_template(
             &template,
             &[
@@ -3141,6 +3199,7 @@ impl Daemon {
                 ("title", title),
                 ("body", body),
                 ("worktree", worktree.display().to_string()),
+                ("tickets", tickets_text),
                 ("pr_list", pr_list),
                 ("pr_numbers", pr_numbers),
                 ("pr_count", pr_count),
@@ -3265,16 +3324,6 @@ fn proposal_marker_text(text: &str) -> bool {
     text.contains("<aif") || text.contains("</aif") || text.contains("aif-ticket")
 }
 
-/// Extract the issue number from one factory pull request branch.
-fn issue_number_from_head(repo: &str, head_ref: &str) -> Option<u64> {
-    let prefix = format!("aif/{repo}/issue-");
-    head_ref
-        .strip_prefix(&prefix)?
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
-}
-
 /// True when GitHub shows the completed refine transition.
 fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
     fresh.issues.get(&number).is_some_and(|issue| {
@@ -3284,16 +3333,16 @@ fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
     })
 }
 
-/// True when GitHub shows a pull request for the implemented issue.
-fn implementation_transitioned(fresh: &RepoSnapshot, repo: &str, number: u64) -> bool {
+/// True when GitHub shows a pull request for the implemented ticket.
+///
+/// The links table holds the open pull requests of the last poll, so the
+/// branch rule and the body rule both count here.
+fn implementation_transitioned(fresh: &RepoSnapshot, links: &Links, number: u64) -> bool {
     fresh.issues.get(&number).is_some_and(|issue| {
         issue.open
             && !issue.labels.iter().any(|label| label == "refined")
             && !issue.labels.iter().any(|label| label == "to-refine")
-    }) && fresh
-        .prs
-        .values()
-        .any(|pr| pr.open && issue_number_from_head(repo, &pr.head_ref) == Some(number))
+    }) && !links.prs_of(number).is_empty()
 }
 
 /// True when GitHub shows the completed review transition.
@@ -3405,134 +3454,6 @@ fn builtin_prompt(stage: Stage) -> &'static str {
     }
 }
 
-/// The built-in prompt of a refine run.
-///
-/// It runs in the repository checkout and never creates a worktree.
-pub const REFINE_PROMPT: &str = r#"You refine one GitHub issue in the repository {repo}
-({owner_repo}). You work in {worktree}, the repository checkout. Never create
-a git worktree; stay in this checkout.
-
-Issue #{number}: {title}
-
-{body}
-
-Read the issue and the surrounding code. Edit the issue body until it is a
-complete, testable specification: the problem, the agreed approach, the
-acceptance criteria. Write comments on the issue with `gh` when you decide
-something the body must record.
-
-When you need a human decision, add the `needs-human` label to the issue with
-`gh` and state the question in a comment. Stop after the label is on.
-
-When the specification is complete, run
-`gh issue edit {number} --remove-label to-refine --add-label refined`.
-Run this command only after the issue body is complete. Then report one line
-that says the issue is refined.
-"#;
-
-/// The built-in prompt of an implement run.
-pub const IMPLEMENT_PROMPT: &str = r#"You implement GitHub issue #{number} of {repo}
-({owner_repo}). You work in {worktree}, your own git worktree. Never create
-another git worktree; work only in this one.
-
-Issue #{number}: {title}
-
-{body}
-
-Implement the issue on the current branch. Follow its acceptance criteria.
-Run the test suite and make it pass. Commit your work in small, complete
-commits. Open a draft pull request with `gh pr create --draft` when the work is
-done. Put `Closes #{number}` in the body. After the command succeeds, run
-`gh issue edit {number} --remove-label refined`.
-
-If the specification is incomplete, or you need a human decision, add the
-`needs-human` label to issue #{number} with `gh`, write the question into a
-comment on it, and stop. Do not guess.
-
-Report one line at the end: what you did, and the pull request number.
-"#;
-
-/// The built-in prompt of a review run.
-pub const REVIEW_PROMPT: &str = r#"You review one pull request of {repo}
-({owner_repo}). You work in {worktree}, your own git worktree. Never create
-another git worktree; work only in this one.
-
-Pull request #{number}: {title}
-
-{body}
-
-Read the diff of the pull request with `gh pr diff {number}`. Review it for
-correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`. If it is correct, approve it and then run
-`gh pr ready {number}`. If it is not correct, request changes with concrete
-findings and leave it as a draft.
-
-If the change needs a human decision, add the `needs-human` label to the
-pull request with `gh`, write the question into a comment, and stop. Do not
-guess.
-
-Report one line at the end: the review verdict.
-"#;
-
-/// The built-in prompt of a release run.
-pub const RELEASE_PROMPT: &str = r#"You release the stacked pull requests of {repo}
-({owner_repo}). You work in {worktree}, the release worktree. Never create
-another git worktree; work only in this one.
-
-The batch holds {pr_count} pull request(s), in merge order:
-
-{pr_list}
-
-Merge every pull request in the listed order with `gh pr merge`, one at a
-time. Merge order is {pr_numbers}. After each merge, pull the base branch
-into this worktree so the next merge sees the updated state. If a merge
-conflicts, stop, and report the pull request number that failed.
-
-When all merges are done, report one line: the released pull requests.
-"#;
-
-/// The built-in prompt of a ticket-creation session.
-pub const TICKET_PROMPT: &str = r#"You help the operator create one GitHub issue in the
-repository {repo} ({owner_repo}). You work in {worktree}, the repository
-checkout. Never create a git worktree; stay in this checkout.
-
-Ask the operator what the ticket should say, in short questions, one topic at
-a time. When you know enough, draft the title and body, show them, and on
-approval create the issue with `gh issue create`. Report the new issue
-number.
-
-If the operator asks for something you cannot decide alone, say so plainly
-and ask again.
-"#;
-
-/// The built-in prompt of an issue conversation.
-pub const TICKET_CHAT_PROMPT: &str = r#"You review GitHub issue #{number} in repository
-{repo} ({owner_repo}). The repository checkout is {worktree}.
-
-Issue title: {title}
-Issue description:
-{body}
-
-Labels: {labels}
-Author: {author}
-Assignees: {assignees}
-Updated: {updated_at}
-GitHub reference: {github_url}
-
-Start with analysis. Do not propose a title or description change unless the
-operator explicitly requests that change.
-
-When the operator explicitly requests a title or description change, finish
-the assistant turn with exactly one complete block in this form:
-
-<aif-ticket-proposal-v1>
-{"title":"New title","body":"New description"}
-</aif-ticket-proposal-v1>
-
-Put valid JSON between the markers. Do not quote the block. Do not put the
-block in a code fence. Include no text after the closing marker.
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3634,6 +3555,47 @@ mod tests {
                 CmdOut::ok(""),
             ),
             common_dir_step(worktree, gitdir),
+        ]
+    }
+
+    /// The git calls of a first dispatch into a PR worktree: cut the branch
+    /// from `HEAD`, prepare the markers, then fetch the GitHub pull ref and
+    /// reset the branch hard to it.
+    fn fresh_pr_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
+        let reference = format!("refs/heads/aif/borsuk/pr-{number}");
+        let branch = format!("aif/borsuk/pr-{number}");
+        let pull_ref = format!("pull/{number}/head");
+        let wt_text = worktree.to_string_lossy().into_owned();
+        vec![
+            git_step(
+                repo,
+                &["rev-parse", "--verify", "--quiet", reference.as_str()],
+                refused(),
+            ),
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                refused(),
+            ),
+            git_step(
+                repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch.as_str(),
+                    wt_text.as_str(),
+                    "HEAD",
+                ],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(worktree, gitdir),
+            git_step(
+                repo,
+                &["fetch", "origin", pull_ref.as_str()],
+                CmdOut::ok(""),
+            ),
+            git_step(worktree, &["reset", "--hard", "FETCH_HEAD"], CmdOut::ok("")),
         ]
     }
 
@@ -3816,6 +3778,14 @@ mod tests {
             .join("worktrees")
             .join("borsuk")
             .join(format!("issue-{number}"))
+    }
+
+    /// The worktree path of one PR inside a rig root.
+    fn pr_wt(dir: &Path, number: u64) -> PathBuf {
+        dir.join("state")
+            .join("worktrees")
+            .join("borsuk")
+            .join(format!("pr-{number}"))
     }
 
     /// The worktree path of the train inside a rig root.
@@ -4363,6 +4333,186 @@ mod tests {
     }
 
     #[test]
+    fn a_review_prompt_names_the_tickets_the_pr_closes() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #4 fixes #9".to_string();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            rig.job(0).prompt.contains("Tickets this PR closes: #4, #9"),
+            "prompt:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    #[test]
+    fn an_unlinked_review_prompt_says_none() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            rig.job(0).prompt.contains("Tickets this PR closes: none"),
+            "prompt:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    #[test]
+    fn a_review_of_a_multi_ticket_pr_runs_in_the_pr_worktree() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #4 and fixes #9".to_string();
+
+        rig.poll(vec![], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert_eq!(rig.job(0).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn a_review_of_a_foreign_branch_pr_starts_without_a_refusal() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+
+        rig.poll(vec![], vec![pull]);
+
+        // The old daemon refused this PR for its branch. The task starts now.
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert_eq!(rig.job(0).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn a_review_waits_while_a_linked_ticket_still_implements() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "aif/borsuk/issue-142".to_string();
+        pull.body = "Closes #142".to_string();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Queued);
+    }
+
+    #[test]
+    fn a_review_without_links_never_waits_on_a_prior_stage() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps: Vec<Step> = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        )
+        .into_iter()
+        .chain(fresh_pr_steps(
+            &rig_repo(&dir),
+            &pr_worktree,
+            7,
+            &rig_gitdir(&dir),
+        ))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+
+        assert_eq!(
+            rig.job_count(),
+            2,
+            "the zero-link review starts beside the implement"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert_eq!(rig.job(1).task, "borsuk/review-p7");
+        assert_eq!(rig.job(1).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn two_reviews_of_prs_of_one_ticket_share_one_worktree_serially() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut first = pr(7, true, &[]);
+        first.head_ref = "aif/borsuk/issue-5".to_string();
+        first.body = "Closes #5".to_string();
+        let mut second = pr(9, true, &[]);
+        second.head_ref = "aif/borsuk/issue-5".to_string();
+        second.body = "Closes #5".to_string();
+
+        rig.poll(vec![], vec![first, second]);
+
+        // Both PRs link only ticket 5, so both reviews map to the ticket
+        // worktree. One runs; the other waits for the worktree.
+        assert_eq!(rig.job_count(), 1);
+        let running = rig.job(0).task.clone();
+        let waiting = if running == "borsuk/review-p7" {
+            "borsuk/review-p9"
+        } else {
+            "borsuk/review-p7"
+        };
+        assert_eq!(rig.task(waiting).state, TaskState::Queued);
+    }
+
+    #[test]
+    fn a_pr_worktree_review_writes_its_session_marker_in_place() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &pr_worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #4 fixes #9".to_string();
+
+        rig.poll(vec![], vec![pull]);
+        rig.event(started("borsuk/review-p7", "sid-1"));
+
+        // The Started event writes the marker through task_cwd, so the
+        // marker proves the daemon resolved the PR worktree for the review.
+        assert_eq!(
+            rig.daemon
+                .worktrees
+                .read_task_session(&pr_worktree, "borsuk/review-p7")
+                .unwrap()
+                .as_deref(),
+            Some("sid-1")
+        );
+    }
+
+    #[test]
     fn a_review_marker_error_requeues_the_review() {
         let dir = temp_root();
         let worktree = issue_wt(&dir, 5);
@@ -4901,9 +5051,9 @@ mod tests {
 
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
         );
-        assert_eq!(rig.task("borsuk/release-p2").state, TaskState::Queued);
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Queued);
         assert_eq!(rig.job_count(), 0);
         assert!(
             rig.exec.calls().is_empty(),
@@ -6801,34 +6951,34 @@ mod tests {
         });
         assert!(rig.job(0).prompt.contains("#2"));
 
-        rig.event(exited("borsuk/release-p2", false, "first"));
-        assert_eq!(rig.task("borsuk/release-p2").attempt, 2);
+        rig.event(exited("borsuk/release", false, "first"));
+        assert_eq!(rig.task("borsuk/release").attempt, 2);
         assert!(rig.job(1).prompt.contains("#2"));
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
         );
         assert!(rig.decision("gate:borsuk").is_none());
 
-        rig.event(exited("borsuk/release-p2", false, "second"));
-        assert_eq!(rig.task("borsuk/release-p2").attempt, 3);
+        rig.event(exited("borsuk/release", false, "second"));
+        assert_eq!(rig.task("borsuk/release").attempt, 3);
         assert!(rig.job(2).prompt.contains("#2"));
 
-        rig.event(exited("borsuk/release-p2", false, "third"));
+        rig.event(exited("borsuk/release", false, "third"));
         assert_eq!(rig.job_count(), 3);
-        assert!(rig.decision("stuck:borsuk/release-p2:3").is_some());
+        assert!(rig.decision("stuck:borsuk/release:3").is_some());
         assert!(rig.decision("gate:borsuk").is_none());
 
         rig.act(Action::Answer {
-            decision_id: "stuck:borsuk/release-p2:3".to_string(),
+            decision_id: "stuck:borsuk/release:3".to_string(),
             response: Response::Retry,
         });
         assert_eq!(rig.job_count(), 4);
         assert!(rig.job(3).prompt.contains("#2"));
-        assert_eq!(rig.task("borsuk/release-p2").attempt, 1);
+        assert_eq!(rig.task("borsuk/release").attempt, 1);
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
         );
     }
 
@@ -6863,7 +7013,87 @@ mod tests {
         );
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
-            Some("borsuk/release-p2")
+            Some("borsuk/release")
+        );
+    }
+
+    #[test]
+    fn a_fired_train_reads_the_scoped_id_in_the_view() {
+        let dir = temp_root();
+        let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));
+        let (mut rig, rx) = pushed_rig(steps);
+        rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
+
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+
+        let view = last_view(&rx);
+        assert!(
+            view.tasks.iter().any(|task| task.id == "borsuk/release"),
+            "task ids: {:?}",
+            view.tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(view
+            .trains
+            .iter()
+            .any(|train| train.in_flight.as_deref() == Some("borsuk/release")));
+    }
+
+    #[test]
+    fn a_second_batch_writes_its_own_log_file() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir))
+                .into_iter()
+                .chain(vec![gh_step(
+                    &[
+                        "api",
+                        "-i",
+                        "-X",
+                        "DELETE",
+                        "repos/acme/borsuk/issues/2/labels/release-stacked",
+                    ],
+                    gh_ok(),
+                )])
+                .chain(reuse_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(
+            vec![],
+            vec![
+                pr(2, false, &["release-stacked"]),
+                pr(5, false, &["release-stacked"]),
+            ],
+        );
+
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        assert!(rig
+            .task("borsuk/release")
+            .log_path
+            .ends_with("borsuk__release-p2.jsonl"));
+
+        rig.event(turn_finished("borsuk/release", true, "released"));
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![5],
+        });
+        assert!(
+            rig.task("borsuk/release")
+                .log_path
+                .ends_with("borsuk__release-p5.jsonl"),
+            "the log keeps the batch number"
         );
     }
 
@@ -6944,16 +7174,16 @@ mod tests {
         assert_eq!(rig.job_count(), 1);
 
         rig.act(Action::Abort {
-            task: "borsuk/release-p2".to_string(),
+            task: "borsuk/release".to_string(),
         });
 
         assert_eq!(
-            rig.task("borsuk/release-p2").state,
+            rig.task("borsuk/release").state,
             TaskState::Failed("cancelled".to_string())
         );
         assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
         assert_eq!(rig.daemon.trains["borsuk"].queue, vec![2]);
-        assert!(!rig.daemon.release_batches.contains_key("borsuk/release-p2"));
+        assert!(!rig.daemon.release_batches.contains_key("borsuk/release"));
     }
 
     #[test]
@@ -7159,7 +7389,7 @@ mod tests {
         assert_eq!(rig.job_count(), 1, "release waits for the review result");
         rig.event(turn_finished("borsuk/review-p5", true, "approved"));
         assert_eq!(rig.job_count(), 2);
-        assert_eq!(rig.job(1).task, "borsuk/release-p5");
+        assert_eq!(rig.job(1).task, "borsuk/release");
     }
 
     #[test]
@@ -7193,7 +7423,7 @@ mod tests {
         rig.event(exited("borsuk/review-p5", false, "review failed"));
 
         assert_eq!(rig.job_count(), 3, "only review attempts can run");
-        let release = rig.task("borsuk/release-p5");
+        let release = rig.task("borsuk/release");
         assert_eq!(release.state, TaskState::Queued);
         assert_eq!(release.attempt, 1, "the release never reached dispatch");
         assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());
@@ -7268,6 +7498,76 @@ mod tests {
         ));
         assert_eq!(rig.job_count(), 2);
         assert_eq!(rig.job(1).cwd, issue_wt(&dir, 142));
+    }
+
+    #[test]
+    fn a_ticket_set_change_supersedes_the_review() {
+        let dir = temp_root();
+        let pr_worktree = pr_wt(&dir, 5);
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_pr_steps(
+                    &rig_repo(&dir),
+                    &pr_worktree,
+                    5,
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(5, true, &[]);
+        pull.body = "Closes #5".to_string();
+        rig.poll(vec![], vec![pull]);
+        let first = rig.session(0);
+
+        // The PR leaves the draft state, so the gate closes. It returns to
+        // draft with a body that now closes ticket 9 too, so the gate
+        // re-opens with the same head and a changed ticket set.
+        let mut updated = pr(5, false, &[]);
+        updated.body = "Closes #5".to_string();
+        rig.poll(vec![], vec![updated.clone()]);
+        updated.draft = true;
+        updated.body = "Closes #5, fixes #9".to_string();
+        rig.poll(vec![], vec![updated]);
+
+        assert!(
+            first.stopped.load(Ordering::SeqCst),
+            "the ticket set change must supersede the running review"
+        );
+        rig.event(exited(
+            "borsuk/review-p5",
+            false,
+            "the superseded process exited",
+        ));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/review-p5");
+        assert_eq!(rig.job(1).cwd, pr_worktree);
+    }
+
+    #[test]
+    fn an_unchanged_ticket_set_and_head_supersedes_nothing() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        let first = rig.session(0);
+
+        // The PR leaves the draft state, so the gate closes; the running
+        // review survives. The PR returns to draft with the same head, so
+        // the gate re-opens and the daemon compares the ticket set.
+        let mut ready = pr(5, false, &[]);
+        rig.poll(vec![], vec![ready.clone()]);
+        ready.draft = true;
+        rig.poll(vec![], vec![ready]);
+
+        assert!(
+            !first.stopped.load(Ordering::SeqCst),
+            "an unchanged ticket set must not supersede the review"
+        );
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
     }
 
     #[test]
@@ -7554,8 +7854,8 @@ mod tests {
             .id
             .clone();
         rig.daemon
-            .review_issue_numbers
-            .insert(review_id.clone(), 142);
+            .review_tickets
+            .insert(review_id.clone(), BTreeSet::from([142]));
 
         rig.act(Action::Pause {
             scope: PauseScope::Stage {
@@ -7926,6 +8226,27 @@ mod tests {
     // The input mode
     // ------------------------------------------------------------------
 
+    #[test]
+    fn a_poll_with_closing_keywords_ships_the_links_in_the_view() {
+        let mut rig = Rig::make(vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &[])], vec![pull]);
+
+        let view = last_view(&push_rx);
+        assert!(
+            view.links
+                .iter()
+                .any(|link| link.repo == "borsuk" && link.ticket == 142 && link.pr == 7),
+            "links: {:?}",
+            view.links
+        );
+    }
+
     /// Drain the push channel and return the last view it holds.
     fn last_view(rx: &mpsc::Receiver<StateView>) -> StateView {
         let mut last = rx.try_recv().expect("the daemon must have pushed a view");
@@ -8238,6 +8559,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(filled, "title=keep {body} literal; body=body text");
+    }
+
+    #[test]
+    fn fill_template_fills_the_tickets_placeholder() {
+        let filled = fill_template(
+            "Tickets this PR closes: {tickets}",
+            &[("tickets", "#4, #9".to_string())],
+        )
+        .unwrap();
+        assert_eq!(filled, "Tickets this PR closes: #4, #9");
+
+        let error =
+            fill_template("hi {tickets} {nope}", &[("tickets", "none".to_string())]).unwrap_err();
+        assert!(error.to_string().contains("nope"));
     }
 
     // Path helpers that mirror the rig layout.

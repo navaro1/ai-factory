@@ -39,6 +39,29 @@ pub enum Cleanable {
     MergedOrClosed,
 }
 
+/// One kind of item worktree the manager owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorktreeKind {
+    /// The worktree of one ticket: the `issue-<n>` directory.
+    Issue,
+    /// The worktree of one PR: the `pr-<n>` directory.
+    Pr,
+}
+
+impl WorktreeKind {
+    /// The directory prefix: `issue-` or `pr-`.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            WorktreeKind::Issue => "issue-",
+            WorktreeKind::Pr => "pr-",
+        }
+    }
+}
+
+/// The worktree kinds the manager owns. The doctor asks for this list, so
+/// the manager is the single source of the directory names.
+pub const WORKTREE_KINDS: [WorktreeKind; 2] = [WorktreeKind::Issue, WorktreeKind::Pr];
+
 /// Creates, reuses, and removes one git worktree per issue, plus the train
 /// worktree of a repository.
 ///
@@ -62,10 +85,20 @@ impl WorktreeManager {
 
     /// The worktree path for one issue: `<state_dir>/worktrees/<alias>/issue-<n>`.
     pub fn issue_path(&self, repo: &RepoConfig, number: u64) -> PathBuf {
+        self.path(repo, WorktreeKind::Issue, number)
+    }
+
+    /// The worktree path for one PR: `<state_dir>/worktrees/<alias>/pr-<n>`.
+    pub fn pr_path(&self, repo: &RepoConfig, number: u64) -> PathBuf {
+        self.path(repo, WorktreeKind::Pr, number)
+    }
+
+    /// The worktree path of one kind: `issue-<n>` or `pr-<n>`.
+    pub fn path(&self, repo: &RepoConfig, kind: WorktreeKind, number: u64) -> PathBuf {
         self.state_dir
             .join("worktrees")
             .join(&repo.alias)
-            .join(format!("issue-{number}"))
+            .join(format!("{}{number}", kind.prefix()))
     }
 
     /// The train worktree path: `<state_dir>/worktrees/<alias>/train`.
@@ -79,6 +112,11 @@ impl WorktreeManager {
     /// The issue branch name: `aif/<alias>/issue-<n>`.
     pub fn issue_branch(repo: &RepoConfig, number: u64) -> String {
         format!("aif/{}/issue-{number}", repo.alias)
+    }
+
+    /// The PR branch name: `aif/<alias>/pr-<n>`.
+    pub fn pr_branch(repo: &RepoConfig, number: u64) -> String {
+        format!("aif/{}/pr-{number}", repo.alias)
     }
 
     /// The train branch name: `aif/<alias>/train`.
@@ -127,19 +165,57 @@ impl WorktreeManager {
     /// branch without `-b`, so the old work survives the loss of the
     /// directory.
     pub fn ensure_issue(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
-        let path = self.issue_path(repo, number);
-        if path.exists() && self.registered(exec, &repo.path, &path)? {
-            self.prepare(exec, &path)?;
-            return Ok(path);
+        self.ensure_on(
+            exec,
+            repo,
+            &self.issue_path(repo, number),
+            &Self::issue_branch(repo, number),
+        )
+    }
+
+    /// Return the PR worktree, and create it when missing.
+    ///
+    /// The worktree sits on the branch `aif/<alias>/pr-<n>`, cut from the
+    /// default branch. The call then fetches the GitHub pull ref
+    /// `pull/<n>/head` and resets the branch hard to it, so the worktree
+    /// always holds the PR content, whatever branch the PR came from.
+    pub fn ensure_pr(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
+        let path = self.pr_path(repo, number);
+        let worktree = self.ensure_on(exec, repo, &path, &Self::pr_branch(repo, number))?;
+        let reference = format!("pull/{number}/head");
+        let out = git(exec, &repo.path, &["fetch", "origin", reference.as_str()])?;
+        require_zero(out, "git fetch")?;
+        let out = git(exec, &worktree, &["reset", "--hard", "FETCH_HEAD"])?;
+        require_zero(out, "git reset")?;
+        Ok(worktree)
+    }
+
+    /// Return the worktree at `path` on `branch`, and create it when missing.
+    ///
+    /// When the path exists and git registers it, the worktree returns as it
+    /// stands, so work resumes in place. Otherwise the branch is cut from
+    /// the default branch: `origin/HEAD` resolved through `git
+    /// symbolic-ref`, else the repository's own `HEAD`. When the branch
+    /// already exists, the worktree is added on that branch without `-b`,
+    /// so the old work survives the loss of the directory.
+    fn ensure_on(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        path: &Path,
+        branch: &str,
+    ) -> Result<PathBuf> {
+        if path.exists() && self.registered(exec, &repo.path, path)? {
+            self.prepare(exec, path)?;
+            return Ok(path.to_path_buf());
         }
 
-        let branch = Self::issue_branch(repo, number);
         let path_text = path.to_string_lossy().into_owned();
-        if self.branch_exists(exec, &repo.path, &branch)? {
+        if self.branch_exists(exec, &repo.path, branch)? {
             let out = git(
                 exec,
                 &repo.path,
-                &["worktree", "add", path_text.as_str(), branch.as_str()],
+                &["worktree", "add", path_text.as_str(), branch],
             )?;
             require_zero(out, "git worktree add")?;
         } else {
@@ -151,15 +227,15 @@ impl WorktreeManager {
                     "worktree",
                     "add",
                     "-b",
-                    branch.as_str(),
+                    branch,
                     path_text.as_str(),
                     base.as_str(),
                 ],
             )?;
             require_zero(out, "git worktree add")?;
         }
-        self.prepare(exec, &path)?;
-        Ok(path)
+        self.prepare(exec, path)?;
+        Ok(path.to_path_buf())
     }
 
     /// Return the train worktree, always cut from the default branch.
@@ -229,8 +305,43 @@ impl WorktreeManager {
             Cleanable::MergedOrClosed => {}
         }
 
-        let path = self.issue_path(repo, number);
-        let branch = Self::issue_branch(repo, number);
+        self.remove_on(
+            exec,
+            repo,
+            &self.issue_path(repo, number),
+            &Self::issue_branch(repo, number),
+        )
+    }
+
+    /// Remove the worktree of a finished PR and delete its branch.
+    ///
+    /// The proof contract matches [`WorktreeManager::remove_issue`].
+    pub fn remove_pr(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        number: u64,
+        proof: Cleanable,
+    ) -> Result<()> {
+        match proof {
+            Cleanable::MergedOrClosed => {}
+        }
+        self.remove_on(
+            exec,
+            repo,
+            &self.pr_path(repo, number),
+            &Self::pr_branch(repo, number),
+        )
+    }
+
+    /// Remove the worktree at `path` and delete `branch`.
+    fn remove_on(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        path: &Path,
+        branch: &str,
+    ) -> Result<()> {
         let path_text = path.to_string_lossy().into_owned();
         let out = git(
             exec,
@@ -238,7 +349,7 @@ impl WorktreeManager {
             &["worktree", "remove", "--force", path_text.as_str()],
         )?;
         require_zero(out, "git worktree remove")?;
-        let out = git(exec, &repo.path, &["branch", "-D", branch.as_str()])?;
+        let out = git(exec, &repo.path, &["branch", "-D", branch])?;
         require_zero(out, "git branch -D")?;
         Ok(())
     }
@@ -810,6 +921,110 @@ mod tests {
         let exclude = fs::read_to_string(wt.join(".git").join("info").join("exclude"))
             .expect("the exclude file must exist");
         assert!(exclude.contains(".aif/"));
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn ensure_pr_builds_the_documented_commands() {
+        let root = temp_root("argv-pr");
+        let repo_path = root.join("repo");
+        let repo = demo_repo(&repo_path);
+        let manager = WorktreeManager::new(root.join("state"));
+        let wt = manager.pr_path(&repo, 7);
+        let wt_text = wt.to_string_lossy().into_owned();
+        let repo_text = repo_path.to_string_lossy().into_owned();
+        let wt_gitdir = wt.join(".git").display().to_string();
+        let verify_repo = repo_text.clone();
+        let symref_repo = repo_text.clone();
+        let add_repo = repo_text.clone();
+        let add_wt = wt_text.clone();
+        let gitdir_wt = wt_text.clone();
+        let fetch_repo = repo_text.clone();
+        let reset_wt = wt_text.clone();
+        let exec = ScriptExec::new()
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                verify_repo.as_str(),
+                                "rev-parse",
+                                "--verify",
+                                "--quiet",
+                                "refs/heads/aif/demo/pr-7",
+                            ]
+                },
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                symref_repo.as_str(),
+                                "symbolic-ref",
+                                "--quiet",
+                                "refs/remotes/origin/HEAD",
+                            ]
+                },
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                add_repo.as_str(),
+                                "worktree",
+                                "add",
+                                "-b",
+                                "aif/demo/pr-7",
+                                add_wt.as_str(),
+                                "refs/remotes/origin/main",
+                            ]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                gitdir_wt.as_str(),
+                                "rev-parse",
+                                "--path-format=absolute",
+                                "--git-common-dir",
+                            ]
+                },
+                CmdOut::ok(format!("{wt_gitdir}\n")),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", fetch_repo.as_str(), "fetch", "origin", "pull/7/head"]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", reset_wt.as_str(), "reset", "--hard", "FETCH_HEAD"]
+                },
+                CmdOut::ok(""),
+            );
+
+        let path = manager.ensure_pr(&exec, &repo, 7).unwrap();
+
+        assert_eq!(path, wt);
+        assert_eq!(exec.calls().len(), 6);
         fs::remove_dir_all(&root).expect("the temp dir must be removable");
     }
 

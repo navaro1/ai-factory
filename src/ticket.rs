@@ -89,7 +89,7 @@ impl TicketController {
                         repo,
                         number,
                         TicketResultKind::Failure,
-                        "The issue is not open in the current GitHub state.",
+                        "The ticket is not open in the current GitHub state.",
                     ))],
                     confirmed: None,
                 },
@@ -148,7 +148,7 @@ impl TicketController {
                             repo,
                             number,
                             TicketResultKind::Failure,
-                            "The issue is not open in the current GitHub state.",
+                            "The ticket is not open in the current GitHub state.",
                         ))],
                         confirmed: None,
                     };
@@ -160,7 +160,7 @@ impl TicketController {
                             repo,
                             number,
                             TicketResultKind::Failure,
-                            "The refined issue no longer has an active conversation.",
+                            "The refined ticket no longer has an active conversation.",
                         ))],
                         confirmed: None,
                     };
@@ -212,7 +212,7 @@ impl TicketController {
                     repo,
                     number,
                     TicketResultKind::Failure,
-                    &format!("GitHub could not fetch the current issue: {error:#}"),
+                    &format!("GitHub could not fetch the current ticket: {error:#}"),
                 )));
                 return TicketEffects {
                     pushes,
@@ -361,7 +361,7 @@ impl TicketController {
                 repo,
                 number,
                 TicketResultKind::Failure,
-                "The issue is not open in the current GitHub state.",
+                "The ticket is not open in the current GitHub state.",
             )));
             return TicketEffects {
                 pushes,
@@ -486,7 +486,7 @@ impl TicketController {
                 repo,
                 number,
                 TicketResultKind::Failure,
-                "The issue is not open in the current GitHub state.",
+                "The ticket is not open in the current GitHub state.",
             )));
             return TicketEffects {
                 pushes,

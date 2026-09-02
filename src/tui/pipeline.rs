@@ -11,7 +11,7 @@
 use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
-use crate::model::Stage;
+use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView};
 use crate::tasks::TaskState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -199,7 +199,7 @@ fn release_batch_task_id(train: &crate::sock::TrainView) -> Option<String> {
         .batch
         .iter()
         .min()
-        .map(|first| format!("{}/release-p{first}", train.repo))
+        .map(|_| crate::tasks::scoped_id(&train.repo, "release"))
 }
 
 /// True when the stage shows no repository group and no train.
@@ -1116,12 +1116,13 @@ fn release_lane_lines(
                     repo: repo.alias.clone(),
                     pr: *pr,
                 };
+                let badge = release_pr_badge(state, &repo.alias, *pr);
                 push_custom_row_line(
                     all,
                     selected,
                     &row,
                     vec![Span::styled(
-                        box_line(&format!("#{pr}"), box_width),
+                        box_line(&format!("#{pr}{badge}"), box_width),
                         Style::default().fg(THEME.text),
                     )],
                     &mut lines,
@@ -1180,6 +1181,7 @@ fn release_lane_lines(
                 vec![
                     Span::styled(format!("#{pr}"), Style::default().fg(THEME.text)),
                     Span::styled(format!(" {status}"), THEME.dim()),
+                    Span::styled(release_pr_badge(state, &repo.alias, *pr), THEME.dim()),
                 ],
                 &mut lines,
             );
@@ -1444,6 +1446,60 @@ fn ticket_label(state: &StateView, task: &TaskView) -> Option<String> {
         .map(|ticket| format!("#{number} {}", truncate(&ticket.title)))
 }
 
+/// The linked numbers as `#7 #9`, at most three, then `+n`.
+fn linked_numbers(values: &[u64]) -> String {
+    let shown: Vec<String> = values
+        .iter()
+        .take(3)
+        .map(|value| format!("#{value}"))
+        .collect();
+    let mut text = shown.join(" ");
+    if values.len() > 3 {
+        text.push_str(&format!(" +{}", values.len() - 3));
+    }
+    text
+}
+
+/// The PR numbers linked to one ticket, ascending.
+fn linked_prs(state: &StateView, repo: &str, ticket: u64) -> Vec<u64> {
+    state
+        .links
+        .iter()
+        .filter(|link| link.repo == repo && link.ticket == ticket)
+        .map(|link| link.pr)
+        .collect()
+}
+
+/// The ticket numbers linked to one PR, ascending.
+fn linked_tickets(state: &StateView, repo: &str, pr: u64) -> Vec<u64> {
+    state
+        .links
+        .iter()
+        .filter(|link| link.repo == repo && link.pr == pr)
+        .map(|link| link.ticket)
+        .collect()
+}
+
+/// The link badge of one task row: `→ #7 #9` on a ticket task, `← #142 #150`
+/// on a PR task. None when no link exists.
+fn link_badge(state: &StateView, task: &TaskView) -> Option<String> {
+    let (arrow, numbers) = match task.kind {
+        ItemKind::Issue => ("→", linked_prs(state, &task.repo, task.number)),
+        ItemKind::Pr => ("←", linked_tickets(state, &task.repo, task.number)),
+    };
+    (!numbers.is_empty()).then(|| format!("{arrow} {}", linked_numbers(&numbers)))
+}
+
+/// The ticket suffix of one release PR row: ` ← #142 #150`, or empty.
+fn release_pr_badge(state: &StateView, repo: &str, pr: u64) -> String {
+    let tickets = linked_tickets(state, repo, pr);
+    if tickets.is_empty() {
+        String::new()
+    } else {
+        format!(" ← {}", linked_numbers(&tickets))
+    }
+}
+
 /// The spans of one ticket row: item, state, attempt, and queued messages.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
@@ -1479,6 +1535,9 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     if let Some(ticket) = ticket_label(state, task) {
         spans.push(Span::styled(format!(" · {ticket}"), THEME.dim()));
     }
+    if let Some(badge) = link_badge(state, task) {
+        spans.push(Span::styled(format!(" · {badge}"), THEME.dim()));
+    }
     spans
 }
 
@@ -1502,6 +1561,9 @@ fn task_label(state: &StateView, task: &TaskView) -> String {
     }
     if let Some(ticket) = ticket_label(state, task) {
         label.push_str(&format!(" · {ticket}"));
+    }
+    if let Some(badge) = link_badge(state, task) {
+        label.push_str(&format!(" · {badge}"));
     }
     label
 }
@@ -1626,6 +1688,7 @@ fn task(
 pub(crate) fn sample_view() -> StateView {
     StateView {
         protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+        links: Vec::new(),
         repos: vec![
             RepoView {
                 alias: "borsuk".to_string(),
@@ -1667,72 +1730,77 @@ pub(crate) fn sample_view() -> StateView {
             },
         ],
         lanes: Vec::new(),
-        tasks: vec![
-            task(
-                "borsuk",
-                Stage::Refine,
-                ItemKind::Issue,
-                142,
-                TaskState::Queued,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Refine,
-                ItemKind::Issue,
-                143,
-                TaskState::Running,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Implement,
-                ItemKind::Issue,
-                140,
-                TaskState::Running,
-                2,
-            ),
-            task(
-                "ryba",
-                Stage::Implement,
-                ItemKind::Issue,
-                7,
-                TaskState::Queued,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Review,
-                ItemKind::Pr,
-                7,
-                TaskState::Running,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Review,
-                ItemKind::Pr,
-                9,
-                TaskState::AwaitingUser,
-                1,
-            ),
-            task(
-                "borsuk",
-                Stage::Release,
-                ItemKind::Pr,
-                5,
-                TaskState::Running,
-                1,
-            ),
-            task(
-                "ryba",
-                Stage::Refine,
-                ItemKind::Issue,
-                9,
-                TaskState::Failed("exit 1".to_string()),
-                3,
-            ),
-        ],
+        tasks: {
+            let mut tasks = vec![
+                task(
+                    "borsuk",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    142,
+                    TaskState::Queued,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    143,
+                    TaskState::Running,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Implement,
+                    ItemKind::Issue,
+                    140,
+                    TaskState::Running,
+                    2,
+                ),
+                task(
+                    "ryba",
+                    Stage::Implement,
+                    ItemKind::Issue,
+                    7,
+                    TaskState::Queued,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Review,
+                    ItemKind::Pr,
+                    7,
+                    TaskState::Running,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Review,
+                    ItemKind::Pr,
+                    9,
+                    TaskState::AwaitingUser,
+                    1,
+                ),
+                task(
+                    "borsuk",
+                    Stage::Release,
+                    ItemKind::Pr,
+                    5,
+                    TaskState::Running,
+                    1,
+                ),
+                task(
+                    "ryba",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    9,
+                    TaskState::Failed("exit 1".to_string()),
+                    3,
+                ),
+            ];
+            // The release train carries the scoped id, not the item id.
+            tasks[6].id = crate::tasks::scoped_id("borsuk", "release");
+            tasks
+        },
         decisions: Vec::new(),
         decision_items: Vec::new(),
         tickets: Vec::new(),
@@ -1744,7 +1812,7 @@ pub(crate) fn sample_view() -> StateView {
                 batch: vec![5],
                 policy: ReleasePolicy::Manual,
                 next_fire_ms: None,
-                in_flight: Some("borsuk/release-p5".to_string()),
+                in_flight: Some("borsuk/release".to_string()),
             },
             TrainView {
                 repo: "ryba".to_string(),
@@ -1802,8 +1870,6 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
 }
 
 #[cfg(test)]
-use crate::model::ItemKind;
-#[cfg(test)]
 use crate::sock::{PausedView, RepoView, StageView, TrainView};
 #[cfg(test)]
 use ratatui::backend::TestBackend;
@@ -1818,6 +1884,7 @@ mod tests {
     fn empty_view() -> StateView {
         StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: Vec::new(),
             stages: Stage::ALL
                 .iter()
@@ -2400,6 +2467,101 @@ mod tests {
         assert!(!text.contains("i142 queued ·"));
         assert!(!text.contains("i7 queued ·"));
         assert!(!text.contains("p7 running ·"));
+    }
+
+    fn link(repo: &str, ticket: u64, pr: u64) -> crate::sock::LinkView {
+        crate::sock::LinkView {
+            repo: repo.to_string(),
+            ticket,
+            pr,
+        }
+    }
+
+    #[test]
+    fn a_ticket_row_shows_the_prs_that_serve_it() {
+        let mut state = sample_view();
+        state.links = vec![link("borsuk", 140, 7), link("borsuk", 140, 9)];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(text.contains("i140 running a2 · → #7 #9"), "board:\n{text}");
+    }
+
+    #[test]
+    fn a_pr_row_shows_the_tickets_it_closes() {
+        let mut state = sample_view();
+        state.links = vec![link("borsuk", 142, 7), link("borsuk", 150, 7)];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(text.contains("p7 running · ← #142 #150"), "board:\n{text}");
+    }
+
+    #[test]
+    fn rows_without_links_show_no_badge() {
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+
+        assert!(!text.contains('→'), "board:\n{text}");
+        assert!(!text.contains('←'), "board:\n{text}");
+    }
+
+    #[test]
+    fn a_release_pr_row_shows_its_tickets() {
+        let mut state = sample_view();
+        state.links = vec![link("borsuk", 142, 7), link("borsuk", 142, 9)];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(text.contains("#7 next ← #142"), "board:\n{text}");
+        assert!(text.contains("#9 new ← #142"), "board:\n{text}");
+    }
+
+    #[test]
+    fn a_saved_retry_batch_resolves_the_scoped_release_task() {
+        let mut state = sample_view();
+        // The train holds a saved retry batch and no task in flight, so
+        // the board must resolve the release task by its scoped id.
+        state.trains[0].in_flight = None;
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(
+            text.contains("p5 running"),
+            "the scoped release task must render inside the batch border:\n{text}"
+        );
+    }
+
+    #[test]
+    fn linked_numbers_cap_at_three_then_count_the_rest() {
+        assert_eq!(linked_numbers(&[1, 2]), "#1 #2");
+        assert_eq!(linked_numbers(&[1, 2, 3, 4]), "#1 #2 #3 +1");
+        assert_eq!(linked_numbers(&[]), "");
     }
 
     #[test]
@@ -2995,7 +3157,7 @@ mod tests {
 
         let text = render_to_string(&mut app);
         assert!(text.contains("PR #5 · borsuk"), "detail:\n{text}");
-        assert!(text.contains("h l pull request"), "train footer:\n{text}");
+        assert!(text.contains("h l PR"), "train footer:\n{text}");
     }
 
     #[test]

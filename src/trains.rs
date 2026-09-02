@@ -217,16 +217,16 @@ impl Train {
     /// retry its saved batch. The call removes the batch from the queue.
     /// It also marks the train as active and records `now_ms`.
     ///
-    /// The id is `<repo>/release-p<n>`. The value `n` is the lowest pull
-    /// request number. A retry of the same batch reuses the same id.
+    /// The id is `<repo>/release`, built by the scoped-id rule. The train,
+    /// not one PR, is the unit of work, so the id stays stable across
+    /// batches. A retry of the same batch reuses the same id.
     pub fn fire(&mut self, prs: &[u64], now_ms: u64) -> Result<String> {
         if let Some(id) = &self.in_flight {
             bail!("a train is already in flight as {id}");
         }
-        let first = match prs.iter().min() {
-            Some(first) => *first,
-            None => bail!("cannot fire an empty train"),
-        };
+        if prs.is_empty() {
+            bail!("cannot fire an empty train");
+        }
         if self.fired.as_deref().is_some_and(|retry| retry != prs) {
             bail!("cannot replace a failed train; retry the saved batch");
         }
@@ -238,7 +238,7 @@ impl Train {
                 bail!("cannot fire pr {pr} more than once");
             }
         }
-        let id = format!("{}/release-p{first}", self.repo);
+        let id = crate::tasks::scoped_id(&self.repo, "release");
         self.queue.retain(|pr| !prs.contains(pr));
         self.in_flight = Some(id.clone());
         self.fired = Some(prs.to_vec());
@@ -360,7 +360,7 @@ mod tests {
         let policy = ReleasePolicy::Threshold { count: 3 };
         let batch = t.should_fire(&policy, 1_000).unwrap();
         let id = t.fire(&batch, 1_000).unwrap();
-        assert_eq!(id, "borsuk/release-p1");
+        assert_eq!(id, "borsuk/release");
         t.enqueue(4);
         assert_eq!(t.should_fire(&policy, 2_000), None);
         let exec = ScriptExec::new();
@@ -430,8 +430,8 @@ mod tests {
         assert_eq!(t.should_fire(&policy, 100_000), None);
         assert_eq!(t.next_deadline_ms(&policy, 100_000), None);
         let id = t.fire(&[2], 5_000).unwrap();
-        assert_eq!(id, "borsuk/release-p2");
-        assert_eq!(t.in_flight.as_deref(), Some("borsuk/release-p2"));
+        assert_eq!(id, "borsuk/release");
+        assert_eq!(t.in_flight.as_deref(), Some("borsuk/release"));
         assert_eq!(t.last_fire_ms, Some(5_000));
     }
 
@@ -797,6 +797,6 @@ mod tests {
     fn the_task_id_names_the_lowest_pr_of_the_batch() {
         let mut t = train(&[4, 2, 7]);
         let id = t.fire(&[4, 2, 7], 1_000).unwrap();
-        assert_eq!(id, "borsuk/release-p2");
+        assert_eq!(id, "borsuk/release");
     }
 }

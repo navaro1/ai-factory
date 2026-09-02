@@ -33,6 +33,7 @@ use crate::config::{
     Config, ExecutionRole, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
+use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::sched::{Limits, Paused};
 use crate::tasks::{TaskState, TaskTable};
@@ -101,6 +102,9 @@ pub struct StateView {
     /// Compact open issue rows for the Tickets view.
     #[serde(default)]
     pub tickets: Vec<TicketSummary>,
+    /// The ticket-PR links of every configured repository.
+    #[serde(default)]
+    pub links: Vec<LinkView>,
     /// The release train of each configured repository.
     pub trains: Vec<TrainView>,
     /// What the operator paused.
@@ -275,6 +279,17 @@ impl RoleFieldSources {
     }
 }
 
+/// One ticket-PR link of one repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkView {
+    /// The repository alias.
+    pub repo: String,
+    /// The ticket number.
+    pub ticket: u64,
+    /// The pull request number.
+    pub pr: u64,
+}
+
 /// What the session view's input bar does for one task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -321,6 +336,8 @@ pub struct StateInput<'a> {
     pub decisions: &'a Decisions,
     /// The last repository snapshot, for decision item descriptions.
     pub snapshot: &'a Snapshot,
+    /// The ticket-PR links of each repository, keyed by repository alias.
+    pub links: &'a BTreeMap<String, Links>,
     /// The release trains, keyed by repository alias.
     pub trains: &'a BTreeMap<String, Train>,
     /// The active release policies, keyed by repository alias.
@@ -343,6 +360,7 @@ impl StateInput<'_> {
             table,
             decisions,
             snapshot,
+            links,
             trains,
             policies,
             input_modes,
@@ -462,6 +480,21 @@ impl StateInput<'_> {
                 .then_with(|| left.repo.cmp(&right.repo))
                 .then_with(|| left.number.cmp(&right.number))
         });
+        let links: Vec<LinkView> = links
+            .iter()
+            .filter(|(repo, _)| config.repos.contains_key(*repo))
+            .flat_map(|(repo, table)| {
+                table
+                    .pairs()
+                    .iter()
+                    .map(|(ticket, pr)| LinkView {
+                        repo: repo.clone(),
+                        ticket: *ticket,
+                        pr: *pr,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let paused = PausedView {
             global: paused.global,
             overrides: paused
@@ -498,6 +531,7 @@ impl StateInput<'_> {
             decisions: decisions.open().to_vec(),
             decision_items,
             tickets,
+            links,
             trains,
             paused,
             settings: SettingsView::from_config(config, settings_revision)?,
@@ -1649,6 +1683,7 @@ mod tests {
     fn sample_view(label: usize) -> StateView {
         StateView {
             protocol_revision: WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: vec![RepoView {
                 alias: format!("repo-{label}"),
                 owner_repo: String::new(),
@@ -1823,6 +1858,7 @@ mod tests {
             table: &TaskTable::new(),
             decisions: &Decisions::new(),
             snapshot: &Snapshot::default(),
+            links: &BTreeMap::new(),
             trains: &BTreeMap::new(),
             policies: &BTreeMap::new(),
             input_modes: &BTreeMap::new(),
@@ -2000,7 +2036,7 @@ mod tests {
             batch: vec![7],
             policy: ReleasePolicy::Manual,
             next_fire_ms: None,
-            in_flight: Some("borsuk/release-p7".to_string()),
+            in_flight: Some("borsuk/release".to_string()),
         };
         let text = serde_json::to_string(&train).unwrap();
         assert_eq!(serde_json::from_str::<TrainView>(&text).unwrap(), train);
@@ -2097,6 +2133,7 @@ mod tests {
             table: &table,
             decisions: &decisions,
             snapshot: &Snapshot::default(),
+            links: &BTreeMap::new(),
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
@@ -2360,6 +2397,41 @@ mod tests {
     }
 
     /// A state view whose single push is far larger than a socket buffer.
+    #[test]
+    fn a_view_without_the_links_field_parses_with_an_empty_list() {
+        let json = r#"{"repos":[],"stages":[],"lanes":[],"tasks":[],"decisions":[],"trains":[],"paused":{"global":false,"overrides":[]},"settings":{"revision":"","global":[],"repositories":[]}}"#;
+        let view: StateView = serde_json::from_str(json).unwrap();
+        assert!(view.links.is_empty());
+    }
+
+    #[test]
+    fn the_links_round_trip_through_json() {
+        let view = StateView {
+            protocol_revision: WIRE_PROTOCOL_REVISION,
+            repos: Vec::new(),
+            stages: Vec::new(),
+            lanes: Vec::new(),
+            tasks: Vec::new(),
+            decisions: Vec::new(),
+            decision_items: Vec::new(),
+            tickets: Vec::new(),
+            links: vec![LinkView {
+                repo: "borsuk".to_string(),
+                ticket: 142,
+                pr: 7,
+            }],
+            trains: Vec::new(),
+            paused: PausedView {
+                global: false,
+                overrides: Vec::new(),
+            },
+            settings: SettingsView::default(),
+        };
+        let text = serde_json::to_string(&view).unwrap();
+        let back: StateView = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, view);
+    }
+
     fn huge_view(label: usize) -> StateView {
         let mut view = sample_view(label);
         view.repos[0].owner_repo = "x".repeat(200_000);
@@ -2566,6 +2638,7 @@ mod tests {
             table: &table,
             decisions: &decisions,
             snapshot: &snapshot,
+            links: &BTreeMap::new(),
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
@@ -2630,6 +2703,7 @@ mod tests {
             table: &table,
             decisions: &decisions,
             snapshot: &snapshot,
+            links: &BTreeMap::new(),
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
@@ -2740,6 +2814,7 @@ mod tests {
             policies: &policies,
             input_modes: &BTreeMap::new(),
             snapshot: &snapshot,
+            links: &BTreeMap::new(),
             now_ms: 3_000,
         }
         .build()
@@ -2833,6 +2908,7 @@ mod tests {
             policies: &policies,
             input_modes: &BTreeMap::new(),
             snapshot: &snapshot,
+            links: &BTreeMap::new(),
             now_ms: 3_000,
         }
         .build()
@@ -2869,6 +2945,7 @@ mod tests {
             table: &table,
             decisions: &decisions,
             snapshot: &Snapshot::default(),
+            links: &BTreeMap::new(),
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
@@ -2962,6 +3039,7 @@ mod tests {
             table: &table,
             decisions: &decisions,
             snapshot: &Snapshot::default(),
+            links: &BTreeMap::new(),
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
@@ -3047,7 +3125,7 @@ mod tests {
         assert_eq!(borsuk_view.batch, vec![7]);
         assert_eq!(borsuk_view.policy, ReleasePolicy::Interval { minutes: 30 });
         assert_eq!(borsuk_view.next_fire_ms, None);
-        assert_eq!(borsuk_view.in_flight.as_deref(), Some("borsuk/release-p7"));
+        assert_eq!(borsuk_view.in_flight.as_deref(), Some("borsuk/release"));
         // A repository without a train entry gets an empty view with the
         // config policy.
         assert_eq!(view.trains[1].repo, "qubitsok");

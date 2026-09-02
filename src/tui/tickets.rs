@@ -721,7 +721,7 @@ impl Tickets {
 
     /// Draw grouped ticket rows with one tab row and one search line.
     fn draw_list(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
-        let block = Block::bordered().title(" tickets // open issues ");
+        let block = Block::bordered().title(" tickets // open ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height == 0 || inner.width == 0 {
@@ -750,7 +750,7 @@ impl Tickets {
         let filtered = self.filtered(state);
         if filtered.is_empty() {
             frame.render_widget(
-                Paragraph::new("No open issue matches the search.").style(THEME.dim()),
+                Paragraph::new("No open ticket matches the search.").style(THEME.dim()),
                 list,
             );
             return;
@@ -900,14 +900,14 @@ impl Tickets {
                 lines
             }
             None => vec![Line::from(Span::styled(
-                "Loading the confirmed issue data…",
+                "Loading the confirmed ticket data…",
                 THEME.dim(),
             ))],
         };
         frame.render_widget(
             Paragraph::new(details)
                 .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(Block::bordered().title(" issue // esc back ")),
+                .block(Block::bordered().title(" ticket // esc back ")),
             panes[0],
         );
         let (chat_title, chat_ready) = ticket_chat_identity(state, repo);
@@ -975,7 +975,7 @@ impl Tickets {
             rows[1],
         );
         frame.render_widget(
-            Paragraph::new("tab field · ctrl-s save · esc issue").style(THEME.dim()),
+            Paragraph::new("tab field · ctrl-s save · esc ticket").style(THEME.dim()),
             rows[2],
         );
     }
@@ -1012,7 +1012,7 @@ impl Tickets {
             frame.render_widget(
                 Paragraph::new("Loading repository labels…")
                     .style(THEME.dim())
-                    .block(Block::bordered().title(" labels // esc issue ")),
+                    .block(Block::bordered().title(" labels // esc ticket ")),
                 area,
             );
             return;
@@ -1066,7 +1066,7 @@ impl Tickets {
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::bordered().title(" labels // space toggle · n new · esc issue ")),
+                .block(Block::bordered().title(" labels // space toggle · n new · esc ticket ")),
             area,
         );
     }
@@ -1163,7 +1163,7 @@ fn ticket_chat_identity(state: &StateView, repo: &str) -> (String, String) {
     let harness = ticket_chat_harness(state, repo);
     (
         format!("{harness} // configured access"),
-        format!("The configured {harness} role is ready for issue analysis."),
+        format!("The configured {harness} role is ready for ticket analysis."),
     )
 }
 
@@ -1216,6 +1216,7 @@ mod tests {
     fn state() -> StateView {
         let mut state = StateView {
             protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
+            links: Vec::new(),
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),
