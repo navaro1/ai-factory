@@ -13,6 +13,7 @@ use crate::sock::{
     TicketDetails, TicketGroup, TicketLabels, TicketResult, TicketResultKind, TicketSummary,
 };
 
+use super::markdown::markdown_lines;
 use super::session::SessionView;
 use super::theme::THEME;
 
@@ -67,6 +68,8 @@ struct NewLabelForm {
 /// The Tickets view state.
 #[derive(Debug, Default)]
 pub struct Tickets {
+    /// The repository tab that the list shows.
+    tab: Option<String>,
     /// The active search text.
     query: String,
     /// True while key presses edit the search text.
@@ -101,6 +104,10 @@ pub struct Tickets {
     chat_active: bool,
     /// The current request that applies a shown proposal.
     proposal_request: Option<String>,
+    /// The focused issue body, rendered once per update.
+    body_lines: Vec<Line<'static>>,
+    /// The focused proposal body, rendered once per update.
+    proposal_lines: Vec<Line<'static>>,
 }
 
 impl Tickets {
@@ -155,7 +162,23 @@ impl Tickets {
             .is_some_and(|(repo, number)| repo == &details.repo && *number == details.issue.number);
         if current {
             self.details = Some(details);
+            self.refresh_body_render();
         }
+    }
+
+    /// Rebuild the rendered markdown caches from the current details.
+    fn refresh_body_render(&mut self) {
+        let Some(details) = self.details.as_ref() else {
+            self.body_lines.clear();
+            self.proposal_lines.clear();
+            return;
+        };
+        self.body_lines = markdown_lines(&details.issue.body);
+        self.proposal_lines = details
+            .proposal
+            .as_ref()
+            .map(|proposal| markdown_lines(&proposal.body))
+            .unwrap_or_default();
     }
 
     /// Apply one label catalog response.
@@ -185,6 +208,7 @@ impl Tickets {
             if let Some(details) = self.details.as_mut() {
                 details.issue = issue.clone();
             }
+            self.refresh_body_render();
         }
         match result.kind {
             TicketResultKind::Conflict => {
@@ -208,6 +232,7 @@ impl Tickets {
                     if let Some(details) = self.details.as_mut() {
                         details.proposal = None;
                     }
+                    self.refresh_body_render();
                     self.proposal_request = None;
                 }
                 self.editor = None;
@@ -221,26 +246,74 @@ impl Tickets {
         self.result = Some(result);
     }
 
-    /// The summaries that match the active search text.
-    fn filtered<'a>(&self, state: &'a StateView) -> Vec<&'a TicketSummary> {
-        let query = self.query.trim().to_ascii_lowercase();
-        if query.is_empty() {
-            return state.tickets.iter().collect();
+    /// The repositories that own at least one open issue, in tab order.
+    ///
+    /// The tab order follows the configured alias order. Repositories that
+    /// the configuration misses keep their summary order.
+    fn tabs(state: &StateView) -> Vec<String> {
+        let mut tabs: Vec<String> = Vec::new();
+        for repo in state.repos.iter().map(|repo| repo.alias.as_str()) {
+            if state.tickets.iter().any(|ticket| ticket.repo == repo)
+                && !tabs.iter().any(|tab| tab == repo)
+            {
+                tabs.push(repo.to_string());
+            }
         }
+        for repo in state.tickets.iter().map(|ticket| ticket.repo.as_str()) {
+            if !tabs.iter().any(|tab| tab == repo) {
+                tabs.push(repo.to_string());
+            }
+        }
+        tabs
+    }
+
+    /// The repository tab that the list shows.
+    fn tab(&self, state: &StateView) -> Option<String> {
+        let tabs = Self::tabs(state);
+        match self.tab.as_deref() {
+            Some(tab) if tabs.iter().any(|current| current == tab) => Some(tab.to_string()),
+            _ => tabs.first().cloned(),
+        }
+    }
+
+    /// Switch to the previous or next repository tab and reset the selection.
+    fn switch_tab(&mut self, state: &StateView, step: isize) {
+        let tabs = Self::tabs(state);
+        if tabs.len() < 2 {
+            return;
+        }
+        let current = self
+            .tab
+            .as_deref()
+            .and_then(|tab| tabs.iter().position(|candidate| candidate == tab))
+            .unwrap_or(0) as isize;
+        let next = (current + step).rem_euclid(tabs.len() as isize) as usize;
+        self.tab = Some(tabs[next].clone());
+        self.selected = 0;
+    }
+
+    /// The active-tab summaries that match the active search text.
+    fn filtered<'a>(&self, state: &'a StateView) -> Vec<&'a TicketSummary> {
+        let Some(tab) = self.tab(state) else {
+            return Vec::new();
+        };
+        let query = self.query.trim().to_ascii_lowercase();
         state
             .tickets
             .iter()
+            .filter(|ticket| ticket.repo == tab)
             .filter(|ticket| {
-                let number = ticket.number.to_string();
-                let marked_number = format!("#{number}");
-                ticket.repo.to_ascii_lowercase().contains(&query)
-                    || number.contains(&query)
-                    || marked_number.contains(&query)
-                    || ticket.title.to_ascii_lowercase().contains(&query)
-                    || ticket
-                        .labels
-                        .iter()
-                        .any(|label| label.to_ascii_lowercase().contains(&query))
+                query.is_empty() || {
+                    let number = ticket.number.to_string();
+                    let marked_number = format!("#{number}");
+                    number.contains(&query)
+                        || marked_number.contains(&query)
+                        || ticket.title.to_ascii_lowercase().contains(&query)
+                        || ticket
+                            .labels
+                            .iter()
+                            .any(|label| label.to_ascii_lowercase().contains(&query))
+                }
             })
             .collect()
     }
@@ -371,6 +444,8 @@ impl Tickets {
         }
         match key.code {
             KeyCode::Char('/') => self.searching = true,
+            KeyCode::Char('h') | KeyCode::Left => self.switch_tab(state, -1),
+            KeyCode::Char('l') | KeyCode::Right => self.switch_tab(state, 1),
             KeyCode::Char('j') | KeyCode::Down => {
                 let count = self.filtered(state).len();
                 if count > 0 {
@@ -415,6 +490,8 @@ impl Tickets {
         self.chat.clear();
         self.chat_active = false;
         self.proposal_request = None;
+        self.body_lines.clear();
+        self.proposal_lines.clear();
     }
 
     /// Apply one key inside the direct editor.
@@ -476,6 +553,7 @@ impl Tickets {
                 if let Some(details) = self.details.as_mut() {
                     details.issue = conflict.remote;
                 }
+                self.refresh_body_render();
                 self.editor = None;
                 self.conflict = None;
                 self.conflict_open = false;
@@ -641,7 +719,7 @@ impl Tickets {
         }
     }
 
-    /// Draw grouped ticket rows with one search line.
+    /// Draw grouped ticket rows with one tab row and one search line.
     fn draw_list(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         let block = Block::bordered().title(" tickets // open issues ");
         let inner = block.inner(area);
@@ -656,14 +734,24 @@ impl Tickets {
         } else {
             format!(" / {}", self.query)
         };
-        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        let tabbed = Self::tabs(state).len() > 1;
+        let mut constraints = vec![Constraint::Length(1)];
+        if tabbed {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+        let rows = Layout::vertical(constraints).split(inner);
         frame.render_widget(Paragraph::new(query).style(THEME.dim()), rows[0]);
+        if tabbed {
+            self.draw_tabs(frame, rows[1], state);
+        }
+        let list = rows[rows.len() - 1];
 
         let filtered = self.filtered(state);
         if filtered.is_empty() {
             frame.render_widget(
                 Paragraph::new("No open issue matches the search.").style(THEME.dim()),
-                rows[1],
+                list,
             );
             return;
         }
@@ -704,7 +792,34 @@ impl Tickets {
             }
             lines.push(line);
         }
-        frame.render_widget(Paragraph::new(lines), rows[1]);
+        frame.render_widget(Paragraph::new(lines), list);
+    }
+
+    /// Draw one tab per repository that owns open issues.
+    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
+        let active = self.tab(state);
+        let mut spans = Vec::new();
+        for (index, tab) in Self::tabs(state).iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" │ ", THEME.dim()));
+            }
+            let count = state
+                .tickets
+                .iter()
+                .filter(|ticket| ticket.repo == *tab)
+                .count();
+            let style = if active.as_deref() == Some(tab.as_str()) {
+                Style::default()
+                    .fg(THEME.accent)
+                    .bg(THEME.selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                THEME.dim()
+            };
+            spans.push(Span::styled(format!(" {tab} {count} "), style));
+        }
+        spans.push(Span::styled("  h l repo", THEME.dim()));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Draw the issue data and the configured ticket chat pane.
@@ -758,14 +873,16 @@ impl Tickets {
                         Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
-                    Line::from(issue.body.clone()),
+                ];
+                lines.extend(self.body_lines.iter().cloned());
+                lines.extend([
                     Line::from(""),
                     Line::from(format!("Labels: {labels}")),
                     Line::from(format!("Author: {}", issue.author)),
                     Line::from(format!("Assignees: {assignees}")),
                     Line::from(format!("Updated: {}", issue.updated_at)),
                     Line::from(format!("GitHub: {}", issue.github_url)),
-                ];
+                ]);
                 if let Some(proposal) = details.proposal.as_ref() {
                     lines.extend([
                         Line::from(""),
@@ -776,8 +893,8 @@ impl Tickets {
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Line::from(format!("Title: {}", proposal.title)),
-                        Line::from(format!("Description: {}", proposal.body)),
                     ]);
+                    lines.extend(self.proposal_lines.iter().cloned());
                 }
                 lines.push(result_line(self.result.as_ref()));
                 lines
@@ -1098,6 +1215,7 @@ mod tests {
 
     fn state() -> StateView {
         let mut state = StateView {
+            protocol_revision: crate::sock::WIRE_PROTOCOL_REVISION,
             repos: Vec::new(),
             stages: Vec::new(),
             lanes: Vec::new(),
@@ -1259,15 +1377,128 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_repository_number_title_and_label_text() {
+    fn search_matches_number_title_and_label_text_inside_the_active_tab() {
         let state = state();
-        for query in ["borsuk", "#42", "ticket list", "analysis"] {
+        for query in ["#7", "ticket list", "ui"] {
             let tickets = Tickets {
                 query: query.to_string(),
                 ..Tickets::default()
             };
             assert_eq!(tickets.filtered(&state).len(), 1, "query {query}");
         }
+        for query in ["#42", "analysis", "borsuk"] {
+            let tickets = Tickets {
+                query: query.to_string(),
+                tab: Some("borsuk".to_string()),
+                ..Tickets::default()
+            };
+            assert!(
+                tickets.filtered(&state).is_empty(),
+                "query {query} left its tab"
+            );
+        }
+    }
+
+    #[test]
+    fn h_and_l_switch_repo_tabs_and_limit_the_list_to_one_tab() {
+        let mut state = state();
+        state.tickets.insert(
+            1,
+            TicketSummary {
+                repo: "borsuk".to_string(),
+                number: 8,
+                title: "Second borsuk issue".to_string(),
+                labels: Vec::new(),
+                updated_at: "2026-08-31T12:00:00Z".to_string(),
+                group: TicketGroup::Untouched,
+            },
+        );
+        let mut tickets = Tickets::default();
+        assert_eq!(tickets.tab(&state).as_deref(), Some("borsuk"));
+
+        tickets.handle_key(&state, key(KeyCode::Char('j')));
+        assert_eq!(tickets.selected, 1);
+
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(tickets.tab(&state).as_deref(), Some("qubitsok"));
+
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(tickets.tab(&state).as_deref(), Some("borsuk"), "l wraps");
+
+        tickets.handle_key(&state, key(KeyCode::Char('h')));
+        assert_eq!(tickets.tab(&state).as_deref(), Some("qubitsok"), "h wraps");
+        assert_eq!(tickets.selected, 0, "a tab switch resets the selection");
+
+        let action = tickets.handle_key(&state, key(KeyCode::Enter));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = action else {
+            panic!("enter must open the issue of the active tab");
+        };
+        assert_eq!(repo, "qubitsok");
+        assert_eq!(number, 42);
+    }
+
+    #[test]
+    fn a_tab_switch_keeps_the_search_text() {
+        let state = state();
+        let mut tickets = Tickets {
+            query: "analysis".to_string(),
+            ..Tickets::default()
+        };
+        assert!(tickets.filtered(&state).is_empty());
+
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(tickets.query, "analysis");
+        assert_eq!(tickets.filtered(&state).len(), 1);
+    }
+
+    #[test]
+    fn body_render_renders_markdown_once_per_update() {
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state(), key(KeyCode::Enter));
+
+        let mut incoming = details();
+        incoming.issue.body = "## Heading\n\n- [ ] step".to_string();
+        incoming.proposal = Some(crate::sock::TicketProposal {
+            id: "proposal-1".to_string(),
+            title: "Rename".to_string(),
+            body: "**bold** plan".to_string(),
+            original_title: "Improve the ticket list".to_string(),
+            original_body: "Show every issue without leaving the terminal.".to_string(),
+        });
+        tickets.observe_details(incoming);
+
+        let text_of = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text_of(&tickets.body_lines[0]), "Heading");
+        assert!(tickets.body_lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(text_of(&tickets.proposal_lines[0]), "bold plan");
+        assert!(tickets.proposal_lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+
+        let mut updated = details();
+        updated.issue.body = "Replaced body".to_string();
+        tickets.observe_result(TicketResult {
+            request: "request-1".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: TicketResultKind::Success,
+            message: "saved".to_string(),
+            issue: Some(updated.issue),
+            conflict: None,
+        });
+        assert_eq!(
+            tickets.body_lines.iter().map(text_of).collect::<Vec<_>>(),
+            vec!["Replaced body".to_string()]
+        );
     }
 
     #[test]
@@ -1503,7 +1734,7 @@ mod tests {
         tickets.handle_key(&state, key(KeyCode::Esc));
         tickets.handle_key(&state, key(KeyCode::Esc));
 
-        tickets.handle_key(&state, key(KeyCode::Down));
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
         tickets.handle_key(&state, key(KeyCode::Enter));
 
         assert_eq!(tickets.focus_key, Some(("qubitsok".to_string(), 42)));

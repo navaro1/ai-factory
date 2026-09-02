@@ -288,13 +288,15 @@ would break trust.
 
 ### Tickets, view 4
 
-The Tickets view shows every open issue from every configured repository.
+The Tickets view shows one tab per repository that has open issues.
+The tabs follow the repository order of the configuration.
 It excludes pull requests. It groups untouched, `to-refine`, and `refined`
-issues.
+issues inside the active tab.
 
 | Context | Key | Action |
 |---|---|---|
-| List | `/` | Search repository, number, title, and label text. |
+| List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
+| List | `/` | Search the active tab: number, title, and label text. |
 | List | `enter` | Open the selected issue. |
 | Issue | `e` | Edit the title and description. |
 | Issue | `l` | Open the repository label picker. |
