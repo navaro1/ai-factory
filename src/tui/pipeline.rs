@@ -1385,13 +1385,40 @@ fn release_repo_spans(
     spans
 }
 
+/// The largest title character count on one board row.
+const TITLE_CHARS: usize = 32;
+
+/// Cut `text` to at most [`TITLE_CHARS`] characters.
+fn truncate(text: &str) -> String {
+    if text.chars().count() <= TITLE_CHARS {
+        text.to_string()
+    } else {
+        text.chars().take(TITLE_CHARS).collect()
+    }
+}
+
+/// The GitHub number and title of the task's ticket, when the state view
+/// knows one.
+///
+/// The tickets list holds open issues only, so a pull request task finds
+/// nothing and its row keeps the bare item label.
+fn ticket_label(state: &StateView, task: &TaskView) -> Option<String> {
+    let number = task.number;
+    state
+        .tickets
+        .iter()
+        .find(|ticket| ticket.repo == task.repo && ticket.number == number)
+        .map(|ticket| format!("#{number} {}", truncate(&ticket.title)))
+}
+
 /// The spans of one ticket row: item, state, attempt, and queued messages.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
 /// state, because it cannot start. A task in any other state keeps its true
 /// state: a pause blocks starts, it does not stop running tasks. A count
 /// above zero of queued messages adds a badge, so a waiting message stays
-/// visible from the board.
+/// visible from the board. A matching open issue adds its number and title,
+/// so the row names the ticket as the Tickets view does.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
@@ -1416,6 +1443,9 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     if task.attempt > 1 {
         spans.push(Span::styled(format!(" a{}", task.attempt), THEME.dim()));
     }
+    if let Some(ticket) = ticket_label(state, task) {
+        spans.push(Span::styled(format!(" · {ticket}"), THEME.dim()));
+    }
     spans
 }
 
@@ -1436,6 +1466,9 @@ fn task_label(state: &StateView, task: &TaskView) -> String {
     }
     if task.attempt > 1 {
         label.push_str(&format!(" a{}", task.attempt));
+    }
+    if let Some(ticket) = ticket_label(state, task) {
+        label.push_str(&format!(" · {ticket}"));
     }
     label
 }
@@ -2280,6 +2313,85 @@ mod tests {
 
         // A ticket without queued messages shows no badge.
         assert!(!text.contains("i142 queued m"));
+    }
+
+    #[test]
+    fn a_matching_open_issue_shows_its_number_and_title_on_the_board() {
+        let mut state = sample_view();
+        state.tickets.push(crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "Fix the flaky retry".to_string(),
+            labels: vec!["bug".to_string()],
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Refined,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(
+            text.contains("i140 running a2 · #140 Fix the flaky retry"),
+            "board:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_task_without_a_matching_issue_keeps_the_bare_row() {
+        let mut state = sample_view();
+        state.tickets.push(crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "Fix the flaky retry".to_string(),
+            labels: Vec::new(),
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Refined,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_string(&mut app);
+
+        // Only issue 140 of borsuk carries a title; the rest stay bare.
+        assert!(!text.contains("i142 queued ·"));
+        assert!(!text.contains("i7 queued ·"));
+        assert!(!text.contains("p7 running ·"));
+    }
+
+    #[test]
+    fn a_long_title_is_cut_to_the_row_budget() {
+        let mut state = sample_view();
+        state.tickets.push(crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "a".repeat(60),
+            labels: Vec::new(),
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Refined,
+        });
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 240, 24);
+
+        assert!(text.contains(&format!("· #140 {}", "a".repeat(32))));
+        assert!(!text.contains(&format!("· #140 {}", "a".repeat(33))));
+    }
+
+    #[test]
+    fn truncate_cuts_at_the_character_budget() {
+        assert_eq!(truncate("short"), "short");
+        assert_eq!(truncate(&"x".repeat(40)), "x".repeat(32));
     }
 
     #[test]
