@@ -58,6 +58,14 @@ fn aif_help_lists_all_subcommands() {
 }
 
 #[test]
+fn aif_reports_the_0_6_0_version() {
+    let output = run(env!("CARGO_BIN_EXE_aif"), &["--version"]);
+
+    assert!(output.status.success());
+    assert_eq!(stdout(&output), "aif 0.6.0\n");
+}
+
+#[test]
 fn aif_doctor_help_lists_the_clean_options() {
     let output = run(env!("CARGO_BIN_EXE_aif"), &["doctor", "--help"]);
 

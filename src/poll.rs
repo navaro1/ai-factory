@@ -648,21 +648,31 @@ mod tests {
     fn two_repo_config() -> Config {
         Config::parse(
             r#"
+schema_version = 1
+
 [stage.refine]
 model = "m"
-runner = "claude"
+harness = "claude"
 
 [stage.implement]
 model = "m"
-runner = "opencode"
+harness = "opencode"
 
 [stage.review]
 model = "m"
-runner = "opencode"
+harness = "opencode"
 
 [stage.release]
 model = "m"
-runner = "claude"
+harness = "claude"
+
+[ticket.create]
+harness = "opencode"
+model = "m"
+
+[ticket.chat]
+harness = "claude"
+model = "m"
 
 [repo.a]
 path = "/repos/a"

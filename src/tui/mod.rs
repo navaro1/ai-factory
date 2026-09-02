@@ -22,6 +22,7 @@ pub mod inbox;
 pub mod markdown;
 pub mod pipeline;
 pub mod session;
+pub mod settings;
 pub mod theme;
 pub mod tickets;
 pub mod transcript;
@@ -50,6 +51,7 @@ use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
+use settings::Settings;
 use theme::THEME;
 use tickets::Tickets;
 
@@ -65,6 +67,8 @@ enum View {
     Inbox,
     /// All open GitHub issues.
     Tickets,
+    /// The execution role settings editor.
+    Settings,
 }
 
 /// What the operator has marked in the visible view.
@@ -95,6 +99,8 @@ enum Msg {
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
     TicketResult(crate::sock::TicketResult),
+    /// One settings save or reload result.
+    SettingsResult(crate::sock::SettingsResult),
     /// The socket reader reached the daemon.
     Connected,
     /// The daemon went away, with the reason for the banner.
@@ -166,12 +172,14 @@ impl Confirm {
     /// Send the confirmed action and toast what was sent.
     fn send(self, app: &mut App, sink: &mut impl ActionSink) {
         match self {
-            Confirm::Abort { task } => emit(
-                app,
-                sink,
-                Action::Abort { task: task.clone() },
-                format!("sent abort {task}"),
-            ),
+            Confirm::Abort { task } => {
+                emit(
+                    app,
+                    sink,
+                    Action::Abort { task: task.clone() },
+                    format!("sent abort {task}"),
+                );
+            }
             Confirm::Go { repo, prs } => {
                 let current = app.state.as_ref().is_some_and(|state| {
                     state.trains.iter().any(|train| {
@@ -225,6 +233,8 @@ struct App {
     inbox: Inbox,
     /// The open issue list and its nested views.
     tickets: Tickets,
+    /// The execution role settings editor.
+    settings: Settings,
     /// The task id the session view follows.
     session_task: Option<String>,
     /// The task the shell still waits for, from `r` or `n`.
@@ -294,6 +304,7 @@ impl App {
     fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
+        self.settings.delivery_failed(None);
     }
 
     /// The toast text while it is still fresh.
@@ -316,6 +327,7 @@ impl App {
             View::Session => true,
             View::Inbox => self.inbox.typing(),
             View::Tickets => self.tickets.typing(),
+            View::Settings => self.settings.typing(),
             View::Pipeline => false,
         }
     }
@@ -408,6 +420,7 @@ impl App {
                     KeyCode::Char('2') => self.view = View::Session,
                     KeyCode::Char('3') => {}
                     KeyCode::Char('4') => self.view = View::Tickets,
+                    KeyCode::Char('5') => self.view = View::Settings,
                     KeyCode::Char('?') => self.help = true,
                     KeyCode::Esc => self.view = View::Pipeline,
                     _ => {
@@ -420,6 +433,7 @@ impl App {
                 KeyCode::Char('2') => self.view = View::Session,
                 KeyCode::Char('3') => self.view = View::Inbox,
                 KeyCode::Char('4') => self.view = View::Tickets,
+                KeyCode::Char('5') => self.view = View::Settings,
                 KeyCode::Char('?') => self.help = true,
                 KeyCode::Char('j') | KeyCode::Down => pipeline::move_selection(self, 1),
                 KeyCode::Char('k') | KeyCode::Up => pipeline::move_selection(self, -1),
@@ -443,6 +457,10 @@ impl App {
                             return true;
                         }
                         KeyCode::Char('4') => return true,
+                        KeyCode::Char('5') => {
+                            self.view = View::Settings;
+                            return true;
+                        }
                         KeyCode::Char('?') => {
                             self.help = true;
                             return true;
@@ -460,6 +478,44 @@ impl App {
                 }
                 if key.code == KeyCode::Esc && !nested {
                     self.view = View::Pipeline;
+                }
+            }
+            View::Settings => {
+                if !self.settings.typing() {
+                    match key.code {
+                        KeyCode::Char('1') => {
+                            self.view = View::Pipeline;
+                            return true;
+                        }
+                        KeyCode::Char('2') => {
+                            self.view = View::Session;
+                            return true;
+                        }
+                        KeyCode::Char('3') => {
+                            self.view = View::Inbox;
+                            return true;
+                        }
+                        KeyCode::Char('4') => {
+                            self.view = View::Tickets;
+                            return true;
+                        }
+                        KeyCode::Char('5') => return true,
+                        KeyCode::Char('?') => {
+                            self.help = true;
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(action) = self
+                    .state
+                    .as_ref()
+                    .and_then(|state| self.settings.handle_key(state, key))
+                {
+                    let copy = action.clone();
+                    if !emit(self, sink, action, "sent settings request".to_string()) {
+                        self.settings.delivery_failed(Some(&copy));
+                    }
                 }
             }
         }
@@ -554,9 +610,12 @@ fn digit_key(key: KeyEvent) -> bool {
 }
 
 /// Send one action to the sink and toast what was sent.
-fn emit(app: &mut App, sink: &mut impl ActionSink, action: Action, toast: String) {
-    sink.send_action(action);
-    app.show_toast(&toast);
+fn emit(app: &mut App, sink: &mut impl ActionSink, action: Action, toast: String) -> bool {
+    let sent = sink.send_action(action);
+    if sent {
+        app.show_toast(&toast);
+    }
+    sent
 }
 
 /// The pull request numbers as `#3 #7`.
@@ -576,9 +635,10 @@ struct CountingSink<'a, S: ActionSink> {
 }
 
 impl<S: ActionSink> ActionSink for CountingSink<'_, S> {
-    fn send_action(&mut self, action: Action) {
-        self.sent += 1;
-        self.inner.send_action(action);
+    fn send_action(&mut self, action: Action) -> bool {
+        let sent = self.inner.send_action(action);
+        self.sent += usize::from(sent);
+        sent
     }
 }
 
@@ -637,23 +697,26 @@ struct DaemonLink {
 }
 
 impl ActionSink for DaemonLink {
-    fn send_action(&mut self, action: Action) {
+    fn send_action(&mut self, action: Action) -> bool {
         if self.client.is_none() {
             self.client = self.connect();
         }
         let Some(client) = self.client.as_mut() else {
-            return;
+            return false;
         };
         if client.send(&action).is_ok() {
-            return;
+            return true;
         }
         // The daemon went away. One fresh connection gets one new try.
         self.client = self.connect();
         if let Some(client) = self.client.as_mut() {
             if let Err(error) = client.send(&action) {
                 eprintln!("tui: cannot send the action to the daemon: {error:#}");
+                return false;
             }
+            return true;
         }
+        false
     }
 }
 
@@ -822,6 +885,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::SettingsResult(result)) => {
+                                        if tx.send(Msg::SettingsResult(result)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Err(error) => {
                                         if error.downcast_ref::<WireProtocolMismatch>().is_some() {
                                             if tx.send(Msg::Fatal(format!("{error:#}"))).is_err() {
@@ -872,7 +940,7 @@ fn run_loop(
                     let changed = match app.view {
                         View::Session => app.session.poll(now),
                         View::Tickets => app.tickets.poll(now),
-                        View::Pipeline | View::Inbox => false,
+                        View::Pipeline | View::Inbox | View::Settings => false,
                     };
                     if changed {
                         draw_app(surface, app, now)?;
@@ -912,6 +980,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::TicketResult(result) => {
             app.tickets.observe_result(result);
+            Ok(true)
+        }
+        Msg::SettingsResult(result) => {
+            app.settings.observe_result(result);
             Ok(true)
         }
         Msg::Connected => {
@@ -1019,6 +1091,11 @@ fn render_with_clock(
                 app.tickets.draw(f, body, state);
             }
         }
+        View::Settings => {
+            if let Some(state) = app.state.as_ref() {
+                app.settings.draw(f, body, state);
+            }
+        }
     }
     draw_toast(f, app, body);
     draw_footer(f, app, footer);
@@ -1031,7 +1108,7 @@ fn render_with_clock(
 
 /// Draw the title row: app name, view tabs, pause flag, and socket state.
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(26)]).split(area);
+    let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
     let title = Style::default()
         .fg(THEME.accent)
         .add_modifier(Modifier::BOLD);
@@ -1040,6 +1117,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     tabs.push(tab_span("2", "session", app.view == View::Session));
     tabs.push(tab_span("3", "inbox", app.view == View::Inbox));
     tabs.push(tab_span("4", "tickets", app.view == View::Tickets));
+    tabs.push(tab_span("5", "settings", app.view == View::Settings));
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
@@ -1104,7 +1182,7 @@ fn banner_text(app: &App) -> String {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
     let hints = Span::styled(
-        " 1/2/3/4 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
+        " 1/2/3/4/5 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
         THEME.dim(),
     );
     f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
@@ -1170,11 +1248,11 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(44, 27, area);
+    let panel = centered(78, 17, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 25] = [
-        ("1 2 3 4", "switch view"),
-        ("esc", "home view"),
+    let rows: [(&str, &str); 30] = [
+        ("1 2 3 4 5", "switch view"),
+        ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
         ("j k Up Down", "move inside a lane"),
         ("h l Left Right", "move between lanes"),
@@ -1197,22 +1275,33 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
         ("/ e l c a", "search and ticket actions"),
-        ("h l", "switch the tickets repo tab"),
+        ("h l", "tickets repo / settings scope"),
+        ("j k", "settings role"),
+        ("Tab", "select settings field"),
+        ("Enter", "edit settings value"),
+        ("s r", "save / reload settings"),
+        ("d", "remove repository override"),
     ];
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(key, text)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {key} "),
-                    Style::default()
-                        .fg(THEME.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {text}")),
-            ])
-        })
-        .collect();
+    let mut sorted = rows.to_vec();
+    sorted.sort_by_key(|(key, text)| std::cmp::Reverse(key.len() + text.len()));
+    let mut lines = Vec::new();
+    for row in 0..15 {
+        let mut spans = Vec::new();
+        for (column, index) in [row, 29 - row].into_iter().enumerate() {
+            let (key, text) = sorted[index];
+            if column > 0 {
+                spans.push(Span::raw("    "));
+            }
+            spans.push(Span::styled(
+                format!(" {key}  "),
+                Style::default()
+                    .fg(THEME.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(text));
+        }
+        lines.push(Line::from(spans));
+    }
     let block = Paragraph::new(lines).block(Block::bordered().title(" keys "));
     f.render_widget(block, panel);
 }
@@ -1285,8 +1374,17 @@ mod tests {
     struct FakeSink(Vec<Action>);
 
     impl ActionSink for FakeSink {
-        fn send_action(&mut self, action: Action) {
+        fn send_action(&mut self, action: Action) -> bool {
             self.0.push(action);
+            true
+        }
+    }
+
+    struct FailSink;
+
+    impl ActionSink for FailSink {
+        fn send_action(&mut self, _action: Action) -> bool {
+            false
         }
     }
 
@@ -2531,5 +2629,80 @@ mod tests {
         assert!(disabled.get());
         assert!(message.contains("leave failed"));
         assert!(message.contains("disable failed"));
+    }
+
+    #[test]
+    fn key_five_opens_the_settings_view_and_updates_the_shell_text() {
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        assert!(app.handle_key(
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            &mut sink
+        ));
+
+        assert_eq!(app.view, View::Settings);
+        let text = render_to_string(&mut app);
+        assert!(text.contains("5 settings"));
+        assert!(text.contains("1/2/3/4/5 views"));
+    }
+
+    #[test]
+    fn a_failed_settings_send_allows_a_later_successful_action() {
+        let mut app = App {
+            view: View::Settings,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        let mut sink = FakeSink::default();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert_eq!(sink.0.len(), 1);
+    }
+
+    #[test]
+    fn a_disconnect_allows_a_later_settings_action() {
+        let mut app = App {
+            view: View::Settings,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.mark_disconnected("lost".to_string());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert_eq!(sink.0.len(), 2);
+    }
+
+    #[test]
+    fn the_help_overlay_lists_settings_actions() {
+        let mut app = App {
+            help: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        for entry in [
+            "settings scope",
+            "settings role",
+            "select settings field",
+            "edit settings value",
+            "save / reload settings",
+            "remove repository override",
+            "home / cancel settings edit",
+        ] {
+            assert!(text.contains(entry), "the help misses {entry}");
+        }
     }
 }

@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ReleasePolicy;
+use crate::config::{ReleasePolicy, ResolvedRoleSettings};
 use crate::model::Stage;
 use crate::sock::TicketProposal;
 
@@ -68,6 +68,9 @@ struct StateFile {
     /// Active issue conversations.
     #[serde(default)]
     ticket_conversations: Vec<TicketConversationState>,
+    /// Immutable role bindings, by stable task identity.
+    #[serde(default)]
+    role_bindings: BTreeMap<String, ResolvedRoleSettings>,
 }
 
 /// The state the daemon persists across restarts.
@@ -86,6 +89,8 @@ pub struct DaemonState {
     pub last_fire_ms: BTreeMap<String, u64>,
     /// Active issue conversations.
     pub ticket_conversations: Vec<TicketConversationState>,
+    /// Immutable role bindings, by stable task identity.
+    pub role_bindings: BTreeMap<String, ResolvedRoleSettings>,
 }
 
 impl DaemonState {
@@ -132,6 +137,7 @@ impl DaemonState {
                     policies: file.policies,
                     last_fire_ms: file.last_fire_ms,
                     ticket_conversations: file.ticket_conversations,
+                    role_bindings: file.role_bindings,
                 }
             }
             Err(e) => {
@@ -164,6 +170,7 @@ impl DaemonState {
             policies: self.policies.clone(),
             last_fire_ms: self.last_fire_ms.clone(),
             ticket_conversations: self.ticket_conversations.clone(),
+            role_bindings: self.role_bindings.clone(),
         };
         serde_json::to_string(&file).context("cannot serialize the daemon state")
     }
@@ -203,12 +210,23 @@ fn invalid_state(file: &StateFile) -> Option<String> {
             | ReleasePolicy::Threshold { .. } => {}
         }
     }
+    for (task, binding) in &file.role_bindings {
+        if let Err(error) = crate::config::validate_persisted_settings(
+            &binding.settings,
+            &format!("role binding {task}"),
+        ) {
+            return Some(error.to_string());
+        }
+    }
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        ExecutionRole, Harness, ResolvedRoleSettings, RoleSettings, SettingsSource,
+    };
 
     /// A unique directory for one test's files.
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -240,6 +258,7 @@ mod tests {
                 handoff_active: true,
                 proposal: None,
             }],
+            role_bindings: BTreeMap::new(),
         };
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);
@@ -290,5 +309,113 @@ mod tests {
         let loaded = DaemonState::load(&path);
         assert_eq!(loaded, DaemonState::default());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_full_role_binding_survives_a_restart() {
+        let dir = temp_dir("role-binding");
+        let path = dir.join("state.json");
+        let binding = ResolvedRoleSettings {
+            role: ExecutionRole::Implement,
+            source: SettingsSource::Repository {
+                alias: "borsuk".to_string(),
+            },
+            settings: RoleSettings {
+                harness: Harness::Codex,
+                program: "codex-custom".to_string(),
+                model: "gpt-test".to_string(),
+                effort: Some("high".to_string()),
+                extra_args: vec!["--color=never".to_string()],
+                agent: None,
+                profile: Some("factory".to_string()),
+                permission_mode: None,
+                permission_handler: None,
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: Some("never".to_string()),
+                sandbox: Some("workspace-write".to_string()),
+            },
+        };
+        let mut state = DaemonState::default();
+        state
+            .role_bindings
+            .insert("borsuk/implement-i142".to_string(), binding.clone());
+
+        state.save(&path).unwrap();
+
+        assert_eq!(
+            DaemonState::load(&path)
+                .role_bindings
+                .get("borsuk/implement-i142"),
+            Some(&binding)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_old_state_file_defaults_to_no_role_bindings() {
+        let dir = temp_dir("old-role-bindings");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"stage_limits":{},"lanes":[],"policies":{},"last_fire_ms":{}}"#,
+        )
+        .unwrap();
+
+        assert!(DaemonState::load(&path).role_bindings.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_corrupt_role_binding_discards_the_complete_state() {
+        let dir = temp_dir("corrupt-role-binding");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        let mut binding = valid_binding();
+        binding.settings.model.clear();
+        state.role_bindings.insert("task".to_string(), binding);
+        state.stage_limits.insert(Stage::Review, 9);
+        state.save(&path).unwrap();
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stale_unsafe_role_binding_discards_the_complete_state() {
+        let dir = temp_dir("unsafe-role-binding");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        let mut binding = valid_binding();
+        binding.settings.extra_args = vec!["--yolo".to_string()];
+        state.role_bindings.insert("task".to_string(), binding);
+        state.save(&path).unwrap();
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn valid_binding() -> ResolvedRoleSettings {
+        ResolvedRoleSettings {
+            role: ExecutionRole::Review,
+            source: SettingsSource::Global,
+            settings: RoleSettings {
+                harness: Harness::Codex,
+                program: "codex".to_string(),
+                model: "gpt-test".to_string(),
+                effort: None,
+                extra_args: Vec::new(),
+                agent: None,
+                profile: None,
+                permission_mode: None,
+                permission_handler: None,
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: Some("never".to_string()),
+                sandbox: Some("workspace-write".to_string()),
+            },
+        }
     }
 }
