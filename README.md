@@ -160,6 +160,27 @@ Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` fo
 
 `aif doctor` checks each configured harness program once. It applies the Claude version floor only to Claude roles.
 
+### Stop the daemon and update
+
+`aif stop` sends the stop action to the daemon. The daemon stops every live
+agent session, waits for the exits, writes its state, and exits. The wait can
+take up to 40 seconds.
+
+The same exit path serves a logout, a reboot, `systemctl --user stop
+aif-daemon`, and `Ctrl-C` on a foreground `aifd run`. Each one sends a signal
+that the daemon turns into the same stop action.
+
+To update AI Factory, run:
+
+```sh
+aif stop
+./install.sh
+aif
+```
+
+The factory resumes: pause marks, attempt counts, queued messages, stuck
+rows, and the tasks that ran at the stop come back.
+
 ### Start paused
 
 `--paused` starts a new daemon with the factory paused. The daemon polls,
@@ -348,16 +369,28 @@ Repository topology changes require a daemon restart.
   record.
 - The worktree of each issue carries the agent session id and the last
   reviewed commit as marker files.
-- `state.json` holds runtime overrides, role bindings, release times, and ticket chat metadata.
+- `state.json` holds runtime overrides, role bindings, release times, and
+  ticket chat metadata.
+- `state.json` also holds one `runtime` object. It carries the pause marks,
+  the task table with its attempt counts, the queued chat messages, the
+  review ticket sets, the release batches, and the stuck rows. The daemon
+  writes the object with every drive, so a crash keeps a snapshot that is at
+  most one drive old.
 - Task logs hold the full transcripts.
-- After a restart, the first poll rebuilds everything. Work resumes in
-  place.
+- After a restart, the first poll rebuilds everything from GitHub, and the
+  runtime object restores the rest. A task that ran at the stop becomes
+  queued again and resumes its agent session. Its first prompt carries a
+  short notice about the restart.
+- The stop sequence stops every live agent session before the daemon exits,
+  so no agent process stays behind as an orphan.
 
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
-- A restart kills the agent processes of the running tasks. The gates
-  re-open that work at the next poll.
+- An interrupted turn restarts from the stage prompt plus the restart
+  notice. The agent reads the worktree to find its place.
+- A `SIGKILL` or a power loss keeps the snapshot of the last drive, not of
+  the last event.
 - Anyone who can set the trigger labels on a repository can start work
   there.
 - A permission answer is valid for one request only. You answer the same
