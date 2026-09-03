@@ -77,6 +77,20 @@ You can change the tool list to permit write access. Add only the Claude tools t
 
 The ticket prompt no longer sets read-only access. The role settings control access.
 
+## Prompt updates
+
+The refine prompt now writes an implementation plan with chunks, ownership,
+dependencies, validation, and parallel waves.
+
+The implement prompt uses those waves. It can start up to three independent
+subagents with separate file ownership.
+
+The installer writes the version 0.6 prompts only when a prompt file is absent.
+An existing prompt file still overrides the built-in prompt.
+
+Compare each existing prompt with `docs/v0.6/prompts/`. Replace the existing
+copy when you want the new execution contract.
+
 ## Extra arguments
 
 Each `extra_args` list passes separate arguments to the harness program.

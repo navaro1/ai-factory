@@ -16,14 +16,37 @@ pub const REFINE_PROMPT: &str = r#"You refine ticket #{number} of {repo}
 ({owner_repo}). You work in {worktree}, the repository checkout. Never create
 a git worktree; stay in this checkout.
 
-Ticket #{number}: {title}
+Your goal is a complete, testable specification that minimizes delivery time.
+Do not implement the change.
 
-{body}
+Read the ticket, the repository instructions, the relevant code, and its
+dependencies. Confirm that the ticket is still valid. Keep the requested scope.
+Use parallel tool calls for independent reads. Use subagents only for sizeable,
+independent research. Use at most three subagents. Do not use a subagent for
+routine reads or for a second review.
 
-Read the ticket and the surrounding code. Edit the ticket body until it is a
-complete, testable specification: the problem, the agreed approach, the
-acceptance criteria. Write comments on the ticket with `gh` when you decide
-something the body must record.
+The ticket body must contain these sections:
+
+- Problem
+- Agreed approach
+- Acceptance criteria
+- Implementation plan
+
+The implementation plan must use this table:
+
+| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |
+|---|---|---|---|---|---|
+
+Create separate chunks only when the split reduces delivery time. Make each
+chunk large enough to justify coordination. Put independent chunks in the same
+wave only when they have no dependency and do not edit the same files. Assign
+shared files and final integration to one coordinator chunk. Put a shared
+interface or data contract before chunks that depend on it. State the final
+integration order and final validation. For a small or tightly coupled change,
+use one C1 row and state that parallel work would add delay.
+
+Edit the ticket body with `gh`. Write a ticket comment only when it preserves
+an important decision that does not belong in the body.
 
 When you need a human decision, add the `needs-human` label to the ticket with
 `gh` and state the question in a comment. Stop after the label is on.
@@ -32,6 +55,10 @@ When the specification is complete, run
 `gh issue edit {number} --remove-label to-refine --add-label refined`.
 Run this command only after the ticket body is complete. Then report one line
 that says the ticket is refined.
+
+Ticket #{number}: {title}
+
+{body}
 "#;
 
 /// The built-in prompt of an implement run.
@@ -39,14 +66,39 @@ pub const IMPLEMENT_PROMPT: &str = r#"You implement ticket #{number} of {repo}
 ({owner_repo}). You work in {worktree}, your own git worktree. Never create
 another git worktree; work only in this one.
 
-Ticket #{number}: {title}
+Your goal is a complete change that meets every acceptance criterion with the
+shortest safe delivery time. Follow the repository instructions and keep the
+requested scope. Implement the ticket on the current branch.
 
-{body}
+Use the ticket implementation plan as the execution schedule. If routine code
+details make the plan stale, update the schedule and continue. If the ticket
+has no plan, make the smallest useful schedule before edits.
 
-Implement the ticket on the current branch. Follow its acceptance criteria.
-Run the test suite and make it pass. Commit your work in small, complete
-commits. Open a draft PR with `gh pr create --draft` when the work is
-done. Put `Closes #{number}` in the body. After the command succeeds, run
+For each execution wave, start ready chunks concurrently when they are
+sizeable, independent, and have separate file ownership. If subagents are
+available, start all agents for that wave in one tool turn. Use at most three
+subagents at once. Work directly for a small, sequential, single-file, or
+tightly coupled change.
+
+Give each subagent the ticket goal, chunk identifier, exact owned paths,
+satisfied dependencies, acceptance criteria, and validation command. Tell each
+subagent to stay in this worktree, edit only its owned paths, and avoid all git
+and `gh` writes. A subagent must not start another subagent. Never
+give two concurrent writers the same file. Do not duplicate delegated work.
+
+If subagents are unavailable, execute the chunks directly in dependency order.
+
+After each wave, inspect every owned path and the combined diff. Treat missing
+or empty subagent output as a failed chunk. Complete or repair failed work before
+the next dependent wave. The coordinator owns shared files, integration, git
+operations, and GitHub operations.
+
+Run focused validation after each chunk. Run the required full validation once
+after integration. Do not run several full test suites concurrently. Make the
+test suite pass. Commit the integrated work in small, complete commits.
+
+Open a draft PR with `gh pr create --draft` when the work is done. Put
+`Closes #{number}` in the body. After the command succeeds, run
 `gh issue edit {number} --remove-label refined`.
 
 If the specification is incomplete, or you need a human decision, add the
@@ -54,6 +106,10 @@ If the specification is incomplete, or you need a human decision, add the
 comment on it, and stop. Do not guess.
 
 Report one line at the end: what you did, and the PR number.
+
+Ticket #{number}: {title}
+
+{body}
 "#;
 
 /// The built-in prompt of a review run.
@@ -218,5 +274,42 @@ mod tests {
             REVIEW_PROMPT,
             include_str!("../docs/v0.6/prompts/review.md")
         );
+    }
+
+    #[test]
+    fn the_refine_prompt_defines_a_parallel_execution_plan() {
+        let prompt = REFINE_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for required in [
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |",
+            "Put independent chunks in the same",
+            "do not edit the same files",
+            "Assign shared files and final integration to one coordinator chunk",
+            "use one C1 row",
+            "Use at most three subagents",
+        ] {
+            assert!(prompt.contains(required), "missing: {required}");
+        }
+    }
+
+    #[test]
+    fn the_implement_prompt_consumes_parallel_waves_safely() {
+        let prompt = IMPLEMENT_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for required in [
+            "Use the ticket implementation plan as the execution schedule",
+            "start all agents for that wave in one tool turn",
+            "Use at most three subagents at once",
+            "avoid all git and `gh` writes",
+            "Never give two concurrent writers the same file",
+            "If subagents are unavailable, execute the chunks directly",
+            "The coordinator owns shared files, integration, git operations, and GitHub operations",
+        ] {
+            assert!(prompt.contains(required), "missing: {required}");
+        }
     }
 }
