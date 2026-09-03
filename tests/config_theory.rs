@@ -3,6 +3,7 @@ use std::path::Path;
 use aif::config::{
     edit_config_text, Config, ExecutionRole, Governor, RoleOverride, SettingsEdit, Weekday,
 };
+use aif::sock::SettingsView;
 
 const BASE: &str = r#"
 schema_version = 1
@@ -199,8 +200,11 @@ fn a_theory_repo_value_must_be_owner_slash_name() {
 fn the_theory_roles_are_optional_global_tables() {
     let config =
         Config::parse(&format!("{BASE}{}", theory_tables())).expect("the theory tables must parse");
+    let view = SettingsView::from_config(&config, "revision").expect("the view must build");
 
     assert_eq!(config.roles.len(), 8);
+    assert_eq!(view.global.len(), 8);
+    assert_eq!(view.repositories.len(), 6);
     let resolved = config
         .resolved_role(None, "theory.audit")
         .expect("the global theory audit role must resolve");

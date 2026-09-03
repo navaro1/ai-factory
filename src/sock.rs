@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use crate::config::SettingsEdit;
 use crate::config::{
@@ -49,7 +49,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 2;
+pub const WIRE_PROTOCOL_REVISION: u32 = 3;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -114,7 +114,7 @@ pub struct StateView {
 }
 
 /// The editable factory settings and their current file revision.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsView {
     /// A stable digest of the complete `factory.toml` content.
     pub revision: String,
@@ -122,6 +122,58 @@ pub struct SettingsView {
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
+}
+
+#[derive(Serialize)]
+struct SettingsViewRef<'a> {
+    revision: &'a str,
+    global: Vec<&'a GlobalRoleSettingsView>,
+    repositories: &'a [RepositoryRoleSettingsView],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    theory_global: Vec<&'a GlobalRoleSettingsView>,
+}
+
+#[derive(Deserialize)]
+struct SettingsViewWire {
+    revision: String,
+    global: Vec<GlobalRoleSettingsView>,
+    repositories: Vec<RepositoryRoleSettingsView>,
+    #[serde(default)]
+    theory_global: Vec<GlobalRoleSettingsView>,
+}
+
+impl Serialize for SettingsView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (global, theory_global) = self
+            .global
+            .iter()
+            .partition(|value| value.role.overridable());
+        SettingsViewRef {
+            revision: &self.revision,
+            global,
+            repositories: &self.repositories,
+            theory_global,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SettingsView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut wire = SettingsViewWire::deserialize(deserializer)?;
+        wire.global.append(&mut wire.theory_global);
+        Ok(Self {
+            revision: wire.revision,
+            global: wire.global,
+            repositories: wire.repositories,
+        })
+    }
 }
 
 impl SettingsView {
@@ -1718,6 +1770,41 @@ impl Iterator for Pushes {
 mod tests {
     use super::*;
 
+    const LEGACY_WIRE_PROTOCOL_REVISION: u32 = 2;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyExecutionRole {
+        Refine,
+        Implement,
+        Review,
+        Release,
+        TicketCreate,
+        TicketChat,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyGlobalRoleSettingsView {
+        role: LegacyExecutionRole,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacySettingsView {
+        global: Vec<LegacyGlobalRoleSettingsView>,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyStateView {
+        protocol_revision: u32,
+        settings: LegacySettingsView,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyPush {
+        State(LegacyStateView),
+    }
+
     /// A temporary directory that removes itself on drop.
     struct TempDir(PathBuf);
 
@@ -2028,6 +2115,42 @@ mod tests {
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_revision_two_client_decodes_the_initial_state_before_rejecting_revision_three() {
+        let text = format!(
+            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
+             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+        let mut view = sample_view(1);
+        view.settings = SettingsView::from_config(&config, "revision").unwrap();
+        let push = Push::State(view);
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+        let legacy = serde_json::from_str::<LegacyPush>(&text)
+            .expect("revision 2 must decode the state before it checks the revision");
+        let LegacyPush::State(legacy) = legacy;
+        assert_ne!(legacy.protocol_revision, LEGACY_WIRE_PROTOCOL_REVISION);
+        assert_eq!(
+            legacy
+                .settings
+                .global
+                .into_iter()
+                .map(|entry| entry.role)
+                .collect::<Vec<_>>(),
+            vec![
+                LegacyExecutionRole::Refine,
+                LegacyExecutionRole::Implement,
+                LegacyExecutionRole::Review,
+                LegacyExecutionRole::Release,
+                LegacyExecutionRole::TicketCreate,
+                LegacyExecutionRole::TicketChat,
+            ]
+        );
     }
 
     #[test]

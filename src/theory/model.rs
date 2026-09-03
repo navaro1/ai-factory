@@ -251,10 +251,8 @@ pub fn parse(text: &str) -> Result<Model, ModelError> {
             }
             other => return Err(error(Some(&id), format!("unknown kind \"{other}\""))),
         };
+        reject_foreign_fields(raw, &entry)?;
         entries.push(entry);
-    }
-    for (raw, entry) in raw.entry.iter().zip(&entries) {
-        reject_foreign_fields(raw, entry)?;
     }
     check_references(&raw.entry, &entries)?;
     Ok(Model { entries })
@@ -497,7 +495,11 @@ mod tests {
         let text = format!(
             "{}{}",
             entry("state", "S-1", "from = \"S-2\""),
-            entry("failure", "F-2", "crosses = \"B-9\"")
+            entry(
+                "boundary",
+                "B-2",
+                "sides = [\"inside\", \"outside\"]\npaths = []"
+            )
         );
         assert_eq!(err(&text), "S-1: from is not allowed on kind state");
     }
