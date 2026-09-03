@@ -303,6 +303,7 @@ issues inside the active tab.
 |---|---|---|
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
+| List | `n` | Create a ticket in the active repository tab. |
 | List | `enter` | Open the selected issue. |
 | Issue | `e` | Edit the title and description. |
 | Issue | `l` | Open the repository label picker. |

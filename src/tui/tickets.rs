@@ -69,6 +69,35 @@ struct NewLabelForm {
     error: Option<String>,
 }
 
+/// The active field of the new-ticket form.
+#[derive(Debug, Clone, Copy, Default)]
+enum NewTicketField {
+    /// The title field.
+    #[default]
+    Title,
+    /// The description field.
+    Body,
+}
+
+/// One direct new-ticket draft.
+#[derive(Debug, Clone, Default)]
+struct NewTicketForm {
+    /// The repository that receives the ticket.
+    repo: String,
+    /// The pending title.
+    title: String,
+    /// The pending description.
+    body: String,
+    /// The field that receives text.
+    field: NewTicketField,
+    /// The current validation or daemon error.
+    error: Option<String>,
+    /// The request identity of the create in flight.
+    request: Option<String>,
+    /// True while one create waits for its result.
+    pending: bool,
+}
+
 /// The Tickets view state.
 #[derive(Debug, Default)]
 pub struct Tickets {
@@ -94,6 +123,8 @@ pub struct Tickets {
     label_selected: usize,
     /// The open new-label form.
     new_label_form: Option<NewLabelForm>,
+    /// The open new-ticket form.
+    new_ticket: Option<NewTicketForm>,
     /// The last mutation result.
     result: Option<TicketResult>,
     /// The retained direct edit draft.
@@ -129,6 +160,7 @@ impl Tickets {
         self.searching
             || self.editor.as_ref().is_some_and(|editor| editor.open)
             || self.new_label_form.is_some()
+            || self.new_ticket.is_some()
             || self.chat_active
     }
 
@@ -254,6 +286,25 @@ impl Tickets {
 
     /// Apply one ticket mutation response.
     pub fn observe_result(&mut self, result: TicketResult) {
+        if self.new_ticket.is_some() {
+            let form_request = self
+                .new_ticket
+                .as_ref()
+                .and_then(|form| form.request.as_deref());
+            if form_request == Some(result.request.as_str()) {
+                match result.kind {
+                    TicketResultKind::Success => self.new_ticket = None,
+                    TicketResultKind::Failure => {
+                        if let Some(form) = self.new_ticket.as_mut() {
+                            form.pending = false;
+                            form.error = Some(result.message.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
         let current = self
             .focus_key
             .as_ref()
@@ -479,6 +530,9 @@ impl Tickets {
             }
             return None;
         }
+        if self.new_ticket.is_some() {
+            return self.handle_new_ticket_key(key);
+        }
         if self.searching {
             match key.code {
                 KeyCode::Esc => {
@@ -501,6 +555,17 @@ impl Tickets {
         }
         match key.code {
             KeyCode::Char('/') => self.searching = true,
+            KeyCode::Char('n') => {
+                let repo = self
+                    .tab(state)
+                    .or_else(|| state.repos.first().map(|repo| repo.alias.clone()));
+                if let Some(repo) = repo {
+                    self.new_ticket = Some(NewTicketForm {
+                        repo,
+                        ..NewTicketForm::default()
+                    });
+                }
+            }
             KeyCode::Char('h') | KeyCode::Left => self.switch_tab(state, -1),
             KeyCode::Char('l') | KeyCode::Right => self.switch_tab(state, 1),
             KeyCode::Char('j') | KeyCode::Down => {
@@ -745,6 +810,70 @@ impl Tickets {
         None
     }
 
+    /// Apply one key inside the new-ticket form.
+    fn handle_new_ticket_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            let form = self.new_ticket.as_mut()?;
+            if form.pending {
+                return None;
+            }
+            let title = form.title.trim().to_string();
+            if title.is_empty() {
+                form.error = Some("The ticket title must not be empty.".to_string());
+                return None;
+            }
+            let request = request_code();
+            let repo = form.repo.clone();
+            let body = form.body.clone();
+            form.request = Some(request.clone());
+            form.pending = true;
+            form.error = None;
+            return Some(Action::Ticket(TicketAction::Create {
+                request,
+                repo,
+                title,
+                body,
+            }));
+        }
+
+        let form = self.new_ticket.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.new_ticket = None,
+            KeyCode::Tab => {
+                form.field = match form.field {
+                    NewTicketField::Title => NewTicketField::Body,
+                    NewTicketField::Body => NewTicketField::Title,
+                };
+                form.error = None;
+            }
+            KeyCode::Backspace => {
+                match form.field {
+                    NewTicketField::Title => {
+                        form.title.pop();
+                    }
+                    NewTicketField::Body => {
+                        form.body.pop();
+                    }
+                }
+                form.error = None;
+            }
+            KeyCode::Enter if matches!(form.field, NewTicketField::Body) => form.body.push('\n'),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match form.field {
+                    NewTicketField::Title => form.title.push(character),
+                    NewTicketField::Body => form.body.push(character),
+                }
+                form.error = None;
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Add the created label to the visible catalog and close its form.
     fn finish_new_label(&mut self) {
         let Some(form) = self.new_label_form.take() else {
@@ -773,6 +902,8 @@ impl Tickets {
     pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         if self.focus {
             self.draw_focus(frame, area, state);
+        } else if self.new_ticket.is_some() {
+            self.draw_new_ticket(frame, area);
         } else {
             self.draw_list(frame, area, state);
         }
@@ -1172,6 +1303,57 @@ impl Tickets {
             .error
             .as_deref()
             .unwrap_or("tab field · ctrl-s create and attach · esc labels");
+        let color = if form.error.is_some() {
+            THEME.error
+        } else {
+            THEME.dim
+        };
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(color)),
+            rows[2],
+        );
+    }
+
+    /// Draw the new-ticket creation form.
+    fn draw_new_ticket(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(form) = self.new_ticket.as_ref() else {
+            return;
+        };
+        let rows = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let title_style = if matches!(form.field, NewTicketField::Title) {
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(THEME.text)
+        };
+        let body_style = if matches!(form.field, NewTicketField::Body) {
+            Style::default().fg(THEME.accent)
+        } else {
+            Style::default().fg(THEME.text)
+        };
+        frame.render_widget(
+            Paragraph::new(form.title.clone())
+                .style(title_style)
+                .block(Block::bordered().title(format!(" new ticket // {} ", form.repo))),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(form.body.clone())
+                .style(body_style)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title(" description ")),
+            rows[1],
+        );
+        let status = form
+            .error
+            .as_deref()
+            .unwrap_or("tab field · enter newline · ctrl-s create · esc cancel");
         let color = if form.error.is_some() {
             THEME.error
         } else {
@@ -2153,5 +2335,269 @@ mod tests {
         assert!(tickets.result.is_none());
         assert!(tickets.conflict.is_none());
         assert!(!tickets.conflict_open);
+    }
+
+    fn type_string(tickets: &mut Tickets, state: &StateView, text: &str) {
+        for character in text.chars() {
+            tickets.handle_key(state, key(KeyCode::Char(character)));
+        }
+    }
+
+    fn send_key(tickets: &mut Tickets, state: &StateView) -> Option<Action> {
+        tickets.handle_key(
+            state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+    }
+
+    #[test]
+    fn n_opens_the_new_ticket_form_for_the_active_tab() {
+        let state = state();
+        let mut tickets = Tickets::default();
+
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+
+        let form = tickets.new_ticket.as_ref().expect("n must open the form");
+        assert_eq!(form.repo, "borsuk");
+        assert!(tickets.typing(), "the form must own the keyboard");
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(tickets.new_ticket.is_none(), "esc drops the draft");
+
+        let mut switched = Tickets::default();
+        switched.handle_key(&state, key(KeyCode::Char('l')));
+        switched.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(switched.new_ticket.as_ref().unwrap().repo, "qubitsok");
+    }
+
+    #[test]
+    fn n_falls_back_to_the_first_repo_and_ignores_an_empty_state() {
+        let mut state = state();
+        state.tickets.clear();
+        state.repos = vec![crate::sock::RepoView {
+            alias: "ryba".to_string(),
+            owner_repo: String::new(),
+        }];
+
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(
+            tickets.new_ticket.as_ref().unwrap().repo,
+            "ryba",
+            "no tab falls back to the first repository"
+        );
+
+        let empty = StateView {
+            tickets: Vec::new(),
+            repos: Vec::new(),
+            ..state
+        };
+        let mut idle = Tickets::default();
+        idle.handle_key(&empty, key(KeyCode::Char('n')));
+        assert!(
+            idle.new_ticket.is_none(),
+            "an empty state must not open the form"
+        );
+    }
+
+    #[test]
+    fn n_stays_free_in_the_focus_and_types_inside_the_search() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert!(tickets.new_ticket.is_none(), "the focus keeps n free");
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Char('/')));
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert!(
+            tickets.new_ticket.is_none(),
+            "the search input must not open the form"
+        );
+        assert_eq!(tickets.query, "n", "the letter went into the search");
+    }
+
+    #[test]
+    fn ctrl_s_sends_one_create_for_the_form_repository() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "  Direct title ");
+        tickets.handle_key(&state, key(KeyCode::Tab));
+        type_string(&mut tickets, &state, "Body");
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.handle_key(&state, key(KeyCode::Char('x')));
+
+        let action = send_key(&mut tickets, &state);
+        let Some(Action::Ticket(TicketAction::Create {
+            request,
+            repo,
+            title,
+            body,
+        })) = action
+        else {
+            panic!("ctrl-s must send one create action");
+        };
+        assert!(!request.is_empty(), "the request code must be fresh");
+        assert_eq!(repo, "borsuk");
+        assert_eq!(title, "Direct title");
+        assert_eq!(body, "Body\nx");
+
+        let form = tickets.new_ticket.as_ref().unwrap();
+        assert_eq!(form.request.as_deref(), Some(request.as_str()));
+        assert!(form.pending, "the form must mark one create in flight");
+
+        let second = send_key(&mut tickets, &state);
+        assert!(second.is_none(), "a pending create must not resend");
+    }
+
+    #[test]
+    fn ctrl_s_with_an_empty_title_shows_the_error_and_sends_nothing() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "   ");
+
+        let action = send_key(&mut tickets, &state);
+
+        assert!(action.is_none());
+        let form = tickets.new_ticket.as_ref().unwrap();
+        assert_eq!(
+            form.error.as_deref(),
+            Some("The ticket title must not be empty.")
+        );
+        assert!(!form.pending);
+    }
+
+    #[test]
+    fn a_failure_keeps_the_draft_and_shows_the_daemon_message() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "Direct title");
+        let sent = send_key(&mut tickets, &state);
+        let Some(Action::Ticket(TicketAction::Create { request, .. })) = sent else {
+            panic!("ctrl-s must send one create action");
+        };
+
+        tickets.observe_result(TicketResult {
+            request,
+            repo: "borsuk".to_string(),
+            number: 0,
+            kind: TicketResultKind::Failure,
+            message: "GitHub rejected the ticket creation: 422".to_string(),
+            issue: None,
+            conflict: None,
+        });
+
+        let form = tickets.new_ticket.as_ref().unwrap();
+        assert_eq!(form.title, "Direct title");
+        assert_eq!(
+            form.error.as_deref(),
+            Some("GitHub rejected the ticket creation: 422")
+        );
+        assert!(!form.pending);
+    }
+
+    #[test]
+    fn a_success_closes_the_form() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "Direct title");
+        let sent = send_key(&mut tickets, &state);
+        let Some(Action::Ticket(TicketAction::Create { request, .. })) = sent else {
+            panic!("ctrl-s must send one create action");
+        };
+
+        tickets.observe_result(TicketResult {
+            request,
+            repo: "borsuk".to_string(),
+            number: 12,
+            kind: TicketResultKind::Success,
+            message: "GitHub created ticket #12.".to_string(),
+            issue: None,
+            conflict: None,
+        });
+
+        assert!(tickets.new_ticket.is_none(), "the success closed the form");
+    }
+
+    #[test]
+    fn a_foreign_request_cannot_change_the_form() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "Direct title");
+        let sent = send_key(&mut tickets, &state);
+        assert!(matches!(
+            sent,
+            Some(Action::Ticket(TicketAction::Create { .. }))
+        ));
+
+        tickets.observe_result(TicketResult {
+            request: "another-request".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: TicketResultKind::Success,
+            message: "GitHub confirmed the label update.".to_string(),
+            issue: None,
+            conflict: None,
+        });
+        tickets.observe_result(TicketResult {
+            request: "third-request".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: TicketResultKind::Failure,
+            message: "GitHub rejected the label update.".to_string(),
+            issue: None,
+            conflict: None,
+        });
+
+        let form = tickets.new_ticket.as_ref().expect("the form stays open");
+        assert!(form.pending, "the create stays in flight");
+        assert!(form.error.is_none(), "no foreign failure reached the form");
+        assert_eq!(form.title, "Direct title");
+    }
+
+    #[test]
+    fn the_new_ticket_form_draws_both_fields_and_the_status_line() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        let screen_of = |tickets: &Tickets| {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| tickets.draw(frame, frame.area(), &state))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .map(|(x, y)| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let screen = screen_of(&tickets);
+        assert!(screen.contains("new ticket // borsuk"), "screen: {screen}");
+        assert!(screen.contains("description"), "screen: {screen}");
+        assert!(screen.contains("ctrl-s create"), "screen: {screen}");
+
+        send_key(&mut tickets, &state);
+        let screen = screen_of(&tickets);
+        assert!(
+            screen.contains("The ticket title must not be empty."),
+            "screen: {screen}"
+        );
+
+        type_string(&mut tickets, &state, "Direct title");
+        let screen = screen_of(&tickets);
+        assert!(screen.contains("Direct title"), "screen: {screen}");
+        assert!(
+            !screen.contains("must not be empty"),
+            "typing cleared the error: {screen}"
+        );
     }
 }

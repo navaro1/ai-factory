@@ -1416,7 +1416,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("h l", "switch session, chat unfocused"),
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ e l c a", "search and ticket actions"),
+        ("/ n e l c a", "search and ticket actions"),
         ("h l", "tickets repo / settings scope"),
         ("j k", "settings role"),
         ("Tab", "select settings field"),
@@ -1982,6 +1982,7 @@ mod tests {
             "PageUp PageDown",
             "PageDown",
             "End",
+            "/ n e l c a",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
@@ -2086,6 +2087,41 @@ mod tests {
         assert!(!app.help, "the letters went into the reason input");
         let text = render_to_string(&mut app);
         assert!(text.contains("reason: q?"), "screen: {text}");
+    }
+
+    #[test]
+    fn the_new_ticket_form_types_a_digit_instead_of_switching_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let ctrl_s = Msg::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('4'),
+                key('n'),
+                key('1'),
+                ctrl_s,
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets, "1 must not switch the view");
+        assert!(app.tickets.typing(), "the form kept the keyboard");
+        let [crate::sock::Action::Ticket(crate::sock::TicketAction::Create { repo, title, .. })] =
+            sink.0.as_slice()
+        else {
+            panic!("ctrl-s must send the typed title: {:?}", sink.0);
+        };
+        assert_eq!(repo, "borsuk", "the form targets the first repository");
+        assert_eq!(title, "1", "the digit went into the title");
     }
 
     #[test]

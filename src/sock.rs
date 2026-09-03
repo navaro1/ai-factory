@@ -49,7 +49,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 2;
+pub const WIRE_PROTOCOL_REVISION: u32 = 3;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -830,7 +830,9 @@ pub struct TicketResult {
     pub request: String,
     /// The repository alias.
     pub repo: String,
-    /// The issue number.
+    /// The issue number. A result for a ticket creation carries `0`, the
+    /// existing sentinel for a ticket with no number yet, until GitHub
+    /// answers; a success then carries the created number.
     pub number: u64,
     /// The result state.
     pub kind: TicketResultKind,
@@ -902,6 +904,17 @@ pub enum TicketAction {
         name: String,
         /// The six-digit hexadecimal color.
         color: String,
+    },
+    /// Create one ticket from the direct form content.
+    Create {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The new ticket title.
+        title: String,
+        /// The new ticket description.
+        body: String,
     },
     /// Start or resume the Claude conversation for one issue.
     Chat {
@@ -2093,6 +2106,23 @@ mod tests {
         });
         let push_text = serde_json::to_string(&push).unwrap();
         assert_eq!(serde_json::from_str::<Push>(&push_text).unwrap(), push);
+    }
+
+    #[test]
+    fn ticket_create_action_round_trips_through_one_json_line() {
+        assert_eq!(
+            WIRE_PROTOCOL_REVISION, 3,
+            "the create variant raised the revision"
+        );
+        let action = Action::Ticket(TicketAction::Create {
+            request: "create-7".to_string(),
+            repo: "borsuk".to_string(),
+            title: "Add a direct creation form".to_string(),
+            body: "The Tickets view needs one typed field.".to_string(),
+        });
+        let text = serde_json::to_string(&action).unwrap();
+        assert!(!text.contains('\n'), "a wire line must not hold a newline");
+        assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
     }
 
     #[test]
