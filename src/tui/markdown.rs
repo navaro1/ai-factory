@@ -8,8 +8,17 @@
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::collections::BTreeMap;
+
+use crate::mentions::{self, MentionTone};
+use crate::sock::MentionStatus;
 
 use super::theme::THEME;
+
+/// The mention statuses of one body, keyed by the scan identity: the
+/// lowercased `owner/repo`, or `None` for the focus repository, plus the
+/// number.
+pub(super) type MentionStatuses = BTreeMap<(Option<String>, u64), MentionStatus>;
 
 /// The text of one list indent level.
 const LIST_INDENT: &str = "  ";
@@ -27,7 +36,7 @@ struct ListFrame {
 
 /// Converts one markdown document into terminal lines.
 #[derive(Debug, Default)]
-struct Renderer {
+struct Renderer<'m> {
     lines: Vec<Line<'static>>,
     spans: Vec<Span<'static>>,
     styles: Vec<Style>,
@@ -43,16 +52,32 @@ struct Renderer {
     head_row: bool,
     cell: Option<Vec<Span<'static>>>,
     cells: Vec<Vec<Span<'static>>>,
+    /// The mention statuses that decorate text spans, when known.
+    mentions: Option<&'m MentionStatuses>,
 }
 
 /// Converts one markdown document into styled terminal lines.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
+    markdown_lines_with_mentions(input, &MentionStatuses::new())
+}
+
+/// Converts one markdown document into styled terminal lines and draws one
+/// status icon before every mention whose status is known.
+///
+/// Code spans and code blocks never decorate: the renderer knows the code
+/// regions exactly from the event stream.
+pub(super) fn markdown_lines_with_mentions(
+    input: &str,
+    statuses: &MentionStatuses,
+) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_TABLES);
     let mut renderer = Renderer {
         styles: vec![Style::default().fg(THEME.text)],
+        mentions: Some(statuses),
         ..Renderer::default()
     };
     for event in Parser::new_ext(input, options) {
@@ -61,7 +86,7 @@ pub(super) fn markdown_lines(input: &str) -> Vec<Line<'static>> {
     renderer.finish()
 }
 
-impl Renderer {
+impl<'m> Renderer<'m> {
     fn event(&mut self, event: Event<'_>) {
         match event {
             Event::Start(tag) => self.start_tag(tag),
@@ -79,7 +104,10 @@ impl Renderer {
                 } else {
                     self.top()
                 };
-                self.push_span(&text, style);
+                match self.mentions {
+                    Some(statuses) => self.push_text_with_mentions(&text, style, statuses),
+                    None => self.push_span(&text, style),
+                }
             }
             Event::Code(code) => {
                 self.link_emitted = true;
@@ -285,6 +313,35 @@ impl Renderer {
         }
     }
 
+    /// Push one text span and place one status icon before every mention
+    /// whose status the map knows.
+    fn push_text_with_mentions(&mut self, text: &str, style: Style, statuses: &MentionStatuses) {
+        let found = mentions::scan(text);
+        if found.is_empty() {
+            self.push_span(text, style);
+            return;
+        }
+        let mut pos = 0usize;
+        for mention in found {
+            if mention.start > pos {
+                self.push_span(&text[pos..mention.start], style);
+            }
+            let key = (mention.repo.clone(), mention.number);
+            if let Some(status) = statuses.get(&key) {
+                let icon = mentions::glyph(*status);
+                if !icon.is_empty() {
+                    let icon_style = Style::default().fg(tone_color(mentions::tone(*status)));
+                    self.push_span(&format!("{icon} "), icon_style);
+                }
+            }
+            self.push_span(&text[mention.start..mention.end], style);
+            pos = mention.end;
+        }
+        if pos < text.len() {
+            self.push_span(&text[pos..], style);
+        }
+    }
+
     fn rule(&mut self) {
         self.flush_line();
         self.lines.push(Line::from(Span::styled(
@@ -384,6 +441,16 @@ impl Renderer {
             self.lines.remove(0);
         }
         self.lines
+    }
+}
+
+/// The palette color of one mention icon tone.
+fn tone_color(tone: MentionTone) -> ratatui::style::Color {
+    match tone {
+        MentionTone::Ok => THEME.ok,
+        MentionTone::Dim => THEME.dim,
+        MentionTone::Repo => THEME.repo,
+        MentionTone::Error => THEME.error,
     }
 }
 
@@ -503,5 +570,62 @@ mod tests {
     fn soft_breaks_keep_author_line_breaks() {
         let texts = render_text("alpha\nbeta");
         assert_eq!(texts, vec!["alpha", "beta"]);
+    }
+
+    /// One status map with two known same-repo mentions and one merged
+    /// cross-repo mention.
+    fn sample_statuses() -> MentionStatuses {
+        let mut statuses = MentionStatuses::new();
+        statuses.insert((None, 8), MentionStatus::OpenIssue);
+        statuses.insert((None, 9), MentionStatus::ClosedIssue);
+        statuses.insert((Some("o/r".into()), 12), MentionStatus::MergedPr);
+        statuses
+    }
+
+    #[test]
+    fn known_mentions_receive_one_icon_span_and_keep_their_text() {
+        let lines = markdown_lines_with_mentions("see #8 and o/r#12 here", &sample_statuses());
+        let line = &lines[0];
+        let texts: Vec<&str> = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["see ", "● ", "#8", " and ", "◆ ", "o/r#12", " here"]
+        );
+    }
+
+    #[test]
+    fn icons_take_their_legend_colors() {
+        let lines = markdown_lines_with_mentions("see #8 and #9", &sample_statuses());
+        let spans = &lines[0].spans;
+        let open = &spans[1];
+        assert_eq!(open.content, "● ");
+        assert_eq!(open.style.fg, Some(THEME.ok));
+        let closed = &spans[4];
+        assert_eq!(closed.content, "○ ");
+        assert_eq!(closed.style.fg, Some(THEME.dim));
+    }
+
+    #[test]
+    fn unknown_mentions_render_exactly_as_before() {
+        let statuses = sample_statuses();
+        let lines = markdown_lines_with_mentions("misses #10 and o/r#13", &statuses);
+        assert_eq!(line_text(&lines[0]), "misses #10 and o/r#13");
+        assert!(lines[0]
+            .spans
+            .iter()
+            .all(|span| !span.content.contains('●')));
+    }
+
+    #[test]
+    fn code_spans_and_code_blocks_never_decorate() {
+        let statuses = sample_statuses();
+        let inline = markdown_lines_with_mentions("use `#8` here", &statuses);
+        assert_eq!(line_text(&inline[0]), "use #8 here");
+        let block = markdown_lines_with_mentions("```\n#8\n```", &statuses);
+        assert_eq!(line_text(&block[0]), "#8");
     }
 }

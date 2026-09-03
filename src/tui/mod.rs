@@ -95,6 +95,8 @@ enum Msg {
     State(StateView),
     /// Full data for one focused issue.
     TicketDetails(crate::sock::TicketDetails),
+    /// The mention statuses of one focused issue.
+    TicketMentions(crate::sock::TicketMentions),
     /// One repository label catalog.
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
@@ -875,6 +877,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::TicketMentions(mentions)) => {
+                                        if tx.send(Msg::TicketMentions(mentions)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Ok(Push::TicketLabels(labels)) => {
                                         if tx.send(Msg::TicketLabels(labels)).is_err() {
                                             return;
@@ -972,6 +979,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::TicketDetails(details) => {
             app.tickets.observe_details(details);
+            Ok(true)
+        }
+        Msg::TicketMentions(mentions) => {
+            app.tickets.observe_mentions(mentions);
             Ok(true)
         }
         Msg::TicketLabels(labels) => {

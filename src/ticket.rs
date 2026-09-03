@@ -8,11 +8,16 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::exec::Exec;
 use crate::gh::GhClient;
+use crate::mentions;
 use crate::model::{Issue, Snapshot};
 use crate::sock::{
-    Push, RepoLabel, TicketAction, TicketConflict, TicketContent, TicketContentSource,
-    TicketDetails, TicketLabels, TicketResult, TicketResultKind,
+    MentionStatus, Push, RepoLabel, TicketAction, TicketConflict, TicketContent,
+    TicketContentSource, TicketDetails, TicketLabels, TicketMentionStatus, TicketMentions,
+    TicketResult, TicketResultKind,
 };
+
+/// The most mentions one body resolves. The rest stay plain.
+const MENTION_CAP: usize = 12;
 
 /// All daemon effects of one ticket action.
 #[derive(Debug, Default)]
@@ -167,7 +172,91 @@ impl TicketController {
                 }
                 TicketEffects::default()
             }
+            TicketAction::Mentions { .. } => TicketEffects::default(),
         }
+    }
+
+    /// Resolve the mention statuses of one focused item and return its
+    /// push, or `None` when nothing resolved.
+    ///
+    /// The caller sends the details push before this method runs, so the
+    /// first paint never waits on the network. The plan consults the
+    /// snapshot first: same-repository numbers that the snapshot holds as
+    /// open issues or open pull requests resolve with no network call.
+    /// Every other number costs one REST call. A fetch failure leaves that
+    /// number without a status.
+    pub fn mentions_push(
+        &mut self,
+        snapshot: &Snapshot,
+        config: &Config,
+        repo: &str,
+        number: u64,
+        subject_is_pr: bool,
+    ) -> Option<Push> {
+        let items = snapshot.repos.get(repo)?;
+        let body = if subject_is_pr {
+            items.prs.get(&number).map(|pr| pr.body.as_str())
+        } else {
+            items.issues.get(&number).map(|issue| issue.body.as_str())
+        }?;
+        let owner_repo = config.repos.get(repo)?.owner_repo.clone();
+        let scanned = mentions::scan(body);
+        let mut seen = std::collections::BTreeSet::new();
+        let planned: Vec<&mentions::Mention> = scanned
+            .iter()
+            .filter(|mention| seen.insert((mention.repo.clone(), mention.number)))
+            .take(MENTION_CAP)
+            .collect();
+        let mut statuses = Vec::new();
+        let gh = GhClient::new(&*self.exec);
+        for mention in planned {
+            // Only the focus repository resolves so far; other targets
+            // stay plain until their resolution path exists.
+            if mention.repo.is_some() {
+                continue;
+            }
+            let mention_number = mention.number;
+            let known = items
+                .issues
+                .get(&mention_number)
+                .map(|_| MentionStatus::OpenIssue)
+                .or_else(|| {
+                    items.prs.get(&mention_number).map(|pr| {
+                        if pr.draft {
+                            MentionStatus::DraftPr
+                        } else {
+                            MentionStatus::OpenPr
+                        }
+                    })
+                });
+            let status = match known {
+                Some(status) => Some(status),
+                None => match gh.fetch_mention_status(&owner_repo, mention_number) {
+                    Ok(Some(fields)) => {
+                        mentions::classify(&fields.state, fields.merged, fields.draft, fields.is_pr)
+                            .ok()
+                    }
+                    Ok(None) => Some(MentionStatus::Missing),
+                    Err(_) => None,
+                },
+            };
+            if let Some(status) = status {
+                statuses.push(TicketMentionStatus {
+                    repo: None,
+                    number: mention_number,
+                    status,
+                });
+            }
+        }
+        if statuses.is_empty() {
+            return None;
+        }
+        Some(Push::TicketMentions(TicketMentions {
+            request: uuid::Uuid::new_v4().to_string(),
+            repo: repo.to_string(),
+            number,
+            statuses,
+        }))
     }
 
     /// Update issue content after a fresh conflict check.
@@ -1297,5 +1386,136 @@ mod tests {
         ] {
             assert_eq!(parse_ticket_proposal(rejected), None, "accepted {rejected}");
         }
+    }
+
+    fn with_number(mut issue: Issue, number: u64) -> Issue {
+        issue.number = number;
+        issue
+    }
+
+    fn not_found(number: u64) -> CmdOut {
+        CmdOut {
+            status: 1,
+            stdout: format!("HTTP/2 404\r\n\r\n{{\"number\":{number}}}"),
+            stderr: "HTTP 404\n".into(),
+        }
+    }
+
+    #[test]
+    fn details_answers_from_the_snapshot_before_any_gh_call() {
+        let exec = Arc::new(ScriptExec::new());
+        let mut controller = TicketController::new(exec.clone());
+
+        let effects = controller.handle(
+            TicketAction::Details {
+                request: "d1".to_string(),
+                repo: "borsuk".to_string(),
+                number: 7,
+            },
+            &snapshot(issue("Title", "Depends on #8")),
+            &config(),
+            1_000,
+        );
+
+        assert_eq!(effects.pushes.len(), 1);
+        assert!(matches!(effects.pushes[0], Push::TicketDetails(_)));
+        assert!(
+            exec.calls().is_empty(),
+            "the details push must never wait on the network"
+        );
+    }
+
+    #[test]
+    fn mentions_push_plans_snapshot_hits_first_and_fetches_the_rest() {
+        let mut base = snapshot(issue("Title", "Depends on #8, tracks #9, misses #10"));
+        let items = base.repos.get_mut("borsuk").unwrap();
+        items.issues.insert(9, with_number(issue("Title", "b"), 9));
+        let exec = Arc::new(
+            ScriptExec::new()
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    ok("{\"number\":8,\"state\":\"closed\"}"),
+                )
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/10"]),
+                    not_found(10),
+                ),
+        );
+        let mut controller = TicketController::new(exec.clone());
+
+        let push = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false)
+            .expect("resolved mentions must push");
+
+        let Push::TicketMentions(mentions) = &push else {
+            panic!("the push must carry mention statuses");
+        };
+        assert_eq!(mentions.repo, "borsuk");
+        assert_eq!(mentions.number, 7);
+        assert_eq!(
+            mentions.statuses,
+            vec![
+                TicketMentionStatus {
+                    repo: None,
+                    number: 8,
+                    status: MentionStatus::ClosedIssue,
+                },
+                TicketMentionStatus {
+                    repo: None,
+                    number: 9,
+                    status: MentionStatus::OpenIssue,
+                },
+                TicketMentionStatus {
+                    repo: None,
+                    number: 10,
+                    status: MentionStatus::Missing,
+                },
+            ]
+        );
+        assert_eq!(
+            exec.calls().len(),
+            2,
+            "the snapshot hit must resolve without a fetch"
+        );
+    }
+
+    #[test]
+    fn a_body_with_more_mentions_than_the_cap_resolves_the_first_twelve() {
+        // Fourteen unique mentions. The focus number 7 stays out so every
+        // planned mention needs one fetch, in document order.
+        let numbers: Vec<u64> = (1..=15).filter(|number| *number != 7).collect();
+        let body = numbers
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let base = snapshot(issue("Title", &body));
+        let mut exec = ScriptExec::new();
+        for number in &numbers[..12] {
+            exec = exec.expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    &format!("repos/acme/borsuk/issues/{number}"),
+                ]),
+                not_found(*number),
+            );
+        }
+        let exec = Arc::new(exec);
+        let mut controller = TicketController::new(exec.clone());
+
+        let push = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false)
+            .expect("the capped mentions must still push");
+
+        let Push::TicketMentions(mentions) = &push else {
+            panic!("the push must carry mention statuses");
+        };
+        assert_eq!(mentions.statuses.len(), 12);
+        assert_eq!(mentions.statuses[0].number, 1);
+        assert_eq!(mentions.statuses[11].number, 13);
+        assert_eq!(exec.calls().len(), 12, "mentions 14 and 15 must stay plain");
     }
 }
