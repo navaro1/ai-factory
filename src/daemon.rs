@@ -1679,6 +1679,10 @@ impl Daemon {
                     ),
                 }
             }
+            Action::Ask { repo, kind, number } => {
+                // The comment fetch of C2 fills this arm.
+                let _ = (repo, kind, number);
+            }
             Action::Chat { task, text } => {
                 self.chat(&task, &text);
             }

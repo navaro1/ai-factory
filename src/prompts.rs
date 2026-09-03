@@ -49,7 +49,10 @@ Edit the ticket body with `gh`. Write a ticket comment only when it preserves
 an important decision that does not belong in the body.
 
 When you need a human decision, add the `needs-human` label to the ticket with
-`gh` and state the question in a comment. Stop after the label is on.
+`gh` and state the question in a comment. Stop after the label is on. When the
+decision is a choice between named answers, end the comment with one strict
+block on one line:
+`<aif-ask-v1>{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}</aif-ask-v1>`.
 
 When the specification is complete, run
 `gh issue edit {number} --remove-label to-refine --add-label refined`.
@@ -103,7 +106,9 @@ Open a draft PR with `gh pr create --draft` when the work is done. Put
 
 If the specification is incomplete, or you need a human decision, add the
 `needs-human` label to ticket #{number} with `gh`, write the question into a
-comment on it, and stop. Do not guess.
+comment on it, and stop. Do not guess. When the decision is a choice between
+named answers, end the comment with one strict block on one line:
+`<aif-ask-v1>{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}</aif-ask-v1>`.
 
 Report one line at the end: what you did, and the PR number.
 
@@ -131,7 +136,9 @@ findings and leave it as a draft.
 
 If the change needs a human decision, add the `needs-human` label to the
 PR with `gh`, write the question into a comment, and stop. Do not
-guess.
+guess. When the decision is a choice between named answers, end the comment
+with one strict block on one line:
+`<aif-ask-v1>{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}</aif-ask-v1>`.
 
 Report one line at the end: the review verdict.
 "#;

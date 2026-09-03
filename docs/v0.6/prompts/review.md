@@ -16,6 +16,8 @@ findings and leave it as a draft.
 
 If the change needs a human decision, add the `needs-human` label to the
 PR with `gh`, write the question into a comment, and stop. Do not
-guess.
+guess. When the decision is a choice between named answers, end the comment
+with one strict block on one line:
+`<aif-ask-v1>{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}</aif-ask-v1>`.
 
 Report one line at the end: the review verdict.

@@ -106,6 +106,8 @@ enum Msg {
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
     TicketResult(crate::sock::TicketResult),
+    /// One fetched question for one `NeedsHuman` detail screen.
+    Ask(crate::sock::AskView),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
     /// The socket reader reached the daemon.
@@ -1008,6 +1010,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::Ask(ask)) => {
+                                        if tx.send(Msg::Ask(ask)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Ok(Push::SettingsResult(result)) => {
                                         if tx.send(Msg::SettingsResult(result)).is_err() {
                                             return;
@@ -1120,6 +1127,11 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::TicketResult(result) => {
             app.tickets.observe_result(result);
+            Ok(true)
+        }
+        Msg::Ask(ask) => {
+            // The inbox observe call of chunk C3 fills this arm.
+            let _ = ask;
             Ok(true)
         }
         Msg::SettingsResult(result) => {

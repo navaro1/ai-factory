@@ -926,6 +926,7 @@ fn paused_check(client: &Client) -> Check {
                 | Push::TicketMentions(_)
                 | Push::TicketLabels(_)
                 | Push::TicketResult(_)
+                | Push::Ask(_)
                 | Push::SettingsResult(_),
             )) => {}
             Some(Err(error)) => return no_state_check(error),

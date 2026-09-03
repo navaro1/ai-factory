@@ -39,7 +39,9 @@ Open a draft PR with `gh pr create --draft` when the work is done. Put
 
 If the specification is incomplete, or you need a human decision, add the
 `needs-human` label to ticket #{number} with `gh`, write the question into a
-comment on it, and stop. Do not guess.
+comment on it, and stop. Do not guess. When the decision is a choice between
+named answers, end the comment with one strict block on one line:
+`<aif-ask-v1>{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}</aif-ask-v1>`.
 
 Report one line at the end: what you did, and the PR number.
 

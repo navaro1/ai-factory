@@ -4,6 +4,7 @@
 //! The modules below mirror the source layout in `docs/v0.5/SPEC.md`.
 //! Later chunks fill them in.
 
+pub mod ask;
 pub mod config;
 pub mod daemon;
 pub mod decisions;
