@@ -587,6 +587,11 @@ pub fn start_detached(
             "--collect",
             "--unit",
             "aif-daemon",
+            // The daemon stops its own agent children in the right order, so
+            // systemd sends SIGTERM to the daemon only (`mixed`) and waits
+            // before any SIGKILL. A survivor still dies after the timeout.
+            "--property=KillMode=mixed",
+            "--property=TimeoutStopSec=45",
             "--",
             program_text.as_str(),
             "run",
@@ -2798,6 +2803,8 @@ mod tests {
                 "--collect",
                 "--unit",
                 "aif-daemon",
+                "--property=KillMode=mixed",
+                "--property=TimeoutStopSec=45",
                 "--",
                 "/opt/aif/bin/aifd",
                 "run"
@@ -3164,6 +3171,8 @@ mod tests {
                 "--collect",
                 "--unit",
                 "aif-daemon",
+                "--property=KillMode=mixed",
+                "--property=TimeoutStopSec=45",
                 "--",
                 "/opt/aif/bin/aifd",
                 "run",
