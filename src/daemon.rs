@@ -51,8 +51,8 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, InputMode, PauseScope, Push, SettingsOperation, SettingsResult, SettingsResultStatus,
-    StateInput, StateView, TicketAction, TicketDetails, TicketProposal,
+    Action, AskView, InputMode, PauseScope, Push, SettingsOperation, SettingsResult,
+    SettingsResultStatus, StateInput, StateView, TicketAction, TicketDetails, TicketProposal,
 };
 use crate::state::{DaemonState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
@@ -1679,10 +1679,7 @@ impl Daemon {
                     ),
                 }
             }
-            Action::Ask { repo, kind, number } => {
-                // The comment fetch of C2 fills this arm.
-                let _ = (repo, kind, number);
-            }
+            Action::Ask { repo, kind, number } => self.fetch_ask(&repo, kind, number),
             Action::Chat { task, text } => {
                 self.chat(&task, &text);
             }
@@ -1951,6 +1948,74 @@ impl Daemon {
             Action::ReloadSettings { request } => self.reload_settings(request),
             Action::Reconcile { repo } => self.reconcile(repo.as_deref()),
             Action::Stop => self.shutdown = true,
+        }
+    }
+
+    /// Fetch the comments of one ask row and push the question view back.
+    ///
+    /// The walk goes from the newest comment to the oldest one and picks
+    /// the first comment that holds a valid ask block. Without a valid
+    /// block the newest comment body becomes the question. A failed fetch
+    /// ships an error view, so the daemon never crashes and never closes
+    /// the inbox row.
+    fn fetch_ask(&mut self, repo: &str, kind: ItemKind, number: u64) {
+        let Some(repo_cfg) = self.config.repos.get(repo).cloned() else {
+            eprintln!("the question request for {repo}: no such repository");
+            return;
+        };
+        let view =
+            match GhClient::new(&*self.exec).fetch_issue_comments(&repo_cfg.owner_repo, number) {
+                Ok(comments) => comments
+                    .iter()
+                    .rev()
+                    .find_map(|comment| {
+                        let ask = crate::ask::parse_ask_block(&comment.body)?;
+                        Some(AskView {
+                            repo: repo.to_string(),
+                            kind,
+                            number,
+                            question: ask.question,
+                            options: ask.options,
+                            author: Some(comment.author.clone()),
+                            created_at: Some(comment.created_at.clone()),
+                            error: None,
+                        })
+                    })
+                    .unwrap_or_else(|| match comments.last() {
+                        Some(comment) => AskView {
+                            repo: repo.to_string(),
+                            kind,
+                            number,
+                            question: comment.body.clone(),
+                            options: Vec::new(),
+                            author: Some(comment.author.clone()),
+                            created_at: Some(comment.created_at.clone()),
+                            error: None,
+                        },
+                        None => AskView {
+                            repo: repo.to_string(),
+                            kind,
+                            number,
+                            question: String::new(),
+                            options: Vec::new(),
+                            author: None,
+                            created_at: None,
+                            error: None,
+                        },
+                    }),
+                Err(error) => AskView {
+                    repo: repo.to_string(),
+                    kind,
+                    number,
+                    question: String::new(),
+                    options: Vec::new(),
+                    author: None,
+                    created_at: None,
+                    error: Some(format!("{error:#}")),
+                },
+            };
+        if let Some(pusher) = self.ticket_pusher.as_ref() {
+            pusher(Push::Ask(view));
         }
     }
 
@@ -4211,7 +4276,9 @@ mod tests {
         assert!(job.prompt.contains("issue 142"));
         assert!(job.prompt.contains("body 142"));
         assert!(job.prompt.contains("borsuk"));
-        assert!(!job.prompt.contains('{'));
+        // The ask block of the refine prompt holds literal braces, so the
+        // pin checks for unfilled placeholders, not for bare braces.
+        assert!(scan_placeholders(&job.prompt).is_empty());
 
         rig.event(started("borsuk/refine-i142", "sid-1"));
         let task = rig.task("borsuk/refine-i142");
@@ -5396,6 +5463,195 @@ mod tests {
             "cancel removes the label without a comment"
         );
         assert!(rig.decision("human:borsuk:i10").is_none());
+    }
+
+    /// One GitHub comment object for the ask fixtures.
+    fn comment(author: &str, created_at: &str, body: &str) -> String {
+        format!(
+            r#"{{"user":{{"login":"{author}"}},"created_at":"{created_at}","body":{}}}"#,
+            serde_json::to_string(body).unwrap()
+        )
+    }
+
+    /// One ask request against the scripted comments answer of one page.
+    fn ask_steps(comments: &str) -> Vec<Step> {
+        vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100&page=1",
+            ],
+            CmdOut::ok(format!("HTTP/2 200\r\n\r\n{comments}")),
+        )]
+    }
+
+    #[test]
+    fn an_ask_request_fetches_comments_and_pushes_the_parsed_block() {
+        let block = format!(
+            "<aif-ask-v1>\n{}\n</aif-ask-v1>\n",
+            serde_json::to_string(&json!({
+                "question": "Which workload mode ships first?",
+                "options": [
+                    {"label": "Fast", "description": "deterministic only"},
+                    {"label": "Full"}
+                ]
+            }))
+            .unwrap()
+        );
+        let comments = format!(
+            "[{},{}]",
+            comment("agent", "2026-09-01T10:00:00Z", &block),
+            comment("human", "2026-09-01T10:05:00Z", "plain prose")
+        );
+        let mut rig = Rig::make(ask_steps(&comments));
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+        rig.poll(vec![issue(9, &["needs-human"])], vec![]);
+
+        rig.act(Action::Ask {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 9,
+        });
+
+        let calls = rig.exec.calls();
+        assert_eq!(calls.len(), 1, "the poll itself ran no gh call");
+        assert_eq!(
+            calls[0].argv(),
+            [
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100&page=1"
+            ]
+        );
+        let Push::Ask(view) = push_rx.try_recv().unwrap() else {
+            panic!("the ask request must push a Push::Ask");
+        };
+        assert_eq!(view.repo, "borsuk");
+        assert_eq!(view.kind, ItemKind::Issue);
+        assert_eq!(view.number, 9);
+        assert_eq!(view.question, "Which workload mode ships first?");
+        assert_eq!(
+            view.options,
+            vec![
+                crate::ask::AskOption {
+                    label: "Fast".to_string(),
+                    description: "deterministic only".to_string(),
+                },
+                crate::ask::AskOption {
+                    label: "Full".to_string(),
+                    description: String::new(),
+                },
+            ]
+        );
+        assert_eq!(view.author.as_deref(), Some("agent"));
+        assert_eq!(view.created_at.as_deref(), Some("2026-09-01T10:00:00Z"));
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn a_poll_of_a_needs_human_item_runs_no_comment_call() {
+        let mut rig = Rig::make(vec![]);
+
+        rig.poll(vec![issue(9, &["needs-human"])], vec![]);
+
+        assert!(rig.decision("human:borsuk:i9").is_some());
+        assert!(rig.exec.calls().is_empty());
+    }
+
+    #[test]
+    fn an_ask_without_a_block_ships_the_newest_comment_body() {
+        let comments = format!(
+            "[{},{}]",
+            comment("agent", "2026-09-01T10:00:00Z", "first prose"),
+            comment("agent", "2026-09-01T10:05:00Z", "second prose")
+        );
+        let mut rig = Rig::make(ask_steps(&comments));
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+        rig.poll(vec![issue(9, &["needs-human"])], vec![]);
+
+        rig.act(Action::Ask {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 9,
+        });
+
+        let Push::Ask(view) = push_rx.try_recv().unwrap() else {
+            panic!("the ask request must push a Push::Ask");
+        };
+        assert_eq!(view.question, "second prose");
+        assert!(view.options.is_empty());
+        assert_eq!(view.author.as_deref(), Some("agent"));
+        assert_eq!(view.created_at.as_deref(), Some("2026-09-01T10:05:00Z"));
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn an_ask_without_comments_ships_an_empty_question() {
+        let mut rig = Rig::make(ask_steps("[]"));
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+        rig.poll(vec![issue(9, &["needs-human"])], vec![]);
+
+        rig.act(Action::Ask {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 9,
+        });
+
+        let Push::Ask(view) = push_rx.try_recv().unwrap() else {
+            panic!("the ask request must push a Push::Ask");
+        };
+        assert_eq!(view.question, "");
+        assert!(view.options.is_empty());
+        assert_eq!(view.author, None);
+        assert_eq!(view.created_at, None);
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn a_failed_comment_fetch_ships_the_error() {
+        let mut rig = Rig::make(vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100&page=1",
+            ],
+            refused(),
+        )]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+        rig.poll(vec![issue(9, &["needs-human"])], vec![]);
+
+        rig.act(Action::Ask {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 9,
+        });
+
+        let Push::Ask(view) = push_rx.try_recv().unwrap() else {
+            panic!("the ask request must push a Push::Ask");
+        };
+        assert_eq!(view.repo, "borsuk");
+        assert_eq!(view.number, 9);
+        assert!(view.error.is_some_and(|error| !error.is_empty()));
+        assert!(view.question.is_empty());
+        assert!(view.options.is_empty());
+        assert!(
+            rig.decision("human:borsuk:i9").is_some(),
+            "a failed fetch never closes the row"
+        );
     }
 
     #[test]
