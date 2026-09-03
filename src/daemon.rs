@@ -1788,6 +1788,9 @@ impl Daemon {
                     TicketAction::Mentions { repo, number, .. } => {
                         Some((repo.clone(), *number, false, false))
                     }
+                    TicketAction::PrMentions { repo, number, .. } => {
+                        Some((repo.clone(), *number, true, false))
+                    }
                     _ => None,
                 };
                 let proposal_apply = match &action {

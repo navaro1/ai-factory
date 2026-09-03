@@ -921,6 +921,15 @@ pub enum TicketAction {
         /// The issue number.
         number: u64,
     },
+    /// Resolve the mention statuses of one focused pull request.
+    PrMentions {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The pull request number.
+        number: u64,
+    },
 }
 
 /// One pipeline stage in the state view.

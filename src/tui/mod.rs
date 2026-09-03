@@ -253,6 +253,17 @@ impl App {
     /// The push proves the connection, clamps the selection to the new row
     /// count, and drops an expired toast. It feeds the inbox and follows
     /// the session task, so both views stay in step with the daemon.
+    /// Send one mention-status request for a pull request detail whose
+    /// description just became visible.
+    fn send_pending_pr_mention(&mut self, sink: &mut impl ActionSink) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        if let Some(action) = self.inbox.take_pending_pr_mention(state) {
+            sink.send_action(action);
+        }
+    }
+
     fn apply_state(&mut self, view: StateView) {
         let count = pipeline::rows(&view).len();
         let keyed_selection = self
@@ -979,9 +990,14 @@ fn run_loop(
 /// Apply one shell message. False requests a clean exit.
 fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result<bool> {
     match msg {
-        Msg::Key(key) => Ok(app.handle_key(key, sink)),
+        Msg::Key(key) => {
+            let handled = app.handle_key(key, sink);
+            app.send_pending_pr_mention(sink);
+            Ok(handled)
+        }
         Msg::State(view) => {
             app.apply_state(view);
+            app.send_pending_pr_mention(sink);
             Ok(true)
         }
         Msg::TicketDetails(details) => {
@@ -989,7 +1005,8 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
             Ok(true)
         }
         Msg::TicketMentions(mentions) => {
-            app.tickets.observe_mentions(mentions);
+            app.tickets.observe_mentions(mentions.clone());
+            app.inbox.observe_pr_mentions(&mentions);
             Ok(true)
         }
         Msg::TicketLabels(labels) => {

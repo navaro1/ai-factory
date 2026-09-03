@@ -445,7 +445,7 @@ impl<'m> Renderer<'m> {
 }
 
 /// The palette color of one mention icon tone.
-fn tone_color(tone: MentionTone) -> ratatui::style::Color {
+pub(super) fn tone_color(tone: MentionTone) -> ratatui::style::Color {
     match tone {
         MentionTone::Ok => THEME.ok,
         MentionTone::Dim => THEME.dim,

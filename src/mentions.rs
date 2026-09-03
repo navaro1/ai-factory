@@ -53,6 +53,10 @@ pub fn scan(text: &str) -> Vec<Mention> {
     let mut found = Vec::new();
     let mut at = 0usize;
     while at < text.len() {
+        if !text.is_char_boundary(at) {
+            at += 1;
+            continue;
+        }
         if let Some((consumed, mention)) = match_url(text, at)
             .or_else(|| match_repo_hash(text, at))
             .or_else(|| match_bare_hash(text, at))
@@ -304,6 +308,12 @@ mod tests {
         let mentions = scan(text);
         assert_eq!(mentions.len(), 1);
         assert_eq!(&text[mentions[0].start..mentions[0].end], "#8");
+    }
+
+    #[test]
+    fn multibyte_text_never_breaks_the_scan() {
+        assert_eq!(repos("→ ● #12 ◆"), vec![(None, 12)]);
+        assert_eq!(repos("超 #12"), vec![(None, 12)]);
     }
 
     #[test]

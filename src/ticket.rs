@@ -188,6 +188,7 @@ impl TicketController {
                 TicketEffects::default()
             }
             TicketAction::Mentions { .. } => TicketEffects::default(),
+            TicketAction::PrMentions { .. } => TicketEffects::default(),
         }
     }
 

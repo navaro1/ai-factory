@@ -36,15 +36,17 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
+use super::markdown::{tone_color, MentionStatuses};
 use super::theme::THEME;
 use super::transcript;
 use crate::decisions::{Decision, DecisionKind, Response};
+use crate::mentions;
 use crate::model::ItemKind;
-use crate::sock::{Action, Client, ItemView, StateView};
+use crate::sock::{Action, Client, ItemView, StateView, TicketAction, TicketMentions};
 
 /// The maximum task log section that one detail draw reads.
 const CONTEXT_LOG_BYTES: u64 = 128 * 1024;
@@ -79,6 +81,11 @@ pub struct Inbox {
     feed_scroll_max: Cell<u16>,
     /// The focused context screen, when Enter opened one decision.
     detail: Option<DetailState>,
+    /// The mention statuses of each seen pull request description, keyed
+    /// by the repository alias and the pull request number.
+    pr_mentions: BTreeMap<(String, u64), MentionStatuses>,
+    /// The pull requests whose statuses one request already went out for.
+    requested_pr_mentions: BTreeSet<(String, u64)>,
 }
 
 /// Local navigation state for one focused decision screen.
@@ -229,6 +236,56 @@ impl Inbox {
     /// An inbox with no selection and no input.
     pub fn new() -> Self {
         Inbox::default()
+    }
+
+    /// Take one mention-status request for the pull request whose detail
+    /// just became visible, or `None`.
+    ///
+    /// One request per pull request identity goes out; the answer merges
+    /// through [`Inbox::observe_pr_mentions`].
+    pub fn take_pending_pr_mention(&mut self, state: &StateView) -> Option<Action> {
+        let detail = self.detail.as_ref()?;
+        let (repo, number) = match detail.anchor.target(state)? {
+            DetailTarget::Decision(decision) => {
+                let (kind, number) = detail_item_key(&decision, detail.item_number)?;
+                if kind != ItemKind::Pr {
+                    return None;
+                }
+                (decision.repo, number)
+            }
+            DetailTarget::Train(train) => {
+                let prs = train_detail_prs(&train);
+                let number = detail
+                    .item_number
+                    .filter(|number| prs.contains(number))
+                    .or_else(|| prs.first().copied())?;
+                (train.repo, number)
+            }
+        };
+        if !self.requested_pr_mentions.insert((repo.clone(), number)) {
+            return None;
+        }
+        Some(Action::Ticket(TicketAction::PrMentions {
+            request: uuid::Uuid::new_v4().to_string(),
+            repo,
+            number,
+        }))
+    }
+
+    /// Merge one mention-status answer into the pull request store.
+    pub fn observe_pr_mentions(&mut self, mentions: &TicketMentions) {
+        let entry = self
+            .pr_mentions
+            .entry((mentions.repo.clone(), mentions.number))
+            .or_default();
+        for status in &mentions.statuses {
+            entry.insert((status.repo.clone(), status.number), status.status);
+        }
+    }
+
+    /// The known mention statuses of one pull request description.
+    fn pr_statuses(&self, repo: &str, number: u64) -> Option<&MentionStatuses> {
+        self.pr_mentions.get(&(repo.to_string(), number))
     }
 
     /// Apply one pushed state.
@@ -1247,7 +1304,15 @@ fn draw_item_detail(
     width: usize,
 ) {
     let title = format!("PR #{number} · {repo}");
-    let Some((title, lines)) = item_lines(state, repo, ItemKind::Pr, number, width, &title) else {
+    let Some((title, lines)) = item_lines(
+        state,
+        repo,
+        ItemKind::Pr,
+        number,
+        width,
+        &title,
+        inbox.pr_statuses(repo, number),
+    ) else {
         return draw_missing_item_detail(
             f,
             content_area,
@@ -1463,8 +1528,13 @@ fn draw_detail(
     let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
             let title = format!("{} #{number} · {}", kind.title_noun(), decision.repo);
+            let statuses = if kind == ItemKind::Pr {
+                inbox.pr_statuses(&decision.repo, number)
+            } else {
+                None
+            };
             let Some((title, lines)) =
-                item_lines(state, &decision.repo, kind, number, width, &title)
+                item_lines(state, &decision.repo, kind, number, width, &title, statuses)
             else {
                 return draw_missing_item_detail(
                     f,
@@ -1672,7 +1742,7 @@ fn find_item<'a>(
 /// The bordered title and body lines of one repository item detail.
 ///
 /// The call returns None when the state push carries no snapshot for the
-/// item.
+/// item. A pull request description decorates its mention statuses.
 fn item_lines(
     state: &StateView,
     repo: &str,
@@ -1680,6 +1750,7 @@ fn item_lines(
     number: u64,
     width: usize,
     title: &str,
+    statuses: Option<&MentionStatuses>,
 ) -> Option<(String, Vec<Line<'static>>)> {
     let item = find_item(state, repo, kind, number)?;
     let mut lines = wrapped_lines(
@@ -1709,13 +1780,124 @@ fn item_lines(
     } else {
         item.body.as_str()
     };
-    lines.extend(wrapped_lines(
-        body,
-        width,
-        "",
-        Style::default().fg(THEME.text),
-    ));
+    match statuses {
+        Some(statuses) => lines.extend(decorated_description(body, statuses, width)),
+        None => lines.extend(wrapped_lines(
+            body,
+            width,
+            "",
+            Style::default().fg(THEME.text),
+        )),
+    }
     Some((title.to_string(), lines))
+}
+
+/// Wrap one pull request description and draw one status icon before
+/// every mention whose status is known.
+///
+/// The decoration runs on the raw text before the wrap, so the icons
+/// count toward the line width and a mention never splits from its icon.
+fn decorated_description(
+    body: &str,
+    statuses: &MentionStatuses,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let decorated = decorate_text(body, statuses);
+    transcript::wrap(&decorated, width)
+        .into_iter()
+        .map(|line| Line::from(mention_line_spans(&line, statuses)))
+        .collect()
+}
+
+/// Insert one icon and one space before every mention with a known
+/// status. The text itself never changes.
+fn decorate_text(body: &str, statuses: &MentionStatuses) -> String {
+    let found = mentions::scan(body);
+    if found.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut pos = 0usize;
+    for mention in found {
+        if mention.start > pos {
+            out.push_str(&body[pos..mention.start]);
+        }
+        if let Some(status) = statuses.get(&(mention.repo.clone(), mention.number)) {
+            let icon = mentions::glyph(*status);
+            if !icon.is_empty() {
+                out.push_str(icon);
+                out.push(' ');
+            }
+        }
+        out.push_str(&body[mention.start..mention.end]);
+        pos = mention.end;
+    }
+    if pos < body.len() {
+        out.push_str(&body[pos..]);
+    }
+    out
+}
+
+/// Split one wrapped line into spans and color the icon before each
+/// mention that carries a known status.
+fn mention_line_spans(line: &str, statuses: &MentionStatuses) -> Vec<Span<'static>> {
+    let plain = Style::default().fg(THEME.text);
+    let found = mentions::scan(line);
+    if found.is_empty() {
+        return vec![Span::styled(line.to_string(), plain)];
+    }
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    for mention in found {
+        let status = statuses
+            .get(&(mention.repo.clone(), mention.number))
+            .copied();
+        let prefix = status
+            .map(|status| {
+                let icon = mentions::glyph(status);
+                if icon.is_empty() {
+                    String::new()
+                } else {
+                    format!("{icon} ")
+                }
+            })
+            .unwrap_or_default();
+        // The decorated icon sits immediately before its mention on this
+        // line; a boundary check keeps every slice safe.
+        let mut decorated_start = mention.start;
+        if !prefix.is_empty() {
+            if let Some(at) = mention
+                .start
+                .checked_sub(prefix.len())
+                .filter(|&at| line.is_char_boundary(at))
+            {
+                if line[at..mention.start] == prefix {
+                    decorated_start = at;
+                }
+            }
+        }
+        if decorated_start > pos {
+            spans.push(Span::styled(line[pos..decorated_start].to_string(), plain));
+        }
+        if let Some(status) = status {
+            if decorated_start < mention.start {
+                let icon_style = Style::default().fg(tone_color(mentions::tone(status)));
+                spans.push(Span::styled(
+                    line[decorated_start..mention.start].to_string(),
+                    icon_style,
+                ));
+            }
+        }
+        spans.push(Span::styled(
+            line[mention.start..mention.end].to_string(),
+            plain,
+        ));
+        pos = mention.end;
+    }
+    if pos < line.len() {
+        spans.push(Span::styled(line[pos..].to_string(), plain));
+    }
+    spans
 }
 
 /// Wrap text with a fixed prefix on every display line.
@@ -1821,7 +2003,9 @@ mod tests {
     use super::*;
     use crate::config::ReleasePolicy;
     use crate::model::Stage;
-    use crate::sock::{InputMode, ItemView, PausedView, RepoView, TaskView, TrainView};
+    use crate::sock::{
+        InputMode, ItemView, MentionStatus, PausedView, RepoView, TaskView, TrainView,
+    };
     use crate::tasks::{Task, TaskState};
 
     /// The epoch time every test decision opens at.
@@ -2105,6 +2289,68 @@ mod tests {
             "screen: {screen}"
         );
         assert!(!screen.contains("[r] retry"), "screen: {screen}");
+    }
+
+    #[test]
+    fn a_pr_description_decorates_its_known_mentions_once_requested() {
+        use crate::sock::{ItemView, TicketMentionStatus};
+
+        let mut state = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            title: "Protect the release gate".to_string(),
+            body: "Closes #9 and needs #8.".to_string(),
+        });
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        let action = inbox.take_pending_pr_mention(&state);
+        assert!(matches!(
+            &action,
+            Some(Action::Ticket(TicketAction::PrMentions { repo, number, .. }))
+                if repo == "borsuk" && *number == 7
+        ));
+        assert!(
+            inbox.take_pending_pr_mention(&state).is_none(),
+            "one request per pull request must be enough"
+        );
+
+        inbox.observe_pr_mentions(&TicketMentions {
+            request: "m".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            statuses: vec![TicketMentionStatus {
+                repo: None,
+                number: 9,
+                status: MentionStatus::OpenIssue,
+            }],
+        });
+
+        let screen = render(&state, &inbox, OPENED + 15_000);
+
+        assert!(screen.contains("● #9"), "screen: {screen}");
+        assert!(
+            !screen.contains("○ #8") && !screen.contains("● #8"),
+            "an unknown mention must stay plain: {screen}"
+        );
+        assert!(rx.try_recv().is_err(), "the request must bypass the sink");
+    }
+
+    #[test]
+    fn an_issue_or_stuck_detail_sends_no_pr_mention_request() {
+        let worker = worker();
+        let state = state_with(vec![Decision::stuck(&worker, "failure", OPENED)]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        assert!(inbox.take_pending_pr_mention(&state).is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
