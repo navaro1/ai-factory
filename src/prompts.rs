@@ -9,6 +9,17 @@
 //! "PR". A `gh` command inside backticks keeps the GitHub word, because
 //! the CLI speaks its own nouns.
 
+/// The notice that precedes the rendered prompt of a task the daemon
+/// interrupted with a stop.
+///
+/// The daemon prepends it only to a run that resumes the saved session of
+/// such a task. The agent reads the worktree to find its place instead of
+/// repeating finished work.
+pub const RESTART_NOTICE: &str = "Note: the AI Factory daemon stopped and restarted \
+while this task ran. This run continues your saved session. Read the worktree \
+state first to find where you stopped, then continue the remaining work. Do not \
+repeat work that is already done.";
+
 /// The built-in prompt of a refine run.
 ///
 /// It runs in the repository checkout and never creates a worktree.
