@@ -128,7 +128,7 @@ The `MentionStatus` enum, the glyph table, and one `classify(state, merged, draf
 ## 7. Chunks and Acceptance Criteria
 
 ### C0 — Same-repo mention icons end to end
-**Status:** `[ ]` pending
+**Status:** `[x]` ✅ IMPLEMENTED
 **Build:** The walking skeleton. Add `src/mentions.rs` with the full three-form scanner, canonical keys, the `MentionStatus` enum, the glyph table, and `classify`. Add the `TicketMentions` push and the `TicketAction::Mentions` variant in `src/sock.rs` (bump `WIRE_PROTOCOL_REVISION` to 2). Add `GhClient::fetch_mention_status` in `src/gh.rs`, reusing the existing response plumbing and field readers, extracting raw `state`, `pull_request.merged_at`, and `draft` for `classify`. On `Details`, `TicketController` runs the resolver — extract, plan (same-repo snapshot hits resolve free; misses fetch, capped at 12 in document order per R9), push details first and mentions second (R10). The tickets view stores the statuses for the open focus, merges a `TicketMentions` push only when repo and number match, and re-renders `body_lines` and `proposal_lines` with mention decoration inside the markdown render path, skipping code regions (R8).
 **AC:**
 - A `mentions.rs` unit test fails before the chunk and passes after: `Depends on #8` against a lookup that maps `acme/borsuk#8` to open yields an inserted `●` span before `#8` and no other text change; `octo/repo#12`, `https://github.com/octo/repo/issues/12`, and `https://github.com/octo/repo/pull/12` each produce the canonical key `octo/repo#12`; `x/y#3` inside a URL query and `abc#3` produce none (R3).
@@ -139,8 +139,11 @@ The `MentionStatus` enum, the glyph table, and one `classify(state, merged, draf
 - A draw test with a proposal body that holds a mention shows the glyph there under the same rules (R1).
 **Depends on:** — · **Traces to:** R1, R3, R5, R8, R9, R10
 
+Implementation notes: shipped in commit `2d5865a`. `src/mentions.rs` carries the scanner, `classify`, `glyph`, and `tone`; the TUI maps the tone onto `THEME`. `markdown_lines_with_mentions` decorates inside the render pipeline; `markdown_lines` stays as the undecorated wrapper. The daemon follow-up runs after the details push; the `details_answers_from_the_snapshot_before_any_gh_call` test pins that order.
+Last updated: 2026-09-03
+
 ### C1 — Unconfigured repositories
-**Status:** `[ ]` pending
+**Status:** `[x]` ✅ IMPLEMENTED
 **Build:** Teach the resolver in `src/ticket.rs` to fetch `owner/repo` targets that no configured alias covers, directly under their canonical key; configured repositories keep their alias mapping (R11). The scanner and the tickets view need no change; C0 shipped the full grammar.
 **AC:**
 - A daemon test with a body that mentions an unconfigured `other/repo#5` records exactly one `gh api repos/other/repo/issues/5` call (R3, R11).
@@ -148,8 +151,11 @@ The `MentionStatus` enum, the glyph table, and one `classify(state, merged, draf
 - A regression draw test repeats the C0 same-repo case unchanged (guard).
 **Depends on:** C0 · **Traces to:** R3, R11
 
+Implementation notes: shipped in commit `77e6516`. The planner resolves each mention target — the focus repository for a bare number, a configured alias via `owner_repo` match, otherwise the canonical key — and every status entry carries its target key.
+Last updated: 2026-09-03
+
 ### C2 — Live refresh and the status cache
-**Status:** `[ ]` pending
+**Status:** `[x]` ✅ IMPLEMENTED
 **Build:** Insert the 90 s TTL status cache at the plan seam in `TicketController`, so every resolution path consults the cache before fetching and spends at most one REST call per number per TTL window (R4). Add the refresh timer to the tickets view: while the focus stays open and details are present, each 60 s tick sends the `TicketAction::Mentions` refresh request; the daemon re-plans and pushes `TicketMentions` only when a status changed or was previously missing. A failed or rate-limited fetch follows R7.
 **AC:**
 - A tickets-view test drives the 60 s tick with a scripted clock: each tick while the focus stays open emits exactly one `TicketAction::Mentions` carrying the focused repo and number; after the focus closes, a further tick emits none (R6).
@@ -160,14 +166,20 @@ The `MentionStatus` enum, the glyph table, and one `classify(state, merged, draf
 - A daemon test feeds a 404, asserts the not-found status is cached, renders no glyph, and records no refetch before the TTL window passes (R7).
 **Depends on:** C0 · **Traces to:** R4, R6, R7
 
+Implementation notes: shipped in commit `d0ebd3d`. The controller keeps a 90 s status cache plus a failure map, so a rate-limited number waits for the TTL window; `force_push` on the details follow-up re-sends statuses to a fresh focus while an unchanged refresh pushes nothing. The tickets view owns the 60 s timer; the run loop sends the refresh through the sink without a toast.
+Last updated: 2026-09-03
+
 ### C3 — Status icons in the inbox PR description
-**Status:** `[ ]` pending
+**Status:** `[x]` ✅ IMPLEMENTED
 **Build:** Add `TicketAction::PrMentions` in `src/sock.rs`, resolved by `TicketController` against the PR body of the snapshot (open PRs live in `RepoSnapshot.prs`); a number with no snapshot entry answers an empty status set with no `gh` call (R11). The inbox stores one status map, sends `PrMentions` when a PR detail becomes the visible selection, merges the resulting push, and decorates the raw description text with the shared scanner before `wrapped_lines` runs.
 **AC:**
 - An inbox draw test with a PR whose description says `Closes #7` and a scripted statuses push shows the ok `●` before `#7` in the description block, with the `Closes` link line and all other text unchanged (R2, R8).
 - A controller test shows `PrMentions` for an unknown PR number answers with an empty status set and no `gh` call (R11).
 - Selecting an issue detail in the inbox records no `PrMentions` action; selecting a PR detail records exactly one (R2).
 **Depends on:** C0 · **Traces to:** R2, R11
+
+Implementation notes: shipped in commit `cd597e5`. Both inbox surfaces decorate: the gate decision path and the release-train path. The description decorates on the raw text before `wrapped_lines` and recolors the icon spans per wrapped line. The request goes out once per pull request identity, after key handling and state pushes.
+Last updated: 2026-09-03
 
 ---
 
