@@ -140,6 +140,49 @@ impl<'a> GhClient<'a> {
         issue_response(&out, "fetch_issue")
     }
 
+    /// Fetch the raw status fields of one mentioned issue or pull request.
+    ///
+    /// A 404 answer maps to `None`, so the caller can cache the not-found
+    /// state. The method reads the raw `state`, `pull_request.merged_at`,
+    /// and `draft` fields only and leaves the classification to
+    /// [`crate::mentions::classify`].
+    pub fn fetch_mention_status(
+        &self,
+        owner_repo: &str,
+        number: u64,
+    ) -> Result<Option<MentionFields>> {
+        let url = format!("repos/{owner_repo}/issues/{number}");
+        let args = ["api", "-i", "-X", "GET", url.as_str()];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let parsed = parse_response(&out.stdout).with_context(|| {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            format!("gh api exited with status {}: {detail}", out.status)
+        })?;
+        if parsed.status == 404 {
+            return Ok(None);
+        }
+        let response = checked_response(&out)?;
+        let value: Value = serde_json::from_str(&response.body)
+            .context("gh api returned a broken fetch_mention_status body")?;
+        let _ = u64_field(&value, "number")?;
+        let state = str_field(&value, "state")?.to_string();
+        let merged = value
+            .pointer("/pull_request/merged_at")
+            .and_then(Value::as_str)
+            .is_some();
+        let draft = value.get("draft").and_then(Value::as_bool).unwrap_or(false);
+        let is_pr = value.get("pull_request").is_some();
+        Ok(Some(MentionFields {
+            state,
+            merged,
+            draft,
+            is_pr,
+        }))
+    }
+
     /// Fetch every repository label in name order.
     pub fn fetch_labels(&self, owner_repo: &str) -> Result<Vec<RepoLabel>> {
         let mut labels = Vec::new();
@@ -418,6 +461,19 @@ impl<'a> GhClient<'a> {
         issue_from_value(&value)?
             .ok_or_else(|| anyhow!("create_issue returned a pull request object"))
     }
+}
+
+/// The raw status fields of one mentioned GitHub object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionFields {
+    /// The raw `state` string: `open` or `closed`.
+    pub state: String,
+    /// Whether `pull_request.merged_at` carries a timestamp.
+    pub merged: bool,
+    /// The raw `draft` flag. A plain issue reports `false`.
+    pub draft: bool,
+    /// Whether the object carries the `pull_request` key.
+    pub is_pr: bool,
 }
 
 /// Parse one issue response and reject a pull request object.
@@ -1294,6 +1350,74 @@ mod tests {
         let error = client.fetch_issues("acme/borsuk").unwrap_err();
 
         assert!(error.to_string().contains("authentication failed"));
+    }
+
+    #[test]
+    fn fetch_mention_status_maps_a_merged_pr() {
+        let pr_json = r#"{"number":5,"node_id":"PR_5","title":"pr 5","body":null,"state":"closed","labels":[],"draft":false,"pull_request":{"merged_at":"2026-09-01T10:00:00Z"},"head":{"sha":"abc","ref":"x"}}"#;
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/5"]),
+            CmdOut::ok(response("HTTP/2 200", &["etag: \"m1\""], pr_json)),
+        );
+        let client = GhClient::new(&exec);
+
+        let fields = client
+            .fetch_mention_status("acme/borsuk", 5)
+            .unwrap()
+            .unwrap();
+
+        assert!(fields.is_pr);
+        assert!(fields.merged);
+        assert_eq!(fields.state, "closed");
+        assert!(!fields.draft);
+    }
+
+    #[test]
+    fn fetch_mention_status_maps_a_plain_closed_issue() {
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+            CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], &issue_json(8))),
+        );
+        let client = GhClient::new(&exec);
+
+        let fields = client
+            .fetch_mention_status("acme/borsuk", 8)
+            .unwrap()
+            .unwrap();
+
+        assert!(!fields.is_pr);
+        assert!(!fields.merged);
+        assert!(!fields.draft);
+        assert_eq!(fields.state, "open", "the fixture issue is open");
+
+        let closed = r#"{"number":9,"node_id":"n9","title":"i 9","body":"","state":"closed","labels":[],"user":{"login":"a"},"assignees":[],"updated_at":"2026-08-09T12:00:00Z","html_url":"u"}"#;
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/9"]),
+            CmdOut::ok(response("HTTP/2 200", &["etag: \"c2\""], closed)),
+        );
+        let client = GhClient::new(&exec);
+        let fields = client
+            .fetch_mention_status("acme/borsuk", 9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fields.state, "closed");
+    }
+
+    #[test]
+    fn a_404_mention_answer_maps_to_none() {
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/99"]),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 404", &[], "{\"message\":\"Not Found\"}"),
+                stderr: "HTTP 404\n".into(),
+            },
+        );
+        let client = GhClient::new(&exec);
+
+        let answer = client.fetch_mention_status("acme/borsuk", 99).unwrap();
+
+        assert!(answer.is_none());
     }
 
     #[test]

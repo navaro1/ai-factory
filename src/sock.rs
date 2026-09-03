@@ -49,7 +49,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 1;
+pub const WIRE_PROTOCOL_REVISION: u32 = 2;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -778,6 +778,51 @@ pub enum TicketResultKind {
     Failure,
 }
 
+/// The live status of one mentioned ticket or pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionStatus {
+    /// The mentioned issue is open.
+    OpenIssue,
+    /// The mentioned issue is closed.
+    ClosedIssue,
+    /// The mentioned pull request is an open draft.
+    DraftPr,
+    /// The mentioned pull request is open and ready.
+    OpenPr,
+    /// The mentioned pull request is merged.
+    MergedPr,
+    /// The mentioned pull request is closed without a merge.
+    ClosedPr,
+    /// GitHub reports no such number.
+    Missing,
+}
+
+/// One resolved status of a mention inside one focus body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketMentionStatus {
+    /// The lowercased `owner/repo` of the mention. `None` targets the
+    /// repository of the focused item.
+    pub repo: Option<String>,
+    /// The mentioned issue or pull request number.
+    pub number: u64,
+    /// The live status of the mention.
+    pub status: MentionStatus,
+}
+
+/// The resolved mention statuses of one focused issue or pull request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TicketMentions {
+    /// The request identity from the daemon.
+    pub request: String,
+    /// The repository alias of the focused item.
+    pub repo: String,
+    /// The number of the focused item.
+    pub number: u64,
+    /// One status per resolved mention, in document order.
+    pub statuses: Vec<TicketMentionStatus>,
+}
+
 /// One result for a ticket mutation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketResult {
@@ -865,6 +910,24 @@ pub enum TicketAction {
         /// The repository alias.
         repo: String,
         /// The issue number.
+        number: u64,
+    },
+    /// Resolve the mention statuses of one focused issue again.
+    Mentions {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
+    /// Resolve the mention statuses of one focused pull request.
+    PrMentions {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The pull request number.
         number: u64,
     },
 }
@@ -1010,6 +1073,8 @@ pub enum Push {
     State(StateView),
     /// Full issue data for one focus request.
     TicketDetails(TicketDetails),
+    /// The mention statuses of one focused issue or pull request.
+    TicketMentions(TicketMentions),
     /// One repository label catalog.
     TicketLabels(TicketLabels),
     /// One ticket mutation state.
@@ -1977,7 +2042,10 @@ mod tests {
             message.contains("daemon wire protocol revision 0"),
             "{message}"
         );
-        assert!(message.contains("client revision 1"), "{message}");
+        assert!(
+            message.contains(&format!("client revision {WIRE_PROTOCOL_REVISION}")),
+            "{message}"
+        );
         assert!(message.contains("aif stop"), "{message}");
         assert!(
             pushes.next().is_none(),
@@ -1988,10 +2056,10 @@ mod tests {
     #[test]
     fn a_client_accepts_a_state_from_the_current_wire_protocol() {
         let mut current = serde_json::to_value(Push::State(sample_view(1))).unwrap();
-        current
-            .as_object_mut()
-            .unwrap()
-            .insert("protocol_revision".to_string(), serde_json::json!(1));
+        current.as_object_mut().unwrap().insert(
+            "protocol_revision".to_string(),
+            serde_json::json!(WIRE_PROTOCOL_REVISION),
+        );
         let (client, mut daemon) = UnixStream::pair().unwrap();
         writeln!(daemon, "{current}").unwrap();
         drop(daemon);

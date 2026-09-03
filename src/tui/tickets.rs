@@ -6,16 +6,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::sock::{
     Action, StateView, TicketAction, TicketConflict, TicketContent, TicketContentSource,
-    TicketDetails, TicketGroup, TicketLabels, TicketResult, TicketResultKind, TicketSummary,
+    TicketDetails, TicketGroup, TicketLabels, TicketMentions, TicketResult, TicketResultKind,
+    TicketSummary,
 };
 
-use super::markdown::markdown_lines;
+use super::markdown::{markdown_lines_with_mentions, MentionStatuses};
 use super::session::SessionView;
 use super::theme::THEME;
+
+/// How often the open focus refreshes its mention statuses.
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The active field of the direct editor.
 #[derive(Debug, Clone, Copy, Default)]
@@ -108,6 +112,10 @@ pub struct Tickets {
     body_lines: Vec<Line<'static>>,
     /// The focused proposal body, rendered once per update.
     proposal_lines: Vec<Line<'static>>,
+    /// The mention statuses of the focused body, keyed by scan identity.
+    mentions: MentionStatuses,
+    /// The last time the focus sent a mention-status refresh.
+    status_polled_at: Option<Instant>,
 }
 
 impl Tickets {
@@ -142,10 +150,14 @@ impl Tickets {
         }
     }
 
-    /// Read new ticket chat log data before one draw.
+    /// Read new ticket chat log data before one draw and seed the mention
+    /// refresh cadence for a newly opened focus.
     pub fn on_redraw(&mut self, now: Instant) {
         if self.chat.task_id().is_some() {
             self.chat.on_redraw(now);
+        }
+        if self.focus && self.details.is_some() && self.status_polled_at.is_none() {
+            self.status_polled_at = Some(now);
         }
     }
 
@@ -173,12 +185,57 @@ impl Tickets {
             self.proposal_lines.clear();
             return;
         };
-        self.body_lines = markdown_lines(&details.issue.body);
+        self.body_lines = markdown_lines_with_mentions(&details.issue.body, &self.mentions);
         self.proposal_lines = details
             .proposal
             .as_ref()
-            .map(|proposal| markdown_lines(&proposal.body))
+            .map(|proposal| markdown_lines_with_mentions(&proposal.body, &self.mentions))
             .unwrap_or_default();
+    }
+
+    /// True when the open focus owes one mention-status refresh.
+    ///
+    /// The view asks at the fixed cadence while the focus stays open; the
+    /// daemon answers from its cache or the network.
+    pub fn status_refresh_due(&self, now: Instant) -> bool {
+        self.focus
+            && self.details.is_some()
+            && self
+                .status_polled_at
+                .is_some_and(|at| now.duration_since(at) >= STATUS_REFRESH_INTERVAL)
+    }
+
+    /// Take one queued mention refresh request, when one is due.
+    pub fn take_status_refresh(&mut self, now: Instant) -> Option<Action> {
+        if !self.status_refresh_due(now) {
+            return None;
+        }
+        self.status_polled_at = Some(now);
+        let (repo, number) = self.focus_key.clone()?;
+        Some(Action::Ticket(TicketAction::Mentions {
+            request: request_code(),
+            repo,
+            number,
+        }))
+    }
+
+    /// Apply one mention-status response for the open focus.
+    ///
+    /// The statuses merge into the known set and the body re-renders, so
+    /// icons appear without any key press.
+    pub fn observe_mentions(&mut self, mentions: TicketMentions) {
+        let current = self
+            .focus_key
+            .as_ref()
+            .is_some_and(|(repo, number)| repo == &mentions.repo && *number == mentions.number);
+        if !current {
+            return;
+        }
+        for status in mentions.statuses {
+            self.mentions
+                .insert((status.repo, status.number), status.status);
+        }
+        self.refresh_body_render();
     }
 
     /// Apply one label catalog response.
@@ -492,6 +549,8 @@ impl Tickets {
         self.proposal_request = None;
         self.body_lines.clear();
         self.proposal_lines.clear();
+        self.mentions.clear();
+        self.status_polled_at = None;
     }
 
     /// Apply one key inside the direct editor.
@@ -1207,7 +1266,8 @@ fn group_line(group: TicketGroup) -> Line<'static> {
 mod tests {
     use super::*;
     use crate::sock::{
-        PausedView, StateView, TicketContent, TicketContentSource, TicketGroup, TicketSummary,
+        MentionStatus, PausedView, StateView, TicketContent, TicketContentSource, TicketGroup,
+        TicketMentions, TicketSummary,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -1398,6 +1458,148 @@ mod tests {
                 "query {query} left its tab"
             );
         }
+    }
+
+    /// Open the focus, apply one detail body, and render the screen text.
+    fn focus_screen(detail: TicketDetails, mentions: Option<TicketMentions>) -> String {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(detail);
+        if let Some(mentions) = mentions {
+            tickets.observe_mentions(mentions);
+        }
+        let backend = TestBackend::new(104, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| tickets.draw(frame, frame.area(), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn mention(number: u64, status: MentionStatus) -> crate::sock::TicketMentionStatus {
+        crate::sock::TicketMentionStatus {
+            repo: None,
+            number,
+            status,
+        }
+    }
+
+    #[test]
+    fn mention_statuses_draw_icons_before_known_mentions_only() {
+        let mut detail = details();
+        detail.issue.body = "Depends on #8 and tracks #9, misses #10.".to_string();
+        let mentions = TicketMentions {
+            request: "m1".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            statuses: vec![
+                mention(8, MentionStatus::ClosedIssue),
+                mention(9, MentionStatus::OpenIssue),
+            ],
+        };
+
+        let screen = focus_screen(detail, Some(mentions));
+
+        assert!(screen.contains("○ #8"), "screen: {screen}");
+        assert!(screen.contains("● #9"), "screen: {screen}");
+        assert!(
+            !screen.contains("#10 ●") && !screen.contains("● #10") && !screen.contains("○ #10"),
+            "an unknown mention must stay plain: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_open_focus_refreshes_mention_statuses_every_sixty_seconds() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        let start = Instant::now();
+
+        tickets.on_redraw(start);
+
+        assert!(!tickets.status_refresh_due(start));
+        assert!(!tickets.status_refresh_due(start + Duration::from_secs(59)));
+        assert!(tickets.status_refresh_due(start + Duration::from_secs(60)));
+
+        let action = tickets.take_status_refresh(start + Duration::from_secs(60));
+        assert!(matches!(
+            action,
+            Some(Action::Ticket(TicketAction::Mentions { repo, number: 7, .. }))
+                if repo == "borsuk"
+        ));
+        assert!(
+            !tickets.status_refresh_due(start + Duration::from_secs(60)),
+            "one taken tick must not fire again inside the interval"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(
+            !tickets.status_refresh_due(start + Duration::from_secs(120)),
+            "a closed focus must never refresh"
+        );
+    }
+
+    #[test]
+    fn a_cross_repo_mention_decorates_from_its_canonical_key() {
+        let mut detail = details();
+        detail.issue.body = "Needs other/repo#5 too.".to_string();
+        let mentions = TicketMentions {
+            request: "m4".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            statuses: vec![crate::sock::TicketMentionStatus {
+                repo: Some("other/repo".to_string()),
+                number: 5,
+                status: MentionStatus::OpenIssue,
+            }],
+        };
+
+        let screen = focus_screen(detail, Some(mentions));
+
+        assert!(screen.contains("● other/repo#5"), "screen: {screen}");
+    }
+
+    #[test]
+    fn a_proposal_body_decorates_its_mentions_too() {
+        let mut detail = details();
+        detail.proposal = Some(crate::sock::TicketProposal {
+            id: "p1".to_string(),
+            title: "Proposal".to_string(),
+            body: "See #9 for the live check.".to_string(),
+            original_title: "Improve the ticket list".to_string(),
+            original_body: "Show every issue without leaving the terminal.".to_string(),
+        });
+        let mentions = TicketMentions {
+            request: "m2".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            statuses: vec![mention(9, MentionStatus::OpenIssue)],
+        };
+
+        let screen = focus_screen(detail, Some(mentions));
+
+        assert!(screen.contains("● #9"), "screen: {screen}");
+    }
+
+    #[test]
+    fn a_mention_push_for_another_issue_never_decorates_the_focus() {
+        let detail = details();
+        let mentions = TicketMentions {
+            request: "m3".to_string(),
+            repo: "borsuk".to_string(),
+            number: 42,
+            statuses: vec![mention(9, MentionStatus::OpenIssue)],
+        };
+
+        let screen = focus_screen(detail, Some(mentions));
+
+        assert!(!screen.contains("●"), "screen: {screen}");
     }
 
     #[test]

@@ -1782,6 +1782,18 @@ impl Daemon {
                     TicketAction::Chat { repo, number, .. } => Some((repo.clone(), *number)),
                     _ => None,
                 };
+                let mentions_followup = match &action {
+                    TicketAction::Details { repo, number, .. } => {
+                        Some((repo.clone(), *number, false, true))
+                    }
+                    TicketAction::Mentions { repo, number, .. } => {
+                        Some((repo.clone(), *number, false, false))
+                    }
+                    TicketAction::PrMentions { repo, number, .. } => {
+                        Some((repo.clone(), *number, true, false))
+                    }
+                    _ => None,
+                };
                 let proposal_apply = match &action {
                     TicketAction::UpdateContent {
                         request,
@@ -1864,6 +1876,20 @@ impl Daemon {
                 }
                 if let Some(pusher) = self.ticket_pusher.as_ref() {
                     for push in effects.pushes {
+                        pusher(push);
+                    }
+                }
+                if let Some((repo, number, subject_is_pr, force)) = mentions_followup {
+                    let push = self.ticket_controller.mentions_push(
+                        &self.snapshot,
+                        &self.config,
+                        &repo,
+                        number,
+                        subject_is_pr,
+                        self.now_ms,
+                        force,
+                    );
+                    if let (Some(push), Some(pusher)) = (push, self.ticket_pusher.as_ref()) {
                         pusher(push);
                     }
                 }
@@ -8674,6 +8700,55 @@ mod tests {
         assert_eq!(details.repo, "borsuk");
         assert_eq!(details.issue.number, 7);
         assert_eq!(details.issue.author, "author");
+    }
+
+    #[test]
+    fn a_ticket_details_action_pushes_details_then_mention_statuses() {
+        let mut focus = issue(7, &[]);
+        focus.body = "Depends on #8 and tracks #9".to_string();
+        let open = issue(9, &[]);
+        let steps = vec![gh_step(
+            &["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"],
+            CmdOut::ok("HTTP/2 200\r\n\r\n{\"number\":8,\"state\":\"closed\"}"),
+        )];
+        let mut rig = Rig::make(steps);
+        rig.poll(vec![focus, open], vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+
+        rig.act(Action::Ticket(crate::sock::TicketAction::Details {
+            request: "details-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+
+        let crate::sock::Push::TicketDetails(details) = push_rx.try_recv().unwrap() else {
+            panic!("the details push must come first");
+        };
+        assert_eq!(details.issue.number, 7);
+        let crate::sock::Push::TicketMentions(mentions) = push_rx.try_recv().unwrap() else {
+            panic!("the mention statuses must follow the details");
+        };
+        assert_eq!(mentions.repo, "borsuk");
+        assert_eq!(mentions.number, 7);
+        let statuses: Vec<(u64, crate::sock::MentionStatus)> = mentions
+            .statuses
+            .iter()
+            .map(|status| (status.number, status.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (8, crate::sock::MentionStatus::ClosedIssue),
+                (9, crate::sock::MentionStatus::OpenIssue),
+            ]
+        );
+        assert_eq!(
+            rig.exec.calls().len(),
+            1,
+            "the open ticket must resolve from the snapshot"
+        );
     }
 
     #[test]

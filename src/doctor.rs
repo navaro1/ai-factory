@@ -923,6 +923,7 @@ fn paused_check(client: &Client) -> Check {
             Some(Ok(Push::State(view))) => return paused_check_from_view(&view.paused),
             Some(Ok(
                 Push::TicketDetails(_)
+                | Push::TicketMentions(_)
                 | Push::TicketLabels(_)
                 | Push::TicketResult(_)
                 | Push::SettingsResult(_),

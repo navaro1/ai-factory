@@ -98,6 +98,8 @@ enum Msg {
     State(StateView),
     /// Full data for one focused issue.
     TicketDetails(crate::sock::TicketDetails),
+    /// The mention statuses of one focused issue.
+    TicketMentions(crate::sock::TicketMentions),
     /// One repository label catalog.
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
@@ -254,6 +256,17 @@ impl App {
     /// The push proves the connection, clamps the selection to the new row
     /// count, and drops an expired toast. It feeds the inbox and follows
     /// the session task, so both views stay in step with the daemon.
+    /// Send one mention-status request for a pull request detail whose
+    /// description just became visible.
+    fn send_pending_pr_mention(&mut self, sink: &mut impl ActionSink) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        if let Some(action) = self.inbox.take_pending_pr_mention(state) {
+            sink.send_action(action);
+        }
+    }
+
     fn apply_state(&mut self, view: StateView) {
         let count = pipeline::rows(&view).len();
         let keyed_selection = self
@@ -945,6 +958,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::TicketMentions(mentions)) => {
+                                        if tx.send(Msg::TicketMentions(mentions)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Ok(Push::TicketLabels(labels)) => {
                                         if tx.send(Msg::TicketLabels(labels)).is_err() {
                                             return;
@@ -1000,8 +1018,10 @@ fn run_loop(
     sink: &mut impl ActionSink,
 ) -> Result<()> {
     loop {
-        let polls_log =
-            app.view == View::Session || (app.view == View::Tickets && app.tickets.needs_poll());
+        let now = Instant::now();
+        let polls_log = app.view == View::Session
+            || (app.view == View::Tickets && app.tickets.needs_poll())
+            || (app.view == View::Tickets && app.tickets.status_refresh_due(now));
         let msg = if polls_log {
             match rx.recv_timeout(session::POLL_INTERVAL) {
                 Ok(msg) => msg,
@@ -1012,6 +1032,11 @@ fn run_loop(
                         View::Tickets => app.tickets.poll(now),
                         View::Pipeline | View::Inbox | View::Settings => false,
                     };
+                    if app.view == View::Tickets {
+                        if let Some(action) = app.tickets.take_status_refresh(now) {
+                            sink.send_action(action);
+                        }
+                    }
                     if changed {
                         draw_app(surface, app, now)?;
                     }
@@ -1035,13 +1060,23 @@ fn run_loop(
 /// Apply one shell message. False requests a clean exit.
 fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result<bool> {
     match msg {
-        Msg::Key(key) => Ok(app.handle_key(key, sink)),
+        Msg::Key(key) => {
+            let handled = app.handle_key(key, sink);
+            app.send_pending_pr_mention(sink);
+            Ok(handled)
+        }
         Msg::State(view) => {
             app.apply_state(view);
+            app.send_pending_pr_mention(sink);
             Ok(true)
         }
         Msg::TicketDetails(details) => {
             app.tickets.observe_details(details);
+            Ok(true)
+        }
+        Msg::TicketMentions(mentions) => {
+            app.tickets.observe_mentions(mentions.clone());
+            app.inbox.observe_pr_mentions(&mentions);
             Ok(true)
         }
         Msg::TicketLabels(labels) => {
