@@ -718,7 +718,7 @@ pub fn daemon_program() -> PathBuf {
 fn read_config(env: &DoctorEnv) -> Result<Config> {
     if !env.config_path.exists() {
         bail!(
-            "no config file at {}; create it there, or copy \
+            "no config file at {}; run ./install.sh or copy \
              docs/v0.5/factory.example.toml as a starting point",
             env.config_path.display()
         );

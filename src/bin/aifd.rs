@@ -79,7 +79,10 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
     let config_text = fs::read_to_string(&config_path)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!("no config file at {}", config_path.display())
+                anyhow!(
+                    "no config file at {}; run ./install.sh to create it",
+                    config_path.display()
+                )
             } else {
                 anyhow!(error).context(format!("cannot read {}", config_path.display()))
             }

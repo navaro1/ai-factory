@@ -383,7 +383,7 @@ impl Config {
     fn load_with_exec(path: Option<&Path>, exec: &dyn Exec) -> Result<Self> {
         let path = path.map_or_else(default_config_path, Path::to_path_buf);
         if !path.exists() {
-            bail!("no config file at {}; create it there, or copy docs/v0.5/factory.example.toml as a starting point", path.display());
+            bail!("no config file at {}; run ./install.sh or copy docs/v0.5/factory.example.toml as a starting point", path.display());
         }
         let text =
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -1029,7 +1029,7 @@ fn migration_error(text: &str) -> Result<()> {
         .parse::<toml_edit::DocumentMut>()
         .context("invalid TOML")?;
     if document.as_table().contains_key("ticket_chat") {
-        bail!("ticket_chat is no longer supported; use [ticket.chat]");
+        bail!("ticket_chat is no longer supported; use [ticket.chat]; see docs/v0.6/MIGRATION.md");
     }
     check_legacy_table(document.as_table(), "")
 }
@@ -1042,7 +1042,7 @@ fn check_legacy_table(table: &toml_edit::Table, prefix: &str) -> Result<()> {
             format!("{prefix}.{key}")
         };
         if prefix != "repo" && matches!(key, "runner" | "variant" | "yolo") {
-            bail!("{path} is no longer supported; use the typed role settings");
+            bail!("{path} is no longer supported; use the typed role settings; see docs/v0.6/MIGRATION.md and docs/v0.5/factory.example.toml");
         }
         if let Some(child) = item.as_table() {
             check_legacy_table(child, &path)?;
@@ -1058,7 +1058,7 @@ fn check_legacy_inline_table(table: &toml_edit::InlineTable, prefix: &str) -> Re
     for (key, value) in table.iter() {
         let path = format!("{prefix}.{key}");
         if prefix != "repo" && matches!(key, "runner" | "variant" | "yolo") {
-            bail!("{path} is no longer supported; use the typed role settings");
+            bail!("{path} is no longer supported; use the typed role settings; see docs/v0.6/MIGRATION.md and docs/v0.5/factory.example.toml");
         }
         if let Some(child) = value.as_inline_table() {
             check_legacy_inline_table(child, &path)?;
