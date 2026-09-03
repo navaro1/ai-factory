@@ -458,7 +458,8 @@ fn checked_response(out: &CmdOut) -> Result<Response> {
         format!("gh api exited with status {}: {detail}", out.status)
     })?;
     ensure_ok(&response, &out.stderr)?;
-    if out.status != 0 {
+    // `gh api` exits with status 1 for a valid conditional HTTP 304.
+    if out.status != 0 && !(out.status == 1 && response.status == 304) {
         let detail = out.stderr.lines().next().unwrap_or("no stderr");
         bail!("gh api exited with status {}: {detail}", out.status);
     }
@@ -785,6 +786,112 @@ mod tests {
         assert_eq!(second.unchanged, vec![1]);
         assert_eq!(second.items.len(), 1);
         assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_nonzero_gh_exit_for_304_reuses_the_cached_page() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"v1\""],
+                    &issues_json(1, 1),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"v1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: response("HTTP/2 304", &["etag: \"v1\""], ""),
+                    stderr: "gh: HTTP 304\n".to_string(),
+                },
+            );
+        let mut client = GhClient::new(&exec);
+        let first = client.fetch_issues("acme/borsuk").unwrap();
+
+        let second = client.fetch_issues("acme/borsuk").unwrap();
+
+        assert_eq!(second.items, first.items);
+        assert_eq!(second.unchanged, vec![1]);
+    }
+
+    #[test]
+    fn a_process_status_other_than_one_keeps_a_304_as_an_error() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"v1\""],
+                    &issues_json(1, 1),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"v1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut {
+                    status: 2,
+                    stdout: response("HTTP/2 304", &["etag: \"v1\""], ""),
+                    stderr: "unexpected command failure\n".to_string(),
+                },
+            );
+        let mut client = GhClient::new(&exec);
+        client.fetch_issues("acme/borsuk").unwrap();
+
+        let error = client.fetch_issues("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("status 2"), "error was: {error}");
+    }
+
+    #[test]
+    fn a_nonzero_process_status_for_a_200_remains_an_error() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=open&per_page=100&page=1",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 200", &[], &issues_json(1, 1)),
+                stderr: "unexpected command failure\n".to_string(),
+            },
+        );
+        let mut client = GhClient::new(&exec);
+
+        let error = client.fetch_issues("acme/borsuk").unwrap_err();
+
+        assert!(error.to_string().contains("status 1"), "error was: {error}");
     }
 
     #[test]
