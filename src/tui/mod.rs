@@ -1804,7 +1804,7 @@ mod tests {
         assert!(text.contains("daemon disconnected - reconnecting"));
         // The last state stays visible below the banner.
         assert!(text.contains("refine"));
-        assert!(text.contains("i142 queued"));
+        assert!(text.contains("queued · i142"));
     }
 
     #[test]

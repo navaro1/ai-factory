@@ -1432,18 +1432,18 @@ fn truncate(text: &str) -> String {
     }
 }
 
-/// The GitHub number and title of the task's ticket, when the state view
-/// knows one.
+/// The title of the task's ticket, when the state view knows one.
 ///
+/// The row shows the number itself, so the suffix carries the title only.
 /// The tickets list holds open issues only, so a pull request task finds
 /// nothing and its row keeps the bare item label.
-fn ticket_label(state: &StateView, task: &TaskView) -> Option<String> {
+fn ticket_title(state: &StateView, task: &TaskView) -> Option<String> {
     let number = task.number;
     state
         .tickets
         .iter()
         .find(|ticket| ticket.repo == task.repo && ticket.number == number)
-        .map(|ticket| format!("#{number} {}", truncate(&ticket.title)))
+        .map(|ticket| truncate(&ticket.title))
 }
 
 /// The linked numbers as `#7 #9`, at most three, then `+n`.
@@ -1500,22 +1500,20 @@ fn release_pr_badge(state: &StateView, repo: &str, pr: u64) -> String {
     }
 }
 
-/// The spans of one ticket row: item, state, attempt, and queued messages.
+/// The spans of one ticket row: state, attempt, queued messages, and item.
+///
+/// The state leads the row. A matching open issue then names the ticket as
+/// `#784 · title`; any other task keeps the bare item label `i784` or `p7`,
+/// because the tickets list holds open issues only and the prefix then
+/// separates issues from PRs.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
 /// state, because it cannot start. A task in any other state keeps its true
 /// state: a pause blocks starts, it does not stop running tasks. A count
 /// above zero of queued messages adds a badge, so a waiting message stays
-/// visible from the board. A matching open issue adds its number and title,
-/// so the row names the ticket as the Tickets view does.
+/// visible from the board.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
-    let mut spans = vec![
-        Span::styled(
-            format!("{}{}", task.kind.as_str(), task.number),
-            Style::default().fg(THEME.text),
-        ),
-        Span::raw(" "),
-    ];
+    let mut spans = Vec::new();
     if matches!(task.state, TaskState::Queued) && task_pause_override(state, task) == Some(false) {
         spans.push(Span::styled("resumed", Style::default().fg(THEME.ok)));
     } else if matches!(task.state, TaskState::Queued) && task_is_paused(state, task) {
@@ -1532,8 +1530,20 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     if task.attempt > 1 {
         spans.push(Span::styled(format!(" a{}", task.attempt), THEME.dim()));
     }
-    if let Some(ticket) = ticket_label(state, task) {
-        spans.push(Span::styled(format!(" · {ticket}"), THEME.dim()));
+    spans.push(Span::raw(" · "));
+    match ticket_title(state, task) {
+        Some(title) => {
+            spans.push(Span::styled(
+                format!("#{}", task.number),
+                Style::default().fg(THEME.text),
+            ));
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(title, THEME.dim()));
+        }
+        None => spans.push(Span::styled(
+            format!("{}{}", task.kind.as_str(), task.number),
+            Style::default().fg(THEME.text),
+        )),
     }
     if let Some(badge) = link_badge(state, task) {
         spans.push(Span::styled(format!(" · {badge}"), THEME.dim()));
@@ -1552,15 +1562,16 @@ fn task_label(state: &StateView, task: &TaskView) -> String {
     } else {
         state_label(&task.state)
     };
-    let mut label = format!("{}{} {status}", task.kind.as_str(), task.number);
+    let mut label = status.to_string();
     if task.queued_messages > 0 {
         label.push_str(&format!(" m{}", task.queued_messages));
     }
     if task.attempt > 1 {
         label.push_str(&format!(" a{}", task.attempt));
     }
-    if let Some(ticket) = ticket_label(state, task) {
-        label.push_str(&format!(" · {ticket}"));
+    match ticket_title(state, task) {
+        Some(title) => label.push_str(&format!(" · #{} · {title}", task.number)),
+        None => label.push_str(&format!(" · {}{}", task.kind.as_str(), task.number)),
     }
     if let Some(badge) = link_badge(state, task) {
         label.push_str(&format!(" · {badge}"));
@@ -2127,7 +2138,7 @@ mod tests {
 
         let text = render_to_size(&mut app, 80, 10);
 
-        assert!(text.contains("▸ i209 queued"), "board:\n{text}");
+        assert!(text.contains("▸ queued · i209"), "board:\n{text}");
     }
 
     #[test]
@@ -2137,21 +2148,20 @@ mod tests {
             connected: true,
             ..App::default()
         };
-        let text = render_to_string(&mut app);
+        let text = render_to_size(&mut app, 200, 24);
         assert!(text.contains("1/1 of 3"));
         assert!(text.contains("1/1 of 5*"));
         assert!(text.contains("* config limit"));
         assert!(text.contains("borsuk"));
         assert!(text.contains("ryba"));
-        assert!(text.contains("i142 queued"));
-        assert!(text.contains("i143 running"));
-        assert!(text.contains("i140 running"));
-        assert!(text.contains("i140 running a2"));
-        assert!(text.contains("i7 queued"));
-        assert!(text.contains("p7 running"));
-        assert!(text.contains("p9 needs input"));
-        assert!(text.contains("p5 running"));
-        assert!(text.contains("i9 failed a3"));
+        assert!(text.contains("queued · i142"));
+        assert!(text.contains("running · i143"));
+        assert!(text.contains("running a2 · i140"));
+        assert!(text.contains("queued · i7"));
+        assert!(text.contains("running · p7"));
+        assert!(text.contains("needs input · p9"));
+        assert!(text.contains("running · p5"));
+        assert!(text.contains("failed a3 · i9"));
     }
 
     #[test]
@@ -2235,10 +2245,10 @@ mod tests {
             ..App::default()
         };
 
-        let text = render_to_string(&mut app);
-        assert_eq!(text.matches("i142 queued").count(), 1, "board:\n{text}");
-        assert_eq!(text.matches("i140 running").count(), 1, "board:\n{text}");
-        assert!(text.contains("p5 running"), "release task:\n{text}");
+        let text = render_to_size(&mut app, 200, 24);
+        assert_eq!(text.matches("queued · i142").count(), 1, "board:\n{text}");
+        assert_eq!(text.matches("· i140").count(), 1, "board:\n{text}");
+        assert!(text.contains("running · p5"), "release task:\n{text}");
     }
 
     #[test]
@@ -2252,7 +2262,7 @@ mod tests {
         let text = render_to_string(&mut app);
         let line = text.lines().find(|line| line.contains("i142")).unwrap();
         assert!(
-            line.contains("│▸ i142 queued"),
+            line.contains("│▸ queued · i142"),
             "unmarked selected line: {line}"
         );
     }
@@ -2275,10 +2285,10 @@ mod tests {
         // A global pause marks the four stage headers, the status bar, and
         // the two queued tickets.
         assert_eq!(text.matches("paused").count(), 7);
-        assert!(text.contains("i142 paused"));
-        assert!(text.contains("i7 paused"));
-        assert!(!text.contains("i142 queued"));
-        assert!(!text.contains("i7 queued"));
+        assert!(text.contains("paused · i142"));
+        assert!(text.contains("paused · i7"));
+        assert!(!text.contains("queued · i142"));
+        assert!(!text.contains("queued · i7"));
 
         // A stage pause marks only that stage header and its queued ticket.
         let state = StateView {
@@ -2300,7 +2310,7 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         assert_eq!(text.matches("paused").count(), 2);
-        assert!(text.contains("i142 paused"));
+        assert!(text.contains("paused · i142"));
     }
 
     #[test]
@@ -2321,9 +2331,9 @@ mod tests {
 
         let text = render_to_string(&mut app);
 
-        assert!(text.contains("i142 resumed"), "board:\n{text}");
-        assert!(!text.contains("i142 paused"), "board:\n{text}");
-        assert!(text.contains("i7 paused"), "board:\n{text}");
+        assert!(text.contains("resumed · i142"), "board:\n{text}");
+        assert!(!text.contains("paused · i142"), "board:\n{text}");
+        assert!(text.contains("paused · i7"), "board:\n{text}");
     }
 
     #[test]
@@ -2377,19 +2387,19 @@ mod tests {
             connected: true,
             ..App::default()
         };
-        let text = render_to_string(&mut app);
+        let text = render_to_size(&mut app, 200, 24);
         // Only the selected lane group and its queued ticket carry the mark.
         assert_eq!(text.matches("borsuk").count(), 4);
         assert_eq!(text.matches("paused").count(), 2);
         assert!(text.contains("borsuk paused"));
         assert!(!text.contains("RELEASING NOW paused"));
-        assert!(text.contains("i142 paused"));
-        assert!(!text.contains("i142 queued"));
+        assert!(text.contains("paused · i142"));
+        assert!(!text.contains("queued · i142"));
         // A running ticket of the paused lane keeps its true state.
-        assert!(text.contains("i140 running"));
+        assert!(text.contains("running a2 · i140"));
         // The other repository keeps its queued state.
-        assert!(text.contains("i7 queued"));
-        assert!(!text.contains("i7 paused"));
+        assert!(text.contains("queued · i7"));
+        assert!(!text.contains("paused · i7"));
     }
 
     #[test]
@@ -2412,15 +2422,15 @@ mod tests {
             connected: true,
             ..App::default()
         };
-        let text = render_to_string(&mut app);
-        assert!(text.contains("i143 running m2"), "board: {text}");
+        let text = render_to_size(&mut app, 200, 24);
+        assert!(text.contains("running m2 · i143"), "board: {text}");
 
         // A ticket without queued messages shows no badge.
-        assert!(!text.contains("i142 queued m"));
+        assert!(text.contains("queued · i142"));
     }
 
     #[test]
-    fn a_matching_open_issue_shows_its_number_and_title_on_the_board() {
+    fn a_matching_open_issue_names_the_ticket_after_the_state() {
         let mut state = sample_view();
         state.tickets.push(crate::sock::TicketSummary {
             repo: "borsuk".to_string(),
@@ -2439,9 +2449,11 @@ mod tests {
         let text = render_to_size(&mut app, 200, 24);
 
         assert!(
-            text.contains("i140 running a2 · #140 Fix the flaky retry"),
+            text.contains("running a2 · #140 · Fix the flaky retry"),
             "board:\n{text}"
         );
+        // The state leads; the number appears once, as `#140`.
+        assert!(!text.contains("i140"), "board:\n{text}");
     }
 
     #[test]
@@ -2464,9 +2476,9 @@ mod tests {
         let text = render_to_string(&mut app);
 
         // Only issue 140 of borsuk carries a title; the rest stay bare.
-        assert!(!text.contains("i142 queued ·"));
-        assert!(!text.contains("i7 queued ·"));
-        assert!(!text.contains("p7 running ·"));
+        assert!(!text.contains("queued · i142 ·"));
+        assert!(!text.contains("queued · i7 ·"));
+        assert!(!text.contains("running · p7 ·"));
     }
 
     fn link(repo: &str, ticket: u64, pr: u64) -> crate::sock::LinkView {
@@ -2489,7 +2501,10 @@ mod tests {
 
         let text = render_to_size(&mut app, 200, 24);
 
-        assert!(text.contains("i140 running a2 · → #7 #9"), "board:\n{text}");
+        assert!(
+            text.contains("running a2 · i140 · → #7 #9"),
+            "board:\n{text}"
+        );
     }
 
     #[test]
@@ -2504,7 +2519,10 @@ mod tests {
 
         let text = render_to_size(&mut app, 200, 24);
 
-        assert!(text.contains("p7 running · ← #142 #150"), "board:\n{text}");
+        assert!(
+            text.contains("running · p7 · ← #142 #150"),
+            "board:\n{text}"
+        );
     }
 
     #[test]
@@ -2552,7 +2570,7 @@ mod tests {
         let text = render_to_size(&mut app, 200, 24);
 
         assert!(
-            text.contains("p5 running"),
+            text.contains("running · p5"),
             "the scoped release task must render inside the batch border:\n{text}"
         );
     }
@@ -2583,8 +2601,8 @@ mod tests {
 
         let text = render_to_size(&mut app, 240, 24);
 
-        assert!(text.contains(&format!("· #140 {}", "a".repeat(32))));
-        assert!(!text.contains(&format!("· #140 {}", "a".repeat(33))));
+        assert!(text.contains(&format!("· {}", "a".repeat(32))));
+        assert!(!text.contains(&format!("· {}", "a".repeat(33))));
     }
 
     #[test]
