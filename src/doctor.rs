@@ -2271,6 +2271,27 @@ mod tests {
     }
 
     #[test]
+    fn item_worktrees_skips_a_stale_sibling_directory() {
+        let dir = temp_dir("stale-item");
+        let worktrees = dir.join("worktrees");
+        fs::create_dir_all(worktrees.join("pr-7")).expect("the pr worktree must be creatable");
+        fs::create_dir_all(worktrees.join("pr-7.stale-1"))
+            .expect("the stale sibling must be creatable");
+
+        let found = item_worktrees(&worktrees).expect("the listing must succeed");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "the stale sibling must not parse as an item: {found:?}"
+        );
+        assert_eq!(found[0].0, WorktreeKind::Pr);
+        assert_eq!(found[0].1, 7);
+        assert_eq!(found[0].2, worktrees.join("pr-7"));
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
     fn a_scheduler_lane_warning_is_reported() {
         let dir = temp_dir("lane-warn");
         let config_path = dir.join("factory.toml");

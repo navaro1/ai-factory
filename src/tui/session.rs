@@ -943,6 +943,48 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_failure_line_replaces_the_no_output_placeholder() {
+        let dir = TempDir::new("dispatch-line");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.on_redraw(Instant::now());
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, Rect::new(0, 0, 80, 12), &[]))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("no output yet"),
+            "the empty log shows the placeholder: {screen}"
+        );
+
+        fs::write(
+            &log,
+            "aif: dispatch failed: cannot prepare the worktree: git worktree prune failed: boom\n",
+        )
+        .unwrap();
+        view.on_redraw(Instant::now());
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, Rect::new(0, 0, 80, 12), &[]))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("aif: dispatch failed: cannot prepare the worktree"),
+            "the session view shows the reason: {screen}"
+        );
+        assert!(
+            !screen.contains("no output yet"),
+            "the placeholder is gone: {screen}"
+        );
+    }
+
+    #[test]
     fn the_poll_reads_at_most_once_per_interval() {
         let dir = TempDir::new("poll");
         let log = dir.path().join("task.jsonl");
