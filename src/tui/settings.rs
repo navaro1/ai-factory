@@ -1137,6 +1137,8 @@ fn role_label(role: ExecutionRole) -> &'static str {
         ExecutionRole::Release => "release",
         ExecutionRole::TicketCreate => "ticket creation",
         ExecutionRole::TicketChat => "ticket chat",
+        ExecutionRole::TheoryAudit => "theory audit",
+        ExecutionRole::TheoryChat => "theory chat",
     }
 }
 

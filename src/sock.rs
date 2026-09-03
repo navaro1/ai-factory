@@ -118,7 +118,7 @@ pub struct StateView {
 pub struct SettingsView {
     /// A stable digest of the complete `factory.toml` content.
     pub revision: String,
-    /// The six global role settings, in role order.
+    /// The configured global role settings, in role order.
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
@@ -129,15 +129,22 @@ impl SettingsView {
     pub fn from_config(config: &Config, revision: &str) -> Result<Self> {
         let global = ExecutionRole::ALL
             .into_iter()
-            .map(|role| GlobalRoleSettingsView {
-                role,
-                settings: config.roles[&role].clone(),
-                limit: role.stage().map(|stage| config.stage(stage).limit),
+            .filter_map(|role| {
+                let settings = config.roles.get(&role)?.clone();
+                Some(GlobalRoleSettingsView {
+                    role,
+                    settings,
+                    limit: role.stage().map(|stage| config.stage(stage).limit),
+                })
             })
             .collect();
         let mut repositories = Vec::new();
         for (alias, repo) in &config.repos {
-            for role in ExecutionRole::ALL {
+            for role in ExecutionRole::ALL
+                .iter()
+                .copied()
+                .filter(|role| role.overridable())
+            {
                 let resolved = config.resolved_role(Some(alias), role.table_name())?;
                 let override_settings = repo.role_overrides.get(&role);
                 repositories.push(RepositoryRoleSettingsView {
