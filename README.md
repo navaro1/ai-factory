@@ -218,7 +218,8 @@ Lowercase `p` follows the selected row:
 The most specific state wins. The order is factory, stage, repository lane,
 and task. A second `p` changes the same state again. Uppercase `P` changes the
 whole factory and removes all narrower states. A pause blocks future task
-starts. It does not stop an active task.
+starts. It does not stop an active task. A pause stops the process of a
+parked task, and the task stays resumable.
 
 ### Session, view 2
 
