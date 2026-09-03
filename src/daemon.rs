@@ -1536,6 +1536,7 @@ impl Daemon {
                 return;
             }
             self.changed = true;
+            self.reconcile(Some(&task.repo));
         } else if ok {
             self.complete_task(&task);
         } else {
@@ -3933,6 +3934,7 @@ mod tests {
         jobs: Arc<Mutex<Vec<Job>>>,
         sessions: Arc<Mutex<Vec<SessionHandle>>>,
         roles: Arc<Mutex<Vec<ResolvedRoleSettings>>>,
+        wake_rx: Receiver<()>,
         t: Arc<Mutex<u64>>,
         repo: PathBuf,
         prompts: PathBuf,
@@ -3972,7 +3974,7 @@ mod tests {
             let sessions = Arc::new(Mutex::new(Vec::new()));
             let roles = Arc::new(Mutex::new(Vec::new()));
             let (_poll_tx, poll_rx) = mpsc::channel::<DaemonMsg>();
-            let (wake_tx, _wake_rx) = mpsc::channel::<()>();
+            let (wake_tx, wake_rx) = mpsc::channel::<()>();
             let mut wake = BTreeMap::new();
             wake.insert("borsuk".to_string(), wake_tx);
             let (_action_tx, action_rx) = mpsc::channel();
@@ -4003,6 +4005,7 @@ mod tests {
                 jobs,
                 sessions,
                 roles,
+                wake_rx,
                 t,
                 repo: dir.join("repo"),
                 prompts,
@@ -4693,6 +4696,18 @@ mod tests {
         );
         assert_eq!(rig.job_count(), 2, "the freed slot admits the second task");
         assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
+
+    #[test]
+    fn a_parked_refine_turn_requests_an_immediate_github_poll() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        rig.event(turn_ended("borsuk/refine-i142"));
+
+        rig.wake_rx
+            .try_recv()
+            .expect("the turn end must wake its repository poller");
     }
 
     #[test]

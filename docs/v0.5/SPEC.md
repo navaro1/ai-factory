@@ -30,7 +30,7 @@ draft PR ──review──▶ PR ready ──release──▶ merged
 4. No domain polling loops and no tick thread. The event loop blocks on
    `recv_timeout(next_deadline)`. Deadlines are computed from pending work
    (train fires, idle reaper expiries). The only periodic clock in the whole
-   system is each repository's 60 s ETag poll thread.
+   system is each repository's 20 s ETag poll thread.
 5. GitHub is the source of truth. Do not build a journal, an event log, or a
    task database. `state.json` holds runtime overrides, train times, and active
    ticket conversation metadata. Task logs hold full transcripts.
@@ -450,7 +450,7 @@ chunk 2; do not edit `src/model.rs`.
   would put a `Sender` inside `DaemonMsg`, which costs `PartialEq` on the
   daemon's whole message enum and so costs chunk 15 its message assertions.
   Each thread loops: fetch, send `DaemonMsg::Polled { repo, snapshot }`, then
-  wait 60 s on a per-repo wake channel so `Reconcile` can force an early pass.
+  wait 20 s on a per-repo wake channel so `Reconcile` can force an early pass.
   A fetch error sends `DaemonMsg::PollFailed { repo, error }` and the thread
   keeps running with backoff to at most 5 minutes.
 - Define `DaemonMsg` here as the daemon's single inbound message enum; later
@@ -984,8 +984,9 @@ loop {
 - Run events map to state: `Started` stores the session id and writes the
   marker; `Ask` with `needs_human` opens a Question decision, otherwise a
   Permission decision; `TurnEnd` moves an interactive task to AwaitingUser and
-  a one-shot task toward its exit; `Exit` with a failure and attempts left
-  requeues, otherwise fails the task and opens a Stuck decision.
+  requests an immediate repository poll, while a one-shot task moves toward its
+  exit; `Exit` with a failure and attempts left requeues, otherwise fails the
+  task and opens a Stuck decision.
 - Review success writes `.aif/reviewed-sha` only after the task reports
   success, never before.
 - Completion differs per runner and you must not treat them alike. For a

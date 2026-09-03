@@ -23,7 +23,7 @@ use crate::gh::GhClient;
 use crate::model::RepoSnapshot;
 
 /// The normal wait between two poll passes of one repository.
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// The longest wait after repeated poll failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -642,6 +642,14 @@ mod tests {
         assert_eq!(next_backoff(MAX_BACKOFF, MAX_BACKOFF), MAX_BACKOFF);
         // An overflow saturates at the cap instead of panicking.
         assert_eq!(next_backoff(Duration::MAX, MAX_BACKOFF), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn the_production_poll_interval_is_between_ten_and_thirty_seconds() {
+        assert!(
+            (Duration::from_secs(10)..=Duration::from_secs(30)).contains(&POLL_INTERVAL),
+            "the production interval was {POLL_INTERVAL:?}"
+        );
     }
 
     /// A config with the four stages and the two repositories `a` and `b`.
