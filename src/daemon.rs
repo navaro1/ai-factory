@@ -1782,9 +1782,11 @@ impl Daemon {
                     _ => None,
                 };
                 let mentions_followup = match &action {
-                    TicketAction::Details { repo, number, .. }
-                    | TicketAction::Mentions { repo, number, .. } => {
-                        Some((repo.clone(), *number, false))
+                    TicketAction::Details { repo, number, .. } => {
+                        Some((repo.clone(), *number, false, true))
+                    }
+                    TicketAction::Mentions { repo, number, .. } => {
+                        Some((repo.clone(), *number, false, false))
                     }
                     _ => None,
                 };
@@ -1873,13 +1875,15 @@ impl Daemon {
                         pusher(push);
                     }
                 }
-                if let Some((repo, number, subject_is_pr)) = mentions_followup {
+                if let Some((repo, number, subject_is_pr, force)) = mentions_followup {
                     let push = self.ticket_controller.mentions_push(
                         &self.snapshot,
                         &self.config,
                         &repo,
                         number,
                         subject_is_pr,
+                        self.now_ms,
+                        force,
                     );
                     if let (Some(push), Some(pusher)) = (push, self.ticket_pusher.as_ref()) {
                         pusher(push);

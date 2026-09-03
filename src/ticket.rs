@@ -19,6 +19,9 @@ use crate::sock::{
 /// The most mentions one body resolves. The rest stay plain.
 const MENTION_CAP: usize = 12;
 
+/// How long one resolved mention status answers repeat requests.
+const STATUS_TTL_MS: u64 = 90_000;
+
 /// All daemon effects of one ticket action.
 #[derive(Debug, Default)]
 pub struct TicketEffects {
@@ -36,6 +39,15 @@ pub struct TicketController {
     last_mutation_ms: BTreeMap<String, u64>,
     /// The last valid label catalog per repository.
     label_catalogs: BTreeMap<String, Vec<RepoLabel>>,
+    /// The resolved mention statuses with their fetch time, keyed by the
+    /// lowercased `owner/repo` and the number.
+    mention_statuses: BTreeMap<(String, u64), (MentionStatus, u64)>,
+    /// The numbers whose last fetch failed, with that time. A failure
+    /// makes no further attempt before the status TTL passes.
+    mention_failures: BTreeMap<(String, u64), u64>,
+    /// The statuses each focus last received, to suppress unchanged
+    /// refresh pushes.
+    last_mentions: BTreeMap<(String, u64), Vec<TicketMentionStatus>>,
 }
 
 impl TicketController {
@@ -45,6 +57,9 @@ impl TicketController {
             exec,
             last_mutation_ms: BTreeMap::new(),
             label_catalogs: BTreeMap::new(),
+            mention_statuses: BTreeMap::new(),
+            mention_failures: BTreeMap::new(),
+            last_mentions: BTreeMap::new(),
         }
     }
 
@@ -177,15 +192,19 @@ impl TicketController {
     }
 
     /// Resolve the mention statuses of one focused item and return its
-    /// push, or `None` when nothing resolved.
+    /// push, or `None` when nothing resolved or nothing changed.
     ///
     /// The caller sends the details push before this method runs, so the
     /// first paint never waits on the network. The plan consults the
-    /// snapshot first: numbers that a configured repository holds as open
-    /// issues or open pull requests resolve with no network call. Every
-    /// other number costs one REST call; an unconfigured repository is
-    /// fetched directly under its canonical key. A fetch failure leaves
-    /// that number without a status.
+    /// snapshot first, then the status cache: numbers that a configured
+    /// repository holds as open issues or open pull requests, or that the
+    /// TTL window still covers, resolve with no network call. Every other
+    /// number costs one REST call; an unconfigured repository is fetched
+    /// directly under its canonical key. A failed fetch makes no further
+    /// attempt before the TTL passes. `force_push` answers even when
+    /// nothing changed, which a fresh focus needs after it cleared its
+    /// own copy of the statuses.
+    #[allow(clippy::too_many_arguments)]
     pub fn mentions_push(
         &mut self,
         snapshot: &Snapshot,
@@ -193,6 +212,8 @@ impl TicketController {
         repo: &str,
         number: u64,
         subject_is_pr: bool,
+        now_ms: u64,
+        force_push: bool,
     ) -> Option<Push> {
         let items = snapshot.repos.get(repo)?;
         let body = if subject_is_pr {
@@ -248,16 +269,49 @@ impl TicketController {
                         })
                     })
             });
-            let status = match known {
+            let cache_key = (fetch_repo.to_ascii_lowercase(), mention_number);
+            let cached = self.cached_status(&cache_key, now_ms);
+            let status = match known.or(cached) {
                 Some(status) => Some(status),
-                None => match gh.fetch_mention_status(&fetch_repo, mention_number) {
-                    Ok(Some(fields)) => {
-                        mentions::classify(&fields.state, fields.merged, fields.draft, fields.is_pr)
-                            .ok()
+                None => {
+                    if self
+                        .mention_failures
+                        .get(&cache_key)
+                        .is_some_and(|failed_at| now_ms - failed_at < STATUS_TTL_MS)
+                    {
+                        None
+                    } else {
+                        match gh.fetch_mention_status(&fetch_repo, mention_number) {
+                            Ok(Some(fields)) => {
+                                match mentions::classify(
+                                    &fields.state,
+                                    fields.merged,
+                                    fields.draft,
+                                    fields.is_pr,
+                                ) {
+                                    Ok(status) => {
+                                        self.mention_statuses
+                                            .insert(cache_key.clone(), (status, now_ms));
+                                        self.mention_failures.remove(&cache_key);
+                                        Some(status)
+                                    }
+                                    Err(_) => None,
+                                }
+                            }
+                            Ok(None) => {
+                                let missing = MentionStatus::Missing;
+                                self.mention_statuses
+                                    .insert(cache_key.clone(), (missing, now_ms));
+                                self.mention_failures.remove(&cache_key);
+                                Some(missing)
+                            }
+                            Err(_) => {
+                                self.mention_failures.insert(cache_key.clone(), now_ms);
+                                None
+                            }
+                        }
                     }
-                    Ok(None) => Some(MentionStatus::Missing),
-                    Err(_) => None,
-                },
+                }
             };
             if let Some(status) = status {
                 statuses.push(TicketMentionStatus {
@@ -267,15 +321,28 @@ impl TicketController {
                 });
             }
         }
+        let focus_key = (repo.to_string(), number);
+        if !force_push && self.last_mentions.get(&focus_key) == Some(&statuses) {
+            return None;
+        }
         if statuses.is_empty() {
             return None;
         }
+        self.last_mentions.insert(focus_key, statuses.clone());
         Some(Push::TicketMentions(TicketMentions {
             request: uuid::Uuid::new_v4().to_string(),
             repo: repo.to_string(),
             number,
             statuses,
         }))
+    }
+
+    /// The cached status of one number while its TTL window lasts.
+    fn cached_status(&self, key: &(String, u64), now_ms: u64) -> Option<MentionStatus> {
+        self.mention_statuses
+            .get(key)
+            .filter(|(_, fetched_ms)| now_ms - fetched_ms < STATUS_TTL_MS)
+            .map(|(status, _)| *status)
     }
 
     /// Update issue content after a fresh conflict check.
@@ -1463,7 +1530,7 @@ mod tests {
         let mut controller = TicketController::new(exec.clone());
 
         let push = controller
-            .mentions_push(&base, &config(), "borsuk", 7, false)
+            .mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true)
             .expect("resolved mentions must push");
 
         let Push::TicketMentions(mentions) = &push else {
@@ -1510,7 +1577,7 @@ mod tests {
         let mut controller = TicketController::new(exec.clone());
 
         let push = controller
-            .mentions_push(&base, &config(), "borsuk", 7, false)
+            .mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true)
             .expect("both cross-repo mentions must resolve");
 
         let Push::TicketMentions(mentions) = &push else {
@@ -1536,6 +1603,136 @@ mod tests {
             1,
             "the configured repository must answer from the snapshot"
         );
+    }
+
+    #[test]
+    fn repeat_resolution_inside_the_ttl_spends_no_new_gh_calls() {
+        let base = snapshot(issue("Title", "See #8."));
+        let exec = Arc::new(
+            ScriptExec::new()
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    ok("{\"number\":8,\"state\":\"open\"}"),
+                )
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    ok("{\"number\":8,\"state\":\"closed\"}"),
+                ),
+        );
+        let mut controller = TicketController::new(exec.clone());
+
+        let first = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true)
+            .unwrap();
+        let second = controller.mentions_push(&base, &config(), "borsuk", 7, false, 2_000, true);
+        let third = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false, 200_000, true)
+            .unwrap();
+
+        let status = |push: &Push| match push {
+            Push::TicketMentions(mentions) => mentions.statuses[0].status,
+            _ => panic!("the push must carry mention statuses"),
+        };
+        assert_eq!(status(&first), MentionStatus::OpenIssue);
+        assert_eq!(status(&second.unwrap()), MentionStatus::OpenIssue);
+        assert_eq!(
+            status(&third),
+            MentionStatus::ClosedIssue,
+            "past the TTL the answer must refresh"
+        );
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn an_unchanged_refresh_pushes_nothing() {
+        let base = snapshot(issue("Title", "See #8."));
+        let exec = Arc::new(ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+            ok("{\"number\":8,\"state\":\"open\"}"),
+        ));
+        let mut controller = TicketController::new(exec.clone());
+
+        let first = controller.mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true);
+        let refresh = controller.mentions_push(&base, &config(), "borsuk", 7, false, 2_000, false);
+
+        assert!(first.is_some(), "the focus needs its first statuses");
+        assert!(
+            refresh.is_none(),
+            "an unchanged refresh must not push again"
+        );
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn a_rate_limited_fetch_waits_for_the_ttl_window() {
+        let base = snapshot(issue("Title", "See #8."));
+        let exec = Arc::new(
+            ScriptExec::new()
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    CmdOut {
+                        status: 1,
+                        stdout: "HTTP/2 403\r\n\r\n{}".to_string(),
+                        stderr: "HTTP 403\nretry-after: 30\n".to_string(),
+                    },
+                )
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    ok("{\"number\":8,\"state\":\"closed\"}"),
+                ),
+        );
+        let mut controller = TicketController::new(exec.clone());
+
+        let limited = controller.mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true);
+        let blocked = controller.mentions_push(&base, &config(), "borsuk", 7, false, 2_000, true);
+        let retried = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false, 200_000, true)
+            .unwrap();
+
+        assert!(limited.is_none(), "a failed number stays without a push");
+        assert!(
+            blocked.is_none(),
+            "the failed number must not retry inside the TTL window"
+        );
+        let Push::TicketMentions(mentions) = &retried else {
+            panic!("the retry must resolve the status");
+        };
+        assert_eq!(mentions.statuses[0].status, MentionStatus::ClosedIssue);
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_not_found_answer_caches_the_missing_status() {
+        let base = snapshot(issue("Title", "See #8."));
+        let exec = Arc::new(
+            ScriptExec::new()
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    not_found(8),
+                )
+                .expect(
+                    gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/issues/8"]),
+                    not_found(8),
+                ),
+        );
+        let mut controller = TicketController::new(exec.clone());
+
+        let first = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true)
+            .unwrap();
+        let refresh = controller.mentions_push(&base, &config(), "borsuk", 7, false, 2_000, false);
+        let again = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false, 200_000, true)
+            .unwrap();
+
+        let status = |push: &Push| match push {
+            Push::TicketMentions(mentions) => mentions.statuses[0].status,
+            _ => panic!("the push must carry mention statuses"),
+        };
+        assert_eq!(status(&first), MentionStatus::Missing);
+        assert!(refresh.is_none(), "the cached answer suppresses the push");
+        assert_eq!(status(&again), MentionStatus::Missing);
+        assert_eq!(exec.calls().len(), 2);
     }
 
     #[test]
@@ -1566,7 +1763,7 @@ mod tests {
         let mut controller = TicketController::new(exec.clone());
 
         let push = controller
-            .mentions_push(&base, &config(), "borsuk", 7, false)
+            .mentions_push(&base, &config(), "borsuk", 7, false, 1_000, true)
             .expect("the capped mentions must still push");
 
         let Push::TicketMentions(mentions) = &push else {

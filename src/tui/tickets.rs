@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::sock::{
     Action, StateView, TicketAction, TicketConflict, TicketContent, TicketContentSource,
@@ -17,6 +17,9 @@ use crate::sock::{
 use super::markdown::{markdown_lines_with_mentions, MentionStatuses};
 use super::session::SessionView;
 use super::theme::THEME;
+
+/// How often the open focus refreshes its mention statuses.
+const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The active field of the direct editor.
 #[derive(Debug, Clone, Copy, Default)]
@@ -111,6 +114,8 @@ pub struct Tickets {
     proposal_lines: Vec<Line<'static>>,
     /// The mention statuses of the focused body, keyed by scan identity.
     mentions: MentionStatuses,
+    /// The last time the focus sent a mention-status refresh.
+    status_polled_at: Option<Instant>,
 }
 
 impl Tickets {
@@ -145,10 +150,14 @@ impl Tickets {
         }
     }
 
-    /// Read new ticket chat log data before one draw.
+    /// Read new ticket chat log data before one draw and seed the mention
+    /// refresh cadence for a newly opened focus.
     pub fn on_redraw(&mut self, now: Instant) {
         if self.chat.task_id().is_some() {
             self.chat.on_redraw(now);
+        }
+        if self.focus && self.details.is_some() && self.status_polled_at.is_none() {
+            self.status_polled_at = Some(now);
         }
     }
 
@@ -182,6 +191,32 @@ impl Tickets {
             .as_ref()
             .map(|proposal| markdown_lines_with_mentions(&proposal.body, &self.mentions))
             .unwrap_or_default();
+    }
+
+    /// True when the open focus owes one mention-status refresh.
+    ///
+    /// The view asks at the fixed cadence while the focus stays open; the
+    /// daemon answers from its cache or the network.
+    pub fn status_refresh_due(&self, now: Instant) -> bool {
+        self.focus
+            && self.details.is_some()
+            && self
+                .status_polled_at
+                .is_some_and(|at| now.duration_since(at) >= STATUS_REFRESH_INTERVAL)
+    }
+
+    /// Take one queued mention refresh request, when one is due.
+    pub fn take_status_refresh(&mut self, now: Instant) -> Option<Action> {
+        if !self.status_refresh_due(now) {
+            return None;
+        }
+        self.status_polled_at = Some(now);
+        let (repo, number) = self.focus_key.clone()?;
+        Some(Action::Ticket(TicketAction::Mentions {
+            request: request_code(),
+            repo,
+            number,
+        }))
     }
 
     /// Apply one mention-status response for the open focus.
@@ -515,6 +550,7 @@ impl Tickets {
         self.body_lines.clear();
         self.proposal_lines.clear();
         self.mentions.clear();
+        self.status_polled_at = None;
     }
 
     /// Apply one key inside the direct editor.
@@ -1474,6 +1510,38 @@ mod tests {
         assert!(
             !screen.contains("#10 ●") && !screen.contains("● #10") && !screen.contains("○ #10"),
             "an unknown mention must stay plain: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_open_focus_refreshes_mention_statuses_every_sixty_seconds() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        let start = Instant::now();
+
+        tickets.on_redraw(start);
+
+        assert!(!tickets.status_refresh_due(start));
+        assert!(!tickets.status_refresh_due(start + Duration::from_secs(59)));
+        assert!(tickets.status_refresh_due(start + Duration::from_secs(60)));
+
+        let action = tickets.take_status_refresh(start + Duration::from_secs(60));
+        assert!(matches!(
+            action,
+            Some(Action::Ticket(TicketAction::Mentions { repo, number: 7, .. }))
+                if repo == "borsuk"
+        ));
+        assert!(
+            !tickets.status_refresh_due(start + Duration::from_secs(60)),
+            "one taken tick must not fire again inside the interval"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(
+            !tickets.status_refresh_due(start + Duration::from_secs(120)),
+            "a closed focus must never refresh"
         );
     }
 

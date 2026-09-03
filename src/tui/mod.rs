@@ -937,8 +937,10 @@ fn run_loop(
     sink: &mut impl ActionSink,
 ) -> Result<()> {
     loop {
-        let polls_log =
-            app.view == View::Session || (app.view == View::Tickets && app.tickets.needs_poll());
+        let now = Instant::now();
+        let polls_log = app.view == View::Session
+            || (app.view == View::Tickets && app.tickets.needs_poll())
+            || (app.view == View::Tickets && app.tickets.status_refresh_due(now));
         let msg = if polls_log {
             match rx.recv_timeout(session::POLL_INTERVAL) {
                 Ok(msg) => msg,
@@ -949,6 +951,11 @@ fn run_loop(
                         View::Tickets => app.tickets.poll(now),
                         View::Pipeline | View::Inbox | View::Settings => false,
                     };
+                    if app.view == View::Tickets {
+                        if let Some(action) = app.tickets.take_status_refresh(now) {
+                            sink.send_action(action);
+                        }
+                    }
                     if changed {
                         draw_app(surface, app, now)?;
                     }
