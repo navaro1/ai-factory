@@ -66,8 +66,10 @@ do not exist:
 | `factory.example.toml` | A portable reference copy of the example. |
 | `prompts/*.md` | The four stage prompts and the ticket chat prompt. |
 
-The installer never overwrites a file that exists. Edit
-`~/.config/aif/factory.toml` and set the path of every repository.
+The installer never overwrites a file that exists. The installer keeps an
+installed prompt file. After an upgrade, copy the new prompt files from
+`docs/v0.6/prompts/` by hand. Edit `~/.config/aif/factory.toml` and set the
+path of every repository.
 
 ## Configure
 
