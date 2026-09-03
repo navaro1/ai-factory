@@ -25,6 +25,13 @@
 //!    [`Action`] to send over the control socket, or none.
 //! 5. Draw with [`SessionView::draw`] inside the pane the shell reserves.
 //!
+//! The view holds a chat focus flag. A focused bar types; an unfocused bar
+//! renders dim and swallows typing, so the shell can use plain letters for
+//! its own keys. The shell releases the focus with `esc` or `tab` and
+//! takes it back with `i` or `enter`. The header shows one tab per live
+//! session when the daemon pushes more than one; the shell switches tabs
+//! with `h` and `l`.
+//!
 //! The view answers with [`Action::Chat`] and [`Action::Abort`] only. The
 //! shell owns view switching and every other global key.
 
@@ -36,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -296,6 +304,10 @@ fn input_hint(mode: &InputMode) -> String {
 #[derive(Debug)]
 pub struct SessionView {
     task: Option<TaskView>,
+    /// The ids of the live sessions, in the order of the last state push.
+    tabs: Vec<String>,
+    /// True while the input bar takes the typing keys.
+    chat_focus: bool,
     tailer: Option<LogTailer>,
     ring: Ring<Entry>,
     input: String,
@@ -314,12 +326,34 @@ impl SessionView {
     pub fn new() -> Self {
         SessionView {
             task: None,
+            tabs: Vec::new(),
+            chat_focus: true,
             tailer: None,
             ring: Ring::new(RING_CAP),
             input: String::new(),
             scroll_up: 0,
             last_poll: None,
         }
+    }
+
+    /// The ids of the live sessions, in the order of the last state push.
+    pub fn tabs(&self) -> &[String] {
+        &self.tabs
+    }
+
+    /// Replace the live-session tab list.
+    pub fn set_tabs(&mut self, tabs: Vec<String>) {
+        self.tabs = tabs;
+    }
+
+    /// True while the input bar takes the typing keys.
+    pub fn chat_focus(&self) -> bool {
+        self.chat_focus
+    }
+
+    /// Take or release the chat focus. The state survives a task switch.
+    pub fn set_chat_focus(&mut self, focus: bool) {
+        self.chat_focus = focus;
     }
 
     /// The id of the task the view shows, when one is chosen.
@@ -333,6 +367,9 @@ impl SessionView {
     }
 
     /// Clear the shown task and all local session data.
+    ///
+    /// The tab list and the chat focus survive: they are shell-level
+    /// state, not data of one task.
     pub fn clear(&mut self) {
         self.task = None;
         self.tailer = None;
@@ -425,18 +462,24 @@ impl SessionView {
     ///
     /// `page` is the visible transcript height in rows; the shell passes
     /// the pane height, and the view uses it as the PageUp and PageDown
-    /// step. Typing feeds the input bar. Enter sends one [`Action::Chat`]
-    /// with the typed text, `ctrl-x` sends [`Action::Abort`], PageUp and
-    /// PageDown scroll, and End returns to following the tail.
+    /// step. A focused bar takes the typing keys: typing feeds the input
+    /// bar, Enter sends one [`Action::Chat`] with the typed text, `ctrl-x`
+    /// sends [`Action::Abort`], PageUp and PageDown scroll, and End
+    /// returns to following the tail.
+    ///
+    /// An unfocused bar swallows typing and Enter and returns none,
+    /// whatever the bar holds. `ctrl-x` and the scroll keys stay alive, so
+    /// the shell can keep them forwarded while its own keys own the plain
+    /// letters.
     ///
     /// A closed input swallows typing and Enter and returns none, whatever
-    /// the bar holds. `ctrl-x` and the scroll keys stay alive.
+    /// the focus says.
     pub fn handle_key(&mut self, key: KeyEvent, page: u16) -> Option<Action> {
         if key.kind != KeyEventKind::Press {
             return None;
         }
         let page = usize::from(page.max(1));
-        let disabled = self.input_is_disabled();
+        let disabled = self.input_is_disabled() || !self.chat_focus;
         match (key.code, key.modifiers) {
             (KeyCode::Char('x'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 let task = self.task.as_ref()?.id.clone();
@@ -554,13 +597,58 @@ impl SessionView {
         lines
     }
 
+    /// The one-row header above the transcript.
+    ///
+    /// With fewer than two live sessions the header is the plain task
+    /// line. With two or more the header is the tab strip: one label per
+    /// live session, the shown one bright, with its attempt and queued
+    /// count at the end.
+    fn header_line(&self) -> Line<'static> {
+        let dim = transcript::dim_style();
+        if self.tabs.len() >= 2 {
+            let active = |id: &str| self.task.as_ref().is_some_and(|task| task.id == *id);
+            let mut spans = Vec::new();
+            for (index, id) in self.tabs.iter().enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled(" │ ", dim));
+                }
+                let style = if active(id) {
+                    Style::default()
+                        .fg(THEME.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    dim
+                };
+                spans.push(Span::styled(id.clone(), style));
+            }
+            if let Some(task) = &self.task {
+                let mut info = format!(" · attempt {}", task.attempt);
+                if task.queued_messages > 0 {
+                    info.push_str(&format!(" · {} queued", task.queued_messages));
+                }
+                spans.push(Span::styled(info, dim));
+            }
+            return Line::from(spans);
+        }
+        match &self.task {
+            Some(task) => {
+                let mut text = format!("{} · {} · attempt {}", task.id, task.state, task.attempt);
+                if task.queued_messages > 0 {
+                    text.push_str(&format!(" · {} queued", task.queued_messages));
+                }
+                Line::styled(text, dim)
+            }
+            None => Line::styled("no task selected".to_string(), dim),
+        }
+    }
+
     /// Draw the view into `area`.
     ///
     /// The layout, from the top: a one-row task header, the transcript,
     /// the inline ask block when a decision of this task waits, and the
-    /// input bar at the bottom. The header shows the queued message count
-    /// when one waits. The input bar hint comes from the task's input
-    /// mode, and a closed bar renders dim.
+    /// input bar at the bottom. The header shows the live-session tabs
+    /// when the daemon pushes more than one. The input bar hint comes from
+    /// the task's input mode, and a closed or unfocused bar renders dim.
     pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, decisions: &[Decision]) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -589,18 +677,7 @@ impl SessionView {
         );
 
         if header_rows > 0 {
-            let header = match &self.task {
-                Some(task) => {
-                    let mut text =
-                        format!("{} · {} · attempt {}", task.id, task.state, task.attempt);
-                    if task.queued_messages > 0 {
-                        text.push_str(&format!(" · {} queued", task.queued_messages));
-                    }
-                    Line::styled(text, transcript::dim_style())
-                }
-                None => Line::styled("no task selected".to_string(), transcript::dim_style()),
-            };
-            frame.render_widget(Paragraph::new(header), header_rect);
+            frame.render_widget(Paragraph::new(self.header_line()), header_rect);
         }
 
         if transcript_rows > 0 {
@@ -618,12 +695,21 @@ impl SessionView {
         }
 
         // The hint states what Enter will do for this task. A closed bar
-        // shows the daemon's reason and renders dim.
-        let hint = match &self.task {
-            Some(task) => input_hint(&task.input),
-            None => "select a task to chat".to_string(),
+        // shows the daemon's reason. An unfocused bar states the keys
+        // that take the focus back and switch the tabs.
+        let hint = if !self.chat_focus {
+            let switch = match self.tabs.len() {
+                0 | 1 => String::new(),
+                _ => "h l switch session · ".to_string(),
+            };
+            format!("{switch}i or enter chats")
+        } else {
+            match &self.task {
+                Some(task) => input_hint(&task.input),
+                None => "select a task to chat".to_string(),
+            }
         };
-        let disabled = self.input_is_disabled();
+        let disabled = self.input_is_disabled() || !self.chat_focus;
         let mut block = Block::default()
             .borders(Borders::ALL)
             .title(" chat ")
@@ -1316,5 +1402,137 @@ mod tests {
         view.show(&task_with_mode(&log, InputMode::Live, 0));
         let screen = drawn_screen(&view);
         assert!(!screen.contains("queued"), "header: {screen}");
+    }
+
+    #[test]
+    fn the_header_shows_a_tab_strip_when_two_sessions_are_live() {
+        let dir = TempDir::new("tabs");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.set_tabs(vec![
+            "borsuk/refine-i143".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+
+        let screen = drawn_screen(&view);
+
+        assert!(
+            screen.contains("borsuk/refine-i143"),
+            "the first tab is listed: {screen}"
+        );
+        assert!(
+            screen.contains("borsuk/implement-i142"),
+            "the shown task keeps its full tab: {screen}"
+        );
+        assert!(
+            screen.contains("attempt 1"),
+            "the shown task keeps its attempt: {screen}"
+        );
+        assert!(
+            !screen.contains("no task selected"),
+            "the plain header is gone: {screen}"
+        );
+
+        // A single live session keeps the plain header.
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.set_tabs(vec!["borsuk/implement-i142".to_string()]);
+        let screen = drawn_screen(&view);
+        assert!(
+            screen.contains("borsuk/implement-i142 · running · attempt 1"),
+            "one tab stays plain: {screen}"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_bar_swallows_typing_but_keeps_scroll_and_abort() {
+        let dir = TempDir::new("unfocused");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.set_chat_focus(false);
+
+        for press in [letter('h'), letter('l'), key(KeyCode::Backspace)] {
+            assert_eq!(view.handle_key(press, 10), None);
+        }
+        assert!(view.input.is_empty(), "an unfocused bar swallows letters");
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter), 10),
+            None,
+            "an unfocused bar sends nothing on Enter"
+        );
+
+        view.handle_key(key(KeyCode::PageUp), 10);
+        assert!(!view.following(), "scrolling stays alive");
+        view.handle_key(key(KeyCode::End), 10);
+        assert!(view.following());
+
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(
+            view.handle_key(ctrl_x, 10),
+            Some(Action::Abort {
+                task: "borsuk/implement-i142".to_string(),
+            }),
+            "abort stays alive without the focus"
+        );
+    }
+
+    #[test]
+    fn the_draw_marks_an_unfocused_bar_with_a_switch_hint() {
+        let dir = TempDir::new("hint");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.set_tabs(vec![
+            "borsuk/refine-i143".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+        view.set_chat_focus(false);
+
+        let screen = drawn_screen(&view);
+        assert!(
+            screen.contains("h l switch session · i or enter chats"),
+            "hint: {screen}"
+        );
+        assert_eq!(
+            drawn_border_style(&view).fg,
+            Some(THEME.dim),
+            "an unfocused bar renders dim"
+        );
+
+        // With one live session there is nothing to switch between.
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.set_chat_focus(false);
+        let screen = drawn_screen(&view);
+        assert!(screen.contains("i or enter chats"), "hint: {screen}");
+        assert!(!screen.contains("switch session"), "hint: {screen}");
+
+        // A focused bar shows the mode hint and keeps its border.
+        view.set_chat_focus(true);
+        let screen = drawn_screen(&view);
+        assert!(screen.contains("enter send"), "hint: {screen}");
+        assert_ne!(drawn_border_style(&view).fg, Some(THEME.dim));
+    }
+
+    #[test]
+    fn the_chat_focus_survives_a_task_switch() {
+        let dir = TempDir::new("focus-keep");
+        let first_log = dir.path().join("first.jsonl");
+        let second_log = dir.path().join("second.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&first_log));
+        view.set_chat_focus(false);
+
+        let mut other = sample_task(&second_log);
+        other.id = "borsuk/refine-i7".to_string();
+        view.show(&other);
+
+        assert!(
+            !view.chat_focus(),
+            "cycling to another session keeps the focus released"
+        );
+        assert_eq!(view.tabs().len(), 0, "the tab list is shell-level data");
     }
 }

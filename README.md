@@ -241,6 +241,9 @@ task, and the bar never promises what the daemon refuses:
   message, the abort makes that message start at once.
 - Press `PageUp` and `PageDown` to scroll. Press `End` to follow the live
   output again.
+- The chat bar holds the keyboard while it is focused. Press `esc` or
+  `tab` to release it, `h` and `l` to move to the previous or next live
+  session, and `i` or `enter` to take the keyboard back.
 - A pending question of the agent appears inline, with its options.
 
 The implement and review agents run one turn per process. A turn that already
