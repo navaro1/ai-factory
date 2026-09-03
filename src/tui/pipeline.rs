@@ -473,7 +473,7 @@ fn open_selected_task(app: &mut App) {
         OpenTarget::Ticket(task) => {
             app.session_task = Some(task);
             app.wanted = None;
-            app.view = View::Session;
+            app.enter_session();
             app.show_session_task();
         }
         OpenTarget::Release { repo, pr } => {
@@ -740,7 +740,7 @@ fn wait_for_task(app: &mut App, task: String, wanted: Wanted) {
     app.session.clear();
     app.wanted = Some(wanted);
     app.session_task = Some(task);
-    app.view = View::Session;
+    app.enter_session();
 }
 
 /// Ask the operator to confirm the abort of the selected task.

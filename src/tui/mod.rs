@@ -15,8 +15,10 @@
 //! `handle_key` for the inbox.
 //!
 //! A view that holds the keyboard for text input keeps a typed `q` away
-//! from the quit handler. The `!` inbox key and the ctrl-q and ctrl-c quit
-//! chords work from every view.
+//! from the quit handler. The session view holds it while its chat bar is
+//! focused; `esc` or `tab` releases the focus, `h` and `l` then switch
+//! the live sessions, and `i` or `enter` takes the focus back. The `!`
+//! inbox key and the ctrl-q and ctrl-c quit chords work from every view.
 
 pub mod inbox;
 pub mod markdown;
@@ -49,6 +51,7 @@ use ratatui::{Frame, Terminal};
 use crate::decisions::DecisionKind;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
+use crate::tasks::TaskState;
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
 use settings::Settings;
@@ -267,6 +270,7 @@ impl App {
         };
         self.inbox.observe(&view);
         self.tickets.observe_state(&view);
+        self.session.set_tabs(live_session_ids(&view));
         let wanted_task = self.wanted.as_ref().and_then(|wanted| {
             view.tasks
                 .iter()
@@ -320,16 +324,59 @@ impl App {
 
     /// True while a view holds the keyboard for text input.
     ///
-    /// The session view always owns its input bar. The inbox owns it while
-    /// a reason input is open.
+    /// The session view owns it while its chat bar holds the focus; the
+    /// shell releases the focus with `esc` or `tab` and takes it back with
+    /// `i` or `enter`. The inbox owns it while a reason input is open.
     fn text_focus(&self) -> bool {
         match self.view {
-            View::Session => true,
+            View::Session => self.session.chat_focus(),
             View::Inbox => self.inbox.typing(),
             View::Tickets => self.tickets.typing(),
             View::Settings => self.settings.typing(),
             View::Pipeline => false,
         }
+    }
+
+    /// Enter the session view and give the chat bar the focus.
+    fn enter_session(&mut self) {
+        self.view = View::Session;
+        self.session.set_chat_focus(true);
+    }
+
+    /// Show the previous or next live session, in state-push order.
+    ///
+    /// The step wraps at the ends. With no live session the call does
+    /// nothing. With a shown session that is not live, `1` shows the
+    /// first live session and `-1` the last.
+    fn cycle_session(&mut self, delta: isize) {
+        let live = self
+            .state
+            .as_ref()
+            .map(live_session_ids)
+            .unwrap_or_default();
+        if live.is_empty() {
+            return;
+        }
+        let next = match self
+            .session_task
+            .as_deref()
+            .and_then(|id| live.iter().position(|entry| entry == id))
+        {
+            Some(position) => {
+                let len = live.len() as isize;
+                (position as isize + delta).rem_euclid(len) as usize
+            }
+            None => {
+                if delta < 0 {
+                    live.len() - 1
+                } else {
+                    0
+                }
+            }
+        };
+        self.session_task = Some(live[next].clone());
+        self.wanted = None;
+        self.show_session_task();
     }
 
     /// The visible transcript height of the session view.
@@ -392,16 +439,26 @@ impl App {
         }
         match self.view {
             View::Session => {
-                if let Some(action) = self.session.handle_key(key, self.session_page()) {
-                    let text = match &action {
-                        Action::Chat { task, .. } => format!("sent chat {task}"),
-                        Action::Abort { task } => format!("sent abort {task}"),
-                        _ => "sent".to_string(),
-                    };
-                    emit(self, sink, action, text);
-                }
-                if key.code == KeyCode::Esc {
-                    self.view = View::Pipeline;
+                let focused = self.session.chat_focus();
+                match key.code {
+                    KeyCode::Esc if focused => self.session.set_chat_focus(false),
+                    KeyCode::Esc => self.view = View::Pipeline,
+                    KeyCode::Tab => self.session.set_chat_focus(!focused),
+                    KeyCode::Char('h') | KeyCode::Left if !focused => self.cycle_session(-1),
+                    KeyCode::Char('l') | KeyCode::Right if !focused => self.cycle_session(1),
+                    KeyCode::Char('i') | KeyCode::Enter if !focused => {
+                        self.session.set_chat_focus(true);
+                    }
+                    _ => {
+                        if let Some(action) = self.session.handle_key(key, self.session_page()) {
+                            let text = match &action {
+                                Action::Chat { task, .. } => format!("sent chat {task}"),
+                                Action::Abort { task } => format!("sent abort {task}"),
+                                _ => "sent".to_string(),
+                            };
+                            emit(self, sink, action, text);
+                        }
+                    }
                 }
             }
             View::Inbox if self.inbox.typing() => {
@@ -417,7 +474,7 @@ impl App {
                 }
                 match key.code {
                     KeyCode::Char('1') => self.view = View::Pipeline,
-                    KeyCode::Char('2') => self.view = View::Session,
+                    KeyCode::Char('2') => self.enter_session(),
                     KeyCode::Char('3') => {}
                     KeyCode::Char('4') => self.view = View::Tickets,
                     KeyCode::Char('5') => self.view = View::Settings,
@@ -430,7 +487,7 @@ impl App {
             }
             View::Pipeline => match key.code {
                 KeyCode::Char('1') => {}
-                KeyCode::Char('2') => self.view = View::Session,
+                KeyCode::Char('2') => self.enter_session(),
                 KeyCode::Char('3') => self.view = View::Inbox,
                 KeyCode::Char('4') => self.view = View::Tickets,
                 KeyCode::Char('5') => self.view = View::Settings,
@@ -449,7 +506,7 @@ impl App {
                             return true;
                         }
                         KeyCode::Char('2') => {
-                            self.view = View::Session;
+                            self.enter_session();
                             return true;
                         }
                         KeyCode::Char('3') => {
@@ -488,7 +545,7 @@ impl App {
                             return true;
                         }
                         KeyCode::Char('2') => {
-                            self.view = View::Session;
+                            self.enter_session();
                             return true;
                         }
                         KeyCode::Char('3') => {
@@ -582,7 +639,7 @@ impl App {
         if let inbox::InboxOutcome::OpenSession(task) = outcome {
             self.session_task = Some(task);
             self.wanted = None;
-            self.view = View::Session;
+            self.enter_session();
             self.show_session_task();
         }
         sent
@@ -607,6 +664,19 @@ fn inbox_key(key: KeyEvent) -> bool {
 /// True when the key is one of the digit keys 1 through 9.
 fn digit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('1'..='9'))
+}
+
+/// The ids of the live sessions, in state-push order.
+///
+/// A live session runs or waits for an answer; a queued task has no
+/// session yet and a terminal task has stopped.
+fn live_session_ids(state: &StateView) -> Vec<String> {
+    state
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Running | TaskState::AwaitingUser))
+        .map(|task| task.id.clone())
+        .collect()
 }
 
 /// Send one action to the sink and toast what was sent.
@@ -1248,9 +1318,9 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(78, 17, area);
+    let panel = centered(78, 18, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 30] = [
+    let rows: [(&str, &str); 32] = [
         ("1 2 3 4 5", "switch view"),
         ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
@@ -1272,6 +1342,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("ctrl-x", "abort the shown task"),
         ("PageUp PageDown", "scroll content"),
         ("End", "follow the tail"),
+        ("esc tab i", "leave or take the chat focus"),
+        ("h l", "switch session, chat unfocused"),
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
         ("/ e l c a", "search and ticket actions"),
@@ -1285,9 +1357,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let mut sorted = rows.to_vec();
     sorted.sort_by_key(|(key, text)| std::cmp::Reverse(key.len() + text.len()));
     let mut lines = Vec::new();
-    for row in 0..15 {
+    for row in 0..16 {
         let mut spans = Vec::new();
-        for (column, index) in [row, 29 - row].into_iter().enumerate() {
+        for (column, index) in [row, sorted.len() - 1 - row].into_iter().enumerate() {
             let (key, text) = sorted[index];
             if column > 0 {
                 spans.push(Span::raw("    "));
@@ -1829,6 +1901,8 @@ mod tests {
             "j k Up Down",
             "h l Left Right",
             "move between lanes",
+            "leave or take the chat focus",
+            "switch session, chat unfocused",
             "toggle the selected PR",
             "ctrl-q",
             "send the chat message",
@@ -2106,7 +2180,18 @@ mod tests {
         assert!(app.session.is_showing("borsuk/refine-i142"));
         assert!(sink.0.is_empty(), "enter must not send an action");
 
-        // Escape returns to the pipeline view.
+        // Escape releases the chat focus first and stays in the view.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session);
+        assert!(!app.session.chat_focus());
+
+        // A second escape leaves the view.
         run_messages(
             &mut surface,
             &mut app,
@@ -2384,6 +2469,146 @@ mod tests {
                 task: "borsuk/refine-i142".to_string(),
                 text: "hi".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn h_and_l_cycle_the_live_sessions_when_the_chat_is_unfocused() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('2'),
+                key('l'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Session);
+        assert_eq!(
+            app.session_task, None,
+            "a focused chat bar types the letter instead of switching"
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('l')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.session_task.as_deref(),
+            Some("borsuk/refine-i143"),
+            "l shows the first live session"
+        );
+        assert!(app.session.is_showing("borsuk/refine-i143"));
+
+        // The sample state holds five live sessions. From the first one,
+        // two steps right and two steps left return to it, and one more
+        // step left wraps to the last live session.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('l'), key('l'), key('h'), key('h'), key('h')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.session_task.as_deref(),
+            Some("borsuk/release"),
+            "the step wraps at the ends"
+        );
+    }
+
+    #[test]
+    fn i_takes_the_chat_focus_back_and_typing_sends_the_chat() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('2'),
+                key_code(KeyCode::Esc),
+                key('l'),
+                key('i'),
+                key('h'),
+                key('i'),
+                key_code(KeyCode::Enter),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.session.chat_focus());
+        assert_eq!(
+            sink.0,
+            vec![Action::Chat {
+                task: "borsuk/refine-i143".to_string(),
+                text: "hi".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn tab_toggles_the_chat_focus_and_q_quits_only_unfocused() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('2'),
+                key_code(KeyCode::Tab),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(!app.session.chat_focus(), "tab releases the chat focus");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Tab), key('q'), key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.session.chat_focus(), "tab takes the chat focus back");
+        assert!(!app.help, "a focused chat types q instead of quitting");
+
+        // A second tab releases the focus again, and q quits the loop.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Tab)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(!app.session.chat_focus());
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('q')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            surface.draws, 7,
+            "q quit the loop, so nothing drew after it"
         );
     }
 
