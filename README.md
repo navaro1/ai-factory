@@ -28,7 +28,7 @@ Labels drive the flow: `to-refine`, `refined`, `needs-human`, and
 `release-stacked`. Add the label `to-refine` to an issue to start the work.
 
 The loop is event-driven. The daemon sleeps until a real deadline and wakes
-only for real events. The only periodic clock is the 60-second GitHub poll
+only for real events. The only periodic clock is the 20-second GitHub poll
 of each repository. The poll is conditional: an unchanged repository costs
 almost nothing.
 
@@ -349,7 +349,7 @@ Repository topology changes require a daemon restart.
 
 ## Known limits
 
-- An external GitHub label change becomes visible at the next 60-second poll.
+- An external GitHub label change becomes visible at the next 20-second poll.
 - A restart kills the agent processes of the running tasks. The gates
   re-open that work at the next poll.
 - Anyone who can set the trigger labels on a repository can start work
