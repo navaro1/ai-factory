@@ -180,7 +180,8 @@ A queued ticket that a pause blocks shows `paused` instead of `queued`.
 
 ## The five views
 
-Keys `1` through `5` switch the views. `!` opens the oldest inbox row.
+Keys `1` through `5` switch the views. `!` opens the oldest inbox row,
+except while an open text input takes the `!` as a typed character.
 `?` opens the help overlay. `q` quits the UI.
 The status bar of every view shows the open decision count.
 
@@ -243,7 +244,8 @@ task, and the bar never promises what the daemon refuses:
   output again.
 - The chat bar holds the keyboard while it is focused. Press `esc` or
   `tab` to release it, `h` and `l` to move to the previous or next live
-  session, and `i` or `enter` to take the keyboard back.
+  session, and `i` or `enter` to take the keyboard back. A focused and
+  open bar takes `!` as text; a released bar leaves `!` to the shell.
 - A bar that cannot take a message holds no keyboard. With no shown task,
   a closed input, or a released focus, keys `1` through `5` switch the
   views and `?` opens the help.
