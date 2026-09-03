@@ -181,10 +181,11 @@ impl TicketController {
     ///
     /// The caller sends the details push before this method runs, so the
     /// first paint never waits on the network. The plan consults the
-    /// snapshot first: same-repository numbers that the snapshot holds as
-    /// open issues or open pull requests resolve with no network call.
-    /// Every other number costs one REST call. A fetch failure leaves that
-    /// number without a status.
+    /// snapshot first: numbers that a configured repository holds as open
+    /// issues or open pull requests resolve with no network call. Every
+    /// other number costs one REST call; an unconfigured repository is
+    /// fetched directly under its canonical key. A fetch failure leaves
+    /// that number without a status.
     pub fn mentions_push(
         &mut self,
         snapshot: &Snapshot,
@@ -199,7 +200,7 @@ impl TicketController {
         } else {
             items.issues.get(&number).map(|issue| issue.body.as_str())
         }?;
-        let owner_repo = config.repos.get(repo)?.owner_repo.clone();
+        let focus_owner = config.repos.get(repo)?.owner_repo.clone();
         let scanned = mentions::scan(body);
         let mut seen = std::collections::BTreeSet::new();
         let planned: Vec<&mentions::Mention> = scanned
@@ -210,28 +211,46 @@ impl TicketController {
         let mut statuses = Vec::new();
         let gh = GhClient::new(&*self.exec);
         for mention in planned {
-            // Only the focus repository resolves so far; other targets
-            // stay plain until their resolution path exists.
-            if mention.repo.is_some() {
-                continue;
-            }
+            // Resolve the target repository of the mention: the focus
+            // repository for a bare number, a configured repository whose
+            // owner/repo matches, or the unconfigured key itself.
+            let fetch_repo: String = match mention.repo.as_deref() {
+                None => focus_owner.clone(),
+                Some(key) => config
+                    .repos
+                    .values()
+                    .find(|repo| repo.owner_repo.eq_ignore_ascii_case(key))
+                    .map(|repo| repo.owner_repo.clone())
+                    .unwrap_or_else(|| key.to_string()),
+            };
+            let snapshot_repo: Option<&str> = match mention.repo.as_deref() {
+                None => Some(repo),
+                Some(key) => config
+                    .repos
+                    .iter()
+                    .find(|(_, repo)| repo.owner_repo.eq_ignore_ascii_case(key))
+                    .map(|(alias, _)| alias.as_str()),
+            };
             let mention_number = mention.number;
-            let known = items
-                .issues
-                .get(&mention_number)
-                .map(|_| MentionStatus::OpenIssue)
-                .or_else(|| {
-                    items.prs.get(&mention_number).map(|pr| {
-                        if pr.draft {
-                            MentionStatus::DraftPr
-                        } else {
-                            MentionStatus::OpenPr
-                        }
+            let known = snapshot_repo.and_then(|alias| {
+                let items = snapshot.repos.get(alias)?;
+                items
+                    .issues
+                    .get(&mention_number)
+                    .map(|_| MentionStatus::OpenIssue)
+                    .or_else(|| {
+                        items.prs.get(&mention_number).map(|pr| {
+                            if pr.draft {
+                                MentionStatus::DraftPr
+                            } else {
+                                MentionStatus::OpenPr
+                            }
+                        })
                     })
-                });
+            });
             let status = match known {
                 Some(status) => Some(status),
-                None => match gh.fetch_mention_status(&owner_repo, mention_number) {
+                None => match gh.fetch_mention_status(&fetch_repo, mention_number) {
                     Ok(Some(fields)) => {
                         mentions::classify(&fields.state, fields.merged, fields.draft, fields.is_pr)
                             .ok()
@@ -242,7 +261,7 @@ impl TicketController {
             };
             if let Some(status) = status {
                 statuses.push(TicketMentionStatus {
-                    repo: None,
+                    repo: mention.repo.clone(),
                     number: mention_number,
                     status,
                 });
@@ -1476,6 +1495,46 @@ mod tests {
             exec.calls().len(),
             2,
             "the snapshot hit must resolve without a fetch"
+        );
+    }
+
+    #[test]
+    fn cross_repo_mentions_resolve_configured_then_fetch_unconfigured() {
+        let mut base = snapshot(issue("Title", "Needs acme/borsuk#9 and other/repo#5."));
+        let items = base.repos.get_mut("borsuk").unwrap();
+        items.issues.insert(9, with_number(issue("Title", "b"), 9));
+        let exec = Arc::new(ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/other/repo/issues/5"]),
+            ok("{\"number\":5,\"state\":\"open\"}"),
+        ));
+        let mut controller = TicketController::new(exec.clone());
+
+        let push = controller
+            .mentions_push(&base, &config(), "borsuk", 7, false)
+            .expect("both cross-repo mentions must resolve");
+
+        let Push::TicketMentions(mentions) = &push else {
+            panic!("the push must carry mention statuses");
+        };
+        assert_eq!(
+            mentions.statuses,
+            vec![
+                TicketMentionStatus {
+                    repo: Some("acme/borsuk".to_string()),
+                    number: 9,
+                    status: MentionStatus::OpenIssue,
+                },
+                TicketMentionStatus {
+                    repo: Some("other/repo".to_string()),
+                    number: 5,
+                    status: MentionStatus::OpenIssue,
+                },
+            ]
+        );
+        assert_eq!(
+            exec.calls().len(),
+            1,
+            "the configured repository must answer from the snapshot"
         );
     }
 

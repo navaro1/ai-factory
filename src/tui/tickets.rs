@@ -1478,6 +1478,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cross_repo_mention_decorates_from_its_canonical_key() {
+        let mut detail = details();
+        detail.issue.body = "Needs other/repo#5 too.".to_string();
+        let mentions = TicketMentions {
+            request: "m4".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            statuses: vec![crate::sock::TicketMentionStatus {
+                repo: Some("other/repo".to_string()),
+                number: 5,
+                status: MentionStatus::OpenIssue,
+            }],
+        };
+
+        let screen = focus_screen(detail, Some(mentions));
+
+        assert!(screen.contains("● other/repo#5"), "screen: {screen}");
+    }
+
+    #[test]
     fn a_proposal_body_decorates_its_mentions_too() {
         let mut detail = details();
         detail.proposal = Some(crate::sock::TicketProposal {
