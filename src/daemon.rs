@@ -338,8 +338,7 @@ impl Daemon {
         // before the first drive, so the restored marks, tasks, and rows
         // behave like live state. A task that ran at save time becomes
         // queued again and keeps its attempt count and session id; the
-        // ticket conversations rebuild their own tasks at the first poll,
-        // because the chat prompt needs the issue of the first snapshot.
+        // first accepted poll validates each restored task before dispatch.
         let restored_at = now_ms();
         let start_paused = paused;
         let runtime = stored.runtime;
@@ -348,7 +347,7 @@ impl Daemon {
         let mut restored_ids: BTreeSet<String> = BTreeSet::new();
         let mut restore_repos: BTreeSet<String> = BTreeSet::new();
         for mut task in runtime.tasks {
-            if !config.repos.contains_key(&task.repo) || task.purpose == TaskPurpose::TicketChat {
+            if !config.repos.contains_key(&task.repo) {
                 continue;
             }
             if task.state == TaskState::Running {
@@ -396,6 +395,7 @@ impl Daemon {
                 .paused
                 .lanes
                 .into_iter()
+                .filter(|entry| config.repos.contains_key(&entry.repo))
                 .map(|entry| ((entry.stage, entry.repo), entry.paused))
                 .collect(),
             tasks: runtime
@@ -1203,9 +1203,13 @@ impl Daemon {
                 continue;
             };
             if task.state == TaskState::Done {
-                self.finish_train(&alias, true);
+                self.finish_train(&alias, true, false);
             } else if task.state.is_terminal() {
-                self.finish_train(&alias, false);
+                let retain_batch = !matches!(
+                    &task.state,
+                    TaskState::Failed(reason) if reason == "cancelled"
+                );
+                self.finish_train(&alias, false, retain_batch);
             }
         }
     }
@@ -1262,6 +1266,11 @@ impl Daemon {
                 eprintln!("the pending chat for {id}: no such task");
                 continue;
             };
+            if (self.restored_ids.contains(&id) && self.restore_repos.contains(&task.repo))
+                || self.interrupted.contains(&id)
+            {
+                continue;
+            }
             if task.state == TaskState::Running {
                 continue;
             }
@@ -1387,7 +1396,9 @@ impl Daemon {
                 || failed.contains(&task.id)
                 || self.stopping_sessions.contains(&task.id)
                 || self.sessions.contains_key(&task.id)
-                || self.pending_chats.contains_key(&task.id)
+                || (self.pending_chats.contains_key(&task.id)
+                    && !self.interrupted.contains(&task.id))
+                || (self.restored_ids.contains(&task.id) && self.restore_repos.contains(&task.repo))
                 || self.prior_stage_active(task)
                 || self.worktree_holder(task).is_some()
             {
@@ -1460,7 +1471,7 @@ impl Daemon {
         };
         // One owner per queued task: a task with queued chat messages
         // belongs to `resume_pending_chats`, whatever the drive order is.
-        if self.pending_chats.contains_key(id) {
+        if self.pending_chats.contains_key(id) && !self.interrupted.contains(id) {
             return Ok(true);
         }
         // The second limit: live processes, not scheduler slots. A parked
@@ -1610,8 +1621,9 @@ impl Daemon {
     /// Close the release train of one repository after its release task.
     ///
     /// Success removes the stacked labels. Failure puts the batch back in the
-    /// queue, still labelled, so a retry ships the identical set.
-    fn finish_train(&mut self, repo: &str, ok: bool) {
+    /// queue, still labelled. A final run failure retains the exact batch for
+    /// an operator retry; cancellation and admission failure remove it.
+    fn finish_train(&mut self, repo: &str, ok: bool, retain_failed_batch: bool) {
         let Some(owner_repo) = self.config.repos.get(repo).map(|r| r.owner_repo.clone()) else {
             return;
         };
@@ -1623,7 +1635,11 @@ impl Daemon {
         match train.finish(ok, &owner_repo, &gh) {
             Ok(batch) => {
                 if let Some(task_id) = task_id {
-                    self.release_batches.remove(&task_id);
+                    if ok || batch.is_empty() || !retain_failed_batch {
+                        self.release_batches.remove(&task_id);
+                    } else {
+                        self.release_batches.insert(task_id, batch.clone());
+                    }
                 }
                 if !batch.is_empty() {
                     self.changed = true;
@@ -1851,7 +1867,7 @@ impl Daemon {
         }
         self.decisions.drop_for_task(&task.id);
         match task.stage {
-            Stage::Release => self.finish_train(&task.repo, true),
+            Stage::Release => self.finish_train(&task.repo, true, false),
             Stage::Refine | Stage::Implement | Stage::Review => {}
         }
         self.reopen_for_pending_chat(&task.id);
@@ -1860,7 +1876,7 @@ impl Daemon {
     /// Fail one run and return a final release batch to its train.
     fn fail_run(&mut self, task: &Task, reason: &str) {
         if task.stage == Stage::Release && task.attempt >= tasks::MAX_ATTEMPTS {
-            self.finish_train(&task.repo, false);
+            self.finish_train(&task.repo, false, true);
         }
         self.fail_task(&task.id, reason);
         self.reopen_for_pending_chat(&task.id);
@@ -3206,7 +3222,7 @@ impl Daemon {
             self.now_ms,
         ) {
             eprintln!("the release task {id}: {e:#}");
-            self.finish_train(repo, false);
+            self.finish_train(repo, false, false);
             return;
         }
         if replace_binding {
@@ -5511,6 +5527,18 @@ mod tests {
             .paused
             .tasks
             .insert("gone/refine-i5".to_string(), true);
+        state.runtime.paused.lanes.extend([
+            crate::state::LanePauseEntry {
+                stage: Stage::Review,
+                repo: "borsuk".to_string(),
+                paused: false,
+            },
+            crate::state::LanePauseEntry {
+                stage: Stage::Review,
+                repo: "gone".to_string(),
+                paused: true,
+            },
+        ]);
         state.save(&path).unwrap();
 
         let rig = Rig::make_in(dir, vec![], |_| {});
@@ -5522,6 +5550,18 @@ mod tests {
         );
         assert!(!rig.daemon.pending_chats.contains_key("gone/refine-i5"));
         assert!(!rig.daemon.paused.tasks.contains_key("gone/refine-i5"));
+        assert_eq!(
+            rig.daemon
+                .paused
+                .lanes
+                .get(&(Stage::Review, "borsuk".to_string())),
+            Some(&false)
+        );
+        assert!(!rig
+            .daemon
+            .paused
+            .lanes
+            .contains_key(&(Stage::Review, "gone".to_string())));
     }
 
     #[test]
@@ -5612,13 +5652,34 @@ mod tests {
             first.drive();
         }
 
-        let mut second = opencode_rig(&dir, 1);
+        let steps = reuse_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 142), &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
+        });
+        second.drive();
+        assert_eq!(
+            second.job_count(),
+            0,
+            "the initial drive waits for the first repository poll"
+        );
         second.poll(vec![issue(142, &["refined"])], vec![]);
-        assert_eq!(second.job_count(), 1, "the follow-up turn starts once");
-        let job = second.job(0);
-        assert_eq!(job.task, "borsuk/implement-i142");
-        assert_eq!(job.prompt, "add a regression test");
-        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(second.job_count(), 1, "the interrupted turn starts first");
+        let restart = second.job(0);
+        assert_eq!(restart.task, "borsuk/implement-i142");
+        assert!(restart.prompt.starts_with(RESTART_NOTICE));
+        assert_eq!(restart.resume.as_deref(), Some("ses-142"));
+        assert_eq!(
+            second.daemon.pending_chats["borsuk/implement-i142"],
+            vec!["add a regression test".to_string()]
+        );
+
+        second.event(exited("borsuk/implement-i142", true, "done"));
+
+        assert_eq!(second.job_count(), 2, "the saved follow-up starts second");
+        let follow_up = second.job(1);
+        assert_eq!(follow_up.task, "borsuk/implement-i142");
+        assert_eq!(follow_up.prompt, "add a regression test");
+        assert_eq!(follow_up.resume.as_deref(), Some("ses-142"));
     }
 
     #[test]
@@ -5634,6 +5695,12 @@ mod tests {
 
         let steps = reuse_issue_steps(&rig_repo(&dir), &worktree, &rig_gitdir(&dir));
         let mut second = Rig::make_in(dir, steps, |_| {});
+        second.drive();
+        assert_eq!(
+            second.job_count(),
+            0,
+            "the production initial drive cannot start restored work"
+        );
         second.poll(vec![], vec![]);
 
         assert_eq!(
@@ -6985,6 +7052,68 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_keeps_a_queued_ticket_chat_and_its_task_pause() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            first.poll(vec![issue(7, &[])], vec![]);
+            first.act(Action::Ticket(TicketAction::Chat {
+                request: "chat-7".to_string(),
+                repo: "borsuk".to_string(),
+                number: 7,
+            }));
+            first.event(started("borsuk/ticket-i7", "session-ticket-7"));
+            first.event(turn_ended("borsuk/ticket-i7"));
+            first.daemon.sessions.remove("borsuk/ticket-i7");
+            first.act(Action::Pause {
+                scope: PauseScope::Task {
+                    task: "borsuk/ticket-i7".to_string(),
+                },
+                paused: true,
+            });
+            first.act(Action::Chat {
+                task: "borsuk/ticket-i7".to_string(),
+                text: "check the acceptance criteria".to_string(),
+            });
+            assert_eq!(
+                first.daemon.pending_chats["borsuk/ticket-i7"],
+                vec!["check the acceptance criteria".to_string()]
+            );
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |_| {});
+        assert_eq!(
+            second.daemon.pending_chats["borsuk/ticket-i7"],
+            vec!["check the acceptance criteria".to_string()]
+        );
+        assert_eq!(
+            second.daemon.paused.tasks.get("borsuk/ticket-i7"),
+            Some(&true)
+        );
+        second.drive();
+        assert_eq!(second.job_count(), 0);
+
+        second.poll(vec![issue(7, &[])], vec![]);
+        assert_eq!(
+            second.job_count(),
+            0,
+            "the restored task pause still blocks"
+        );
+        second.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/ticket-i7".to_string(),
+            },
+            paused: false,
+        });
+
+        assert_eq!(second.job_count(), 1);
+        let resumed = second.job(0);
+        assert_eq!(resumed.task, "borsuk/ticket-i7");
+        assert_eq!(resumed.prompt, "check the acceptance criteria");
+        assert_eq!(resumed.resume.as_deref(), Some("session-ticket-7"));
+    }
+
+    #[test]
     fn each_to_refine_label_interval_sends_one_handoff_to_the_same_session() {
         let mut rig = Rig::make(vec![]);
         rig.poll(vec![issue(7, &[])], vec![]);
@@ -7684,6 +7813,48 @@ mod tests {
             rig.daemon.trains["borsuk"].in_flight.as_deref(),
             Some("borsuk/release")
         );
+    }
+
+    #[test]
+    fn a_manual_release_retry_keeps_its_unstacked_batch_after_a_restart() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = train_wt(&dir);
+        let gitdir = rig_gitdir(&dir);
+        {
+            let steps: Vec<Step> = fresh_train_steps(&repo, &worktree, &gitdir)
+                .into_iter()
+                .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+                .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+                .collect();
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
+            first.poll(vec![], vec![pr(2, false, &[])]);
+            first.act(Action::Go {
+                repo: "borsuk".to_string(),
+                prs: vec![2],
+            });
+            for detail in ["first", "second", "third"] {
+                first.event(exited("borsuk/release", false, detail));
+            }
+            assert!(first.decision("stuck:borsuk/release:3").is_some());
+            assert_eq!(first.daemon.release_batches["borsuk/release"], vec![2]);
+        }
+
+        let steps = reuse_train_steps(&repo, &worktree, &gitdir);
+        let mut second = Rig::make_in(dir, steps, |_| {});
+        second.drive();
+        second.poll(vec![], vec![pr(2, false, &[]), pr(3, false, &[])]);
+        second.act(Action::Answer {
+            decision_id: "stuck:borsuk/release:3".to_string(),
+            response: Response::Retry,
+        });
+
+        assert_eq!(second.job_count(), 1);
+        let retry = second.job(0);
+        assert!(retry.prompt.contains("#2"));
+        assert!(!retry.prompt.contains("#3"));
+        assert_eq!(second.daemon.trains["borsuk"].batch(), &[2]);
+        assert_eq!(second.daemon.trains["borsuk"].queue, vec![3]);
     }
 
     #[test]
