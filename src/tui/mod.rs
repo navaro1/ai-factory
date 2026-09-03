@@ -50,7 +50,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::catalog;
 use crate::decisions::DecisionKind;
+use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
 use crate::tasks::TaskState;
@@ -108,6 +110,8 @@ enum Msg {
     TicketResult(crate::sock::TicketResult),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
+    /// The parsed `opencode models` probe result of this shell start.
+    HarnessModels(Result<Vec<String>, String>),
     /// The socket reader reached the daemon.
     Connected,
     /// The daemon went away, with the reason for the banner.
@@ -929,6 +933,7 @@ pub fn run(socket: &Path) -> Result<()> {
         terminal: Terminal::new(backend).context("cannot create the terminal")?,
     };
     let (tx, rx) = channel();
+    spawn_model_probe(tx.clone());
     spawn_key_thread(tx.clone());
     spawn_socket_thread(tx, socket.to_path_buf());
     let mut app = App::default();
@@ -937,6 +942,19 @@ pub fn run(socket: &Path) -> Result<()> {
         client: None,
     };
     run_loop(&mut surface, &mut app, &rx, &mut link)
+}
+
+/// Run `opencode models` once in the background.
+///
+/// The thread sends one message with the parsed model list or the failure
+/// reason. The shell never blocks on this thread; a late result still
+/// refreshes an open model value list.
+fn spawn_model_probe(tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let result =
+            catalog::fetch_opencode_models(&RealExec).map_err(|error| format!("{error:#}"));
+        let _ = tx.send(Msg::HarnessModels(result));
+    });
 }
 
 /// Read crossterm events until the channel dies.
@@ -1124,6 +1142,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::SettingsResult(result) => {
             app.settings.observe_result(result);
+            Ok(true)
+        }
+        Msg::HarnessModels(result) => {
+            app.settings.observe_models(result);
             Ok(true)
         }
         Msg::Connected => {
@@ -1905,6 +1927,69 @@ mod tests {
         app.apply_state(next);
 
         assert_eq!(app.selection, Selection::None);
+    }
+
+    #[test]
+    fn a_model_discovery_message_fills_the_open_value_list() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.settings = crate::sock::SettingsView {
+            revision: "rev-one".to_string(),
+            global: crate::config::ExecutionRole::ALL
+                .into_iter()
+                .map(|role| crate::sock::GlobalRoleSettingsView {
+                    role,
+                    settings: crate::config::RoleSettings {
+                        harness: crate::config::Harness::Opencode,
+                        program: "opencode".to_string(),
+                        model: "model-one".to_string(),
+                        effort: None,
+                        extra_args: Vec::new(),
+                        agent: None,
+                        profile: None,
+                        permission_mode: None,
+                        permission_handler: None,
+                        tools: Vec::new(),
+                        disallowed_tools: Vec::new(),
+                        strict_mcp: None,
+                        auto_approve: Some(false),
+                        approval_policy: None,
+                        sandbox: None,
+                    },
+                    limit: None,
+                })
+                .collect(),
+            repositories: Vec::new(),
+        };
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('5'),
+                key('j'),
+                key_code(KeyCode::Tab),
+                key_code(KeyCode::Tab),
+                key_code(KeyCode::Enter),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("discovering models..."), "{screen}");
+
+        handle_message(
+            &mut app,
+            Msg::HarnessModels(Ok(vec!["zai-coding-plan/glm-5.3-flash".to_string()])),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("zai-coding-plan/glm-5.3-flash"), "{screen}");
     }
 
     #[test]
