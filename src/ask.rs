@@ -93,7 +93,11 @@ pub fn parse_ask_block(text: &str) -> Option<Ask> {
     if ask.options.is_empty() || ask.options.len() > 9 {
         return None;
     }
-    if ask.options.iter().any(|option| option.label.trim().is_empty()) {
+    if ask
+        .options
+        .iter()
+        .any(|option| option.label.trim().is_empty())
+    {
         return None;
     }
     Some(Ask {
@@ -155,7 +159,10 @@ mod tests {
     fn a_fenced_block_still_parses() {
         let text = format!("```\n{OPEN}\n{{\"question\":\"Still works?\",\"options\":[{{\"label\":\"Yes\"}}]}}\n{CLOSE}\n```");
 
-        assert!(parse_ask_block(&text).is_some(), "a real code fence beside the ask must not reject the comment");
+        assert!(
+            parse_ask_block(&text).is_some(),
+            "a real code fence beside the ask must not reject the comment"
+        );
     }
 
     #[test]
@@ -163,7 +170,9 @@ mod tests {
         let good = r#"{"question":"Q","options":[{"label":"A"}]}"#;
         let cases = vec![
             // Ten options exceed the digit keys.
-            block(r#"{"question":"Q","options":[{"label":"1"},{"label":"2"},{"label":"3"},{"label":"4"},{"label":"5"},{"label":"6"},{"label":"7"},{"label":"8"},{"label":"9"},{"label":"10"}]}"#),
+            block(
+                r#"{"question":"Q","options":[{"label":"1"},{"label":"2"},{"label":"3"},{"label":"4"},{"label":"5"},{"label":"6"},{"label":"7"},{"label":"8"},{"label":"9"},{"label":"10"}]}"#,
+            ),
             // An empty question.
             block(r#"{"question":"   ","options":[{"label":"A"}]}"#),
             // An empty option label.

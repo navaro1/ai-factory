@@ -271,7 +271,10 @@ The selected item shows its choices and quick actions.
 Press `enter` to open the source context:
 
 - A release decision shows the pull request title and description.
-- A `needs-human` decision shows the issue or pull request description.
+- A `needs-human` decision opens the answer screen. It shows the GitHub
+  link, the question comment of the agent, the offered options, and the
+  item description. The daemon fetches the question once per row, when
+  you open the screen.
 - A task decision shows recent visible agent context from the exact task log.
 - Press `o` in a task detail to open the full session.
 - Press `esc` to return to the same feed item.
@@ -285,12 +288,27 @@ Each decision type has one answer path:
 | Permission | `y` allows. `n` denies, with a typed reason. |
 | Question | `1`–`9` picks an option. `s` submits. `i` types a free answer. |
 | Stuck | `r` retries. `c` cancels. |
-| Needs human | `t` writes a comment and clears the label. `c` clears the label. |
+| Needs human | `1`–`9` picks an offered option. `s` submits the option label as a comment. `t` writes a comment and clears the label. `c` clears the label. `w` opens the Tickets view focus of the issue. |
 | Release gate | `1`–`9` includes one pull request. Space changes all. `g` releases. |
 
 There is no "allow always" key. This is deliberate. The wire protocol can
 not carry a saved permission, and a key that promises more than it does
 would break trust.
+
+The agent tells you its question in one way. It adds the `needs-human`
+label, writes a comment, and ends that comment with one strict block:
+
+```
+<aif-ask-v1>
+{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
+</aif-ask-v1>
+```
+
+The JSON sits on one line between the tags. The question holds one to
+nine options, and each option holds a label and an optional
+description. When a comment holds no block, the screen shows the newest
+comment body as the question. A picked option posts its label as the
+comment and clears the label.
 
 ### Tickets, view 4
 
