@@ -32,6 +32,11 @@
 //! session when the daemon pushes more than one; the shell switches tabs
 //! with `h` and `l`.
 //!
+//! A bar that cannot take text holds no keyboard. When the bar is
+//! unfocused, or disabled with no task or a closed input, the shell keeps
+//! its own view keys alive: `1` through `5` switch views and `?` opens
+//! the help overlay.
+//!
 //! The view answers with [`Action::Chat`] and [`Action::Abort`] only. The
 //! shell owns view switching and every other global key.
 
@@ -356,6 +361,11 @@ impl SessionView {
         self.chat_focus = focus;
     }
 
+    /// The text the input bar holds now.
+    pub fn input_text(&self) -> &str {
+        &self.input
+    }
+
     /// The id of the task the view shows, when one is chosen.
     pub fn task_id(&self) -> Option<&str> {
         self.task.as_ref().map(|task| task.id.as_str())
@@ -448,14 +458,24 @@ impl SessionView {
         self.scroll_up == 0
     }
 
+    /// True when the input bar can take a chat message.
+    ///
+    /// The bar needs a shown task whose input mode is open. The shell
+    /// reads this to decide whether the view owns the typing keys: a bar
+    /// that cannot take text leaves the view keys `1` through `5` and `?`
+    /// to the shell.
+    pub fn input_enabled(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(|task| !matches!(task.input, InputMode::Closed { .. }))
+    }
+
     /// True when the input bar accepts no chat message.
     ///
     /// A missing task and a closed task disable the bar. The bar swallows
     /// typing and Enter, so the shell sends no message it cannot deliver.
     fn input_is_disabled(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_none_or(|task| matches!(task.input, InputMode::Closed { .. }))
+        !self.input_enabled()
     }
 
     /// Handle one key press. Returns the action to send to the daemon.
@@ -700,9 +720,9 @@ impl SessionView {
         let hint = if !self.chat_focus {
             let switch = match self.tabs.len() {
                 0 | 1 => String::new(),
-                _ => "h l switch session · ".to_string(),
+                _ => "h l session · ".to_string(),
             };
-            format!("{switch}i or enter chats")
+            format!("{switch}1-5 views · i or enter chats")
         } else {
             match &self.task {
                 Some(task) => input_hint(&task.input),
@@ -1492,7 +1512,7 @@ mod tests {
 
         let screen = drawn_screen(&view);
         assert!(
-            screen.contains("h l switch session · i or enter chats"),
+            screen.contains("h l session · 1-5 views · i or enter chats"),
             "hint: {screen}"
         );
         assert_eq!(
@@ -1506,7 +1526,10 @@ mod tests {
         view.show(&sample_task(&log));
         view.set_chat_focus(false);
         let screen = drawn_screen(&view);
-        assert!(screen.contains("i or enter chats"), "hint: {screen}");
+        assert!(
+            screen.contains("1-5 views · i or enter chats"),
+            "hint: {screen}"
+        );
         assert!(!screen.contains("switch session"), "hint: {screen}");
 
         // A focused bar shows the mode hint and keeps its border.

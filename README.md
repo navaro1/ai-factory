@@ -244,6 +244,9 @@ task, and the bar never promises what the daemon refuses:
 - The chat bar holds the keyboard while it is focused. Press `esc` or
   `tab` to release it, `h` and `l` to move to the previous or next live
   session, and `i` or `enter` to take the keyboard back.
+- A bar that cannot take a message holds no keyboard. With no shown task,
+  a closed input, or a released focus, keys `1` through `5` switch the
+  views and `?` opens the help.
 - A pending question of the agent appears inline, with its options.
 
 The implement and review agents run one turn per process. A turn that already

@@ -16,9 +16,11 @@
 //!
 //! A view that holds the keyboard for text input keeps a typed `q` away
 //! from the quit handler. The session view holds it while its chat bar is
-//! focused; `esc` or `tab` releases the focus, `h` and `l` then switch
-//! the live sessions, and `i` or `enter` takes the focus back. The `!`
-//! inbox key and the ctrl-q and ctrl-c quit chords work from every view.
+//! focused and open; `esc` or `tab` releases the focus, `h` and `l` then
+//! switch the live sessions, and `i` or `enter` takes the focus back.
+//! A session bar that cannot take text, and every other view, leaves the
+//! `1` through `5` view keys and `?` to the shell. The `!` inbox key and
+//! the ctrl-q and ctrl-c quit chords work from every view.
 
 pub mod inbox;
 pub mod markdown;
@@ -453,6 +455,39 @@ impl App {
         match self.view {
             View::Session => {
                 let focused = self.session.chat_focus();
+                // A bar that cannot take text holds no keyboard. The
+                // shell keeps its view keys alive: no task, a closed
+                // input, or a released focus leaves 1 through 5 and ?
+                // free for view switching.
+                if !focused || !self.session.input_enabled() {
+                    match key.code {
+                        KeyCode::Char('1') => {
+                            self.view = View::Pipeline;
+                            return true;
+                        }
+                        KeyCode::Char('2') => {
+                            self.enter_session();
+                            return true;
+                        }
+                        KeyCode::Char('3') => {
+                            self.view = View::Inbox;
+                            return true;
+                        }
+                        KeyCode::Char('4') => {
+                            self.view = View::Tickets;
+                            return true;
+                        }
+                        KeyCode::Char('5') => {
+                            self.view = View::Settings;
+                            return true;
+                        }
+                        KeyCode::Char('?') => {
+                            self.help = true;
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
                 match key.code {
                     KeyCode::Esc if focused => self.session.set_chat_focus(false),
                     KeyCode::Esc => self.view = View::Pipeline,
@@ -2564,6 +2599,140 @@ mod tests {
     }
 
     #[test]
+    fn view_keys_leave_a_session_whose_bar_cannot_type() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        // No shown task: the focused bar is disabled, so the view keys
+        // stay with the shell.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('2'),
+                key('1'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Pipeline, "1 returns to the pipeline");
+        assert!(app.session.input_text().is_empty(), "the bar stays empty");
+
+        // A closed input disables the focused bar the same way.
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].input = crate::sock::InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('3')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "3 left the closed session");
+        assert!(sink.0.is_empty(), "no chat action left the view");
+        assert!(app.session.input_text().is_empty(), "the bar stayed empty");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('2'), key('5')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Settings, "2 re-entered, 5 left");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('2'), key('?')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session);
+        assert!(app.help, "? opened the help overlay from the session");
+
+        // Escape closes the overlay, then 1 leaves the disabled session.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('1')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(!app.help);
+        assert_eq!(app.view, View::Pipeline, "1 left the closed session");
+
+        // An unfocused bar keeps the view keys too.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('2'), key_code(KeyCode::Esc), key('4')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Tickets,
+            "2 re-entered, esc released, 4 left"
+        );
+    }
+
+    #[test]
+    fn a_focused_live_bar_types_digits_instead_of_switching() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view())].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('3')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session, "the focused bar keeps the view");
+        assert_eq!(
+            app.session.input_text(),
+            "3",
+            "the digit went into the message"
+        );
+
+        // Releasing the focus hands the view keys back to the shell.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('3')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "3 switched views after esc");
+    }
+
+    #[test]
     fn i_takes_the_chat_focus_back_and_typing_sends_the_chat() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
@@ -2618,12 +2787,16 @@ mod tests {
         run_messages(
             &mut surface,
             &mut app,
-            vec![key_code(KeyCode::Tab), key('q'), key('?')].into_iter(),
+            vec![key_code(KeyCode::Tab), key('q'), key('x')].into_iter(),
             &mut sink,
         )
         .unwrap();
         assert!(app.session.chat_focus(), "tab takes the chat focus back");
         assert!(!app.help, "a focused chat types q instead of quitting");
+        assert!(
+            app.session.input_text().is_empty(),
+            "a focused but disabled bar swallows the letters"
+        );
 
         // A second tab releases the focus again, and q quits the loop.
         run_messages(
