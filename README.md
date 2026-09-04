@@ -86,6 +86,7 @@ limit = 3
 [stage.implement]
 harness = "opencode"
 model = "zai-coding-plan/glm-5.3-flash"
+auto_approve = true
 limit = 3
 
 [stage.review]
@@ -93,6 +94,7 @@ harness = "opencode"
 model = "openai/gpt-5.6-sol"
 effort = "xhigh"
 extra_args = []
+auto_approve = true
 limit = 7
 
 [stage.release]
@@ -134,6 +136,12 @@ effort = "max"
 
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
 OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
+
+Set `auto_approve = true` on every unattended opencode role. Without it,
+opencode auto-rejects every permission request. Tools that read outside the
+project directory then fail, and the task loses its evidence. The run can
+still end `ok`. `aif doctor` reports a `permissions` warning for each opencode
+role that lacks the approval.
 
 A repository role table can override individual fields. A harness change requires a complete role block.
 The Settings view marks inherited repository values with `~`.
@@ -448,6 +456,9 @@ Repository topology changes require a daemon restart.
   tool again next time.
 - An implement or review turn that already runs can not change course. A
   message waits for the next turn.
+- An opencode role without `auto_approve = true` auto-rejects every
+  permission request in an unattended run. Its tools fail. `aif doctor`
+  reports each such role.
 - A release gate row refreshes at the poll after you stack a pull request.
 
 ## Development
