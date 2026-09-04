@@ -59,7 +59,7 @@ use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
-use crate::worktree::WorktreeManager;
+use crate::worktree::{WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// The label that asks a human to decide something on GitHub.
 pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
@@ -133,11 +133,14 @@ enum WorktreeKey {
 }
 
 impl fmt::Display for WorktreeKey {
+    /// The directory name of the worktree, as the manager writes it on
+    /// disk. The names come from the worktree module, so the refusal text
+    /// and the directory cannot drift apart.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WorktreeKey::Issue(number) => write!(f, "issue-{number}"),
-            WorktreeKey::Pr(number) => write!(f, "pr-{number}"),
-            WorktreeKey::Train => f.write_str("train"),
+            WorktreeKey::Issue(number) => write!(f, "{}{number}", WorktreeKind::Issue.prefix()),
+            WorktreeKey::Pr(number) => write!(f, "{}{number}", WorktreeKind::Pr.prefix()),
+            WorktreeKey::Train => f.write_str(TRAIN_DIR),
         }
     }
 }
