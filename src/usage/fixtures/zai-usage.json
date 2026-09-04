@@ -1,0 +1,25 @@
+{
+  "success": true,
+  "data": {
+    "level": "GLM Coding Plan",
+    "limits": [
+      {
+        "type": "CREDIT_LIMIT",
+        "number": 5,
+        "unit": "TIME_LIMIT_HOUR",
+        "usage": 1200,
+        "currentValue": 300,
+        "percentage": 0.25,
+        "nextResetTime": 1788220800000
+      },
+      {
+        "type": "CREDIT_LIMIT",
+        "unit": "CREDIT",
+        "usage": 1000,
+        "currentValue": 750,
+        "percentage": 75.0,
+        "nextResetTime": 0
+      }
+    ]
+  }
+}

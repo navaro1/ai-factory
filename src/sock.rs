@@ -40,6 +40,7 @@ use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::sched::{Limits, Paused};
 use crate::tasks::{TaskState, TaskTable};
 use crate::trains::Train;
+use crate::usage::UsageView;
 
 /// The minimum time between two state pushes, in milliseconds.
 ///
@@ -116,6 +117,9 @@ pub struct StateView {
     pub paused: PausedView,
     /// The editable role configuration.
     pub settings: SettingsView,
+    /// One usage row per billed identity, in panel order.
+    #[serde(default)]
+    pub usage: Vec<UsageView>,
 }
 
 /// The editable factory settings and their current file revision.
@@ -445,6 +449,8 @@ pub struct StateInput<'a> {
     /// The input mode of each task, keyed by task id. The daemon decides
     /// every mode; this module only serializes it.
     pub input_modes: &'a BTreeMap<String, InputMode>,
+    /// One usage row per billed identity, already ordered for the panel.
+    pub usage: &'a [UsageView],
     /// The effective prompt template of every role.
     pub prompts: &'a [PromptView],
     /// The immutable role binding of each bound task, keyed by task id.
@@ -468,6 +474,7 @@ impl StateInput<'_> {
             trains,
             policies,
             input_modes,
+            usage,
             prompts,
             role_bindings,
             now_ms,
@@ -659,6 +666,7 @@ impl StateInput<'_> {
             trains,
             paused,
             settings: SettingsView::from_config(config, settings_revision, prompts)?,
+            usage: usage.to_vec(),
         })
     }
 }
@@ -2038,6 +2046,7 @@ mod tests {
                 overrides: Vec::new(),
             },
             settings: SettingsView::default(),
+            usage: Vec::new(),
         }
     }
 
@@ -2206,6 +2215,7 @@ mod tests {
             trains: &BTreeMap::new(),
             policies: &BTreeMap::new(),
             input_modes: &BTreeMap::new(),
+            usage: &[],
             prompts: &prompts,
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
@@ -2380,12 +2390,38 @@ mod tests {
                 vec![7, 9],
                 1_000,
             )],
+            usage: vec![UsageView {
+                identity: "claude".to_string(),
+                harness: crate::config::Harness::Claude,
+                mode: crate::usage::UsageMode::Plan,
+                plan: Some("Max".to_string()),
+                models: vec!["claude-opus-5[1m]".to_string()],
+                windows: vec![crate::usage::UsageWindow {
+                    label: "5 hour".to_string(),
+                    used_percent: 30.0,
+                    resets_at_ms: Some(2_000),
+                }],
+                factory_spend_usd: 1.25,
+                updated_ms: 1_000,
+                ..UsageView::default()
+            }],
             ..sample_view(1)
         };
         let push = Push::State(view.clone());
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
+        assert!(text.contains("\"usage\":["), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_state_view_without_the_usage_field_parses_with_an_empty_list() {
+        let mut value = serde_json::to_value(sample_view(1)).unwrap();
+        value.as_object_mut().unwrap().remove("usage");
+
+        let view: StateView = serde_json::from_value(value).unwrap();
+
+        assert!(view.usage.is_empty());
     }
 
     #[test]
@@ -2726,6 +2762,7 @@ mod tests {
             input_modes: &input_modes,
             prompts: &[],
             role_bindings: &role_bindings,
+            usage: &[],
             now_ms: 0,
         }
         .build()
@@ -2773,6 +2810,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
@@ -3066,6 +3104,7 @@ mod tests {
                 overrides: Vec::new(),
             },
             settings: SettingsView::default(),
+            usage: Vec::new(),
         };
         let text = serde_json::to_string(&view).unwrap();
         let back: StateView = serde_json::from_str(&text).unwrap();
@@ -3133,6 +3172,7 @@ mod tests {
             input_modes: &input_modes,
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            usage: &[],
             now_ms: 0,
         }
         .build()
@@ -3374,6 +3414,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
@@ -3441,6 +3482,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
@@ -3553,6 +3595,7 @@ mod tests {
             role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
+            usage: &[],
             now_ms: 3_000,
         }
         .build()
@@ -3649,6 +3692,7 @@ mod tests {
             role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
+            usage: &[],
             now_ms: 3_000,
         }
         .build()
@@ -3689,6 +3733,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
@@ -3785,6 +3830,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 120_000,

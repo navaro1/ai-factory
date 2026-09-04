@@ -31,7 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{
-    self, Config, ExecutionRole, ReleasePolicy, RepoConfig, ResolvedRoleSettings, SettingsEdit,
+    self, Config, ExecutionRole, Harness, ReleasePolicy, RepoConfig, ResolvedRoleSettings,
+    SettingsEdit,
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
@@ -57,6 +58,7 @@ use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
+use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
 use crate::worktree::{WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// The label that asks a human to decide something on GitHub.
@@ -68,6 +70,12 @@ pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
 /// The task of a reaped session stays `AwaitingUser` and a chat message
 /// resumes it later with a fresh process.
 pub const DEFAULT_IDLE_REAP_MS: u64 = 30 * 60_000;
+
+/// The largest probe wait of one identity, in minutes.
+///
+/// A failed probe doubles its identity's wait; the doubling stops here so a
+/// persistently failing provider still gets retried about once an hour.
+pub const USAGE_WAIT_CAP_MINUTES: u64 = 60;
 
 /// How long the shutdown sequence waits for the agent sessions to report
 /// their exit.
@@ -100,6 +108,13 @@ pub enum Inbound {
     Run(RunEvent),
     /// One operator action from the control socket.
     Act(Box<Action>),
+    /// One finished usage probe of one billed identity.
+    Usage {
+        /// The billed identity the probe ran for.
+        identity: String,
+        /// The probe result. An error carries the failure reason.
+        result: Result<UsageRecord, String>,
+    },
 }
 
 /// The assistant text data needed for one strict proposal parse.
@@ -211,6 +226,26 @@ pub struct Daemon {
     ticket_conversations: BTreeMap<(String, u64), TicketConversationState>,
     /// The final-text candidate of each active ticket turn.
     ticket_turn_text: BTreeMap<String, TicketTurnText>,
+
+    /// The last good usage record of each billed identity.
+    usage_records: BTreeMap<String, UsageRecord>,
+    /// The accumulated factory spend of each billed identity.
+    usage_spend: BTreeMap<String, SpendTotals>,
+    /// The identities with one probe still running.
+    usage_in_flight: BTreeSet<String>,
+    /// The next probe moment of each identity, in milliseconds.
+    usage_next_probe_ms: BTreeMap<String, u64>,
+    /// The current probe wait of each identity, in minutes. A failure
+    /// doubles the wait up to the cap; a success resets it.
+    usage_wait_minutes: BTreeMap<String, u64>,
+    /// The home directory the probes read their credential files from.
+    /// Production leaves this unset, so the probes read the operator home.
+    usage_home: Option<PathBuf>,
+    /// The outbound end of the usage probe channel; each probe thread gets
+    /// a clone.
+    usage_tx: Sender<(String, Result<UsageRecord, String>)>,
+    /// The inbound end of the usage probe channel.
+    usage_rx: Option<Receiver<(String, Result<UsageRecord, String>)>>,
 
     /// One live session per running or parked task.
     sessions: BTreeMap<String, Box<dyn Session>>,
@@ -381,6 +416,8 @@ impl Daemon {
         let restored_at = now_ms();
         let start_paused = paused;
         let runtime = stored.runtime;
+        let usage_records = runtime.usage.clone();
+        let usage_spend = runtime.spend.clone();
         let mut restored_table = TaskTable::new();
         let mut interrupted = BTreeSet::new();
         let mut restored_ids: BTreeSet<String> = BTreeSet::new();
@@ -490,6 +527,7 @@ impl Daemon {
         }
 
         let (run_tx, run_rx) = mpsc::channel();
+        let (usage_tx, usage_rx) = mpsc::channel();
         let ticket_controller = TicketController::new(exec.clone());
         let mut daemon = Daemon {
             config,
@@ -522,6 +560,14 @@ impl Daemon {
             ticket_controller,
             ticket_conversations,
             ticket_turn_text: BTreeMap::new(),
+            usage_records,
+            usage_spend,
+            usage_in_flight: BTreeSet::new(),
+            usage_next_probe_ms: BTreeMap::new(),
+            usage_wait_minutes: BTreeMap::new(),
+            usage_home: None,
+            usage_tx,
+            usage_rx: Some(usage_rx),
             sessions: BTreeMap::new(),
             stopping_sessions: BTreeMap::new(),
             pending_chats,
@@ -570,10 +616,12 @@ impl Daemon {
         let poll_rx = std::mem::replace(&mut self.poll_rx, dummy_rx);
         let dummy_rx: Receiver<RunEvent> = mpsc::channel().1;
         let run_rx = std::mem::replace(&mut self.run_rx, dummy_rx);
+        let usage_rx = self.usage_rx.take().unwrap_or_else(|| mpsc::channel().1);
         let action_rx = self.action_rx.take().unwrap_or_else(|| mpsc::channel().1);
         let _forwarders = [
             forwarder("aif-poll", poll_rx, in_tx.clone(), Inbound::Poll)?,
             forwarder("aif-run", run_rx, in_tx.clone(), Inbound::Run)?,
+            forwarder("aif-usage", usage_rx, in_tx.clone(), inbound_usage)?,
             forwarder("aif-act", action_rx, in_tx, inbound_action)?,
         ];
 
@@ -680,6 +728,7 @@ impl Daemon {
             Inbound::Poll(message) => self.on_poll(message),
             Inbound::Run(event) => self.on_run_event(event),
             Inbound::Act(action) => self.on_action(*action),
+            Inbound::Usage { identity, result } => self.on_usage_result(&identity, result),
         }
         self.drive();
     }
@@ -698,6 +747,7 @@ impl Daemon {
         self.refresh_release_gates();
         self.reconcile_trains();
         self.reap_idle_sessions();
+        self.poll_usage();
         self.resume_pending_chats();
         self.dispatch_queued();
         self.save_state();
@@ -706,9 +756,10 @@ impl Daemon {
 
     /// The moment the loop must wake next, as a duration from now.
     ///
-    /// The answer is the earliest of each interval train's fire moment and
-    /// each parked session's reaper expiry. `None` means the loop may block:
-    /// nothing can become due without a message.
+    /// The answer is the earliest of each interval train's fire moment, each
+    /// parked session's reaper expiry, and each identity's next usage probe.
+    /// `None` means the loop may block: nothing can become due without a
+    /// message.
     pub fn next_deadline(&self) -> Option<Duration> {
         let mut earliest: Option<u64> = None;
         for (repo, train) in &self.trains {
@@ -737,6 +788,17 @@ impl Daemon {
                 Some(so_far) => so_far.min(at),
                 None => at,
             });
+        }
+        if self.config.usage.enabled {
+            for (identity, at) in &self.usage_next_probe_ms {
+                if self.usage_in_flight.contains(identity) {
+                    continue;
+                }
+                earliest = Some(match earliest {
+                    Some(so_far) => so_far.min(*at),
+                    None => *at,
+                });
+            }
         }
         earliest.map(|at| Duration::from_millis(at.saturating_sub(self.now_ms)))
     }
@@ -767,6 +829,24 @@ impl Daemon {
         self.ticket_pusher = Some(pusher);
     }
 
+    /// Point the usage probes at one home directory.
+    ///
+    /// Production never calls this. Tests point the probes at a temporary
+    /// home, so they never read the operator's real credentials.
+    pub fn set_usage_home(&mut self, home: PathBuf) {
+        self.usage_home = Some(home);
+    }
+
+    /// Take the inbound end of the usage probe channel.
+    ///
+    /// The event loop takes it when `run` starts, so a later call returns
+    /// None. Tests use this end to apply probe results without threads.
+    pub fn take_usage_receiver(
+        &mut self,
+    ) -> Option<Receiver<(String, Result<UsageRecord, String>)>> {
+        self.usage_rx.take()
+    }
+
     /// Build the state view from the live state and hand it to the pusher.
     ///
     /// The call runs at the end of every drive pass and pushes only when
@@ -783,6 +863,7 @@ impl Daemon {
             .values()
             .map(|task| (task.id.clone(), self.input_mode(task)))
             .collect();
+        let usage = self.usage_views();
         let input = StateInput {
             config: &self.config,
             settings_revision: &self.settings_revision,
@@ -795,6 +876,7 @@ impl Daemon {
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
+            usage: &usage,
             prompts: &self.prompts,
             role_bindings: &self.role_bindings,
             now_ms: self.now_ms,
@@ -812,6 +894,200 @@ impl Daemon {
         if let Some(pusher) = self.pusher.as_ref() {
             pusher(view);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Usage probes
+    // ------------------------------------------------------------------
+
+    /// Spawn one probe for every identity whose next moment is due.
+    ///
+    /// At most one probe per identity runs at any time. The pass first
+    /// drops the schedule of every retired identity. A disabled `[usage]`
+    /// table spawns nothing, so the view stays empty and the pipeline draws
+    /// no band.
+    fn poll_usage(&mut self) {
+        if !self.config.usage.enabled {
+            return;
+        }
+        let identities = usage::identities(&self.config);
+        // A role edit retires an identity. Its past-due moment would keep
+        // the event loop awake with nothing to run, so the schedule maps
+        // follow the live identity set.
+        let live: BTreeSet<&str> = identities.iter().map(|one| one.id.as_str()).collect();
+        self.usage_next_probe_ms
+            .retain(|identity, _| live.contains(identity.as_str()));
+        self.usage_wait_minutes
+            .retain(|identity, _| live.contains(identity.as_str()));
+        for identity in identities {
+            if self.usage_in_flight.contains(&identity.id) {
+                continue;
+            }
+            let due = self
+                .usage_next_probe_ms
+                .get(&identity.id)
+                .copied()
+                .unwrap_or(0);
+            if due > self.now_ms {
+                continue;
+            }
+            self.spawn_probe(identity);
+        }
+    }
+
+    /// Start the probe of one identity on its own thread.
+    ///
+    /// The thread never touches daemon state; it reports through the usage
+    /// channel, and [`Daemon::on_usage_result`] applies the answer.
+    fn spawn_probe(&mut self, identity: usage::Identity) {
+        self.usage_in_flight.insert(identity.id.clone());
+        let exec = Arc::clone(&self.exec);
+        let tx = self.usage_tx.clone();
+        let now_ms = self.now_ms;
+        let home = self.usage_home.clone().unwrap_or_else(usage::home_dir);
+        let id = identity.id.clone();
+        let thread_identity = identity.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("aif-usage-{id}"))
+            .spawn(move || {
+                let result = usage::run_probe(&*exec, &thread_identity, &home, now_ms)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = tx.send((id, result));
+            });
+        if let Err(error) = spawned {
+            self.usage_in_flight.remove(&identity.id);
+            // Without a new moment the identity stays due and every pass
+            // retries at once, so the failure takes the normal cadence.
+            self.usage_next_probe_ms.insert(
+                identity.id.clone(),
+                self.now_ms + self.config.usage.minutes * 60_000,
+            );
+            eprintln!(
+                "aifd: cannot spawn the usage probe of {}: {error}",
+                identity.id
+            );
+        }
+    }
+
+    /// Apply one finished probe.
+    ///
+    /// A success stores the record whole and resets the wait, so a reason
+    /// the probe itself reports, such as a pay-as-you-go key, reaches the
+    /// panel. A failure keeps the last good record, names the reason, and
+    /// doubles the wait up to the cap. Both paths clear the in-flight mark
+    /// and schedule the next probe.
+    fn on_usage_result(&mut self, identity: &str, result: Result<UsageRecord, String>) {
+        self.usage_in_flight.remove(identity);
+        let current_wait = self
+            .usage_wait_minutes
+            .get(identity)
+            .copied()
+            .unwrap_or(self.config.usage.minutes);
+        let next_wait = match result {
+            Ok(mut record) => {
+                record.harness = self.identity_harness(identity);
+                if record.models.is_empty() {
+                    record.models = self.identity_models(identity);
+                }
+                record.updated_ms = self.now_ms;
+                self.usage_records.insert(identity.to_string(), record);
+                self.config.usage.minutes
+            }
+            Err(reason) => {
+                if let Some(record) = self.usage_records.get_mut(identity) {
+                    record.error = Some(reason);
+                } else {
+                    self.usage_records.insert(
+                        identity.to_string(),
+                        UsageRecord {
+                            harness: self.identity_harness(identity),
+                            models: self.identity_models(identity),
+                            error: Some(reason),
+                            ..UsageRecord::default()
+                        },
+                    );
+                }
+                current_wait.saturating_mul(2).min(USAGE_WAIT_CAP_MINUTES)
+            }
+        };
+        self.usage_wait_minutes
+            .insert(identity.to_string(), next_wait);
+        self.usage_next_probe_ms
+            .insert(identity.to_string(), self.now_ms + next_wait * 60_000);
+        self.changed = true;
+    }
+
+    /// The harness of one identity: the stored record wins, then the id
+    /// form decides. An unknown OpenCode provider id reads as OpenCode.
+    fn identity_harness(&self, identity: &str) -> Harness {
+        if let Some(record) = self.usage_records.get(identity) {
+            return record.harness;
+        }
+        match identity {
+            "claude" => Harness::Claude,
+            "codex" => Harness::Codex,
+            _ => Harness::Opencode,
+        }
+    }
+
+    /// The configured models that map to one identity.
+    fn identity_models(&self, identity: &str) -> Vec<String> {
+        usage::identities(&self.config)
+            .into_iter()
+            .find(|candidate| candidate.id == identity)
+            .map(|candidate| candidate.models)
+            .unwrap_or_default()
+    }
+
+    /// The usage rows of the state view, in panel order.
+    ///
+    /// The order is claude first, then the OpenCode providers sorted, then
+    /// codex, as [`usage::identities`] returns them. Each row joins the
+    /// last good record with the live factory spend, so the spend always
+    /// shows even before the first probe returns.
+    fn usage_views(&self) -> Vec<UsageView> {
+        if !self.config.usage.enabled {
+            return Vec::new();
+        }
+        let mut views = Vec::new();
+        for identity in usage::identities(&self.config) {
+            let spend = self
+                .usage_spend
+                .get(&identity.id)
+                .map(|totals| totals.total_usd)
+                .unwrap_or(0.0);
+            let record = self
+                .usage_records
+                .get(&identity.id)
+                .cloned()
+                .unwrap_or_else(|| UsageRecord {
+                    harness: identity.harness,
+                    models: identity.models.clone(),
+                    ..UsageRecord::default()
+                });
+            views.push(UsageView::from_record(&identity.id, &record, spend));
+        }
+        views
+    }
+
+    /// Add one finished turn cost to the identity and model of the task.
+    ///
+    /// The identity comes from the bound role of the task, so a repository
+    /// override counts under its own identity.
+    fn add_turn_cost(&mut self, task_id: &str, cost_usd: f64) {
+        let Some(task) = self.table.by_id.get(task_id) else {
+            return;
+        };
+        let Ok(role) = self.resolved_task_role(task) else {
+            return;
+        };
+        let identity = usage::identity_of(role.settings.harness, &role.settings.model);
+        let model = role.settings.model.clone();
+        self.usage_spend
+            .entry(identity.clone())
+            .or_default()
+            .add(&model, cost_usd);
+        self.changed = true;
     }
 
     // ------------------------------------------------------------------
@@ -2065,7 +2341,15 @@ impl Daemon {
                 // The runner tees this into the task log; the interfaces read
                 // the log file, so the daemon stores nothing here.
             }
-            RunEvent::TurnEnd { ok, summary, .. } => {
+            RunEvent::TurnEnd {
+                ok,
+                summary,
+                cost_usd,
+                ..
+            } => {
+                if let Some(cost_usd) = cost_usd {
+                    self.add_turn_cost(&task_id, cost_usd);
+                }
                 if ok {
                     self.finish_ticket_proposal_turn(&task_id);
                 } else {
@@ -4482,6 +4766,8 @@ impl Daemon {
                 .filter(|row| matches!(row.kind, DecisionKind::Stuck { .. }))
                 .cloned()
                 .collect(),
+            usage: self.usage_records.clone(),
+            spend: self.usage_spend.clone(),
             asks: self
                 .decisions
                 .open()
@@ -4649,6 +4935,11 @@ fn forwarder<T: Send + 'static>(
 /// Pack one control action for the shared inbound queue.
 fn inbound_action(action: Action) -> Inbound {
     Inbound::Act(Box::new(action))
+}
+
+/// Pack one finished usage probe for the shared inbound queue.
+fn inbound_usage((identity, result): (String, Result<UsageRecord, String>)) -> Inbound {
+    Inbound::Usage { identity, result }
 }
 
 /// The current time in milliseconds since the Unix epoch.
@@ -5076,6 +5367,7 @@ mod tests {
             ticket_chat: crate::config::TicketChatConfig {
                 model: Some("m".to_string()),
             },
+            usage: crate::config::UsageConfig::default(),
         }
     }
 
@@ -5188,6 +5480,9 @@ mod tests {
             let state = dir.join("state");
             let prompts = dir.join("prompts");
             let mut config = test_config(&dir);
+            // The probes call real programs through the scripted exec, so a
+            // rig keeps them off unless a usage test turns them on.
+            config.usage.enabled = false;
             tweak(&mut config);
             let exec = scripted(steps);
             let jobs = Arc::new(Mutex::new(Vec::new()));
@@ -5219,6 +5514,9 @@ mod tests {
             );
             let clock_t = t.clone();
             daemon.clock = Arc::new(move || *clock_t.lock().unwrap());
+            // The probes read their credential files under this home, so a
+            // test never reads the credentials of the operator.
+            daemon.set_usage_home(dir.join("usage-home"));
             Rig {
                 daemon,
                 exec,
@@ -13427,5 +13725,303 @@ mod tests {
         // The real train state: an interval policy over an empty queue
         // gives no fire time.
         assert_eq!(view.trains[0].next_fire_ms, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Usage probes
+    // ------------------------------------------------------------------
+
+    /// A rig with the usage probes on.
+    fn usage_rig() -> Rig {
+        Rig::make_with(Vec::new(), |config| {
+            config.usage.enabled = true;
+        })
+    }
+
+    #[test]
+    fn a_due_identity_spawns_one_probe_and_an_in_flight_identity_spawns_none() {
+        let mut rig = usage_rig();
+        let usage_rx = rig.daemon.usage_rx.take().unwrap();
+
+        rig.daemon.drive();
+
+        let (identity, result) = usage_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first drive must spawn the claude probe");
+        assert_eq!(identity, "claude");
+        assert!(
+            result.is_err(),
+            "the scripted rig gives the probe no credentials: {result:?}"
+        );
+
+        // The probe thread ran, but the answer is not applied yet, so the
+        // identity stays in flight and a second drive spawns nothing.
+        rig.daemon.drive();
+        assert!(
+            usage_rx.try_recv().is_err(),
+            "a drive while the probe is in flight must spawn nothing"
+        );
+
+        rig.daemon.handle(Inbound::Usage { identity, result });
+
+        let record = rig.daemon.usage_records.get("claude").unwrap();
+        assert!(record.error.is_some());
+        assert!(!rig.daemon.usage_in_flight.contains("claude"));
+
+        // The failure started the backoff, so the next drive waits.
+        rig.daemon.drive();
+        assert!(
+            usage_rx.try_recv().is_err(),
+            "a drive inside the backoff window must spawn nothing"
+        );
+    }
+
+    #[test]
+    fn a_usage_result_applies_the_record_clears_in_flight_and_resets_the_wait() {
+        let mut rig = usage_rig();
+        let usage_rx = rig.daemon.usage_rx.take().unwrap();
+        rig.daemon.drive();
+        let _ = usage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Ok(UsageRecord {
+                harness: Harness::Claude,
+                mode: usage::UsageMode::Plan,
+                windows: vec![usage::UsageWindow {
+                    label: "5 hour".to_string(),
+                    used_percent: 30.0,
+                    resets_at_ms: Some(T0 + 3_600_000),
+                }],
+                ..UsageRecord::default()
+            }),
+        });
+
+        let record = rig.daemon.usage_records.get("claude").unwrap();
+        assert_eq!(record.error, None);
+        assert_eq!(record.mode, usage::UsageMode::Plan);
+        assert_eq!(record.windows.len(), 1);
+        assert_eq!(record.updated_ms, T0);
+        assert!(!rig.daemon.usage_in_flight.contains("claude"));
+        assert_eq!(
+            rig.daemon.usage_wait_minutes["claude"],
+            rig.daemon.config.usage.minutes
+        );
+
+        // The success resets the wait, so the next drive spawns nothing.
+        rig.daemon.drive();
+        assert!(usage_rx.try_recv().is_err());
+        let deadline = rig.daemon.next_deadline().unwrap();
+        assert!(
+            deadline <= Duration::from_millis(10 * 60_000),
+            "the usage moment must bound the sleep: {deadline:?}"
+        );
+    }
+
+    #[test]
+    fn a_successful_probe_keeps_the_reason_it_reports_itself() {
+        let mut rig = usage_rig();
+        let _usage_rx = rig.daemon.usage_rx.take().unwrap();
+
+        // The z.ai and zen probes answer Ok with a reason instead of a
+        // failure, because the factory spend of the identity stays valid.
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Ok(UsageRecord {
+                harness: Harness::Claude,
+                mode: usage::UsageMode::Api,
+                error: Some("pay as you go key: factory spend only".to_string()),
+                ..UsageRecord::default()
+            }),
+        });
+
+        let record = rig.daemon.usage_records.get("claude").unwrap();
+        assert_eq!(
+            record.error.as_deref(),
+            Some("pay as you go key: factory spend only")
+        );
+        assert_eq!(record.mode, usage::UsageMode::Api);
+        // The probe succeeded, so the wait stays at the configured cadence.
+        assert_eq!(
+            rig.daemon.usage_wait_minutes["claude"],
+            rig.daemon.config.usage.minutes
+        );
+        let views = rig.daemon.usage_views();
+        assert_eq!(
+            views[0].error.as_deref(),
+            Some("pay as you go key: factory spend only")
+        );
+    }
+
+    #[test]
+    fn a_later_good_probe_drops_the_error_of_the_failed_one() {
+        let mut rig = usage_rig();
+        let _usage_rx = rig.daemon.usage_rx.take().unwrap();
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Err("rate limited".to_string()),
+        });
+        assert!(rig.daemon.usage_records["claude"].error.is_some());
+
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Ok(UsageRecord {
+                harness: Harness::Claude,
+                mode: usage::UsageMode::Plan,
+                ..UsageRecord::default()
+            }),
+        });
+
+        assert_eq!(rig.daemon.usage_records["claude"].error, None);
+    }
+
+    #[test]
+    fn a_failed_probe_doubles_the_wait_and_keeps_the_last_good_record() {
+        let mut rig = usage_rig();
+        let usage_rx = rig.daemon.usage_rx.take().unwrap();
+        rig.daemon.drive();
+        let _ = usage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Ok(UsageRecord {
+                harness: Harness::Claude,
+                mode: usage::UsageMode::Plan,
+                windows: vec![usage::UsageWindow {
+                    label: "weekly".to_string(),
+                    used_percent: 10.0,
+                    resets_at_ms: None,
+                }],
+                updated_ms: T0,
+                ..UsageRecord::default()
+            }),
+        });
+
+        *rig.t.lock().unwrap() = T0 + 60_000;
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Err("rate limited".to_string()),
+        });
+
+        let record = rig.daemon.usage_records.get("claude").unwrap();
+        assert_eq!(
+            record.windows.len(),
+            1,
+            "the last good windows must stay visible"
+        );
+        assert_eq!(record.updated_ms, T0, "the last good time must stay");
+        assert_eq!(record.error.as_deref(), Some("rate limited"));
+        assert_eq!(rig.daemon.usage_wait_minutes["claude"], 20);
+
+        // Before the doubled moment no probe spawns; after it, one does.
+        // The failure landed at T0 + 1m, so the moment is T0 + 21m. A bare
+        // drive does not refresh the clock, so the test moves both.
+        for (now, due) in [(T0 + 15 * 60_000, false), (T0 + 21 * 60_000, true)] {
+            *rig.t.lock().unwrap() = now;
+            rig.daemon.now_ms = now;
+            rig.daemon.drive();
+            let arrived = usage_rx
+                .recv_timeout(Duration::from_millis(if due { 5_000 } else { 50 }))
+                .is_ok();
+            assert_eq!(
+                arrived, due,
+                "the doubled wait must gate the probe at {now}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_end_costs_accumulate_per_identity_and_survive_a_restart() {
+        let mut rig = Rig::make_with(Vec::new(), |config| {
+            config.usage.enabled = true;
+            set_role_harness(config, ExecutionRole::Review, Harness::Codex);
+        });
+        rig.daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                PathBuf::from("logs/refine.jsonl"),
+                T0,
+            )
+            .unwrap();
+        rig.daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Issue,
+                9,
+                PathBuf::from("logs/review.jsonl"),
+                T0,
+            )
+            .unwrap();
+        let ids = rig.daemon.table.order.clone();
+
+        rig.daemon.add_turn_cost(&ids[0], 0.5);
+        rig.daemon.add_turn_cost(&ids[1], 0.25);
+        rig.daemon.add_turn_cost(&ids[0], 0.25);
+
+        let claude = &rig.daemon.usage_spend["claude"];
+        assert_eq!(claude.total_usd, 0.75);
+        let codex = &rig.daemon.usage_spend["codex"];
+        assert_eq!(codex.total_usd, 0.25);
+        assert_eq!(claude.models["m"], 0.75);
+
+        // The spend shows in the view before any probe returns.
+        let views = rig.daemon.usage_views();
+        let claude_row = views.iter().find(|row| row.identity == "claude").unwrap();
+        assert_eq!(claude_row.factory_spend_usd, 0.75);
+        let codex_row = views.iter().find(|row| row.identity == "codex").unwrap();
+        assert_eq!(codex_row.factory_spend_usd, 0.25);
+
+        // A restart loads the totals back from state.json.
+        rig.daemon.force_save_state();
+        let reloaded = DaemonState::load(&rig.daemon.state_path);
+        assert_eq!(reloaded.runtime.spend["claude"].total_usd, 0.75);
+        assert_eq!(reloaded.runtime.spend["codex"].total_usd, 0.25);
+    }
+
+    #[test]
+    fn a_retired_identity_loses_its_moment_and_never_pins_the_loop_awake() {
+        let mut rig = usage_rig();
+        let _usage_rx = rig.daemon.usage_rx.take().unwrap();
+        // A role edit can retire an identity. The daemon keeps its past-due
+        // moment, which would make every deadline zero and spin the loop.
+        rig.daemon
+            .usage_next_probe_ms
+            .insert("codex".to_string(), T0 - 60_000);
+        rig.daemon
+            .usage_wait_minutes
+            .insert("codex".to_string(), 20);
+        rig.daemon
+            .usage_next_probe_ms
+            .insert("claude".to_string(), T0 + 10 * 60_000);
+        rig.daemon.now_ms = T0;
+
+        rig.daemon.drive();
+
+        assert!(!rig.daemon.usage_next_probe_ms.contains_key("codex"));
+        assert!(!rig.daemon.usage_wait_minutes.contains_key("codex"));
+        assert_eq!(
+            rig.daemon.next_deadline(),
+            Some(Duration::from_millis(10 * 60_000)),
+            "only the live identity may set the wake moment"
+        );
+    }
+
+    #[test]
+    fn a_disabled_usage_table_spawns_no_probe_and_keeps_the_view_empty() {
+        let mut rig = Rig::make_with(Vec::new(), |config| {
+            config.usage.enabled = false;
+        });
+        let usage_rx = rig.daemon.usage_rx.take().unwrap();
+
+        rig.daemon.drive();
+
+        assert!(usage_rx.try_recv().is_err());
+        assert!(rig.daemon.usage_views().is_empty());
+        assert!(rig.daemon.usage_in_flight.is_empty());
     }
 }

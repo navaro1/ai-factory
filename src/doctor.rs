@@ -181,6 +181,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             checks.extend(repo_checks(&config, &facts));
             checks.extend(tool_checks(env.exec, Some(&config)));
             checks.push(gh_auth_check(env.exec));
+            checks.extend(usage_curl_check(env.exec, &config));
             checks.extend(daemon_checks(env.socket));
             checks.extend(scheduler_checks(&config));
             checks.extend(permission_checks(&config));
@@ -819,6 +820,49 @@ fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
             .map(|(program, claude)| tool_check(exec, &program, claude)),
     );
     checks
+}
+
+/// Check that `curl` is present when the usage probes need it.
+///
+/// The usage probes read the provider endpoints through `curl`, so a
+/// missing `curl` leaves the USAGE band of the pipeline view empty. The
+/// check runs only when the `[usage]` table is enabled and the config
+/// derives at least one billed identity. A missing `curl` never stops the
+/// factory, so the check warns instead of failing.
+fn usage_curl_check(exec: &dyn Exec, config: &Config) -> Option<Check> {
+    if !config.usage.enabled || aif::usage::identities(config).is_empty() {
+        return None;
+    }
+    let label = "usage curl".to_string();
+    let empty = "the USAGE band stays empty".to_string();
+    Some(match exec.run("curl", &["--version"], None) {
+        Ok(out) if out.status == 0 => {
+            let version = out
+                .stdout
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("unknown")
+                .to_string();
+            Check {
+                label,
+                status: Status::Pass,
+                detail: format!("curl {version} reads the usage endpoints"),
+            }
+        }
+        Ok(out) => Check {
+            label,
+            status: Status::Warn,
+            detail: format!("curl --version exited with status {}; {empty}", out.status),
+        },
+        Err(error) => Check {
+            label,
+            status: Status::Warn,
+            detail: format!("cannot run curl: {error:#}; {empty}"),
+        },
+    })
 }
 
 /// Check that `gh` is authenticated.
@@ -1889,6 +1933,78 @@ mod tests {
         assert_eq!(check.detail, "logged in to github.com as navaro1");
     }
 
+    // --- usage curl. ---
+
+    #[test]
+    fn the_usage_curl_check_passes_with_a_version_line() {
+        let config = Config::parse(&config_text(&[], "")).unwrap();
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "curl" && call.args == ["--version"],
+            CmdOut::ok("curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0\n"),
+        );
+
+        let check = usage_curl_check(&exec, &config).unwrap();
+
+        assert_eq!(check.label, "usage curl");
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.detail.contains("curl 8.5.0"), "{}", check.detail);
+    }
+
+    #[test]
+    fn the_usage_curl_check_warns_when_curl_is_missing() {
+        let config = Config::parse(&config_text(&[], "")).unwrap();
+        let exec = ScriptExec::new();
+
+        let check = usage_curl_check(&exec, &config).unwrap();
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("USAGE band stays empty"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn the_usage_curl_check_disappears_when_probes_are_disabled() {
+        let text = format!("{}\n[usage]\nenabled = false\n", config_text(&[], ""));
+        let config = Config::parse(&text).unwrap();
+        let exec = ScriptExec::new();
+
+        assert!(usage_curl_check(&exec, &config).is_none());
+        assert!(
+            !exec.calls().iter().any(|call| call.program == "curl"),
+            "a disabled usage table must not run curl"
+        );
+    }
+
+    #[test]
+    fn the_report_carries_the_usage_curl_check_for_a_parsed_config() {
+        let dir = temp_dir("usage-curl-report");
+        let config_path = dir.join("factory.toml");
+        std::fs::write(&config_path, config_text(&[], "")).unwrap();
+        let exec = ScriptExec::new();
+        let env = DoctorEnv {
+            config_path: &config_path,
+            state_dir: &dir,
+            socket: &dir.join("daemon.sock"),
+            exec: &exec,
+        };
+
+        let checks = report(&env);
+
+        assert!(
+            checks.iter().any(|check| check.label == "usage curl"),
+            "checks: {:?}",
+            checks
+                .iter()
+                .map(|check| check.label.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(exec.calls().iter().any(|call| call.program == "curl"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_logged_out_gh_auth_status_fails_and_names_the_fix() {
         // The real answer of gh 2.74.0 with no configured host: the
@@ -2296,7 +2412,9 @@ mod tests {
             summary.detail
         );
         assert!(!has_failures(&checks));
-        assert_eq!(exec.calls().len(), 9, "calls: {:?}", exec.calls());
+        // The nine tool, auth, and repository answers plus the usage curl
+        // version check of the enabled [usage] table.
+        assert_eq!(exec.calls().len(), 10, "calls: {:?}", exec.calls());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
@@ -3403,6 +3521,7 @@ mod tests {
                 overrides: Vec::new(),
             },
             settings: SettingsView::default(),
+            usage: Vec::new(),
         });
         let missing_config = dir.join("factory.toml");
         let exec = ScriptExec::new();

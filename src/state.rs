@@ -19,6 +19,7 @@ use crate::model::Stage;
 use crate::runner::AllowedPermission;
 use crate::sock::TicketProposal;
 use crate::tasks::{Task, MAX_ATTEMPTS};
+use crate::usage::{SpendTotals, UsageRecord};
 
 /// One issue conversation that survives a daemon restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +86,7 @@ pub struct PausedState {
 /// The object holds what the task table and the session bookkeeping hold,
 /// so a restarted daemon resumes its work instead of losing it. Every field
 /// defaults to empty, so an older file loads without an error.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RuntimeState {
     /// The pause marks the operator set.
     #[serde(default)]
@@ -105,6 +106,12 @@ pub struct RuntimeState {
     /// The stuck rows of the tasks that gave up.
     #[serde(default)]
     pub stuck: Vec<Decision>,
+    /// The last good usage record of each billed identity.
+    #[serde(default)]
+    pub usage: BTreeMap<String, UsageRecord>,
+    /// The accumulated factory spend of each billed identity.
+    #[serde(default)]
+    pub spend: BTreeMap<String, SpendTotals>,
     /// The open ask rows of the one-shot tasks, which a failure keeps.
     #[serde(default)]
     pub asks: Vec<Decision>,
@@ -118,7 +125,7 @@ pub struct RuntimeState {
 ///
 /// Every field defaults to empty, so a file written by an older daemon and a
 /// file with missing sections both load.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 struct StateFile {
     /// The stage limit overrides, by stage.
     #[serde(default)]
@@ -148,7 +155,7 @@ struct StateFile {
 ///
 /// The override fields contain only values that differ from the config file.
 /// The conversation field contains each active ticket chat.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DaemonState {
     /// The stage limit overrides, by stage.
     pub stage_limits: BTreeMap<Stage, usize>,
@@ -683,6 +690,8 @@ mod tests {
                 )]),
                 release_batches: BTreeMap::from([("borsuk/release".to_string(), vec![5])]),
                 stuck: Vec::new(),
+                usage: BTreeMap::new(),
+                spend: BTreeMap::new(),
                 asks: Vec::new(),
                 allowed_permissions: BTreeMap::new(),
             },
@@ -690,6 +699,51 @@ mod tests {
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);
         assert_eq!(loaded, state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_old_runtime_section_loads_with_empty_usage_and_spend() {
+        let dir = temp_dir("old-usage");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"stage_limits":{},"lanes":[],"policies":{},"last_fire_ms":{},
+                "runtime":{"paused":{"global":false},"tasks":[],"pending_chats":{},
+                "review_tickets":{},"release_batches":{},"stuck":[]}}"#,
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert!(loaded.runtime.usage.is_empty());
+        assert!(loaded.runtime.spend.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_usage_records_and_spend_survive_a_round_trip() {
+        let dir = temp_dir("usage-round-trip");
+        let path = dir.join("state.json");
+        let record = UsageRecord {
+            harness: crate::config::Harness::Opencode,
+            mode: crate::usage::UsageMode::Plan,
+            plan: Some("Pro".to_string()),
+            models: vec!["zai-coding-plan/glm-5.3".to_string()],
+            updated_ms: 5_000,
+            ..UsageRecord::default()
+        };
+        let mut spend = SpendTotals::default();
+        spend.add("zai-coding-plan/glm-5.3", 0.75);
+        let mut state = DaemonState::default();
+        state.runtime.usage.insert("zai-coding-plan".into(), record);
+        state.runtime.spend.insert("zai-coding-plan".into(), spend);
+
+        state.save(&path).unwrap();
+
+        let loaded = DaemonState::load(&path);
+        assert_eq!(loaded.runtime, state.runtime);
+        assert_eq!(loaded.runtime.spend["zai-coding-plan"].total_usd, 0.75);
         let _ = fs::remove_dir_all(dir);
     }
 

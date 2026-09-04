@@ -45,6 +45,8 @@ You need:
 - `git`
 - the GitHub command-line interface (`gh`), with an active login
 - each harness program that your six roles select
+- `curl`, when you want the usage probes. The daemon reads the quota and
+  spend of each billed identity through `curl`.
 
 AI Factory supports Claude, OpenCode, and Codex. Claude roles require Claude Code 2.1.223 or later.
 
@@ -133,6 +135,27 @@ effort = "max"
 - `lanes` reserves stage slots for one repository.
 - `release.policy` is `manual`, `interval` with `minutes`, or `threshold`
   with `count`.
+
+The optional `[usage]` table controls the usage probes:
+
+```toml
+[usage]
+enabled = true
+minutes = 10
+```
+
+- `enabled` turns the probes on or off. The default is `true`. With `false`,
+  the daemon spawns no probe, and the pipeline draws no USAGE band.
+- `minutes` is the cadence between two probes of one identity, from 1 to
+  1440. The default is `10`. A failed probe doubles the wait of its identity
+  up to 60 minutes.
+
+The daemon derives one billed identity per plan: `claude`, `codex`, and one
+identity per OpenCode provider segment of a model, such as
+`zai-coding-plan`. Subscription plans show the percent LEFT of each quota
+window and its reset time. Direct API keys show the SPEND. The factory spend
+of each identity always shows, and it survives a restart. The probes read
+the credentials of the operator home and never store or log a token.
 
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
 OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
@@ -269,6 +292,16 @@ and task. A second `p` changes the same state again. Uppercase `P` changes the
 whole factory and removes all narrower states. A pause blocks future task
 starts. It does not stop an active task. A pause stops the process of a
 parked task, and the task stays resumable.
+
+Below the four lanes, the pipeline draws the `USAGE` band when the state
+carries usage rows. One row per billed identity shows the plan name, the
+quota windows as `N% left` with a bar and the reset time, and the factory
+spend as `factory $x`. A direct API row shows the spend instead of windows.
+A blocked window shows `0% left` in the alarm color. A probe failure and a
+probe reason both add one dim reason line, and stale data names its age.
+The band takes at most one third of the board height, and overflow ends
+with one `+ n more` line. The band is read-only: it has no keys and no
+actions.
 
 ### Session, view 2
 
