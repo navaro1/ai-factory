@@ -629,13 +629,24 @@ impl SessionView {
 
     /// The one-row header above the transcript.
     ///
-    /// With fewer than two live sessions the header is the plain task
-    /// line. With two or more the header is the tab strip: one label per
-    /// live session, the shown one bright, with its attempt and queued
-    /// count at the end.
+    /// With two or more live sessions the header is the tab strip: one
+    /// label per live session, the shown one bright, with its attempt and
+    /// queued count at the end. Every other case is the plain task line.
+    ///
+    /// A shown task with no live session takes the plain line too. The
+    /// strip would highlight no label. It would also hang the attempt of
+    /// the shown task on an unrelated one. The header would then name
+    /// neither the task nor its state.
+    ///
+    /// A view with no shown task keeps the strip. The strip hides nothing
+    /// there, and it lists where the tab keys lead.
     fn header_line(&self) -> Line<'static> {
         let dim = transcript::dim_style();
-        if self.tabs.len() >= 2 {
+        let shown_is_hidden = self
+            .task
+            .as_ref()
+            .is_some_and(|task| !self.tabs.contains(&task.id));
+        if self.tabs.len() >= 2 && !shown_is_hidden {
             let active = |id: &str| self.task.as_ref().is_some_and(|task| task.id == *id);
             let mut spans = Vec::new();
             for (index, id) in self.tabs.iter().enumerate() {
@@ -1576,6 +1587,61 @@ mod tests {
         assert!(
             screen.contains("borsuk/implement-i142 · running · attempt 1"),
             "one tab stays plain: {screen}"
+        );
+    }
+
+    /// A view with no shown task keeps the strip.
+    ///
+    /// Every `set_tabs` call follows a `show`, so no other test reaches
+    /// this case. Without it, a guard that hid the strip whenever the
+    /// shown task is absent would keep the suite green.
+    #[test]
+    fn the_header_keeps_the_tab_strip_when_no_task_is_shown() {
+        let mut view = SessionView::new();
+        view.set_tabs(vec![
+            "borsuk/refine-i143".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+
+        let screen = drawn_screen(&view);
+
+        assert!(
+            screen.contains("borsuk/refine-i143"),
+            "the strip lists the live sessions: {screen}"
+        );
+        assert!(
+            screen.contains("borsuk/implement-i142"),
+            "the strip lists the live sessions: {screen}"
+        );
+        assert!(
+            !screen.contains("no task selected"),
+            "the strip hides no task, so it stays: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_header_names_a_shown_task_that_owns_no_live_session() {
+        let dir = TempDir::new("no-live-tab");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        let mut shown = sample_task(&log);
+        shown.id = "borsuk/release".to_string();
+        shown.state = TaskState::Queued;
+        view.show(&shown);
+        view.set_tabs(vec![
+            "borsuk/refine-i143".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+
+        let screen = drawn_screen(&view);
+
+        assert!(
+            screen.contains("borsuk/release · queued · attempt 1"),
+            "the header names the shown task and its state: {screen}"
+        );
+        assert!(
+            !screen.contains("borsuk/refine-i143"),
+            "a strip that highlights no tab is gone: {screen}"
         );
     }
 
