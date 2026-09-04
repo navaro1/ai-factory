@@ -403,7 +403,7 @@ AIF applies a shown proposal only after key `a`.
 
 ### Settings, view 5
 
-The Settings view edits all six execution roles. It supports global and repository scopes.
+The Settings view edits every execution role. It supports global and repository scopes. The two theory roles take no repository override.
 
 | Key | Action |
 |---|---|
