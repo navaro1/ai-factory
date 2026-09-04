@@ -18,7 +18,7 @@ refine ──▶ implement ──▶ review ──▶ release
 |---|---|---|
 | refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
-| review | OpenCode, GPT-5.6 | The agent reviews the change and marks the pull request ready. |
+| review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
@@ -449,6 +449,10 @@ Repository topology changes require a daemon restart.
 - An implement or review turn that already runs can not change course. A
   message waits for the next turn.
 - A release gate row refreshes at the poll after you stack a pull request.
+- A review push on a draft pull request can restart that review at the next
+  poll.
+- A review of a pull request from a fork takes the `needs-human` path before a
+  repair.
 
 ## Development
 
