@@ -56,7 +56,7 @@ use crate::catalog;
 use crate::decisions::DecisionKind;
 use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
-use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
+use crate::sock::{Action, Client, Push, StateView, TaskView, TicketAction, WireProtocolMismatch};
 use crate::tasks::TaskState;
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
@@ -181,6 +181,13 @@ enum Confirm {
         /// The pull request numbers in the batch.
         prs: Vec<u64>,
     },
+    /// Add the `to-refine` label to one ticket.
+    Refine {
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
 }
 
 impl Confirm {
@@ -216,6 +223,20 @@ impl Confirm {
                         prs: prs.clone(),
                     },
                     format!("sent release {repo} {}", pr_text(&prs)),
+                );
+            }
+            Confirm::Refine { repo, number } => {
+                emit(
+                    app,
+                    sink,
+                    Action::Ticket(TicketAction::ToggleLabel {
+                        request: tickets::request_code(),
+                        repo: repo.clone(),
+                        number,
+                        label: crate::gates::TO_REFINE.to_string(),
+                        on: true,
+                    }),
+                    format!("sent to-refine {repo} #{number}"),
                 );
             }
         }
@@ -335,6 +356,7 @@ impl App {
     fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
+        self.tickets.delivery_failed(None);
         self.settings.delivery_failed(None);
     }
 
@@ -601,13 +623,26 @@ impl App {
                         _ => {}
                     }
                 }
+                if key.code == KeyCode::Char('m') && self.tickets.focus_plain() {
+                    if let Some((repo, number)) = self.tickets.focus_key() {
+                        if self.tickets.focus_has_label(crate::gates::TO_REFINE) {
+                            self.show_toast("the ticket already has to-refine");
+                        } else {
+                            self.confirm = Some(Confirm::Refine { repo, number });
+                        }
+                    }
+                    return true;
+                }
                 let nested = self.tickets.focus_open() || self.tickets.typing();
                 if let Some(action) = self
                     .state
                     .as_ref()
                     .and_then(|state| self.tickets.handle_key(state, key))
                 {
-                    emit(self, sink, action, "sent ticket request".to_string());
+                    let copy = action.clone();
+                    if !emit(self, sink, action, "sent ticket request".to_string()) {
+                        self.tickets.delivery_failed(Some(&copy));
+                    }
                 }
                 if key.code == KeyCode::Esc && !nested {
                     self.view = View::Pipeline;
@@ -1380,16 +1415,46 @@ fn banner_text(app: &App) -> String {
     }
 }
 
-/// Draw the key hints and the inbox badge.
+/// The longest bottom-row hint that an 80-column terminal shows in full.
+///
+/// The left footer side keeps 66 columns beside the 14-column inbox
+/// badge, and the row pads the text with one space on each side. Every
+/// view holds its hints at or below this count. The per-view tests read
+/// it, so the contract lives in one place.
+#[cfg(test)]
+pub(super) const HINT_CAP: usize = 64;
+
+/// The bottom-row hints of the current state.
+///
+/// The overlays win first, then the shell states, and the active view
+/// supplies the hints last. Each hint names only keys that the current
+/// state acts on.
+fn footer_hints(app: &App) -> String {
+    if app.confirm.is_some() {
+        return "y confirm · esc cancel".to_string();
+    }
+    if app.help {
+        return "? or esc close".to_string();
+    }
+    let Some(state) = app.state.as_ref().filter(|_| app.connected) else {
+        return "? help · ctrl-q quit".to_string();
+    };
+    match app.view {
+        View::Pipeline => pipeline::footer_hints(app),
+        View::Session => app.session.footer_hints(),
+        View::Inbox => inbox::footer_text(state, &app.inbox),
+        View::Tickets => app.tickets.footer_hints(),
+        View::Settings => app.settings.footer_hints(),
+    }
+}
+
+/// Draw the contextual key hints and the inbox badge.
 ///
 /// The badge renders in every view, so an open decision stays visible from
 /// anywhere.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
-    let hints = Span::styled(
-        " 1/2/3/4/5 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
-        THEME.dim(),
-    );
+    let hints = Span::styled(format!(" {} ", footer_hints(app)), THEME.dim());
     f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
     let Some(state) = app.state.as_ref() else {
         return;
@@ -1437,6 +1502,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let question = match confirm {
         Confirm::Abort { task } => format!("abort {task}?"),
         Confirm::Go { repo, prs } => format!("release {repo}: {}", pr_text(prs)),
+        Confirm::Refine { repo, number } => format!("add to-refine to {repo} #{number}?"),
     };
     let hint = "y confirm - esc cancel";
     let width = question.chars().count().max(hint.len()) as u16 + 6;
@@ -1481,8 +1547,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("h l", "switch session, chat unfocused"),
         ("y n i t c s w 1-9", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ e l c a", "search and ticket actions"),
-        ("h l", "tickets repo / settings scope"),
+        ("/ n e L c a m", "search and ticket keys"),
+        ("h l", "repo / ticket / settings scope"),
         ("j k", "settings role"),
         ("Tab", "select settings field"),
         ("Enter", "edit settings value"),
@@ -1619,6 +1685,55 @@ mod tests {
             1_000,
         );
         Decision::permission(&task, request_id, "Write", serde_json::json!({}), opened_ms)
+    }
+
+    /// One ticket summary for the shell ticket tests.
+    fn ticket_summary(repo: &str, number: u64) -> crate::sock::TicketSummary {
+        crate::sock::TicketSummary {
+            repo: repo.to_string(),
+            number,
+            title: "Improve the ticket list".to_string(),
+            labels: vec!["ui".to_string()],
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Untouched,
+        }
+    }
+
+    /// One full issue response for the shell ticket tests.
+    fn ticket_details(repo: &str, number: u64) -> crate::sock::TicketDetails {
+        crate::sock::TicketDetails {
+            request: "shell-details".to_string(),
+            repo: repo.to_string(),
+            issue: crate::model::Issue {
+                number,
+                node_id: format!("node-{number}"),
+                title: "Improve the ticket list".to_string(),
+                body: "Show every issue without leaving the terminal.".to_string(),
+                labels: vec!["ui".to_string()],
+                author: "piotr".to_string(),
+                assignees: Vec::new(),
+                updated_at: "2026-08-30T12:00:00Z".to_string(),
+                github_url: format!("https://github.com/acme/{repo}/issues/{number}"),
+                open: true,
+            },
+            proposal: None,
+            chat_error: None,
+        }
+    }
+
+    /// Open the plain ticket focus on one pushed ticket and clear the sink.
+    fn open_ticket_focus(surface: &mut CountingSurface, app: &mut App, sink: &mut FakeSink) {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tickets.push(ticket_summary("borsuk", 7));
+        run_messages(
+            surface,
+            app,
+            vec![Msg::State(state), key('4'), key_code(KeyCode::Enter)].into_iter(),
+            sink,
+        )
+        .unwrap();
+        sink.0.clear();
+        app.tickets.observe_details(ticket_details("borsuk", 7));
     }
 
     #[test]
@@ -2110,6 +2225,7 @@ mod tests {
             "PageUp PageDown",
             "PageDown",
             "End",
+            "/ n e L c a m",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
@@ -2214,6 +2330,94 @@ mod tests {
         assert!(!app.help, "the letters went into the reason input");
         let text = render_to_string(&mut app);
         assert!(text.contains("reason: q?"), "screen: {text}");
+    }
+
+    #[test]
+    fn the_new_ticket_form_types_a_digit_instead_of_switching_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let ctrl_s = Msg::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('4'),
+                key('n'),
+                key('1'),
+                ctrl_s,
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets, "1 must not switch the view");
+        assert!(app.tickets.typing(), "the form kept the keyboard");
+        let [crate::sock::Action::Ticket(crate::sock::TicketAction::Create { repo, title, .. })] =
+            sink.0.as_slice()
+        else {
+            panic!("ctrl-s must send the typed title: {:?}", sink.0);
+        };
+        assert_eq!(repo, "borsuk", "the form targets the first repository");
+        assert_eq!(title, "1", "the digit went into the title");
+    }
+
+    #[test]
+    fn a_failed_ticket_send_keeps_the_draft_and_allows_a_retry() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(ctrl_s, &mut FailSink);
+
+        let mut sink = FakeSink::default();
+        app.handle_key(ctrl_s, &mut sink);
+
+        let [Action::Ticket(crate::sock::TicketAction::Create { title, .. })] = sink.0.as_slice()
+        else {
+            panic!("the retry must send the retained ticket draft");
+        };
+        assert_eq!(title, "x");
+    }
+
+    #[test]
+    fn a_disconnect_unlocks_a_pending_ticket_send() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(ctrl_s, &mut sink);
+
+        app.mark_disconnected("lost".to_string());
+        app.handle_key(ctrl_s, &mut sink);
+
+        assert_eq!(sink.0.len(), 2, "the disconnect must allow one retry");
     }
 
     #[test]
@@ -2839,6 +3043,261 @@ mod tests {
     }
 
     #[test]
+    fn m_asks_before_it_adds_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                app.confirm,
+                Some(Confirm::Refine { ref repo, number: 7 }) if repo == "borsuk"
+            ),
+            "m must open the confirm prompt"
+        );
+        assert!(sink.0.is_empty(), "the prompt must send nothing yet");
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains("add to-refine to borsuk #7?"),
+            "screen: {text}"
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.0.len(), 1);
+        let Some(Action::Ticket(TicketAction::ToggleLabel {
+            repo,
+            number,
+            label,
+            on,
+            ..
+        })) = sink.0.first()
+        else {
+            panic!("y must send the to-refine toggle");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(*number, 7);
+        assert_eq!(label, "to-refine");
+        assert!(*on);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.visible_toast(), Some("sent to-refine borsuk #7"));
+    }
+
+    #[test]
+    fn esc_cancels_the_to_refine_prompt() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m'), key_code(KeyCode::Esc), key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty(), "a cancelled prompt must send nothing");
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn m_reports_a_ticket_that_already_has_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let mut labeled = ticket_details("borsuk", 7);
+        labeled
+            .issue
+            .labels
+            .push(crate::gates::TO_REFINE.to_string());
+        app.tickets.observe_details(labeled);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(
+            app.confirm.is_none(),
+            "a labeled ticket must skip the prompt"
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("the ticket already has to-refine")
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn m_stays_out_of_the_nested_ticket_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('e'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the editor keeps the m key");
+        assert!(!app.tickets.focus_plain(), "the editor holds the keyboard");
+        let screen = render_to_string(&mut app);
+        let title_row = screen
+            .lines()
+            .position(|line| line.contains(" title "))
+            .expect("the editor title block is visible");
+        let draft = screen
+            .lines()
+            .nth(title_row + 1)
+            .expect("the title draft row is visible");
+        assert!(
+            draft.trim_end_matches([' ', '│']).ends_with('m'),
+            "m typed into the editor title: {draft}"
+        );
+    }
+
+    #[test]
+    fn m_stays_out_of_the_label_picker_and_the_chat() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        // The label picker owns the keyboard.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('L'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.confirm.is_none(), "the label picker keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the label picker holds the keyboard"
+        );
+
+        // The new-label form owns the keyboard too.
+        app.tickets.observe_labels(crate::sock::TicketLabels {
+            request: "labels-1".to_string(),
+            repo: "borsuk".to_string(),
+            labels: vec![crate::sock::RepoLabel {
+                name: "ui".to_string(),
+                color: "ededed".to_string(),
+            }],
+            error: None,
+        });
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('n'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.confirm.is_none(), "the new-label form keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the new-label form holds the keyboard"
+        );
+
+        // The chat input owns the keyboard.
+        let mut chatting = App::default();
+        let mut chat_sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut chatting, &mut chat_sink);
+        run_messages(
+            &mut surface,
+            &mut chatting,
+            vec![key('c'), key('m')].into_iter(),
+            &mut chat_sink,
+        )
+        .unwrap();
+        assert!(chatting.confirm.is_none(), "the chat keeps the m key");
+        assert!(
+            !chatting.tickets.focus_plain(),
+            "the chat holds the keyboard"
+        );
+    }
+
+    #[test]
+    fn m_stays_out_of_the_ticket_conflict_view() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let details = ticket_details("borsuk", 7);
+        app.tickets.observe_result(crate::sock::TicketResult {
+            request: "content-1".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: crate::sock::TicketResultKind::Conflict,
+            message: "the issue changed on GitHub".to_string(),
+            issue: None,
+            conflict: Some(crate::sock::TicketConflict {
+                remote: details.issue.clone(),
+                pending: crate::sock::TicketContent {
+                    title: "A local title".to_string(),
+                    body: "A local body".to_string(),
+                },
+                source: crate::sock::TicketContentSource::Direct,
+            }),
+        });
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the conflict view keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the conflict view holds the keyboard"
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn the_help_overlay_names_the_new_ticket_keys() {
+        let mut app = App {
+            help: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        for entry in [
+            "/ n e L c a m",
+            "search and ticket keys",
+            "repo / ticket / settings scope",
+        ] {
+            assert!(text.contains(entry), "the help misses {entry}");
+        }
+    }
+
+    #[test]
     fn enter_sends_the_session_chat_action() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
@@ -3227,6 +3686,7 @@ mod tests {
             log_path: PathBuf::from("borsuk-refine-i140.jsonl"),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+            binding: None,
         });
         run_messages(
             &mut surface,
@@ -3311,6 +3771,7 @@ mod tests {
             log_path: PathBuf::from("ryba-refine-i0.jsonl"),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+            binding: None,
         });
         run_messages(
             &mut surface,
@@ -3393,7 +3854,11 @@ mod tests {
 
     #[test]
     fn key_five_opens_the_settings_view_and_updates_the_shell_text() {
-        let mut app = App::default();
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
         let mut sink = FakeSink::default();
 
         assert!(app.handle_key(
@@ -3404,7 +3869,7 @@ mod tests {
         assert_eq!(app.view, View::Settings);
         let text = render_to_string(&mut app);
         assert!(text.contains("5 settings"));
-        assert!(text.contains("1/2/3/4/5 views"));
+        assert!(text.contains("j k role · tab field · enter open · s save · r reload · ? help"));
     }
 
     #[test]
@@ -3464,5 +3929,139 @@ mod tests {
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
+    }
+
+    #[test]
+    fn the_bottom_row_hints_follow_the_overlay_and_shell_precedence() {
+        let mut app = App {
+            confirm: Some(Confirm::Abort {
+                task: "borsuk/refine-i142".to_string(),
+            }),
+            help: true,
+            ..App::default()
+        };
+        assert_eq!(footer_hints(&app), "y confirm · esc cancel");
+
+        app.confirm = None;
+        assert_eq!(footer_hints(&app), "? or esc close");
+
+        app.help = false;
+        assert_eq!(footer_hints(&app), "? help · ctrl-q quit");
+
+        app.connected = true;
+        app.state = Some(crate::tui::pipeline::sample_view());
+        assert_eq!(
+            footer_hints(&app),
+            "j k move · enter open · ? help",
+            "a connected shell serves the active view"
+        );
+
+        app.connected = false;
+        assert_eq!(
+            footer_hints(&app),
+            "? help · ctrl-q quit",
+            "the banner state repeats the quit chord"
+        );
+        assert!(footer_hints(&app).chars().count() <= HINT_CAP);
+    }
+
+    #[test]
+    fn the_shell_renders_one_contextual_row_without_the_static_hint_line() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("j k move · enter open · ? help"), "{text}");
+        assert!(!text.contains("1/2/3/4/5 views"), "{text}");
+        assert!(!text.contains("h/j/k/l move"), "{text}");
+        assert!(!text.contains("ctrl-q quit"), "{text}");
+
+        app.confirm = Some(Confirm::Abort {
+            task: "borsuk/refine-i142".to_string(),
+        });
+        let text = render_to_string(&mut app);
+        assert!(text.contains("y confirm · esc cancel"), "{text}");
+
+        app.confirm = None;
+        app.help = true;
+        let text = render_to_string(&mut app);
+        assert!(text.contains("? or esc close"), "{text}");
+    }
+
+    #[test]
+    fn the_inbox_shows_its_key_map_once_on_the_shell_bottom_row() {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            view: View::Inbox,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains("PgUp PgDn scroll · j k move · y allow · n deny · enter details"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("y allow").count(),
+            1,
+            "the key map renders once, on the bottom row:\n{text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        let body_last = lines[lines.len() - 2];
+        assert!(
+            body_last.starts_with("└"),
+            "the inbox body reaches the bottom row: {body_last}"
+        );
+    }
+
+    #[test]
+    fn the_shell_serves_the_hints_of_every_view_inside_the_row_cap() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let expected = [
+            (View::Pipeline, "j k move · enter open · ? help"),
+            (View::Session, "1 2 3 4 5 views · ? help"),
+            // The sample state holds no decision, so the inbox names
+            // the move and the jump key of an empty feed.
+            (View::Inbox, "j k move · ! oldest"),
+            (
+                View::Tickets,
+                "h l tabs · / search · n new · enter open · ? help",
+            ),
+            (
+                View::Settings,
+                "j k role · tab field · enter open · s save · r reload · ? help",
+            ),
+        ];
+        for (view, hint) in expected {
+            app.view = view;
+            let text = footer_hints(&app);
+            assert_eq!(text, hint, "view {view:?}");
+            assert!(text.chars().count() <= HINT_CAP, "view {view:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_confirm_prompt_from_the_tickets_view_wins_over_the_view_hints() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Tickets,
+            confirm: Some(Confirm::Refine {
+                repo: "borsuk".to_string(),
+                number: 7,
+            }),
+            ..App::default()
+        };
+        assert_eq!(footer_hints(&app), "y confirm · esc cancel");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("y confirm · esc cancel"), "{text}");
     }
 }

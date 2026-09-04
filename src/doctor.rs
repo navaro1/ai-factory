@@ -183,6 +183,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             checks.push(gh_auth_check(env.exec));
             checks.extend(daemon_checks(env.socket));
             checks.extend(scheduler_checks(&config));
+            checks.extend(permission_checks(&config));
             checks.extend(worktree_checks(env, &config, &facts));
         }
         Err(error) => {
@@ -791,10 +792,10 @@ fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
         }
         for alias in config.repos.keys() {
             for role in ExecutionRole::ALL {
-                let settings = config
-                    .resolved_role(Some(alias), role.table_name())
-                    .expect("a parsed configuration has valid role settings")
-                    .settings;
+                let Ok(resolved) = config.resolved_role(Some(alias), role.table_name()) else {
+                    continue;
+                };
+                let settings = resolved.settings;
                 programs
                     .entry(settings.program)
                     .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
@@ -1018,6 +1019,67 @@ fn scheduler_checks(config: &Config) -> Vec<Check> {
             .into_iter()
             .map(|warning| Check {
                 label: "scheduler".to_string(),
+                status: Status::Warn,
+                detail: warning,
+            })
+            .collect()
+    }
+}
+
+/// Report every opencode role that runs without permission auto-approval.
+///
+/// An unattended `opencode run` without `--auto` auto-rejects every
+/// permission request, so tools that read outside the project directory
+/// fail. The check resolves each global role and each repository override
+/// and warns for every opencode role whose resolved `auto_approve` is not
+/// true. A repository resolution that still points at the global role stays
+/// silent, because the global table carries the answer.
+fn permission_checks(config: &Config) -> Vec<Check> {
+    let offenders = |resolved: &aif::config::ResolvedRoleSettings| {
+        resolved.settings.harness == Harness::Opencode
+            && resolved.settings.auto_approve != Some(true)
+    };
+    let mut warnings = Vec::new();
+    for role in ExecutionRole::ALL {
+        if let Ok(resolved) = config.resolved_role(None, role.table_name()) {
+            if offenders(&resolved) {
+                warnings.push(format!(
+                    "{}: opencode auto-rejects every permission request without auto_approve; \
+                     unattended tools fail",
+                    role.table_name()
+                ));
+            }
+        }
+    }
+    for repo in config.repos.values() {
+        for role in ExecutionRole::ALL {
+            if let Ok(resolved) = config.resolved_role(Some(&repo.alias), role.table_name()) {
+                if matches!(
+                    resolved.source,
+                    aif::config::SettingsSource::Repository { .. }
+                ) && offenders(&resolved)
+                {
+                    warnings.push(format!(
+                        "repo.{}.{}: opencode auto-rejects every permission request without \
+                         auto_approve; unattended tools fail",
+                        repo.alias,
+                        role.table_name()
+                    ));
+                }
+            }
+        }
+    }
+    if warnings.is_empty() {
+        vec![Check {
+            label: "permissions".to_string(),
+            status: Status::Pass,
+            detail: "all opencode roles auto-approve permissions".to_string(),
+        }]
+    } else {
+        warnings
+            .into_iter()
+            .map(|warning| Check {
+                label: "permissions".to_string(),
                 status: Status::Warn,
                 detail: warning,
             })
@@ -2350,6 +2412,105 @@ mod tests {
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
 
+    /// Plain role text where only `stage.review` runs opencode without
+    /// `auto_approve`; every other role runs claude or approves.
+    fn permissions_review_text(review_extra: &str) -> String {
+        format!(
+            "schema_version = 1\n\
+             [stage.refine]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [stage.implement]\nharness = \"opencode\"\nmodel = \"m\"\nauto_approve = true\n\
+             [stage.review]\nharness = \"opencode\"\nmodel = \"m\"\n{review_extra}\
+             [stage.release]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n"
+        )
+    }
+
+    #[test]
+    fn an_opencode_role_without_auto_approve_warns() {
+        let config =
+            Config::parse(&permissions_review_text("")).expect("the role configuration must parse");
+
+        let checks = permission_checks(&config);
+
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].label, "permissions");
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(
+            checks[0].detail.contains("stage.review"),
+            "detail: {}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0]
+                .detail
+                .contains("opencode auto-rejects every permission request"),
+            "detail: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn a_disapproving_repository_override_warns_with_its_table_path() {
+        let text = permissions_review_text("auto_approve = true\n")
+            + "[repo.demo]\npath = \"/tmp/demo\"\n\
+               [repo.demo.stage.review]\nauto_approve = false\n";
+        let config = Config::parse(&text).expect("the role configuration must parse");
+
+        let checks = permission_checks(&config);
+
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(
+            checks[0].detail.contains("repo.demo.stage.review"),
+            "detail: {}",
+            checks[0].detail
+        );
+        assert!(
+            !checks[0].detail.starts_with("stage.review"),
+            "detail: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn approving_and_non_opencode_roles_pass_the_permissions_check() {
+        let example = Config::parse(include_str!("../docs/v0.5/factory.example.toml"))
+            .expect("the installer example must parse");
+        let claude_only = "schema_version = 1\n\
+             [stage.refine]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [stage.implement]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [stage.review]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [stage.release]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n";
+        let claude_only = Config::parse(claude_only).expect("the claude roles must parse");
+        let codex_review = permissions_review_text("")
+            .replacen(
+                "[stage.review]\nharness = \"opencode\"\nmodel = \"m\"\n",
+                "[stage.review]\nharness = \"codex\"\nmodel = \"m\"\nprofile = \"p\"\n",
+                1,
+            )
+            .replacen(
+                "[stage.implement]\nharness = \"opencode\"\nmodel = \"m\"\nauto_approve = true\n",
+                "[stage.implement]\nharness = \"claude\"\nmodel = \"m\"\n",
+                1,
+            );
+        let codex_review = Config::parse(&codex_review).expect("the codex roles must parse");
+
+        for config in [&example, &claude_only, &codex_review] {
+            let checks = permission_checks(config);
+            assert_eq!(checks.len(), 1, "checks: {checks:?}");
+            assert_eq!(checks[0].label, "permissions");
+            assert_eq!(checks[0].status, Status::Pass);
+            assert_eq!(
+                checks[0].detail,
+                "all opencode roles auto-approve permissions"
+            );
+            assert!(!checks.iter().any(|check| check.status == Status::Warn));
+        }
+    }
+
     #[test]
     fn a_repository_that_is_not_a_git_checkout_fails() {
         let dir = temp_dir("plain-repo");
@@ -3235,6 +3396,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: true,

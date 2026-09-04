@@ -18,7 +18,7 @@ refine ──▶ implement ──▶ review ──▶ release
 |---|---|---|
 | refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
-| review | OpenCode, GPT-5.6 | The agent reviews the change and marks the pull request ready. |
+| review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
@@ -86,6 +86,7 @@ limit = 3
 [stage.implement]
 harness = "opencode"
 model = "zai-coding-plan/glm-5.3-flash"
+auto_approve = true
 limit = 3
 
 [stage.review]
@@ -93,6 +94,7 @@ harness = "opencode"
 model = "openai/gpt-5.6-sol"
 effort = "xhigh"
 extra_args = []
+auto_approve = true
 limit = 7
 
 [stage.release]
@@ -134,6 +136,12 @@ effort = "max"
 
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
 OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
+
+Set `auto_approve = true` on every unattended opencode role. Without it,
+opencode auto-rejects every permission request. Tools that read outside the
+project directory then fail, and the task loses its evidence. The run can
+still end `ok`. `aif doctor` reports a `permissions` warning for each opencode
+role that lacks the approval.
 
 A repository role table can override individual fields. A harness change requires a complete role block.
 The Settings view marks inherited repository values with `~`.
@@ -217,6 +225,14 @@ The release lane puts the next, active, or retry batch inside a border.
 The waiting pull requests start below the border.
 The oldest request is at the top, and the newest request is at the bottom.
 
+One piece of work holds one row. A finished task loses its row as soon as a
+later lane shows the same work: a done refine yields to its implement, a done
+implement yields to the review of its pull request, and a done review yields
+to the release train that holds that pull request. A failed task keeps its row
+until a later lane picks the work up, so you can always retry it. The daemon
+drops the tasks of an issue or a pull request that left GitHub, so a merge
+leaves no row behind.
+
 | Key | Action |
 |---|---|
 | `j` / `k` or Up / Down | Move the selection inside a lane. |
@@ -249,7 +265,9 @@ parked task, and the task stays resumable.
 
 The session view follows the log of one task. You see the agent output and
 you converse with the agent. Press `enter` on a ticket in the pipeline to
-open its session.
+open its session. The header line names the harness, the model, and the
+variant of the role that the task bound for its runs. A task that never
+started holds no binding, so its header names no role.
 
 The input bar states what your message does. The daemon decides this per
 task, and the bar never promises what the daemon refuses:
@@ -347,9 +365,13 @@ issues inside the active tab.
 |---|---|---|
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
+| List | `n` | Create a ticket in the active repository tab. |
 | List | `enter` | Open the selected issue. |
+| Issue | `j` / `k` or Down / Up | Scroll the issue pane by one line. |
+| Issue | `h` / `l` or Left / Right | Open the previous or the next issue of the tab. |
 | Issue | `e` | Edit the title and description. |
-| Issue | `l` | Open the repository label picker. |
+| Issue | `L` | Open the repository label picker. |
+| Issue | `m` | Add the label `to-refine`. A prompt asks first. |
 | Issue | `c` | Start or resume the configured ticket chat. |
 | Issue | `a` | Apply the latest shown agent proposal. |
 | Editor | `ctrl-s` | Save the content edit. |
@@ -360,6 +382,10 @@ issues inside the active tab.
 | Nested view | `esc` | Return one level. |
 
 The issue focus shows all issue details and the GitHub reference.
+A dim hint line under the pane names these keys.
+The issue move follows the order and the search filter of the list.
+It stops at the first issue and at the last issue of the tab.
+It never changes the repository tab.
 Wide terminals put the details and chat beside each other.
 Narrow terminals put the chat below the details.
 
@@ -449,7 +475,14 @@ Repository topology changes require a daemon restart.
   tool again next time.
 - An implement or review turn that already runs can not change course. A
   message waits for the next turn.
+- An opencode role without `auto_approve = true` auto-rejects every
+  permission request in an unattended run. Its tools fail. `aif doctor`
+  reports each such role.
 - A release gate row refreshes at the poll after you stack a pull request.
+- A review push on a draft pull request can restart that review at the next
+  poll.
+- A review of a pull request from a fork takes the `needs-human` path before a
+  repair.
 
 ## Development
 
