@@ -2429,6 +2429,7 @@ mod tests {
                 overrides: Vec::new(),
             },
             settings: crate::sock::SettingsView::default(),
+            usage: Vec::new(),
         }
     }
 
@@ -4019,6 +4020,7 @@ mod tests {
                 overrides: Vec::new(),
             },
             settings: crate::sock::SettingsView::default(),
+            usage: Vec::new(),
         }
     }
 

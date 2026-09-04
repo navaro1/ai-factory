@@ -26,4 +26,5 @@ pub mod tasks;
 pub mod ticket;
 pub mod trains;
 pub mod tui;
+pub mod usage;
 pub mod worktree;

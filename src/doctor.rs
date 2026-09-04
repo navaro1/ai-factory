@@ -3241,6 +3241,7 @@ mod tests {
                 overrides: Vec::new(),
             },
             settings: SettingsView::default(),
+            usage: Vec::new(),
         });
         let missing_config = dir.join("factory.toml");
         let exec = ScriptExec::new();

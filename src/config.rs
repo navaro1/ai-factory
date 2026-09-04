@@ -169,6 +169,34 @@ pub enum ReleasePolicy {
     },
 }
 
+/// The usage probe cadence of the `[usage]` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageConfig {
+    /// True when the daemon probes the provider usage endpoints.
+    #[serde(default = "default_usage_enabled")]
+    pub enabled: bool,
+    /// The minutes between two probes of one identity.
+    #[serde(default = "default_usage_minutes")]
+    pub minutes: u64,
+}
+
+fn default_usage_enabled() -> bool {
+    true
+}
+fn default_usage_minutes() -> u64 {
+    10
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minutes: 10,
+        }
+    }
+}
+
 /// Temporary stage data for callers that still use the old runner interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageConfig {
@@ -211,6 +239,7 @@ pub struct Config {
     pub stages: BTreeMap<Stage, StageConfig>,
     pub repos: BTreeMap<String, RepoConfig>,
     pub ticket_chat: TicketChatConfig,
+    pub usage: UsageConfig,
 }
 
 impl Config {
@@ -271,6 +300,7 @@ impl Config {
         if raw.schema_version != Some(1) {
             bail!("schema_version must equal 1");
         }
+        validate_usage(&raw.usage)?;
         let stage_limits = [
             raw.stage.refine.as_ref().and_then(|value| value.limit),
             raw.stage.implement.as_ref().and_then(|value| value.limit),
@@ -374,6 +404,7 @@ impl Config {
                 model: Some(roles[&ExecutionRole::TicketChat].model.clone()),
             },
             roles,
+            usage: raw.usage,
         })
     }
 
@@ -434,6 +465,8 @@ struct RawConfig {
     ticket: RawTickets,
     #[serde(default)]
     repo: BTreeMap<String, RawRepo>,
+    #[serde(default)]
+    usage: UsageConfig,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -994,6 +1027,15 @@ fn validate_release(value: &ReleasePolicy, alias: &str) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+fn validate_usage(value: &UsageConfig) -> Result<()> {
+    if value.minutes == 0 {
+        bail!("usage.minutes must be at least 1");
+    }
+    if value.minutes > 1_440 {
+        bail!("usage.minutes must be at most 1440");
+    }
+    Ok(())
 }
 fn validate_lane_sums(
     stages: &BTreeMap<Stage, StageConfig>,
@@ -1692,5 +1734,77 @@ mod lifecycle_tests {
         assert_eq!(file_revision("same"), file_revision("same"));
         assert_ne!(file_revision("same"), file_revision("same\n"));
         assert_ne!(file_revision("same"), file_revision("other"));
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    const ROLES: &str = r#"
+schema_version = 1
+
+[stage.refine]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[stage.implement]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[stage.review]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[stage.release]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[ticket.create]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[ticket.chat]
+harness = "claude"
+model = "claude-opus-5[1m]"
+"#;
+
+    #[test]
+    fn a_usage_table_parses_its_minutes() {
+        let config = Config::parse(&format!("{ROLES}\n[usage]\nminutes = 30\n")).unwrap();
+        assert!(config.usage.enabled);
+        assert_eq!(config.usage.minutes, 30);
+    }
+
+    #[test]
+    fn a_missing_usage_table_defaults_to_enabled_and_ten_minutes() {
+        let config = Config::parse(ROLES).unwrap();
+        assert_eq!(config.usage, UsageConfig::default());
+        assert_eq!(config.usage.minutes, 10);
+    }
+
+    #[test]
+    fn usage_minutes_outside_the_range_is_rejected_with_the_field_name() {
+        for (minutes, expected) in [
+            ("0", "usage.minutes must be at least 1"),
+            ("1441", "usage.minutes must be at most 1440"),
+        ] {
+            let text = format!("{ROLES}\n[usage]\nminutes = {minutes}\n");
+            let error = Config::parse(&text).expect_err("the invalid cadence must fail");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "minutes {minutes} gave: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_usage_field_is_rejected_with_the_field_name() {
+        let text = format!("{ROLES}\n[usage]\nminutes = 30\nnope = true\n");
+        let error = Config::parse(&text).expect_err("the unknown field must fail");
+        assert!(
+            format!("{error:#}").contains("unknown field `nope`"),
+            "error was: {error:#}"
+        );
     }
 }

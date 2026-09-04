@@ -36,6 +36,13 @@ permission_handler = "inbox"
 tools = ["Read", "Glob", "Grep"]
 extra_args = []
 
+# Usage probes. When enabled, the daemon reads the quota and spend of each
+# billed identity and shows it in the USAGE band of the pipeline view.
+# minutes is the cadence per identity, from 1 to 1440.
+#[usage]
+#enabled = true
+#minutes = 10
+
 [repo.borsuk]
 path = "/home/navaro/Workplace/borsuk"
 lanes = { implement = 1 }
