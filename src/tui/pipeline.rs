@@ -2519,6 +2519,88 @@ mod tests {
     }
 
     #[test]
+    fn a_train_that_holds_the_linked_pr_hides_a_done_implement_row() {
+        // The review task already ended and retired, so only the train
+        // reports the work. The link is the sole path from issue to lane.
+        let mut state = minimal_view();
+        state.tasks = vec![task(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            TaskState::Done,
+            1,
+        )];
+        state.links = vec![link("borsuk", 142, 7)];
+        state.trains = vec![train("borsuk", vec![7], Vec::new(), Vec::new())];
+
+        assert!(shown_ticket_ids(&state).is_empty());
+        assert!(stage_is_empty(&state, Stage::Implement));
+    }
+
+    #[test]
+    fn a_linked_later_lane_hides_a_done_refine_row_without_an_implement_task() {
+        // No implement task exists, so the first clause of the refine rule
+        // matches nothing. The link to a pull request in a later lane must
+        // still hide the row.
+        let review = task(
+            "borsuk",
+            Stage::Review,
+            ItemKind::Pr,
+            7,
+            TaskState::Queued,
+            1,
+        );
+        for (tasks, trains) in [
+            (vec![review.clone()], Vec::new()),
+            (
+                Vec::new(),
+                vec![train("borsuk", vec![7], Vec::new(), Vec::new())],
+            ),
+        ] {
+            let mut state = minimal_view();
+            state.tasks = vec![task(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                TaskState::Done,
+                1,
+            )];
+            state.tasks.extend(tasks);
+            state.links = vec![link("borsuk", 142, 7)];
+            state.trains = trains;
+
+            assert!(
+                !shown_ticket_ids(&state).contains(&"borsuk/refine-i142".to_string()),
+                "the refine row must yield to the linked lane"
+            );
+            assert!(stage_is_empty(&state, Stage::Refine));
+        }
+    }
+
+    #[test]
+    fn an_unlinked_pull_request_leaves_a_done_implement_row_alone() {
+        // The train holds pull request 7, but no link joins it to issue
+        // 142, so the board still owes the human that implement row.
+        let mut state = minimal_view();
+        state.tasks = vec![task(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            TaskState::Done,
+            1,
+        )];
+        state.trains = vec![train("borsuk", vec![7], Vec::new(), Vec::new())];
+
+        assert_eq!(
+            shown_ticket_ids(&state),
+            vec!["borsuk/implement-i142".to_string()]
+        );
+    }
+
+    #[test]
     fn a_failed_review_row_stays_while_no_train_holds_the_pr() {
         let mut state = minimal_view();
         state.tasks = vec![task(
