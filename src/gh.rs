@@ -47,6 +47,17 @@ pub struct Collection<T> {
     pub unchanged: Vec<u64>,
 }
 
+/// One comment on an issue or a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueComment {
+    /// The login of the comment author; `unknown` after a deleted account.
+    pub author: String,
+    /// The creation time in RFC 3339 form.
+    pub created_at: String,
+    /// The raw comment body.
+    pub body: String,
+}
+
 /// Which GitHub list a page belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ListKind {
@@ -210,6 +221,41 @@ impl<'a> GhClient<'a> {
         }
         labels.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(labels)
+    }
+
+    /// Fetch every comment of one issue or pull request, oldest first.
+    ///
+    /// The method pages the comments endpoint exactly like
+    /// [`GhClient::fetch_labels`] pages the label catalog: the walk ends at
+    /// a page below [`PAGE_SIZE`] entries or without a `rel="next"` link.
+    pub fn fetch_issue_comments(&self, owner_repo: &str, number: u64) -> Result<Vec<IssueComment>> {
+        let mut comments = Vec::new();
+        let mut page = 1u64;
+        loop {
+            let url = format!(
+                "repos/{owner_repo}/issues/{number}/comments?per_page={PAGE_SIZE}&page={page}"
+            );
+            let args = ["api", "-i", "-X", "GET", url.as_str()];
+            let out = self
+                .exec
+                .run("gh", &args, None)
+                .context("gh api failed to run")?;
+            let response = checked_response(&out)?;
+            let values: Vec<Value> = serde_json::from_str(&response.body)
+                .context("gh api returned a broken issue comment body")?;
+            for value in &values {
+                comments.push(IssueComment {
+                    author: author_login(value)?.to_string(),
+                    created_at: str_field(value, "created_at")?.to_string(),
+                    body: str_field(value, "body")?.to_string(),
+                });
+            }
+            if values.len() < PAGE_SIZE || !response.link_next {
+                break;
+            }
+            page += 1;
+        }
+        Ok(comments)
     }
 
     /// Create one repository label and return GitHub's label.
@@ -1670,5 +1716,114 @@ mod tests {
         assert_eq!(issue.node_id, "IC_42");
         assert_eq!(issue.title, "decision");
         assert_eq!(issue.body, "why");
+    }
+
+    /// A JSON array of comment objects whose bodies carry their index.
+    fn comments_json(count: usize) -> String {
+        let items: Vec<String> = (0..count)
+            .map(|index| {
+                format!(
+                    r#"{{"user":{{"login":"agent"}},"created_at":"2026-09-01T10:00:00Z","body":"comment {index}"}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    #[test]
+    fn fetch_issue_comments_runs_the_exact_gh_call_and_maps_the_comments() {
+        let body = r#"[{"user":{"login":"agent"},"created_at":"2026-09-01T10:00:00Z","body":"Which mode ships first?"},{"user":{"login":"human"},"created_at":"2026-09-02T11:30:00Z","body":"plain prose"}]"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100&page=1",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], body)),
+        );
+        let client = GhClient::new(&exec);
+        let comments = client.fetch_issue_comments("acme/borsuk", 9).unwrap();
+
+        assert_eq!(
+            comments,
+            vec![
+                IssueComment {
+                    author: "agent".to_string(),
+                    created_at: "2026-09-01T10:00:00Z".to_string(),
+                    body: "Which mode ships first?".to_string(),
+                },
+                IssueComment {
+                    author: "human".to_string(),
+                    created_at: "2026-09-02T11:30:00Z".to_string(),
+                    body: "plain prose".to_string(),
+                },
+            ]
+        );
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argv(),
+            [
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100&page=1"
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_issue_comments_walks_a_link_next_page_and_merges_in_order() {
+        let next_link = "link: <https://api.github.com/repositories/1/issues/9/comments?page=2>\
+             ; rel=\"next\", <https://api.github.com/repositories/1/issues/9/comments?page=2>\
+             ; rel=\"last\"";
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues/9/comments?per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c1\"", next_link],
+                    &comments_json(100),
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues/9/comments?per_page=100&page=2",
+                ]),
+                CmdOut::ok(response("HTTP/2 200", &["etag: \"c2\""], &comments_json(2))),
+            );
+        let client = GhClient::new(&exec);
+        let comments = client.fetch_issue_comments("acme/borsuk", 9).unwrap();
+
+        assert_eq!(comments.len(), 102);
+        assert_eq!(comments[0].body, "comment 0");
+        assert_eq!(comments[99].body, "comment 99");
+        assert_eq!(comments[100].body, "comment 0");
+        assert_eq!(comments[101].body, "comment 1");
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].argv(),
+            [
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100&page=2"
+            ]
+        );
     }
 }

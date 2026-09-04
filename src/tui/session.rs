@@ -7,6 +7,11 @@
 //! [`crate::tui::transcript`] and keeps the last [`RING_CAP`] items in a
 //! ring buffer.
 //!
+//! The log carries no user lines: the claude CLI writes no typed message
+//! into its output stream. The view echoes each sent message into the ring
+//! itself, so the transcript shows what the human typed. The echo lives
+//! only in the ring; a task switch drops it.
+//!
 //! The input bar states what a typed message will do. The daemon says the
 //! mode with [`TaskView::input`]; the bar renders a hint for that mode. A
 //! closed input takes no message: the bar shows the daemon's reason, and
@@ -483,9 +488,9 @@ impl SessionView {
     /// `page` is the visible transcript height in rows; the shell passes
     /// the pane height, and the view uses it as the PageUp and PageDown
     /// step. A focused bar takes the typing keys: typing feeds the input
-    /// bar, Enter sends one [`Action::Chat`] with the typed text, `ctrl-x`
-    /// sends [`Action::Abort`], PageUp and PageDown scroll, and End
-    /// returns to following the tail.
+    /// bar, Enter sends one [`Action::Chat`] with the typed text and echoes
+    /// the text into the transcript, `ctrl-x` sends [`Action::Abort`],
+    /// PageUp and PageDown scroll, and End returns to following the tail.
     ///
     /// An unfocused bar swallows typing and Enter and returns none,
     /// whatever the bar holds. `ctrl-x` and the scroll keys stay alive, so
@@ -511,6 +516,11 @@ impl SessionView {
                 if text.trim().is_empty() {
                     return None;
                 }
+                // The log file carries no user lines: the claude CLI never
+                // echoes a typed message into its output. The view echoes
+                // the sent text into the ring itself, so the transcript
+                // shows what the human typed.
+                self.ring.push(Entry::User { text: text.clone() });
                 Some(Action::Chat { task, text })
             }
             (KeyCode::Char(letter), modifiers)
@@ -619,13 +629,24 @@ impl SessionView {
 
     /// The one-row header above the transcript.
     ///
-    /// With fewer than two live sessions the header is the plain task
-    /// line. With two or more the header is the tab strip: one label per
-    /// live session, the shown one bright, with its attempt and queued
-    /// count at the end.
+    /// With two or more live sessions the header is the tab strip: one
+    /// label per live session, the shown one bright, with its attempt and
+    /// queued count at the end. Every other case is the plain task line.
+    ///
+    /// A shown task with no live session takes the plain line too. The
+    /// strip would highlight no label. It would also hang the attempt of
+    /// the shown task on an unrelated one. The header would then name
+    /// neither the task nor its state.
+    ///
+    /// A view with no shown task keeps the strip. The strip hides nothing
+    /// there, and it lists where the tab keys lead.
     fn header_line(&self) -> Line<'static> {
         let dim = transcript::dim_style();
-        if self.tabs.len() >= 2 {
+        let shown_is_hidden = self
+            .task
+            .as_ref()
+            .is_some_and(|task| !self.tabs.contains(&task.id));
+        if self.tabs.len() >= 2 && !shown_is_hidden {
             let active = |id: &str| self.task.as_ref().is_some_and(|task| task.id == *id);
             let mut spans = Vec::new();
             for (index, id) in self.tabs.iter().enumerate() {
@@ -943,6 +964,48 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_failure_line_replaces_the_no_output_placeholder() {
+        let dir = TempDir::new("dispatch-line");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        view.on_redraw(Instant::now());
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, Rect::new(0, 0, 80, 12), &[]))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("no output yet"),
+            "the empty log shows the placeholder: {screen}"
+        );
+
+        fs::write(
+            &log,
+            "aif: dispatch failed: cannot prepare the worktree: git worktree prune failed: boom\n",
+        )
+        .unwrap();
+        view.on_redraw(Instant::now());
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, Rect::new(0, 0, 80, 12), &[]))
+            .unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("aif: dispatch failed: cannot prepare the worktree"),
+            "the session view shows the reason: {screen}"
+        );
+        assert!(
+            !screen.contains("no output yet"),
+            "the placeholder is gone: {screen}"
+        );
+    }
+
+    #[test]
     fn the_poll_reads_at_most_once_per_interval() {
         let dir = TempDir::new("poll");
         let log = dir.path().join("task.jsonl");
@@ -1037,6 +1100,61 @@ mod tests {
         assert_eq!(view.handle_key(letter('a'), 10), None);
         assert_eq!(view.handle_key(key(KeyCode::Backspace), 10), None);
         assert_eq!(view.handle_key(key(KeyCode::Enter), 10), None);
+        assert!(
+            view.ring.is_empty(),
+            "a blank send echoes nothing into the transcript"
+        );
+    }
+
+    #[test]
+    fn enter_echoes_the_sent_message_into_the_transcript() {
+        let dir = TempDir::new("echo");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+
+        for press in [
+            letter('s'),
+            letter('t'),
+            letter('e'),
+            letter('e'),
+            letter('r'),
+        ] {
+            assert_eq!(view.handle_key(press, 10), None);
+        }
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter), 10),
+            Some(Action::Chat {
+                task: "borsuk/implement-i142".to_string(),
+                text: "steer".to_string(),
+            })
+        );
+
+        assert_eq!(view.ring.len(), 1);
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "steer".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn the_draw_shows_the_sent_message_in_the_transcript() {
+        let dir = TempDir::new("echo-draw");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        for press in [letter('h'), letter('i')] {
+            view.handle_key(press, 10);
+        }
+        view.handle_key(key(KeyCode::Enter), 10);
+
+        let screen = drawn_screen(&view);
+        assert!(
+            screen.contains("› hi"),
+            "the sent message must show in the transcript: {screen}"
+        );
     }
 
     #[test]
@@ -1253,7 +1371,12 @@ mod tests {
         assert_eq!(asks[0].options, vec!["a".to_string(), "b".to_string()]);
         assert!(asks[1].options.is_empty());
 
-        // A wrapped object and a wrong shape both yield nothing.
+        // The recorded tool input wraps the same list under `questions`.
+        let wrapped = ask_questions(&serde_json::json!({"questions": value}));
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].options, vec!["a".to_string(), "b".to_string()]);
+
+        // A wrong shape yields nothing.
         assert!(ask_questions(&serde_json::json!(null)).is_empty());
         assert!(ask_questions(&serde_json::json!("no")).is_empty());
     }
@@ -1385,6 +1508,13 @@ mod tests {
                 text: "hi".to_string(),
             })
         );
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "hi".to_string()
+            }),
+            "a queued message echoes into the transcript too"
+        );
     }
 
     #[test]
@@ -1462,6 +1592,61 @@ mod tests {
         assert!(
             screen.contains("borsuk/implement-i142 · running · attempt 1"),
             "one tab stays plain: {screen}"
+        );
+    }
+
+    /// A view with no shown task keeps the strip.
+    ///
+    /// Every `set_tabs` call follows a `show`, so no other test reaches
+    /// this case. Without it, a guard that hid the strip whenever the
+    /// shown task is absent would keep the suite green.
+    #[test]
+    fn the_header_keeps_the_tab_strip_when_no_task_is_shown() {
+        let mut view = SessionView::new();
+        view.set_tabs(vec![
+            "borsuk/refine-i143".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+
+        let screen = drawn_screen(&view);
+
+        assert!(
+            screen.contains("borsuk/refine-i143"),
+            "the strip lists the live sessions: {screen}"
+        );
+        assert!(
+            screen.contains("borsuk/implement-i142"),
+            "the strip lists the live sessions: {screen}"
+        );
+        assert!(
+            !screen.contains("no task selected"),
+            "the strip hides no task, so it stays: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_header_names_a_shown_task_that_owns_no_live_session() {
+        let dir = TempDir::new("no-live-tab");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        let mut shown = sample_task(&log);
+        shown.id = "borsuk/release".to_string();
+        shown.state = TaskState::Queued;
+        view.show(&shown);
+        view.set_tabs(vec![
+            "borsuk/refine-i143".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+
+        let screen = drawn_screen(&view);
+
+        assert!(
+            screen.contains("borsuk/release · queued · attempt 1"),
+            "the header names the shown task and its state: {screen}"
+        );
+        assert!(
+            !screen.contains("borsuk/refine-i143"),
+            "a strip that highlights no tab is gone: {screen}"
         );
     }
 
