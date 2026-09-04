@@ -10323,12 +10323,24 @@ mod tests {
                 Some(&["start from the specification".to_string()][..]),
                 "the refine state {refine_state:?} must not block the implement chat"
             );
+            // The chat reopened the task, so the bar now names the cause of
+            // the wait. The operator never faces a silent stall.
+            let queued = rig.task("borsuk/implement-i142");
+            assert_eq!(queued.state, TaskState::Queued);
+            assert_eq!(
+                rig.daemon.input_mode(&queued),
+                InputMode::Closed {
+                    reason: "This task waits for \"borsuk/refine-i142\" to finish.".to_string()
+                },
+                "the bar names the prior stage for the refine state {refine_state:?}"
+            );
         }
     }
 
     #[test]
     fn a_follow_up_to_the_refine_starts_while_the_implement_runs() {
         let dir = temp_root();
+        let checkout = rig_repo(&dir);
         let steps = fresh_issue_steps(
             &rig_repo(&dir),
             &issue_wt(&dir, 142),
@@ -10352,21 +10364,25 @@ mod tests {
             rig.daemon.input_mode(&task),
             InputMode::Closed { .. }
         ));
-        rig.daemon
-            .chat("borsuk/refine-i142", "clarify the second requirement");
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "clarify the second requirement".to_string(),
+        });
 
-        assert_eq!(
-            rig.daemon
-                .pending_chats
-                .get("borsuk/refine-i142")
-                .map(Vec::as_slice),
-            Some(&["clarify the second requirement".to_string()][..])
-        );
+        // The shared checkout carries no guard, and no prior stage holds a
+        // refine, so the follow-up turn runs while the implement runs.
+        assert_eq!(rig.job_count(), 3, "the refine follow-up started");
+        let followup = rig.job(2);
+        assert_eq!(followup.task, "borsuk/refine-i142");
+        assert_eq!(followup.cwd, checkout, "the refine keeps the checkout");
+        assert_eq!(followup.prompt, "clarify the second requirement");
+        assert!(rig.daemon.pending_chats.is_empty());
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
     }
 
     #[test]
-    fn a_follow_up_to_the_implement_starts_while_the_ticket_chat_is_active() {
+    fn a_follow_up_to_the_implement_queues_while_the_ticket_chat_is_active() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
@@ -10387,8 +10403,10 @@ mod tests {
             rig.daemon.sibling_refusal(&task).is_none(),
             "the ticket chat never blocks the implement"
         );
-        rig.daemon
-            .chat("borsuk/implement-i142", "extend the change");
+        rig.act(Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "extend the change".to_string(),
+        });
 
         assert_eq!(
             rig.daemon
@@ -10396,6 +10414,21 @@ mod tests {
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
             Some(&["extend the change".to_string()][..])
+        );
+        // The worktree guard takes the message. The pipeline order still
+        // holds the turn: the ticket chat carries the refine stage of the
+        // same ticket, so it is a prior stage of the implement.
+        let implement_runs = (0..rig.job_count())
+            .filter(|&index| rig.job(index).task == "borsuk/implement-i142")
+            .count();
+        assert_eq!(implement_runs, 1, "the pipeline order holds the turn");
+        let queued = rig.task("borsuk/implement-i142");
+        assert_eq!(
+            rig.daemon.input_mode(&queued),
+            InputMode::Closed {
+                reason: "This task waits for \"borsuk/ticket-i142\" to finish.".to_string()
+            },
+            "the bar names the ticket chat as the cause"
         );
     }
 
