@@ -64,12 +64,12 @@ do not exist:
 |---|---|
 | `factory.toml` | Your configuration, copied from the example. |
 | `factory.example.toml` | A portable reference copy of the example. |
-| `prompts/*.md` | The four stage prompts and the ticket chat prompt. |
+| `prompts/*.md` | The six role prompts: the four stages, ticket creation, and ticket chat. |
 
 The installer never overwrites a file that exists. The installer keeps an
 installed prompt file. After an upgrade, copy the new prompt files from
-`docs/v0.6/prompts/` by hand. Edit `~/.config/aif/factory.toml` and set the
-path of every repository.
+`docs/v0.6/prompts/` by hand, or edit each prompt in the Settings view.
+Edit `~/.config/aif/factory.toml` and set the path of every repository.
 
 ## Configure
 
@@ -147,6 +147,13 @@ Use only the typed permission fields for dangerous native modes. The Settings vi
 
 A task binds its resolved settings when it starts. Retries, parked sessions, and restarts keep that binding.
 Later configuration changes apply only to tasks without a binding.
+
+Each role reads its prompt from `prompts/<name>.md` beside `factory.toml`:
+`refine.md`, `implement.md`, `review.md`, `release.md`, `ticket.md`, and
+`ticket-chat.md`. An absent file means the built-in prompt. The daemon reads
+the file each time a task of the role starts. A saved prompt applies to the
+next task start. A running task keeps its prompt. The Settings view edits
+each prompt; see the `prompt` field below.
 
 Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` for migration steps.
 
@@ -376,10 +383,10 @@ The Settings view edits all six execution roles. It supports global and reposito
 | `h` / `l` | Select the global or repository scope. |
 | `j` / `k` | Select a role, or a row inside an open list. |
 | `Tab` | Select a field. |
-| `Enter` | Open the value list of the field, or apply the marked row. |
-| `d` | Remove the selected repository override. |
+| `Enter` | Open the value list of the field, or apply the marked row. On `prompt`, open the prompt editor. |
+| `d` | Remove the selected repository override. On `prompt`, restore the built-in prompt after a second `d`. |
 | `s` | Save the draft. |
-| `r` | Reload the file. |
+| `r` | Reload the file and the prompt files. |
 | `Esc` | Close a list, cancel an edit, or confirm draft removal. |
 
 `Enter` opens a value list on these fields: `harness`, `program`, `model`,
@@ -413,6 +420,32 @@ the next harness change.
 Narrow terminals stack the role list above the form.
 The daemon rejects a stale save if the file changed after the draft loaded.
 Repository topology changes require a daemon restart.
+
+#### The prompt of a role
+
+The last field of every role in the global scope is `prompt`. The row shows
+the source of the prompt, `built-in` or `prompts/<name>.md`, and its line
+count. Prompts have no repository scope. `Enter` opens the prompt editor
+over the whole view.
+
+| Key | Action |
+|---|---|
+| typed text | Insert at the cursor. `Enter` starts a new line. |
+| Arrows, `Home`, `End` | Move the cursor. |
+| `PageUp` / `PageDown` | Move the cursor 20 lines. |
+| `Backspace` / `Delete` | Remove the character before or under the cursor. |
+| `ctrl-s` | Save the prompt file through the daemon. |
+| `Esc` | Close the editor. A changed prompt asks for a second `Esc`. |
+
+The daemon checks the prompt before it writes the file. A placeholder that
+the role cannot fill blocks the save, and the message names it and lists
+the known placeholders. The daemon also refuses a save when the prompt file
+changed on disk after the editor opened. The message says so, and a second
+`ctrl-s` overwrites the file. A saved prompt applies to the next task of the
+role. A running task keeps its prompt.
+
+`d` on the `prompt` row asks for a second `d`, then removes the prompt file.
+The role returns to the built-in prompt.
 
 ## How state survives
 

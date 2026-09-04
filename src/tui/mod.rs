@@ -1453,9 +1453,9 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(78, 18, area);
+    let panel = centered(78, 19, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 32] = [
+    let rows: [(&str, &str); 34] = [
         ("1 2 3 4 5", "switch view"),
         ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
@@ -1488,11 +1488,13 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Enter", "edit settings value"),
         ("s r", "save / reload settings"),
         ("d", "remove repository override"),
+        ("d", "restore the built-in prompt"),
+        ("ctrl-s", "save the ticket or prompt editor"),
     ];
     let mut sorted = rows.to_vec();
     sorted.sort_by_key(|(key, text)| std::cmp::Reverse(key.len() + text.len()));
     let mut lines = Vec::new();
-    for row in 0..16 {
+    for row in 0..17 {
         let mut spans = Vec::new();
         for (column, index) in [row, sorted.len() - 1 - row].into_iter().enumerate() {
             let (key, text) = sorted[index];
@@ -2005,6 +2007,7 @@ mod tests {
                 })
                 .collect(),
             repositories: Vec::new(),
+            prompts: Vec::new(),
         };
 
         run_messages(
@@ -3460,6 +3463,8 @@ mod tests {
             "edit settings value",
             "save / reload settings",
             "remove repository override",
+            "restore the built-in prompt",
+            "save the ticket or prompt editor",
             "home / cancel settings edit",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");

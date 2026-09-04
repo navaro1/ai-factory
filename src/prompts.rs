@@ -1,13 +1,28 @@
-//! The built-in prompt templates of every stage.
+//! The prompt templates of every execution role.
 //!
-//! Every template lives here, outside the daemon, so wording changes touch
-//! one file. A file `prompts/<stage>.md` in the config directory overrides
-//! the built-in default. The docs directory `docs/v0.6/prompts/` holds a
-//! reference copy of each template, pinned byte for byte by a test.
+//! Every built-in template lives here, outside the daemon, so wording
+//! changes touch one file. A file `prompts/<name>.md` in the config
+//! directory overrides the built-in default; [`file_name`] gives the name
+//! of each role. The docs directory `docs/v0.6/prompts/` holds a reference
+//! copy of each template, pinned byte for byte by a test.
+//!
+//! The daemon reads the prompt file of a role each time a task of that role
+//! starts. So a saved prompt applies to the next task start, and a running
+//! task keeps the prompt it started with. The Settings view edits the files
+//! through the daemon, and [`check`] rejects a template with a placeholder
+//! the role cannot fill before the file changes.
 //!
 //! The vocabulary rule: a template names a repository item "ticket" or
 //! "PR". A `gh` command inside backticks keeps the GitHub word, because
 //! the CLI speaks its own nouns.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+
+use crate::config::ExecutionRole;
 
 /// The notice that precedes the rendered prompt of a task the daemon
 /// interrupted with a stop.
@@ -240,9 +255,381 @@ Put valid JSON between the markers. Do not quote the block. Do not put the
 block in a code fence. Include no text after the closing marker.
 "#;
 
+/// The placeholders the daemon fills in a stage prompt.
+const STAGE_PLACEHOLDERS: &[&str] = &[
+    "repo",
+    "owner_repo",
+    "number",
+    "title",
+    "body",
+    "worktree",
+    "tickets",
+    "pr_list",
+    "pr_numbers",
+    "pr_count",
+];
+
+/// The placeholders the daemon fills in the ticket-creation prompt.
+const TICKET_PLACEHOLDERS: &[&str] = &["repo", "owner_repo", "worktree"];
+
+/// The placeholders the daemon fills in the ticket chat prompt.
+const TICKET_CHAT_PLACEHOLDERS: &[&str] = &[
+    "repo",
+    "owner_repo",
+    "number",
+    "title",
+    "body",
+    "labels",
+    "author",
+    "assignees",
+    "updated_at",
+    "github_url",
+    "worktree",
+];
+
+/// The file name of the prompt template of one role, inside the prompts
+/// directory.
+pub const fn file_name(role: ExecutionRole) -> &'static str {
+    match role {
+        ExecutionRole::Refine => "refine.md",
+        ExecutionRole::Implement => "implement.md",
+        ExecutionRole::Review => "review.md",
+        ExecutionRole::Release => "release.md",
+        ExecutionRole::TicketCreate => "ticket.md",
+        ExecutionRole::TicketChat => "ticket-chat.md",
+    }
+}
+
+/// The built-in template of one role.
+pub const fn builtin(role: ExecutionRole) -> &'static str {
+    match role {
+        ExecutionRole::Refine => REFINE_PROMPT,
+        ExecutionRole::Implement => IMPLEMENT_PROMPT,
+        ExecutionRole::Review => REVIEW_PROMPT,
+        ExecutionRole::Release => RELEASE_PROMPT,
+        ExecutionRole::TicketCreate => TICKET_PROMPT,
+        ExecutionRole::TicketChat => TICKET_CHAT_PROMPT,
+    }
+}
+
+/// The placeholders the daemon fills for one role.
+///
+/// A template may use any subset of them. A placeholder outside the set is
+/// an error, both at save time and at dispatch time.
+pub const fn placeholders(role: ExecutionRole) -> &'static [&'static str] {
+    match role {
+        ExecutionRole::Refine
+        | ExecutionRole::Implement
+        | ExecutionRole::Review
+        | ExecutionRole::Release => STAGE_PLACEHOLDERS,
+        ExecutionRole::TicketCreate => TICKET_PLACEHOLDERS,
+        ExecutionRole::TicketChat => TICKET_CHAT_PLACEHOLDERS,
+    }
+}
+
+/// The path of the prompt file of one role.
+pub fn path(prompts_dir: &Path, role: ExecutionRole) -> PathBuf {
+    prompts_dir.join(file_name(role))
+}
+
+/// One loaded template and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Template {
+    /// The template text.
+    pub text: String,
+    /// True when the text came from the prompt file. False for the built-in.
+    pub from_file: bool,
+}
+
+/// Read the template of one role.
+///
+/// The prompt file wins when it exists. An absent file yields the built-in.
+/// An unreadable file is an error that names the path.
+pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
+    let path = path(prompts_dir, role);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Template {
+            text,
+            from_file: true,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Template {
+            text: builtin(role).to_string(),
+            from_file: false,
+        }),
+        Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
+    }
+}
+
+/// Check one template against the placeholder set of its role.
+///
+/// The error names the first unknown placeholder and lists the known ones.
+/// A blank template is an error too: the agent would start with no
+/// instructions.
+pub fn check(role: ExecutionRole, text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("the prompt is empty");
+    }
+    let allowed = placeholders(role);
+    if let Some(token) = scan_placeholders(text)
+        .into_iter()
+        .find(|token| !allowed.contains(token))
+    {
+        let known = allowed
+            .iter()
+            .map(|name| format!("{{{name}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "the prompt uses the unknown placeholder {{{token}}}; the {role} prompt knows {known}"
+        );
+    }
+    Ok(())
+}
+
+/// Write the prompt file of one role.
+///
+/// The text goes to a sibling temporary file first, and one rename replaces
+/// the destination, so a reader never sees a half-written prompt.
+pub fn save(prompts_dir: &Path, role: ExecutionRole, text: &str) -> Result<()> {
+    fs::create_dir_all(prompts_dir)
+        .with_context(|| format!("cannot create {}", prompts_dir.display()))?;
+    let destination = path(prompts_dir, role);
+    let temporary = prompts_dir.join(format!(".{}.{}.tmp", file_name(role), std::process::id()));
+    let written = fs::write(&temporary, text)
+        .with_context(|| format!("cannot write {}", temporary.display()))
+        .and_then(|()| {
+            fs::rename(&temporary, &destination).with_context(|| {
+                format!(
+                    "cannot rename {} to {}",
+                    temporary.display(),
+                    destination.display()
+                )
+            })
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Remove the prompt file of one role, so the built-in template applies.
+///
+/// An absent file is not an error.
+pub fn reset(prompts_dir: &Path, role: ExecutionRole) -> Result<()> {
+    let path = path(prompts_dir, role);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!("cannot remove {}: {error}", path.display())),
+    }
+}
+
+/// Fill a prompt template.
+///
+/// Every placeholder must be known; an unknown one is an error that names
+/// it, never a silent literal. A filled value stays literal: a `{body}`
+/// inside a ticket title is not filled again.
+pub fn fill_template(template: &str, values: &[(&str, String)]) -> Result<String> {
+    for token in scan_placeholders(template) {
+        if !values.iter().any(|(name, _)| *name == token) {
+            bail!("the prompt template uses the unknown placeholder {{{token}}}");
+        }
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let token = &after[..end];
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == token) {
+            out.push_str(value);
+        } else {
+            out.push_str(&rest[start..start + end + 2]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// List the `{placeholder}` tokens of a template, in first-seen order.
+///
+/// A token is placeholder-shaped when it holds only ASCII letters, digits,
+/// underscores, and hyphens. Other brace content stays untouched.
+pub fn scan_placeholders(template: &str) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let token = &after[..end];
+        if !token.is_empty()
+            && !token.contains('{')
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && !found.contains(&token)
+        {
+            found.push(token);
+        }
+        rest = &after[end + 1..];
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh, empty prompts directory under the system temporary root.
+    fn temp_prompts_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aif-prompts-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn every_role_has_one_file_name_and_its_builtin_template() {
+        let names = ExecutionRole::ALL.map(file_name);
+        for (index, name) in names.iter().enumerate() {
+            assert!(name.ends_with(".md"), "{name} is not a markdown file");
+            assert!(
+                !names[..index].contains(name),
+                "{name} is the file name of two roles"
+            );
+        }
+        assert_eq!(file_name(ExecutionRole::TicketCreate), "ticket.md");
+        assert_eq!(file_name(ExecutionRole::TicketChat), "ticket-chat.md");
+        assert_eq!(builtin(ExecutionRole::Refine), REFINE_PROMPT);
+        assert_eq!(builtin(ExecutionRole::TicketChat), TICKET_CHAT_PROMPT);
+    }
+
+    #[test]
+    fn every_builtin_template_passes_the_check_of_its_role() {
+        for role in ExecutionRole::ALL {
+            check(role, builtin(role)).unwrap_or_else(|error| {
+                panic!("the built-in {role} prompt fails its own check: {error:#}")
+            });
+            for token in scan_placeholders(builtin(role)) {
+                assert!(
+                    placeholders(role).contains(&token),
+                    "the built-in {role} prompt uses {{{token}}} outside its placeholder set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_check_rejects_an_unknown_placeholder_and_an_empty_prompt() {
+        let error = check(ExecutionRole::Implement, "hello {frobnicate}").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("{frobnicate}"), "{message}");
+        assert!(message.contains("stage.implement"), "{message}");
+        assert!(message.contains("{number}"), "{message}");
+
+        let error = check(ExecutionRole::TicketCreate, "ticket #{number}").unwrap_err();
+        assert!(error.to_string().contains("{number}"));
+
+        let error = check(ExecutionRole::Refine, " \n\t").unwrap_err();
+        assert_eq!(error.to_string(), "the prompt is empty");
+
+        check(ExecutionRole::Release, "release {pr_list} now").unwrap();
+        check(
+            ExecutionRole::Review,
+            r#"literal json {"question":"x"} keeps {number}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_prefers_the_file_and_falls_back_to_the_builtin() {
+        let dir = temp_prompts_dir("load");
+        let missing = dir.join("absent");
+        let loaded = load(&missing, ExecutionRole::Review).unwrap();
+        assert_eq!(
+            loaded,
+            Template {
+                text: REVIEW_PROMPT.to_string(),
+                from_file: false
+            }
+        );
+
+        save(&missing, ExecutionRole::Review, "custom {number}\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(missing.join("review.md")).unwrap(),
+            "custom {number}\n"
+        );
+        assert!(
+            fs::read_dir(&missing).unwrap().count() == 1,
+            "the save leaves no temporary file behind"
+        );
+        let loaded = load(&missing, ExecutionRole::Review).unwrap();
+        assert_eq!(
+            loaded,
+            Template {
+                text: "custom {number}\n".to_string(),
+                from_file: true
+            }
+        );
+
+        reset(&missing, ExecutionRole::Review).unwrap();
+        reset(&missing, ExecutionRole::Review).unwrap();
+        assert!(!missing.join("review.md").exists());
+        assert!(!load(&missing, ExecutionRole::Review).unwrap().from_file);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scan_placeholders_finds_placeholder_shaped_tokens() {
+        assert_eq!(scan_placeholders("{a} x {b_1} {a}"), vec!["a", "b_1"]);
+        assert!(scan_placeholders("{not a} {} {unclosed {oops}").is_empty());
+    }
+
+    #[test]
+    fn fill_template_rejects_an_unknown_placeholder_and_fills_known_ones() {
+        let error = fill_template("hi {name} {other}", &[("name", "x".to_string())]).unwrap_err();
+        assert!(error.to_string().contains("other"));
+        let filled = fill_template("hi {name}", &[("name", "x".to_string())]).unwrap();
+        assert_eq!(filled, "hi x");
+
+        let error = fill_template("hi {not-known}", &[("name", "x".to_string())]).unwrap_err();
+        assert!(error.to_string().contains("not-known"));
+
+        let filled = fill_template(
+            "title={title}; body={body}",
+            &[
+                ("title", "keep {body} literal".to_string()),
+                ("body", "body text".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(filled, "title=keep {body} literal; body=body text");
+    }
+
+    #[test]
+    fn fill_template_fills_the_tickets_placeholder() {
+        let filled = fill_template(
+            "Tickets this PR closes: {tickets}",
+            &[("tickets", "#4, #9".to_string())],
+        )
+        .unwrap();
+        assert_eq!(filled, "Tickets this PR closes: #4, #9");
+
+        let error =
+            fill_template("hi {tickets} {nope}", &[("tickets", "none".to_string())]).unwrap_err();
+        assert!(error.to_string().contains("nope"));
+    }
 
     /// Drop every backtick span from one line.
     ///

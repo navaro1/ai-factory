@@ -50,7 +50,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 3;
+pub const WIRE_PROTOCOL_REVISION: u32 = 4;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -123,11 +123,41 @@ pub struct SettingsView {
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
+    /// The effective prompt template of every role, in role order.
+    #[serde(default)]
+    pub prompts: Vec<PromptView>,
+}
+
+/// Where the effective prompt text of one role comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    /// The built-in template of the crate.
+    Builtin,
+    /// The prompt file of the role in the prompts directory.
+    File,
+}
+
+/// The effective prompt template of one role.
+///
+/// The daemon reads the file again at each task start, so the view shows
+/// the template the next task of the role gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptView {
+    /// The role identity.
+    pub role: ExecutionRole,
+    /// Where the text comes from.
+    pub source: PromptSource,
+    /// The effective template text.
+    pub text: String,
+    /// A stable digest of the effective text. A prompt save names it.
+    pub revision: String,
 }
 
 impl SettingsView {
-    /// Build the socket view from one validated configuration.
-    pub fn from_config(config: &Config, revision: &str) -> Result<Self> {
+    /// Build the socket view from one validated configuration and the
+    /// effective prompt templates.
+    pub fn from_config(config: &Config, revision: &str, prompts: &[PromptView]) -> Result<Self> {
         let global = ExecutionRole::ALL
             .into_iter()
             .map(|role| GlobalRoleSettingsView {
@@ -154,6 +184,7 @@ impl SettingsView {
             revision: revision.to_string(),
             global,
             repositories,
+            prompts: prompts.to_vec(),
         })
     }
 }
@@ -346,6 +377,8 @@ pub struct StateInput<'a> {
     /// The input mode of each task, keyed by task id. The daemon decides
     /// every mode; this module only serializes it.
     pub input_modes: &'a BTreeMap<String, InputMode>,
+    /// The effective prompt template of every role.
+    pub prompts: &'a [PromptView],
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -365,6 +398,7 @@ impl StateInput<'_> {
             trains,
             policies,
             input_modes,
+            prompts,
             now_ms,
         } = *self;
         let repos = config
@@ -535,7 +569,7 @@ impl StateInput<'_> {
             links,
             trains,
             paused,
-            settings: SettingsView::from_config(config, settings_revision)?,
+            settings: SettingsView::from_config(config, settings_revision, prompts)?,
         })
     }
 }
@@ -1055,6 +1089,10 @@ pub enum SettingsOperation {
     Save,
     /// A reload request.
     Reload,
+    /// A prompt save request.
+    SavePrompt,
+    /// A prompt reset request.
+    ResetPrompt,
 }
 
 /// The typed outcome of one settings operation.
@@ -1228,6 +1266,26 @@ pub enum Action {
     ReloadSettings {
         /// The request identity from the UI.
         request: String,
+    },
+    /// Write the prompt file of one role against an exact prompt revision.
+    SavePrompt {
+        /// The request identity from the UI.
+        request: String,
+        /// The role whose prompt changes.
+        role: ExecutionRole,
+        /// The prompt revision that the edit started from.
+        base_revision: String,
+        /// The complete new template text.
+        text: String,
+    },
+    /// Remove the prompt file of one role, so the built-in template applies.
+    ResetPrompt {
+        /// The request identity from the UI.
+        request: String,
+        /// The role whose prompt returns to the built-in.
+        role: ExecutionRole,
+        /// The prompt revision that the request started from.
+        base_revision: String,
     },
     /// Force an early poll of one repository, or of all when None.
     Reconcile {
@@ -1931,7 +1989,14 @@ mod tests {
         );
         let config = Config::parse(&text).unwrap();
 
-        let view = SettingsView::from_config(&config, "content-revision").unwrap();
+        let prompts = vec![PromptView {
+            role: crate::config::ExecutionRole::Refine,
+            source: PromptSource::File,
+            text: "refine {number}\n".to_string(),
+            revision: "prompt-rev".to_string(),
+        }];
+        let view = SettingsView::from_config(&config, "content-revision", &prompts).unwrap();
+        assert_eq!(view.prompts, prompts);
 
         assert_eq!(view.revision, "content-revision");
         assert_eq!(view.global.len(), 6);
@@ -1971,11 +2036,44 @@ mod tests {
             trains: &BTreeMap::new(),
             policies: &BTreeMap::new(),
             input_modes: &BTreeMap::new(),
+            prompts: &prompts,
             now_ms: 0,
         }
         .build()
         .unwrap();
         assert_eq!(state.settings, view);
+    }
+
+    #[test]
+    fn prompt_actions_and_views_round_trip_and_an_old_view_defaults_to_no_prompts() {
+        let save = Action::SavePrompt {
+            request: "prompt-1".to_string(),
+            role: crate::config::ExecutionRole::Implement,
+            base_revision: "rev-old".to_string(),
+            text: "implement {number}\n".to_string(),
+        };
+        let reset = Action::ResetPrompt {
+            request: "prompt-2".to_string(),
+            role: crate::config::ExecutionRole::TicketChat,
+            base_revision: "rev-old".to_string(),
+        };
+        for action in [save, reset] {
+            let text = serde_json::to_string(&action).unwrap();
+            assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
+        }
+        let push = Push::SettingsResult(SettingsResult {
+            request: "prompt-1".to_string(),
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Invalid,
+            revision: "rev-current".to_string(),
+            message: Some("the prompt uses the unknown placeholder {x}".to_string()),
+        });
+        let text = serde_json::to_string(&push).unwrap();
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+
+        let json = r#"{"revision":"r","global":[],"repositories":[]}"#;
+        let view: SettingsView = serde_json::from_str(json).unwrap();
+        assert!(view.prompts.is_empty());
     }
 
     #[test]
@@ -2280,6 +2378,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             now_ms: 0,
         }
         .build()
@@ -2785,6 +2884,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             now_ms: 1_000,
         }
         .build()
@@ -2850,6 +2950,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             now_ms: 1_000,
         }
         .build()
@@ -2956,6 +3057,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             now_ms: 3_000,
@@ -3050,6 +3152,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             now_ms: 3_000,
@@ -3092,6 +3195,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
             now_ms: 0,
         }
         .build()
@@ -3186,6 +3290,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             now_ms: 120_000,
         }
         .build()
