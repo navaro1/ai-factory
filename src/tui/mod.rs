@@ -110,6 +110,8 @@ enum Msg {
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
     TicketResult(crate::sock::TicketResult),
+    /// One fetched question for one `NeedsHuman` detail screen.
+    Ask(crate::sock::AskView),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
     /// The parsed `opencode models` probe result of this shell start.
@@ -265,12 +267,16 @@ impl App {
     /// count, and drops an expired toast. It feeds the inbox and follows
     /// the session task, so both views stay in step with the daemon.
     /// Send one mention-status request for a pull request detail whose
-    /// description just became visible.
+    /// description just became visible, and one ask request for a
+    /// `NeedsHuman` detail whose question just became visible.
     fn send_pending_pr_mention(&mut self, sink: &mut impl ActionSink) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
         if let Some(action) = self.inbox.take_pending_pr_mention(state) {
+            sink.send_action(action);
+        }
+        if let Some(action) = self.inbox.take_pending_ask(state) {
             sink.send_action(action);
         }
     }
@@ -692,7 +698,8 @@ impl App {
     /// Apply one key to the inbox and report whether an action crossed.
     ///
     /// A sent action toasts. An open-session outcome switches to the
-    /// session view of that task.
+    /// session view of that task. An open-ticket outcome switches to the
+    /// Tickets view focus of one issue.
     fn inbox_dispatch(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
         let Some(state) = self.state.as_ref() else {
             return false;
@@ -706,11 +713,20 @@ impl App {
         if sent {
             self.show_toast("sent");
         }
-        if let inbox::InboxOutcome::OpenSession(task) = outcome {
-            self.session_task = Some(task);
-            self.wanted = None;
-            self.enter_session();
-            self.show_session_task();
+        match outcome {
+            inbox::InboxOutcome::None => {}
+            inbox::InboxOutcome::OpenSession(task) => {
+                self.session_task = Some(task);
+                self.wanted = None;
+                self.enter_session();
+                self.show_session_task();
+            }
+            inbox::InboxOutcome::OpenTicket { repo, number } => {
+                self.view = View::Tickets;
+                if let Some(action) = self.tickets.open(&repo, number) {
+                    emit(self, sink, action, "sent ticket request".to_string());
+                }
+            }
         }
         sent
     }
@@ -1044,6 +1060,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::Ask(ask)) => {
+                                        if tx.send(Msg::Ask(ask)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Ok(Push::SettingsResult(result)) => {
                                         if tx.send(Msg::SettingsResult(result)).is_err() {
                                             return;
@@ -1156,6 +1177,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::TicketResult(result) => {
             app.tickets.observe_result(result);
+            Ok(true)
+        }
+        Msg::Ask(ask) => {
+            app.inbox.observe_ask(&ask);
             Ok(true)
         }
         Msg::SettingsResult(result) => {
@@ -1454,7 +1479,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("End", "follow the tail"),
         ("esc tab i", "leave or take the chat focus"),
         ("h l", "switch session, chat unfocused"),
-        ("y n i t c", "inbox answers"),
+        ("y n i t c s w 1-9", "inbox answers"),
         ("g", "fire the release gate"),
         ("/ e l c a", "search and ticket actions"),
         ("h l", "tickets repo / settings scope"),
@@ -2429,6 +2454,59 @@ mod tests {
             app.inbox.selected_id(),
             Some("perm:borsuk/implement-i140:oldest")
         );
+    }
+
+    #[test]
+    fn w_on_a_needs_human_issue_opens_the_tickets_focus_and_sends_details() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![Decision::needs_human(
+            "borsuk",
+            ItemKind::Issue,
+            142,
+            "Choose the storage",
+            1_000,
+        )];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('3'),
+                key_code(KeyCode::Enter),
+                key('w'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets);
+        assert!(app.tickets.focus_open());
+        let asks = sink
+            .0
+            .iter()
+            .filter(|action| matches!(action, Action::Ask { .. }))
+            .count();
+        assert_eq!(asks, 1, "the ask request must go out once: {:?}", sink.0);
+        let details: Vec<&Action> = sink
+            .0
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    Action::Ticket(crate::sock::TicketAction::Details { .. })
+                )
+            })
+            .collect();
+        assert_eq!(details.len(), 1, "sink: {:?}", sink.0);
+        assert!(matches!(
+            details[0],
+            Action::Ticket(crate::sock::TicketAction::Details { repo, number, .. })
+                if repo == "borsuk" && *number == 142
+        ));
     }
 
     #[test]

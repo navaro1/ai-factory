@@ -13,6 +13,10 @@
 //! | `NeedsHuman` | `t` type a comment, `c` clear the label, `enter` show the item |
 //! | `ReleaseGate` | `1`..`9` toggle one pull request, `space` all or none, `g` release, `enter` show a pull request |
 //!
+//! The `NeedsHuman` feed row keeps `t` comment, `c` clear label, and
+//! `enter` show the item. Its detail screen adds `1`..`9` pick, `s`
+//! submit, and `w` to leave for manual work in the Tickets view.
+//!
 //! Global keys: `j`, `k`, and the arrow keys move the selection. `PageUp` and
 //! `PageDown` scroll a selected item that is taller than the viewport. `!`
 //! selects the oldest decision. A detail screen uses `esc` to return. It uses
@@ -46,7 +50,7 @@ use super::transcript;
 use crate::decisions::{Decision, DecisionKind, Response};
 use crate::mentions;
 use crate::model::ItemKind;
-use crate::sock::{Action, Client, ItemView, StateView, TicketAction, TicketMentions};
+use crate::sock::{Action, AskView, Client, ItemView, StateView, TicketAction, TicketMentions};
 
 /// The maximum task log section that one detail draw reads.
 const CONTEXT_LOG_BYTES: u64 = 128 * 1024;
@@ -86,6 +90,12 @@ pub struct Inbox {
     pr_mentions: BTreeMap<(String, u64), MentionStatuses>,
     /// The pull requests whose statuses one request already went out for.
     requested_pr_mentions: BTreeSet<(String, u64)>,
+    /// The fetched question of each `NeedsHuman` row, keyed by decision id.
+    asks: BTreeMap<String, AskView>,
+    /// The `NeedsHuman` rows whose ask request already went out.
+    requested_asks: BTreeSet<String>,
+    /// The picked option index of each `NeedsHuman` row, keyed by decision id.
+    ask_picks: BTreeMap<String, usize>,
 }
 
 /// Local navigation state for one focused decision screen.
@@ -202,6 +212,13 @@ pub enum InboxOutcome {
     None,
     /// The key asked for the session view of one task id.
     OpenSession(String),
+    /// The key asked for the Tickets view focus of one issue.
+    OpenTicket {
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
 }
 
 /// Where the inbox hands the actions it produces.
@@ -272,6 +289,38 @@ impl Inbox {
         }))
     }
 
+    /// Take one ask request for the `NeedsHuman` decision whose detail
+    /// just became visible, or `None`.
+    ///
+    /// One request per decision goes out; the answer lands through
+    /// [`Inbox::observe_ask`].
+    pub fn take_pending_ask(&mut self, state: &StateView) -> Option<Action> {
+        let detail = self.detail.as_ref()?;
+        let DetailTarget::Decision(decision) = detail.anchor.target(state)? else {
+            return None;
+        };
+        let DecisionKind::NeedsHuman { kind, number, .. } = &decision.kind else {
+            return None;
+        };
+        if !self.requested_asks.insert(decision.id.clone()) {
+            return None;
+        }
+        Some(Action::Ask {
+            repo: decision.repo.clone(),
+            kind: *kind,
+            number: *number,
+        })
+    }
+
+    /// Merge one fetched question into the store of its decision.
+    ///
+    /// The key derives the same way the [`Decision::needs_human`] id
+    /// derives, so the answer finds its row without a round trip.
+    pub fn observe_ask(&mut self, ask: &AskView) {
+        let id = format!("human:{}:{}{}", ask.repo, ask.kind.as_str(), ask.number);
+        self.asks.insert(id, ask.clone());
+    }
+
     /// Merge one mention-status answer into the pull request store.
     pub fn observe_pr_mentions(&mut self, mentions: &TicketMentions) {
         let entry = self
@@ -317,6 +366,12 @@ impl Inbox {
             checked.retain(|pr| prs.contains(pr));
             true
         });
+        self.asks
+            .retain(|id, _| state.decisions.iter().any(|decision| decision.id == *id));
+        self.requested_asks
+            .retain(|id| state.decisions.iter().any(|decision| decision.id == *id));
+        self.ask_picks
+            .retain(|id, _| state.decisions.iter().any(|decision| decision.id == *id));
         if self.input.as_ref().is_some_and(|input| {
             state
                 .decisions
@@ -639,6 +694,12 @@ impl Inbox {
             }
             DetailTarget::Train(_) => true,
         };
+        let is_needs_human = match &target {
+            DetailTarget::Decision(decision) => {
+                matches!(decision.kind, DecisionKind::NeedsHuman { .. })
+            }
+            DetailTarget::Train(_) => false,
+        };
         match key.code {
             KeyCode::Esc => {
                 self.detail = None;
@@ -681,6 +742,22 @@ impl Inbox {
                     Some(task) => InboxOutcome::OpenSession(task.to_string()),
                     None => InboxOutcome::None,
                 },
+                DetailTarget::Train(_) => InboxOutcome::None,
+            },
+            KeyCode::Char(digit @ '1'..='9') if is_needs_human => {
+                if let DetailTarget::Decision(decision) = &target {
+                    self.pick_ask_option(decision, digit);
+                }
+                InboxOutcome::None
+            }
+            KeyCode::Char('s') if is_needs_human => {
+                if let DetailTarget::Decision(decision) = &target {
+                    self.submit_ask_pick(decision, sink);
+                }
+                InboxOutcome::None
+            }
+            KeyCode::Char('w') if is_needs_human => match &target {
+                DetailTarget::Decision(decision) => self.open_ask_ticket(decision),
                 DetailTarget::Train(_) => InboxOutcome::None,
             },
             _ => match target {
@@ -988,6 +1065,61 @@ impl Inbox {
             return;
         }
         self.answer(&decision.id, Response::Go { prs: checked }, sink);
+    }
+
+    /// Apply one digit key to the options of the open `NeedsHuman` ask.
+    ///
+    /// A digit that names no stored option changes nothing. A new digit
+    /// replaces the pick.
+    fn pick_ask_option(&mut self, decision: &Decision, digit: char) {
+        let Some(digit) = digit.to_digit(10) else {
+            return;
+        };
+        let index = digit as usize - 1;
+        let has_option = self
+            .asks
+            .get(&decision.id)
+            .is_some_and(|ask| ask.options.get(index).is_some());
+        if has_option {
+            self.ask_picks.insert(decision.id.clone(), index);
+        }
+    }
+
+    /// Submit the pick of the open `NeedsHuman` ask as one text answer.
+    ///
+    /// The answer text is the exact option label. Without a pick inside
+    /// the option list the call sends nothing and names the way out.
+    fn submit_ask_pick(&mut self, decision: &Decision, sink: &mut impl ActionSink) {
+        let pick = self.ask_picks.get(&decision.id).copied().and_then(|pick| {
+            self.asks
+                .get(&decision.id)
+                .and_then(|ask| ask.options.get(pick))
+        });
+        let Some(option) = pick else {
+            self.hint = Some("pick an option, or press t to write");
+            return;
+        };
+        let label = option.label.clone();
+        self.answer(&decision.id, Response::Text { text: label }, sink);
+    }
+
+    /// Leave one `NeedsHuman` issue for manual work in the Tickets view.
+    ///
+    /// A pull request has no ticket focus, so the call keeps the detail
+    /// open and names the link instead.
+    fn open_ask_ticket(&mut self, decision: &Decision) -> InboxOutcome {
+        let DecisionKind::NeedsHuman { kind, number, .. } = &decision.kind else {
+            return InboxOutcome::None;
+        };
+        if *kind != ItemKind::Issue {
+            self.hint = Some("the tickets view holds issues only; open the link");
+            return InboxOutcome::None;
+        }
+        self.detail = None;
+        InboxOutcome::OpenTicket {
+            repo: decision.repo.clone(),
+            number: *number,
+        }
     }
 }
 
@@ -1525,6 +1657,11 @@ fn draw_detail(
 ) {
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    if matches!(decision.kind, DecisionKind::NeedsHuman { .. }) {
+        return draw_ask_detail(
+            f, rows[0], rows[1], state, inbox, decision, detail, now_ms, width,
+        );
+    }
     let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
             let title = format!("{} #{number} · {}", kind.title_noun(), decision.repo);
@@ -1557,6 +1694,144 @@ fn draw_detail(
         .scroll((scroll, 0));
     f.render_widget(content, rows[0]);
     f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
+}
+
+/// Draw the question screen of one `NeedsHuman` decision.
+///
+/// The screen shows the item title, the GitHub link, the fetched
+/// question with its numbered options, and the item description.
+#[allow(clippy::too_many_arguments)]
+fn draw_ask_detail(
+    f: &mut Frame,
+    content_area: Rect,
+    footer_area: Rect,
+    state: &StateView,
+    inbox: &Inbox,
+    decision: &Decision,
+    detail: &DetailState,
+    now_ms: u64,
+    width: usize,
+) {
+    let DecisionKind::NeedsHuman {
+        kind,
+        number,
+        title,
+    } = &decision.kind
+    else {
+        return;
+    };
+    let title = match find_item(state, &decision.repo, *kind, *number) {
+        Some(item) => item.title.clone(),
+        None => title.clone(),
+    };
+    let mut lines = wrapped_lines(
+        &title,
+        width,
+        "",
+        Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
+    );
+    if let Some(link) = github_link(state, &decision.repo, *number) {
+        lines.push(Line::styled(link, THEME.dim()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Question", THEME.dim()));
+    match inbox.asks.get(&decision.id) {
+        None => lines.push(Line::styled("Loading the question...", THEME.dim())),
+        Some(ask) if ask.error.is_some() => {
+            let error = ask.error.as_deref().unwrap_or_default();
+            lines.extend(wrapped_lines(
+                error,
+                width,
+                "",
+                Style::default().fg(THEME.error),
+            ));
+        }
+        Some(ask) => {
+            if let Some(author) = ask.author.as_deref() {
+                let metadata = match ask.created_at.as_deref().and_then(rfc3339_ms) {
+                    Some(ms) => format!("{author} · {}", age_text(ms, now_ms)),
+                    None => author.to_string(),
+                };
+                lines.push(Line::styled(metadata, THEME.dim()));
+            }
+            let question = if ask.question.trim().is_empty() {
+                "No question comment."
+            } else {
+                ask.question.as_str()
+            };
+            lines.extend(wrapped_lines(
+                question,
+                width,
+                "",
+                Style::default().fg(THEME.text),
+            ));
+        }
+    }
+    let options = inbox
+        .asks
+        .get(&decision.id)
+        .map(|ask| ask.options.as_slice())
+        .unwrap_or(&[]);
+    if !options.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Options", THEME.dim()));
+        for (index, option) in options.iter().enumerate() {
+            let mark = if inbox.ask_picks.get(&decision.id) == Some(&index) {
+                "x"
+            } else {
+                " "
+            };
+            let description = if option.description.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", option.description)
+            };
+            let choice = format!("{}. [{mark}] {}{description}", index + 1, option.label);
+            lines.extend(ask_option_lines(
+                &choice,
+                width,
+                Style::default().fg(THEME.text),
+            ));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Description", THEME.dim()));
+    let body = find_item(state, &decision.repo, *kind, *number)
+        .map(|item| item.body.as_str())
+        .unwrap_or_default();
+    let body = if body.trim().is_empty() {
+        "No description."
+    } else {
+        body
+    };
+    lines.extend(wrapped_lines(
+        body,
+        width,
+        "",
+        Style::default().fg(THEME.text),
+    ));
+    let scroll = clamped_detail_scroll(detail, lines.len(), content_area);
+    let content = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title(format!(
+            "{} #{number} · {}",
+            kind.title_noun(),
+            decision.repo
+        )))
+        .scroll((scroll, 0));
+    f.render_widget(content, content_area);
+    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
+}
+
+/// The wrapped display lines of one ask option.
+///
+/// A line that fits keeps its exact text, so the two spaces before a
+/// description survive. Only a long line goes through the wrap, which
+/// collapses whitespace.
+fn ask_option_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    if text.chars().count() + 2 <= width {
+        return vec![Line::styled(format!("  {text}"), style)];
+    }
+    wrapped_lines(text, width, "  ", style)
 }
 
 /// Draw a repository detail whose latest item snapshot is absent.
@@ -1737,6 +2012,73 @@ fn find_item<'a>(
         .decision_items
         .iter()
         .find(|item| item.repo == repo && item.kind == kind && item.number == number)
+}
+
+/// The GitHub web link of one item, or `None` before the first resolve.
+///
+/// Both kinds share the issues path, which GitHub serves for pull
+/// requests too.
+fn github_link(state: &StateView, repo: &str, number: u64) -> Option<String> {
+    let owner_repo = state
+        .repos
+        .iter()
+        .find(|view| view.alias == repo)
+        .map(|view| view.owner_repo.as_str())
+        .filter(|owner_repo| !owner_repo.is_empty())?;
+    Some(format!("https://github.com/{owner_repo}/issues/{number}"))
+}
+
+/// Convert one GitHub RFC 3339 timestamp to milliseconds since the epoch.
+///
+/// The parser accepts the exact `YYYY-MM-DDTHH:MM:SSZ` form that GitHub
+/// reports. Any other form gives `None`.
+fn rfc3339_ms(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    let shaped = bytes.len() == 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'Z';
+    if !shaped {
+        return None;
+    }
+    let year: i64 = text.get(0..4)?.parse().ok()?;
+    let month: i64 = text.get(5..7)?.parse().ok()?;
+    let day: i64 = text.get(8..10)?.parse().ok()?;
+    let hour: i64 = text.get(11..13)?.parse().ok()?;
+    let minute: i64 = text.get(14..16)?.parse().ok()?;
+    let second: i64 = text.get(17..19)?.parse().ok()?;
+    let in_range = (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && (0..=23).contains(&hour)
+        && (0..=59).contains(&minute)
+        && (0..=59).contains(&second);
+    if !in_range {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(seconds)
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1_000))
+}
+
+/// Count the days from 1970-01-01 to one civil date.
+///
+/// The formula is the proleptic Gregorian day count of Howard
+/// Hinnant's date algorithm. An extreme date gives `None`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
 }
 
 /// The bordered title and body lines of one repository item detail.
@@ -1952,8 +2294,21 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
                     DecisionKind::Stuck { .. } => {
                         "esc back · j k scroll · r retry · c cancel · o session".to_string()
                     }
-                    DecisionKind::NeedsHuman { .. } => {
-                        "esc back · j k scroll · t comment · c clear label".to_string()
+                    DecisionKind::NeedsHuman { kind, .. } => {
+                        let mut parts =
+                            vec!["esc back", "j k scroll", "t comment", "c clear label"];
+                        if inbox
+                            .asks
+                            .get(id)
+                            .is_some_and(|ask| !ask.options.is_empty())
+                        {
+                            parts.push("1-9 pick");
+                            parts.push("s submit");
+                        }
+                        if kind == ItemKind::Issue {
+                            parts.push("w tickets");
+                        }
+                        parts.join(" · ")
                     }
                 }
             }
@@ -2004,7 +2359,7 @@ mod tests {
     use crate::config::ReleasePolicy;
     use crate::model::Stage;
     use crate::sock::{
-        InputMode, ItemView, MentionStatus, PausedView, RepoView, TaskView, TrainView,
+        AskOption, InputMode, ItemView, MentionStatus, PausedView, RepoView, TaskView, TrainView,
     };
     use crate::tasks::{Task, TaskState};
 
@@ -3740,5 +4095,321 @@ mod tests {
         let bare = state_with(Vec::new());
         inbox.observe(&bare);
         assert!(!inbox.detail_open());
+    }
+
+    /// A `NeedsHuman` issue state with one item snapshot and a repo view.
+    fn ask_state() -> StateView {
+        let mut state = state_with(vec![Decision::needs_human(
+            "borsuk",
+            ItemKind::Issue,
+            142,
+            "Choose the storage",
+            OPENED,
+        )]);
+        state.decision_items.push(ItemView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+            title: "Choose the storage".to_string(),
+            body: "Compare the operational cost of both storage options.".to_string(),
+        });
+        state.repos.push(RepoView {
+            alias: "borsuk".to_string(),
+            owner_repo: "acme/borsuk".to_string(),
+        });
+        state
+    }
+
+    /// One fetched ask for the borsuk issue 142 decision.
+    fn ask_view() -> AskView {
+        AskView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+            question: "Which workload mode ships first?".to_string(),
+            options: vec![
+                AskOption {
+                    label: "Fast".to_string(),
+                    description: "deterministic only".to_string(),
+                },
+                AskOption {
+                    label: "Full".to_string(),
+                    description: String::new(),
+                },
+            ],
+            author: Some("piotr".to_string()),
+            // 1970-01-01T02:46:40Z is exactly `OPENED`.
+            created_at: Some("1970-01-01T02:46:40Z".to_string()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn enter_on_a_needs_human_row_requests_the_ask_once_and_shows_loading() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert_eq!(
+            inbox.take_pending_ask(&state),
+            Some(Action::Ask {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 142,
+            })
+        );
+        assert!(
+            inbox.take_pending_ask(&state).is_none(),
+            "one request per row must be enough"
+        );
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(
+            screen.contains("Loading the question..."),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("https://github.com/acme/borsuk/issues/142"),
+            "screen: {screen}"
+        );
+
+        // A second enter reuses the request that already went out.
+        inbox.handle_key(&state, press_code(KeyCode::Esc), &mut tx);
+        assert!(!inbox.detail_open());
+        assert_eq!(inbox.selected_id(), Some("human:borsuk:i142"));
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(inbox.take_pending_ask(&state).is_none());
+        assert!(rx.try_recv().is_err(), "the request bypasses the sink");
+    }
+
+    #[test]
+    fn the_ask_screen_shows_the_question_author_options_and_description() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.observe_ask(&ask_view());
+
+        let screen = render(&state, &inbox, OPENED + 90_000);
+
+        assert!(
+            screen.contains("Which workload mode ships first?"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("piotr · 1m"), "screen: {screen}");
+        assert!(
+            screen.contains("https://github.com/acme/borsuk/issues/142"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("Compare the operational cost of both storage options."),
+            "screen: {screen}"
+        );
+
+        inbox.handle_key(&state, press('1'), &mut tx);
+        let first = render(&state, &inbox, OPENED + 90_000);
+        assert!(
+            first.contains("1. [x] Fast  deterministic only"),
+            "screen: {first}"
+        );
+        assert!(first.contains("2. [ ] Full"), "screen: {first}");
+
+        // A new digit replaces the pick.
+        inbox.handle_key(&state, press('2'), &mut tx);
+        let second = render(&state, &inbox, OPENED + 90_000);
+        assert!(
+            second.contains("1. [ ] Fast  deterministic only"),
+            "screen: {second}"
+        );
+        assert!(second.contains("2. [x] Full"), "screen: {second}");
+    }
+
+    #[test]
+    fn ask_s_with_a_pick_sends_one_text_answer_with_the_exact_label() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.observe_ask(&ask_view());
+
+        inbox.handle_key(&state, press('2'), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "human:borsuk:i142".to_string(),
+                response: Response::Text {
+                    text: "Full".to_string(),
+                },
+            }
+        );
+        assert!(rx.try_recv().is_err(), "one pick sends exactly one answer");
+    }
+
+    #[test]
+    fn ask_s_without_a_pick_sends_nothing_and_shows_a_hint() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.observe_ask(&ask_view());
+
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a submit without a pick sent an answer"
+        );
+        let screen = render(&state, &inbox, OPENED);
+        assert!(
+            screen.contains("pick an option, or press t to write"),
+            "hint: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_ask_footer_lists_pick_and_submit_only_with_options() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.observe_ask(&ask_view());
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("1-9 pick · s submit"), "footer: {screen}");
+        assert!(screen.contains("t comment"), "footer: {screen}");
+
+        // Without options the pick and submit keys leave the footer.
+        let mut without = ask_view();
+        without.options.clear();
+        inbox.observe_ask(&without);
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(!screen.contains("1-9 pick"), "footer: {screen}");
+        assert!(!screen.contains("s submit"), "footer: {screen}");
+        assert!(screen.contains("t comment"), "footer: {screen}");
+    }
+
+    #[test]
+    fn w_on_an_issue_asks_for_the_tickets_focus_and_w_on_a_pr_shows_a_hint() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        let outcome = inbox.handle_key(&state, press('w'), &mut tx);
+
+        assert_eq!(
+            outcome,
+            InboxOutcome::OpenTicket {
+                repo: "borsuk".to_string(),
+                number: 142,
+            }
+        );
+        assert!(inbox.detail.is_none(), "w leaves the inbox detail");
+
+        let mut pr = state_with(vec![Decision::needs_human(
+            "borsuk",
+            ItemKind::Pr,
+            7,
+            "Tidy the changelog",
+            OPENED,
+        )]);
+        pr.repos.push(RepoView {
+            alias: "borsuk".to_string(),
+            owner_repo: "acme/borsuk".to_string(),
+        });
+        let mut inbox = selected(&pr, 0);
+        let (mut tx, rx) = fake_sink();
+        inbox.handle_key(&pr, press_code(KeyCode::Enter), &mut tx);
+        inbox.observe_ask(&AskView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Pr,
+            number: 7,
+            question: "Merge as is?".to_string(),
+            options: vec![AskOption {
+                label: "Yes".to_string(),
+                description: String::new(),
+            }],
+            author: None,
+            created_at: None,
+            error: None,
+        });
+
+        let outcome = inbox.handle_key(&pr, press('w'), &mut tx);
+
+        assert_eq!(outcome, InboxOutcome::None);
+        assert!(rx.try_recv().is_err(), "w on a pull request sent an action");
+        let screen = render(&pr, &inbox, OPENED);
+        assert!(
+            screen.contains("the tickets view holds issues only; open the link"),
+            "hint: {screen}"
+        );
+        assert!(
+            screen.contains("https://github.com/acme/borsuk/issues/7"),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn an_ask_with_an_error_shows_the_error_text() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        let mut failed = ask_view();
+        failed.error = Some("gh could not read the comment".to_string());
+        failed.question.clear();
+        failed.options.clear();
+        inbox.observe_ask(&failed);
+
+        let screen = render(&state, &inbox, OPENED);
+
+        assert!(
+            screen.contains("gh could not read the comment"),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_push_that_closes_the_row_drops_its_ask_pick_and_request_guard() {
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(inbox.take_pending_ask(&state).is_some());
+        inbox.observe_ask(&ask_view());
+        inbox.handle_key(&state, press('2'), &mut tx);
+        assert!(inbox.asks.contains_key("human:borsuk:i142"));
+        assert!(inbox.requested_asks.contains("human:borsuk:i142"));
+        assert!(inbox.ask_picks.contains_key("human:borsuk:i142"));
+
+        let next = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
+        inbox.observe(&next);
+
+        assert!(inbox.asks.is_empty());
+        assert!(inbox.requested_asks.is_empty());
+        assert!(inbox.ask_picks.is_empty());
+
+        let reopened = ask_state();
+        inbox.observe(&reopened);
+        inbox.handle_key(&reopened, press_code(KeyCode::Enter), &mut tx);
+        assert!(
+            inbox.take_pending_ask(&reopened).is_some(),
+            "a new row for the same item must fetch its new question"
+        );
+    }
+
+    #[test]
+    fn rfc3339_ms_parses_the_exact_github_form() {
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("1970-01-01T02:46:40Z"), Some(10_000_000));
+        assert_eq!(rfc3339_ms("2026-08-30T12:00:00Z"), Some(1_788_091_200_000));
+        assert_eq!(rfc3339_ms("2026-08-30 12:00:00Z"), None);
+        assert_eq!(rfc3339_ms("2026-08-30T12:00:00+02:00"), None);
+        assert_eq!(rfc3339_ms("2026-13-30T12:00:00Z"), None);
+        assert_eq!(rfc3339_ms("not a time"), None);
     }
 }

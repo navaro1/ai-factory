@@ -40,7 +40,12 @@ Edit the ticket body with `gh`. Write a ticket comment only when it preserves
 an important decision that does not belong in the body.
 
 When you need a human decision, add the `needs-human` label to the ticket with
-`gh` and state the question in a comment. Stop after the label is on.
+`gh` and state the question in a comment. Stop after the label is on. When the
+decision is a choice between named answers, end the comment with one strict
+block in this form. Keep the JSON on one line:
+<aif-ask-v1>
+{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
+</aif-ask-v1>
 
 When the specification is complete, run
 `gh issue edit {number} --remove-label to-refine --add-label refined`.

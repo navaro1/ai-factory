@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
     Config, ExecutionRole, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
@@ -49,7 +50,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 2;
+pub const WIRE_PROTOCOL_REVISION: u32 = 3;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -699,6 +700,30 @@ pub enum TicketContentSource {
     },
 }
 
+/// One fetched question for one `NeedsHuman` detail screen.
+///
+/// The daemon builds this view on demand, when the UI opens the detail of
+/// a row that carries the `needs-human` label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskView {
+    /// The repository alias.
+    pub repo: String,
+    /// Whether the item is an issue or a pull request.
+    pub kind: ItemKind,
+    /// The issue or pull request number.
+    pub number: u64,
+    /// The question text. Empty when no comment exists or a block held it.
+    pub question: String,
+    /// The offered answers, in file order. Empty without a valid block.
+    pub options: Vec<AskOption>,
+    /// The login of the comment author, when one comment exists.
+    pub author: Option<String>,
+    /// The comment creation time in RFC 3339 form, when one comment exists.
+    pub created_at: Option<String>,
+    /// A fetch error. The question and the option list stay empty.
+    pub error: Option<String>,
+}
+
 /// One repository label from the GitHub label catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoLabel {
@@ -1079,6 +1104,8 @@ pub enum Push {
     TicketLabels(TicketLabels),
     /// One ticket mutation state.
     TicketResult(TicketResult),
+    /// One fetched question for one `NeedsHuman` detail screen.
+    Ask(AskView),
     /// One settings save or reload result.
     SettingsResult(SettingsResult),
 }
@@ -1092,6 +1119,18 @@ pub enum Push {
 pub enum Action {
     /// Queue a refine task for one item.
     Refine {
+        /// The repository alias.
+        repo: String,
+        /// Whether the item is an issue or a pull request.
+        kind: ItemKind,
+        /// The issue or pull request number.
+        number: u64,
+    },
+    /// Fetch the question comment of one `needs-human` item.
+    ///
+    /// The daemon answers with one [`Push::Ask`]. The UI sends the action
+    /// once per row, when the operator opens its detail screen.
+    Ask {
         /// The repository alias.
         repo: String,
         /// Whether the item is an issue or a pull request.
@@ -1782,6 +1821,11 @@ mod tests {
                 kind: ItemKind::Issue,
                 number: 142,
             },
+            Action::Ask {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 142,
+            },
             Action::Chat {
                 task: "borsuk/refine-i142".to_string(),
                 text: "use sqlite".to_string(),
@@ -2069,6 +2113,37 @@ mod tests {
         };
 
         assert!(matches!(pushes.next(), Some(Ok(Push::State(_)))));
+    }
+
+    #[test]
+    fn an_ask_push_round_trips_through_json_with_the_documented_tags() {
+        let push = Push::Ask(AskView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+            question: "Which workload mode ships first?".to_string(),
+            options: vec![AskOption {
+                label: "Fast".to_string(),
+                description: "deterministic only".to_string(),
+            }],
+            author: Some("agent".to_string()),
+            created_at: Some("2026-09-01T10:00:00Z".to_string()),
+            error: None,
+        });
+        let text = serde_json::to_string(&push).unwrap();
+        assert!(text.contains("\"type\":\"ask\""), "line: {text}");
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+
+        let action_text = serde_json::to_string(&Action::Ask {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+        })
+        .unwrap();
+        assert_eq!(
+            action_text,
+            "{\"action\":\"ask\",\"repo\":\"borsuk\",\"kind\":\"issue\",\"number\":142}"
+        );
     }
 
     #[test]
