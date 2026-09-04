@@ -779,6 +779,14 @@ impl Settings {
 
     /// Apply one key while the prompt editor is open.
     fn handle_prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // The banner says any key keeps the prompt, so every key that is
+        // not `Esc` cancels the question, `ctrl-s` and an unhandled key
+        // included.
+        if key.code != KeyCode::Esc {
+            if let Some(editor) = self.prompt_editor.as_mut() {
+                editor.discard_confirm = false;
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             return self.save_prompt();
         }
@@ -797,9 +805,6 @@ impl Settings {
             return None;
         }
         let editor = self.prompt_editor.as_mut()?;
-        // The banner says any key keeps the prompt, so every key that is
-        // not `Esc` cancels the question, handled or not.
-        editor.discard_confirm = false;
         match key.code {
             KeyCode::Enter => editor.newline(),
             KeyCode::Backspace => editor.backspace(),
@@ -4000,6 +4005,14 @@ mod tests {
         );
         settings.handle_key(&state, key(KeyCode::Esc));
         assert!(settings.typing(), "the editor asks again");
+
+        // A local ctrl-s rejection also cancels the question.
+        type_text(&mut settings, &state, "{frobnicate}");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(text(&settings, &state, 100, 30).contains("Esc again discards"));
+        assert!(settings.handle_key(&state, ctrl('s')).is_none());
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(settings.typing(), "the editor asks again after ctrl-s");
     }
 
     /// The editor window shows the lines after the cursor, so a long
