@@ -1950,15 +1950,30 @@ impl Daemon {
     /// Write the `.aif/reviewed-sha` marker of a finished review.
     ///
     /// The marker records the head sha the gate admitted, and it is written
-    /// only here, after the review task reported success.
+    /// only here, after the review task reported success. A task without a
+    /// stored sha falls back to the head of the same pull request in the last
+    /// poll, so a bookkeeping gap cannot discard a finished review.
     fn write_review_marker(&self, task: &Task) -> Result<()> {
-        let Some(sha) = task.head_sha.clone() else {
+        let Some(sha) = task.head_sha.clone().or_else(|| self.polled_head_sha(task)) else {
             bail!("review task {} has no head sha", task.id);
         };
         let Some(cwd) = self.task_cwd(&task.id) else {
             bail!("review task {} has no worktree", task.id);
         };
         self.worktrees.write_reviewed_sha(&cwd, &sha)
+    }
+
+    /// The head sha of the pull request of `task` in the last poll.
+    fn polled_head_sha(&self, task: &Task) -> Option<String> {
+        if task.kind != ItemKind::Pr {
+            return None;
+        }
+        self.snapshot
+            .repos
+            .get(&task.repo)?
+            .prs
+            .get(&task.number)
+            .map(|pr| pr.head_sha.clone())
     }
 
     // ------------------------------------------------------------------
@@ -3011,7 +3026,12 @@ impl Daemon {
             log,
             self.now_ms,
         ) {
-            Ok(_) => {
+            Ok(fresh) => {
+                // The fresh task starts empty, but the retry reviews the same
+                // head as the failed task. Without this the review completes
+                // and then fails on the missing sha, and the gate treats the
+                // retry as superseded work.
+                fresh.head_sha = task.head_sha.clone();
                 self.decisions.drop_for_task(id);
                 self.changed = true;
             }
@@ -4972,6 +4992,77 @@ mod tests {
         let task = rig.task("borsuk/review-p5");
         assert_eq!(task.state, TaskState::Queued);
         assert_eq!(task.attempt, 2);
+    }
+
+    #[test]
+    fn a_retry_keeps_the_review_head_sha() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        for _ in 0..3 {
+            rig.event(exited("borsuk/review-p5", false, "boom"));
+        }
+        assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());
+
+        rig.act(Action::Retry {
+            task: "borsuk/review-p5".to_string(),
+        });
+
+        assert_eq!(
+            rig.task("borsuk/review-p5").head_sha.as_deref(),
+            Some("sha5"),
+            "the retry reviews the same head as the failed task"
+        );
+
+        rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
+
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
+        let marker = worktree.join(".aif").join("reviewed-sha");
+        assert_eq!(fs::read_to_string(marker).unwrap().trim_end(), "sha5");
+    }
+
+    #[test]
+    fn a_review_without_a_stored_sha_takes_the_polled_head() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/review-p5")
+            .unwrap()
+            .head_sha = None;
+
+        rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p5").state,
+            TaskState::Done,
+            "a missing sha must not discard a finished review"
+        );
+        let marker = worktree.join(".aif").join("reviewed-sha");
+        assert_eq!(fs::read_to_string(marker).unwrap().trim_end(), "sha5");
     }
 
     #[test]
