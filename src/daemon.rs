@@ -859,13 +859,15 @@ impl Daemon {
     /// Retire work whose item closed, went back to draft, or vanished.
     ///
     /// GitHub is the source of truth: a gone or draft pull request leaves the
-    /// train, and a gone or closed item cancels its active tasks.
+    /// train, and a gone or closed item cancels its active tasks and drops
+    /// its terminal tasks, so the board keeps no stale row.
     fn reconcile_removed(&mut self, repo: &str, old: &RepoSnapshot, fresh: &RepoSnapshot) {
         for number in old.issues.keys() {
             let gone = fresh.issues.get(number).is_none_or(|issue| !issue.open);
             if gone {
                 self.gates.forget(repo, ItemKind::Issue, *number);
                 self.cancel_item_tasks(repo, ItemKind::Issue, *number);
+                self.retire_item_tasks(repo, ItemKind::Issue, *number);
             }
         }
         for number in old.prs.keys() {
@@ -879,6 +881,7 @@ impl Daemon {
             if gone {
                 self.gates.forget(repo, ItemKind::Pr, *number);
                 self.cancel_item_tasks(repo, ItemKind::Pr, *number);
+                self.retire_item_tasks(repo, ItemKind::Pr, *number);
             }
         }
     }
@@ -898,6 +901,50 @@ impl Daemon {
             .collect();
         for id in ids {
             self.cancel_task(&id, false);
+        }
+    }
+
+    /// Drop one task and every per-task record it owns.
+    ///
+    /// The daemon removes the tasks of an item that left GitHub instead of
+    /// keeping them for ever. A missing id is a no-operation.
+    fn retire_task(&mut self, id: &str) {
+        if self.table.remove(id).is_none() {
+            return;
+        }
+        self.role_bindings.remove(id);
+        self.review_tickets.remove(id);
+        self.release_batches.remove(id);
+        self.pending_chats.remove(id);
+        self.ticket_turn_text.remove(id);
+        self.paused.tasks.remove(id);
+        self.decisions.drop_for_task(id);
+        self.changed = true;
+    }
+
+    /// Drop every pipeline task of one item that left GitHub.
+    ///
+    /// A ticket chat and a ticket-creation session serve the Tickets view,
+    /// so their purpose keeps them. A release task that a train holds in
+    /// flight stays too, so [`Daemon::reconcile_trains`] can still close
+    /// the train.
+    fn retire_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
+        let ids: Vec<String> = self
+            .table
+            .by_id
+            .values()
+            .filter(|task| task.repo == repo && task.kind == kind && task.number == number)
+            .filter(|task| task.purpose == TaskPurpose::Pipeline)
+            .filter(|task| {
+                !self
+                    .trains
+                    .values()
+                    .any(|train| train.in_flight.as_deref() == Some(task.id.as_str()))
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        for id in ids {
+            self.retire_task(&id);
         }
     }
 
@@ -8384,7 +8431,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_an_issue_cancels_its_running_tasks() {
+    fn a_dropped_issue_stops_its_session_and_retires_its_tasks() {
         let dir = temp_root();
         let steps = fresh_issue_steps(
             &rig_repo(&dir),
@@ -8395,16 +8442,160 @@ mod tests {
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         assert_eq!(rig.job_count(), 1);
+        let session = rig.session(0);
 
         rig.poll(vec![], vec![]);
+
         assert!(
-            rig.session(0).stopped.load(Ordering::SeqCst),
+            session.stopped.load(Ordering::SeqCst),
             "the vanished issue stops the live session"
         );
-        assert_eq!(
-            rig.task("borsuk/implement-i142").state,
-            TaskState::Failed("cancelled".to_string())
+        assert!(
+            !rig.daemon
+                .table
+                .by_id
+                .values()
+                .any(|task| task.repo == "borsuk"
+                    && task.kind == ItemKind::Issue
+                    && task.number == 142),
+            "the dropped issue leaves no task in the table"
         );
+    }
+
+    #[test]
+    fn a_dropped_pr_retires_its_done_review_task() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        rig.event(turn_finished("borsuk/review-p5", true, "approved"));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the dropped pull request leaves no review task in the table"
+        );
+    }
+
+    #[test]
+    fn a_dropped_issue_ends_its_open_ticket_conversation() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        assert!(rig
+            .daemon
+            .ticket_conversations
+            .contains_key(&("borsuk".to_string(), 7)));
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            rig.daemon.ticket_conversations.is_empty(),
+            "the dropped issue ends the conversation"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/ticket-i7"),
+            "the conversation reconciler removes the chat task"
+        );
+    }
+
+    #[test]
+    fn a_dropped_pr_keeps_the_in_flight_release_and_closes_the_train() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        rig.event(turn_finished("borsuk/review-p5", true, "approved"));
+        rig.event(started("borsuk/release", "session-release"));
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release")
+        );
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the in-flight release task survives the retire"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the dropped review retires"
+        );
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight, None,
+            "reconcile_trains closes the train after the release task ends"
+        );
+    }
+
+    #[test]
+    fn a_retire_drops_the_binding_the_pause_and_the_decisions() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "session-impl"));
+        assert!(rig
+            .daemon
+            .role_bindings
+            .contains_key("borsuk/implement-i142"));
+        rig.event(RunEvent::Ask {
+            task: "borsuk/implement-i142".to_string(),
+            request_id: "q-1".to_string(),
+            tool: "AskUserQuestion".to_string(),
+            input: json!([{"question": "which database?"}]),
+            suggestions: serde_json::Value::Null,
+            needs_human: true,
+        });
+        assert!(rig.decision("perm:borsuk/implement-i142:q-1").is_some());
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/implement-i142".to_string(),
+            },
+            paused: true,
+        });
+        assert!(rig
+            .daemon
+            .paused
+            .tasks
+            .contains_key("borsuk/implement-i142"));
+
+        rig.poll(vec![], vec![]);
+
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/implement-i142"));
+        assert!(!rig
+            .daemon
+            .role_bindings
+            .contains_key("borsuk/implement-i142"));
+        assert!(!rig
+            .daemon
+            .paused
+            .tasks
+            .contains_key("borsuk/implement-i142"));
+        assert!(rig.decision("perm:borsuk/implement-i142:q-1").is_none());
     }
 
     #[test]
