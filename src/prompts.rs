@@ -3,8 +3,9 @@
 //! Every built-in template lives here, outside the daemon, so wording
 //! changes touch one file. A file `prompts/<name>.md` in the config
 //! directory overrides the built-in default; [`file_name`] gives the name
-//! of each role. The docs directory `docs/v0.6/prompts/` holds a reference
-//! copy of each template, pinned byte for byte by a test.
+//! of each role and [`ROLES`] lists the roles that have one. The docs
+//! directory `docs/v0.6/prompts/` holds a reference copy of each template,
+//! pinned byte for byte by a test.
 //!
 //! The daemon reads the prompt file of a role each time a task of that role
 //! starts. So a saved prompt applies to the next task start, and a running
@@ -174,21 +175,54 @@ PR #{number}: {title}
 
 Tickets this PR closes: {tickets}
 
-Read the diff of the PR with `gh pr diff {number}`. Review it for
-correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`. If it is correct, approve it and then run
-`gh pr ready {number}`. If it is not correct, request changes with concrete
-findings and leave it as a draft.
+You are the last agent on this change. You repair every finding yourself. You
+never hand a finding back to the author. The PR must leave your run ready for
+review, or labelled `needs-human`.
 
-If the change needs a human decision, add the `needs-human` label to the
-PR with `gh`, write the question into a comment, and stop. Do not
-guess. When the decision is a choice between named answers, end the comment
-with one strict block in this form. Keep the JSON on one line:
+Read the diff of the PR with `gh pr diff {number}`. Review it for
+correctness, tests, and fit with the codebase. Read the repository
+instructions and the linked tickets.
+
+Before your first edit, check whether the PR comes from a fork:
+`gh pr view {number} --json isCrossRepository --jq .isCrossRepository`.
+When the command prints `true`, take the human path. Never push a fork repair
+to `origin`.
+
+Before your first edit, prove that this worktree holds the PR head. Compare
+`gh pr view {number} --json headRefOid --jq .headRefOid` with
+`git rev-parse HEAD`. When the two differ, run
+`git fetch origin pull/{number}/head` and then `git reset --hard FETCH_HEAD`.
+
+Fix every finding in this worktree. Add the missing tests. Keep the scope of
+the linked tickets. Run the full validation of the repository and make it
+pass. Commit the repairs in small, complete commits.
+
+Push once, at the end of the run. A push on a draft PR can restart your own
+review, so never push a partial fix. Push the commits and open the release
+gate in one command line:
+
+`git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}`
+
+Never pass `--force`. Never merge the PR.
+
+Record the outcome with `gh pr comment {number}`. Name the findings, the
+repairs, and the validation result. GitHub refuses a formal review of your own
+PR, so this comment is the record.
+
+When the PR needs no repair, post the record and run `gh pr ready {number}`.
+
+Take the human path when the PR comes from a fork, when a finding needs a human
+decision, when the repair leaves the scope of the linked tickets, or when the
+push fails. On that path, add the `needs-human` label to the PR with `gh`, write
+the question into a comment, leave the draft, and stop. Do not guess. When the
+decision is a choice between named answers, end the comment with one strict
+block in this form. Keep the JSON on one line:
 <aif-ask-v1>
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Report one line at the end: the review verdict.
+Report one line at the end: the review verdict, and the number of commits you
+pushed.
 "#;
 
 /// The built-in prompt of a release run.
@@ -287,49 +321,76 @@ const TICKET_CHAT_PLACEHOLDERS: &[&str] = &[
     "worktree",
 ];
 
+/// Every role the daemon renders a prompt for, in role order.
+///
+/// The theory roles are absent. `theory.audit` and `theory.chat` carry no
+/// template yet, and each will take one template per task purpose, not one
+/// per role. A prompt file for them would sit unread, so the daemon
+/// publishes no prompt view for them and the Settings view shows no prompt
+/// row on them.
+pub const ROLES: [ExecutionRole; 6] = [
+    ExecutionRole::Refine,
+    ExecutionRole::Implement,
+    ExecutionRole::Review,
+    ExecutionRole::Release,
+    ExecutionRole::TicketCreate,
+    ExecutionRole::TicketChat,
+];
+
 /// The file name of the prompt template of one role, inside the prompts
-/// directory.
-pub const fn file_name(role: ExecutionRole) -> &'static str {
+/// directory, or `None` for a role with no template.
+pub const fn file_name(role: ExecutionRole) -> Option<&'static str> {
     match role {
-        ExecutionRole::Refine => "refine.md",
-        ExecutionRole::Implement => "implement.md",
-        ExecutionRole::Review => "review.md",
-        ExecutionRole::Release => "release.md",
-        ExecutionRole::TicketCreate => "ticket.md",
-        ExecutionRole::TicketChat => "ticket-chat.md",
+        ExecutionRole::Refine => Some("refine.md"),
+        ExecutionRole::Implement => Some("implement.md"),
+        ExecutionRole::Review => Some("review.md"),
+        ExecutionRole::Release => Some("release.md"),
+        ExecutionRole::TicketCreate => Some("ticket.md"),
+        ExecutionRole::TicketChat => Some("ticket-chat.md"),
+        ExecutionRole::TheoryAudit | ExecutionRole::TheoryChat => None,
     }
 }
 
-/// The built-in template of one role.
-pub const fn builtin(role: ExecutionRole) -> &'static str {
+/// The built-in template of one role, or `None` for a role with no
+/// template.
+pub const fn builtin(role: ExecutionRole) -> Option<&'static str> {
     match role {
-        ExecutionRole::Refine => REFINE_PROMPT,
-        ExecutionRole::Implement => IMPLEMENT_PROMPT,
-        ExecutionRole::Review => REVIEW_PROMPT,
-        ExecutionRole::Release => RELEASE_PROMPT,
-        ExecutionRole::TicketCreate => TICKET_PROMPT,
-        ExecutionRole::TicketChat => TICKET_CHAT_PROMPT,
+        ExecutionRole::Refine => Some(REFINE_PROMPT),
+        ExecutionRole::Implement => Some(IMPLEMENT_PROMPT),
+        ExecutionRole::Review => Some(REVIEW_PROMPT),
+        ExecutionRole::Release => Some(RELEASE_PROMPT),
+        ExecutionRole::TicketCreate => Some(TICKET_PROMPT),
+        ExecutionRole::TicketChat => Some(TICKET_CHAT_PROMPT),
+        ExecutionRole::TheoryAudit | ExecutionRole::TheoryChat => None,
     }
 }
 
-/// The placeholders the daemon fills for one role.
+/// The placeholders the daemon fills for one role, or `None` for a role
+/// with no template.
 ///
 /// A template may use any subset of them. A placeholder outside the set is
 /// an error, both at save time and at dispatch time.
-pub const fn placeholders(role: ExecutionRole) -> &'static [&'static str] {
+pub const fn placeholders(role: ExecutionRole) -> Option<&'static [&'static str]> {
     match role {
         ExecutionRole::Refine
         | ExecutionRole::Implement
         | ExecutionRole::Review
-        | ExecutionRole::Release => STAGE_PLACEHOLDERS,
-        ExecutionRole::TicketCreate => TICKET_PLACEHOLDERS,
-        ExecutionRole::TicketChat => TICKET_CHAT_PLACEHOLDERS,
+        | ExecutionRole::Release => Some(STAGE_PLACEHOLDERS),
+        ExecutionRole::TicketCreate => Some(TICKET_PLACEHOLDERS),
+        ExecutionRole::TicketChat => Some(TICKET_CHAT_PLACEHOLDERS),
+        ExecutionRole::TheoryAudit | ExecutionRole::TheoryChat => None,
     }
 }
 
-/// The path of the prompt file of one role.
-pub fn path(prompts_dir: &Path, role: ExecutionRole) -> PathBuf {
-    prompts_dir.join(file_name(role))
+/// The path of the prompt file of one role, or an error naming a role with
+/// no template.
+pub fn path(prompts_dir: &Path, role: ExecutionRole) -> Result<PathBuf> {
+    Ok(prompts_dir.join(name_of(role)?))
+}
+
+/// The file name of one role, or an error that names the role.
+fn name_of(role: ExecutionRole) -> Result<&'static str> {
+    file_name(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))
 }
 
 /// One loaded template and where it came from.
@@ -344,16 +405,18 @@ pub struct Template {
 /// Read the template of one role.
 ///
 /// The prompt file wins when it exists. An absent file yields the built-in.
-/// An unreadable file is an error that names the path.
+/// An unreadable file is an error that names the path. A role with no
+/// template is an error that names the role.
 pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
-    let path = path(prompts_dir, role);
+    let path = path(prompts_dir, role)?;
+    let builtin = builtin(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Template {
             text,
             from_file: true,
         }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Template {
-            text: builtin(role).to_string(),
+            text: builtin.to_string(),
             from_file: false,
         }),
         Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
@@ -364,12 +427,13 @@ pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
 ///
 /// The error names the first unknown placeholder and lists the known ones.
 /// A blank template is an error too: the agent would start with no
-/// instructions.
+/// instructions. A role with no template is an error that names the role.
 pub fn check(role: ExecutionRole, text: &str) -> Result<()> {
+    let allowed =
+        placeholders(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
     if text.trim().is_empty() {
         bail!("the prompt is empty");
     }
-    let allowed = placeholders(role);
     if let Some(token) = scan_placeholders(text)
         .into_iter()
         .find(|token| !allowed.contains(token))
@@ -389,12 +453,14 @@ pub fn check(role: ExecutionRole, text: &str) -> Result<()> {
 /// Write the prompt file of one role.
 ///
 /// The text goes to a sibling temporary file first, and one rename replaces
-/// the destination, so a reader never sees a half-written prompt.
+/// the destination, so a reader never sees a half-written prompt. A role
+/// with no template is an error that names the role.
 pub fn save(prompts_dir: &Path, role: ExecutionRole, text: &str) -> Result<()> {
+    let name = name_of(role)?;
     fs::create_dir_all(prompts_dir)
         .with_context(|| format!("cannot create {}", prompts_dir.display()))?;
-    let destination = path(prompts_dir, role);
-    let temporary = prompts_dir.join(format!(".{}.{}.tmp", file_name(role), std::process::id()));
+    let destination = prompts_dir.join(name);
+    let temporary = prompts_dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let written = fs::write(&temporary, text)
         .with_context(|| format!("cannot write {}", temporary.display()))
         .and_then(|()| {
@@ -414,9 +480,10 @@ pub fn save(prompts_dir: &Path, role: ExecutionRole, text: &str) -> Result<()> {
 
 /// Remove the prompt file of one role, so the built-in template applies.
 ///
-/// An absent file is not an error.
+/// An absent file is not an error. A role with no template is an error that
+/// names the role.
 pub fn reset(prompts_dir: &Path, role: ExecutionRole) -> Result<()> {
-    let path = path(prompts_dir, role);
+    let path = path(prompts_dir, role)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -501,7 +568,7 @@ mod tests {
 
     #[test]
     fn every_role_has_one_file_name_and_its_builtin_template() {
-        let names = ExecutionRole::ALL.map(file_name);
+        let names = ROLES.map(|role| file_name(role).expect("a listed role names a file"));
         for (index, name) in names.iter().enumerate() {
             assert!(name.ends_with(".md"), "{name} is not a markdown file");
             assert!(
@@ -509,25 +576,61 @@ mod tests {
                 "{name} is the file name of two roles"
             );
         }
-        assert_eq!(file_name(ExecutionRole::TicketCreate), "ticket.md");
-        assert_eq!(file_name(ExecutionRole::TicketChat), "ticket-chat.md");
-        assert_eq!(builtin(ExecutionRole::Refine), REFINE_PROMPT);
-        assert_eq!(builtin(ExecutionRole::TicketChat), TICKET_CHAT_PROMPT);
+        assert_eq!(file_name(ExecutionRole::TicketCreate), Some("ticket.md"));
+        assert_eq!(file_name(ExecutionRole::TicketChat), Some("ticket-chat.md"));
+        assert_eq!(builtin(ExecutionRole::Refine), Some(REFINE_PROMPT));
+        assert_eq!(builtin(ExecutionRole::TicketChat), Some(TICKET_CHAT_PROMPT));
     }
 
     #[test]
     fn every_builtin_template_passes_the_check_of_its_role() {
-        for role in ExecutionRole::ALL {
-            check(role, builtin(role)).unwrap_or_else(|error| {
+        for role in ROLES {
+            let text = builtin(role).expect("a listed role has a built-in template");
+            check(role, text).unwrap_or_else(|error| {
                 panic!("the built-in {role} prompt fails its own check: {error:#}")
             });
-            for token in scan_placeholders(builtin(role)) {
+            let allowed = placeholders(role).expect("a listed role has a placeholder set");
+            for token in scan_placeholders(text) {
                 assert!(
-                    placeholders(role).contains(&token),
+                    allowed.contains(&token),
                     "the built-in {role} prompt uses {{{token}}} outside its placeholder set"
                 );
             }
         }
+    }
+
+    /// The theory roles carry no template yet. Every prompt entry point
+    /// refuses them by name, so nothing writes a file that no task reads.
+    #[test]
+    fn the_theory_roles_have_no_prompt_and_every_entry_point_refuses_them() {
+        assert_eq!(
+            ROLES.len() + 2,
+            ExecutionRole::ALL.len(),
+            "only the two theory roles stay outside ROLES"
+        );
+        let dir = temp_prompts_dir("theory");
+        for role in [ExecutionRole::TheoryAudit, ExecutionRole::TheoryChat] {
+            assert!(!ROLES.contains(&role), "{role}");
+            assert_eq!(file_name(role), None, "{role}");
+            assert_eq!(builtin(role), None, "{role}");
+            assert!(placeholders(role).is_none(), "{role}");
+            let expected = format!("the {role} role has no prompt template");
+            for result in [
+                path(&dir, role).map(|_| ()),
+                load(&dir, role).map(|_| ()),
+                check(role, "anything"),
+                save(&dir, role, "anything"),
+                reset(&dir, role),
+            ] {
+                assert_eq!(result.unwrap_err().to_string(), expected);
+            }
+        }
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no file was written"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -750,6 +853,29 @@ mod tests {
             "Never give two concurrent writers the same file",
             "If subagents are unavailable, execute the chunks directly",
             "The coordinator owns shared files, integration, git operations, and GitHub operations",
+        ] {
+            assert!(prompt.contains(required), "missing: {required}");
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_mandates_a_repair_a_push_and_the_ready_flip() {
+        let prompt = REVIEW_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for required in [
+            "You repair every finding yourself",
+            "ready for review, or labelled `needs-human`",
+            "gh pr view {number} --json isCrossRepository --jq .isCrossRepository",
+            "Never push a fork repair to `origin`",
+            "Take the human path when the PR comes from a fork",
+            "prove that this worktree holds the PR head",
+            "Push once, at the end of the run",
+            "git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}",
+            "Never pass `--force`. Never merge the PR.",
+            "GitHub refuses a formal review of your own PR",
+            "add the `needs-human` label to the PR",
         ] {
             assert!(prompt.contains(required), "missing: {required}");
         }

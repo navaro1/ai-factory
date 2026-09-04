@@ -139,6 +139,12 @@ impl TicketController {
                 name,
                 color,
             } => self.create_label(request, repo, number, name, color, snapshot, config, now_ms),
+            TicketAction::Create {
+                request,
+                repo,
+                title,
+                body,
+            } => self.create_ticket(request, repo, title, body, config, now_ms),
             TicketAction::Chat {
                 request,
                 repo,
@@ -780,6 +786,84 @@ impl TicketController {
             confirmed: Some((repo, issue, now_ms)),
         }
     }
+
+    /// Create one ticket from the direct form content.
+    fn create_ticket(
+        &mut self,
+        request: String,
+        repo: String,
+        title: String,
+        body: String,
+        config: &Config,
+        now_ms: u64,
+    ) -> TicketEffects {
+        let mut pushes = vec![Push::TicketResult(result(
+            request.clone(),
+            repo.clone(),
+            0,
+            TicketResultKind::Pending,
+            "GitHub ticket creation pending.",
+        ))];
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            pushes.push(Push::TicketResult(result(
+                request,
+                repo,
+                0,
+                TicketResultKind::Failure,
+                "The ticket title must not be empty.",
+            )));
+            return TicketEffects {
+                pushes,
+                confirmed: None,
+            };
+        }
+        let Some(repo_config) = config.repos.get(&repo) else {
+            pushes.push(Push::TicketResult(result(
+                request,
+                repo,
+                0,
+                TicketResultKind::Failure,
+                "The repository is not configured.",
+            )));
+            return TicketEffects {
+                pushes,
+                confirmed: None,
+            };
+        };
+        let gh = GhClient::new(&*self.exec);
+        let issue = match gh.create_issue(&repo_config.owner_repo, &title, &body) {
+            Ok(issue) => issue,
+            Err(error) => {
+                pushes.push(Push::TicketResult(result(
+                    request,
+                    repo,
+                    0,
+                    TicketResultKind::Failure,
+                    &format!("GitHub rejected the ticket creation: {error:#}"),
+                )));
+                return TicketEffects {
+                    pushes,
+                    confirmed: None,
+                };
+            }
+        };
+        let number = issue.number;
+        self.last_mutation_ms.insert(repo.clone(), now_ms);
+        pushes.push(Push::TicketResult(TicketResult {
+            request,
+            repo: repo.clone(),
+            number,
+            kind: TicketResultKind::Success,
+            message: format!("GitHub created ticket #{number}."),
+            issue: Some(issue.clone()),
+            conflict: None,
+        }));
+        TicketEffects {
+            pushes,
+            confirmed: Some((repo, issue, now_ms)),
+        }
+    }
 }
 
 /// Normalize one optional-hash six-digit label color.
@@ -1390,6 +1474,164 @@ mod tests {
         });
         assert_eq!(catalog.unwrap().labels[0].color, "ff0000");
         assert_eq!(exec.calls().len(), 3);
+    }
+
+    #[test]
+    fn a_ticket_creation_pushes_pending_then_success_and_confirms() {
+        let created = serde_json::json!({
+            "number": 12,
+            "node_id": "node-12",
+            "title": "Direct title",
+            "body": "Direct body",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-03T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk/issues/12"
+        })
+        .to_string();
+        let exec = Arc::new(ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Direct title",
+                "-f",
+                "body=Direct body",
+            ]),
+            ok(&created),
+        ));
+        let mut controller = TicketController::new(exec.clone());
+        let effects = controller.handle(
+            TicketAction::Create {
+                request: "create-1".to_string(),
+                repo: "borsuk".to_string(),
+                title: "  Direct title  ".to_string(),
+                body: "Direct body".to_string(),
+            },
+            &Snapshot::default(),
+            &config(),
+            6_000,
+        );
+
+        assert_eq!(effects.pushes.len(), 2);
+        let Push::TicketResult(pending) = &effects.pushes[0] else {
+            panic!("the first push must report pending");
+        };
+        assert_eq!(pending.kind, TicketResultKind::Pending);
+        assert_eq!(pending.number, 0);
+        let Push::TicketResult(success) = &effects.pushes[1] else {
+            panic!("the second push must report success");
+        };
+        assert_eq!(success.kind, TicketResultKind::Success);
+        assert_eq!(success.number, 12);
+        assert_eq!(success.message, "GitHub created ticket #12.");
+        assert_eq!(success.issue.as_ref().unwrap().title, "Direct title");
+        assert_eq!(
+            effects
+                .confirmed
+                .as_ref()
+                .map(|(repo, issue, _)| (repo.as_str(), issue.number)),
+            Some(("borsuk", 12))
+        );
+        assert_eq!(controller.last_mutation_ms("borsuk"), Some(6_000));
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_title_and_an_unknown_repo_fail_without_a_gh_call() {
+        let exec = Arc::new(ScriptExec::new());
+        let mut controller = TicketController::new(exec.clone());
+
+        let effects = controller.handle(
+            TicketAction::Create {
+                request: "create-2".to_string(),
+                repo: "borsuk".to_string(),
+                title: "   ".to_string(),
+                body: String::new(),
+            },
+            &Snapshot::default(),
+            &config(),
+            6_000,
+        );
+        assert_eq!(effects.pushes.len(), 2);
+        let Push::TicketResult(pending) = &effects.pushes[0] else {
+            panic!("the first push must report pending");
+        };
+        assert_eq!(pending.kind, TicketResultKind::Pending);
+        assert_eq!(pending.number, 0);
+        let Push::TicketResult(failure) = &effects.pushes[1] else {
+            panic!("the second push must report failure");
+        };
+        assert_eq!(failure.kind, TicketResultKind::Failure);
+        assert_eq!(failure.message, "The ticket title must not be empty.");
+        assert!(exec.calls().is_empty());
+
+        let effects = controller.handle(
+            TicketAction::Create {
+                request: "create-3".to_string(),
+                repo: "ghost".to_string(),
+                title: "Direct title".to_string(),
+                body: String::new(),
+            },
+            &Snapshot::default(),
+            &config(),
+            6_000,
+        );
+        let Push::TicketResult(failure) = &effects.pushes[1] else {
+            panic!("the second push must report failure");
+        };
+        assert_eq!(failure.kind, TicketResultKind::Failure);
+        assert_eq!(failure.message, "The repository is not configured.");
+        assert!(exec.calls().is_empty());
+        assert!(effects.confirmed.is_none());
+    }
+
+    #[test]
+    fn a_github_failure_during_creation_reports_one_failure() {
+        let exec = Arc::new(ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Direct title",
+                "-f",
+                "body=Direct body",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: "HTTP/2 422\r\n\r\n{}".to_string(),
+                stderr: "validation failed".to_string(),
+            },
+        ));
+        let mut controller = TicketController::new(exec);
+        let effects = controller.handle(
+            TicketAction::Create {
+                request: "create-4".to_string(),
+                repo: "borsuk".to_string(),
+                title: "Direct title".to_string(),
+                body: "Direct body".to_string(),
+            },
+            &Snapshot::default(),
+            &config(),
+            6_000,
+        );
+
+        assert_eq!(effects.pushes.len(), 2);
+        let Push::TicketResult(failure) = &effects.pushes[1] else {
+            panic!("the final push must report failure");
+        };
+        assert_eq!(failure.kind, TicketResultKind::Failure);
+        assert!(failure.message.contains("GitHub"), "{}", failure.message);
+        assert!(failure.issue.is_none());
+        assert!(effects.confirmed.is_none());
     }
 
     #[test]

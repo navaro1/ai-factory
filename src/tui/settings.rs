@@ -452,6 +452,35 @@ impl Settings {
             || self.prompt_editor.is_some()
     }
 
+    /// The bottom-row hints of the settings state.
+    ///
+    /// An open editor names its own keys and shows no `? help`. The form
+    /// names the navigation keys and the keys of the active scope: the
+    /// repository scope removes its override, the global scope reloads.
+    /// On the form `j` and `k` step the execution role; inside the list
+    /// editor they step one row.
+    pub fn footer_hints(&self) -> String {
+        if self.prompt_editor.is_some() {
+            return "ctrl-s save · esc close · arrows move".to_string();
+        }
+        if let Some(editor) = self.list_editor.as_ref() {
+            if editor.row_editor.is_some() {
+                return "enter apply · esc cancel".to_string();
+            }
+            return "j k row · a add · d delete · enter edit · esc close".to_string();
+        }
+        if self.text_editor.is_some() {
+            return "enter apply · esc cancel".to_string();
+        }
+        if self.value_list.is_some() {
+            return "type filter · enter apply · esc close".to_string();
+        }
+        if self.scope > 0 {
+            return "j k role · tab field · enter open · s save · d remove · ? help".to_string();
+        }
+        "j k role · tab field · enter open · s save · r reload · ? help".to_string()
+    }
+
     /// Store the result of the `opencode models` probe and refresh an
     /// open model list.
     pub fn observe_models(&mut self, result: Result<Vec<String>, String>) {
@@ -1360,8 +1389,9 @@ impl Settings {
         if self.scope == 0 && self.selected_role_for().stage().is_some() {
             fields.push(Field::Limit);
         }
-        // Prompts have no repository scope; the file is one per role.
-        if self.scope == 0 {
+        // Prompts have no repository scope; the file is one per role. The
+        // theory roles carry no template, so they get no prompt row.
+        if self.scope == 0 && prompts::file_name(self.selected_role_for()).is_some() {
             fields.push(Field::Prompt);
         }
         fields
@@ -2010,9 +2040,9 @@ fn request_code() -> String {
 /// The source text of the prompt row: `built-in` or the prompt file path
 /// under the config directory.
 fn prompt_source_label(role: ExecutionRole, source: PromptSource) -> String {
-    match source {
-        PromptSource::Builtin => "built-in".to_string(),
-        PromptSource::File => format!("prompts/{}", prompts::file_name(role)),
+    match (source, prompts::file_name(role)) {
+        (PromptSource::File, Some(name)) => format!("prompts/{name}"),
+        _ => "built-in".to_string(),
     }
 }
 
@@ -2024,6 +2054,8 @@ fn role_label(role: ExecutionRole) -> &'static str {
         ExecutionRole::Release => "release",
         ExecutionRole::TicketCreate => "ticket creation",
         ExecutionRole::TicketChat => "ticket chat",
+        ExecutionRole::TheoryAudit => "theory audit",
+        ExecutionRole::TheoryChat => "theory chat",
     }
 }
 
@@ -2324,7 +2356,11 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 
 fn settings_panes(area: Rect, narrow: bool) -> [Rect; 2] {
     if narrow {
-        let panes = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(area);
+        let role_height = u16::try_from(ExecutionRole::ALL.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        let panes =
+            Layout::vertical([Constraint::Length(role_height), Constraint::Min(1)]).split(area);
         [panes[0], panes[1]]
     } else {
         let panes = Layout::horizontal([Constraint::Length(22), Constraint::Min(30)]).split(area);
@@ -2441,7 +2477,7 @@ mod tests {
                     overridden: true,
                 })
                 .collect(),
-            prompts: ExecutionRole::ALL.into_iter().map(prompt).collect(),
+            prompts: prompts::ROLES.into_iter().map(prompt).collect(),
         };
         state
     }
@@ -2501,6 +2537,8 @@ mod tests {
                 "release",
                 "ticket creation",
                 "ticket chat",
+                "theory audit",
+                "theory chat",
             ]
             .map(|name| output.find(name).expect("the role must be visible"));
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
@@ -3621,14 +3659,42 @@ mod tests {
     fn the_prompt_row_is_the_last_global_field_of_every_role_and_absent_in_a_repository() {
         let state = state();
         let mut settings = Settings::default();
-        for role_name in ExecutionRole::ALL {
+        for role_name in prompts::ROLES {
             settings.set_role(role_name);
             let fields = settings.visible_fields(&state);
             assert_eq!(fields.last(), Some(&Field::Prompt), "{role_name}");
         }
+        settings.set_role(ExecutionRole::Refine);
         settings.handle_key(&state, key(KeyCode::Char('l')));
         assert_eq!(settings.scope_label(&state), "borsuk");
         assert!(!settings.visible_fields(&state).contains(&Field::Prompt));
+    }
+
+    /// A theory role carries no prompt template, so the form shows no
+    /// prompt row and `d` on it never sends a reset.
+    #[test]
+    fn a_theory_role_has_no_prompt_row() {
+        let state = state();
+        let mut settings = Settings::default();
+        for role_name in [ExecutionRole::TheoryAudit, ExecutionRole::TheoryChat] {
+            settings.set_role(role_name);
+            let fields = settings.visible_fields(&state);
+            assert!(!fields.contains(&Field::Prompt), "{role_name}: {fields:?}");
+            settings.set_field(Field::Prompt);
+            assert_ne!(
+                settings.selected_field_for(Some(&state)),
+                Field::Prompt,
+                "{role_name} must not select the prompt row"
+            );
+            assert!(
+                settings
+                    .handle_key(&state, key(KeyCode::Char('d')))
+                    .is_none(),
+                "{role_name}"
+            );
+            assert!(settings.handle_key(&state, key(KeyCode::Enter)).is_none());
+            assert!(!settings.typing(), "{role_name} opens no prompt editor");
+        }
     }
 
     #[test]
@@ -3861,5 +3927,66 @@ mod tests {
         assert!(output.contains("line 1/3 col 1"));
         type_text(&mut settings, &state, "!");
         assert!(text(&settings, &state, 100, 30).contains("changed, not saved"));
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_scope_and_the_open_editors() {
+        let state = state();
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.footer_hints(),
+            "j k role · tab field · enter open · s save · r reload · ? help"
+        );
+
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(settings.scope, 1);
+        assert_eq!(
+            settings.footer_hints(),
+            "j k role · tab field · enter open · s save · d remove · ? help"
+        );
+
+        settings.scope = 0;
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings.value_list.is_some());
+        assert_eq!(
+            settings.footer_hints(),
+            "type filter · enter apply · esc close"
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+
+        settings.text_editor = Some(TextEditor {
+            field: Field::Program,
+            buffer: String::new(),
+        });
+        assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
+        settings.text_editor = None;
+
+        settings.list_editor = Some(ListEditor {
+            field: Field::ExtraArgs,
+            selected: 0,
+            rows: Vec::new(),
+            row_editor: None,
+        });
+        assert_eq!(
+            settings.footer_hints(),
+            "j k row · a add · d delete · enter edit · esc close"
+        );
+        settings.list_editor = Some(ListEditor {
+            field: Field::ExtraArgs,
+            selected: 0,
+            rows: vec!["--verbose".to_string()],
+            row_editor: Some(String::new()),
+        });
+        assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
+
+        for hint in [
+            "j k role · tab field · enter open · s save · r reload · ? help",
+            "j k role · tab field · enter open · s save · d remove · ? help",
+            "j k row · a add · d delete · enter edit · esc close",
+            "type filter · enter apply · esc close",
+            "enter apply · esc cancel",
+        ] {
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
+        }
     }
 }
