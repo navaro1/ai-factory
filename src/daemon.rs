@@ -1184,39 +1184,65 @@ impl Daemon {
     }
 
     /// True when the task before this one still owns the same work.
+    fn prior_stage_active(&self, task: &Task) -> bool {
+        self.prior_stage_blocker(task).is_some()
+    }
+
+    /// True when `prior` still owns the work that `task` waits for.
     ///
     /// An agent updates GitHub before its runner result arrives. The next gate
     /// can therefore open first. This guard prevents two stages from using one
     /// issue at the same time and prevents a release from beating its review.
-    fn prior_stage_active(&self, task: &Task) -> bool {
-        self.table.by_id.values().any(|prior| {
-            prior.state != TaskState::Done
-                && match task.stage {
-                    Stage::Refine => false,
-                    Stage::Implement => {
-                        prior.repo == task.repo
-                            && prior.stage == Stage::Refine
-                            && prior.kind == ItemKind::Issue
-                            && prior.number == task.number
-                    }
-                    Stage::Review => {
-                        prior.repo == task.repo
-                            && prior.stage == Stage::Implement
-                            && self
-                                .review_tickets
-                                .get(&task.id)
-                                .is_some_and(|tickets| tickets.contains(&prior.number))
-                    }
-                    Stage::Release => {
-                        prior.repo == task.repo
-                            && prior.stage == Stage::Review
-                            && self
-                                .release_batches
-                                .get(&task.id)
-                                .is_some_and(|prs| prs.contains(&prior.number))
-                    }
+    /// A failed prior task holds the gate too, because its stage never
+    /// finished the work.
+    fn holds_prior_stage(&self, task: &Task, prior: &Task) -> bool {
+        prior.state != TaskState::Done
+            && match task.stage {
+                Stage::Refine => false,
+                Stage::Implement => {
+                    prior.repo == task.repo
+                        && prior.stage == Stage::Refine
+                        && prior.kind == ItemKind::Issue
+                        && prior.number == task.number
                 }
-        })
+                Stage::Review => {
+                    prior.repo == task.repo
+                        && prior.stage == Stage::Implement
+                        && self
+                            .review_tickets
+                            .get(&task.id)
+                            .is_some_and(|tickets| tickets.contains(&prior.number))
+                }
+                Stage::Release => {
+                    prior.repo == task.repo
+                        && prior.stage == Stage::Review
+                        && self
+                            .release_batches
+                            .get(&task.id)
+                            .is_some_and(|prs| prs.contains(&prior.number))
+                }
+            }
+    }
+
+    /// The id of the task before this one that still owns the same work.
+    ///
+    /// A failed blocker wins over every other one. It never finishes on its
+    /// own, so it is the task the human must act on. A batch can hold one
+    /// running review and one failed review at the same time; the running
+    /// one ends by itself, and only the failed one stops the release for
+    /// good. The table is a `BTreeMap`, so both choices are stable.
+    fn prior_stage_blocker(&self, task: &Task) -> Option<String> {
+        let mut active: Option<&str> = None;
+        for prior in self.table.by_id.values() {
+            if !self.holds_prior_stage(task, prior) {
+                continue;
+            }
+            if matches!(prior.state, TaskState::Failed(_)) {
+                return Some(prior.id.clone());
+            }
+            active.get_or_insert(prior.id.as_str());
+        }
+        active.map(str::to_string)
     }
 
     /// Start one queued task: ensure the worktree, render the prompt, start
@@ -2378,7 +2404,39 @@ impl Daemon {
     ///
     /// A task with no session id and no marker needs a new session. A task
     /// with a spent session needs an action that fits its current state.
+    ///
+    /// A queued task that a prior stage holds names that blocker. Without
+    /// the name the human sees a task that never starts and no cause. This
+    /// is the one place the session view can carry the cause, so it does.
+    ///
+    /// A failed blocker never finishes on its own, and it holds the queued
+    /// task forever. Only that case names an action, because only a failed
+    /// task takes a retry. A blocker that still runs needs no action.
+    ///
+    /// The action names the board, not the inbox. A failed task keeps an
+    /// inbox row only when it spent every attempt. `cancel_task` drops the
+    /// row of the task it cancels, so an aborted task and a cancelled stuck
+    /// row both rest in `Failed` with no row at all. The `R` key of the
+    /// board retries any failed task and needs no row.
     fn closed_reason(&self, task: &Task, has_session: bool) -> String {
+        if task.state == TaskState::Queued {
+            if let Some(blocker) = self.prior_stage_blocker(task) {
+                let stuck = self
+                    .table
+                    .by_id
+                    .get(&blocker)
+                    .is_some_and(|prior| matches!(prior.state, TaskState::Failed(_)));
+                let action = if stuck {
+                    " That task failed. Press R on its pipeline row to retry it."
+                } else {
+                    ""
+                };
+                return format!(
+                    "The task \"{}\" waits for task \"{blocker}\" to finish.{action}",
+                    task.id,
+                );
+            }
+        }
         if !has_session {
             let action = match task.state {
                 TaskState::Queued => "Send a message after the task runs once.",
@@ -7428,6 +7486,16 @@ mod tests {
         rig.poll(vec![], vec![pr(5, false, &[])]);
 
         assert_eq!(rig.job_count(), 1, "release waits for the review result");
+        let release = rig.task("borsuk/release");
+        assert_eq!(
+            rig.daemon.input_mode(&release),
+            InputMode::Closed {
+                reason: "The task \"borsuk/release\" waits for task \"borsuk/review-p5\" \
+                         to finish."
+                    .to_string()
+            },
+            "a running blocker needs no action, so the reason names none"
+        );
         rig.event(turn_finished("borsuk/review-p5", true, "approved"));
         assert_eq!(rig.job_count(), 2);
         assert_eq!(rig.job(1).task, "borsuk/release");
@@ -7468,6 +7536,130 @@ mod tests {
         assert_eq!(release.state, TaskState::Queued);
         assert_eq!(release.attempt, 1, "the release never reached dispatch");
         assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());
+        assert_eq!(
+            rig.daemon.input_mode(&release),
+            InputMode::Closed {
+                reason: "The task \"borsuk/release\" waits for task \"borsuk/review-p5\" \
+                         to finish. That task failed. Press R on its pipeline row to retry it."
+                    .to_string()
+            },
+            "the session view must name the task that holds the release"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_stuck_review_still_names_a_recovery_the_human_can_reach() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        for _ in 0..3 {
+            rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+            rig.event(exited("borsuk/review-p5", false, "review failed"));
+        }
+
+        // The human answers Cancel on the stuck row. The review stays failed,
+        // so it still holds the release, but its inbox row is gone.
+        rig.act(Action::Answer {
+            decision_id: "stuck:borsuk/review-p5:3".to_string(),
+            response: Response::Cancel,
+        });
+
+        assert!(
+            rig.decision("stuck:borsuk/review-p5:3").is_none(),
+            "the cancel drops the inbox row"
+        );
+        assert!(
+            matches!(rig.task("borsuk/review-p5").state, TaskState::Failed(_)),
+            "the cancelled review stays failed, so it still holds the release"
+        );
+        let release = rig.task("borsuk/release");
+        assert_eq!(release.state, TaskState::Queued);
+        let InputMode::Closed { reason } = rig.daemon.input_mode(&release) else {
+            panic!("a queued release takes no message");
+        };
+        assert!(
+            reason.contains("Press R on its pipeline row"),
+            "the named recovery must not be the inbox, which now holds nothing: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_release_names_the_failed_review_over_the_running_one() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        for _ in 0..3 {
+            rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+            rig.event(exited("borsuk/review-p5", false, "review failed"));
+        }
+
+        // A second review of the same batch still runs. Its id sorts before
+        // the failed one, so a plain scan would name it and offer no action.
+        let log = rig.task("borsuk/review-p5").log_path.clone();
+        rig.daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Pr,
+                3,
+                log,
+                rig.daemon.now_ms,
+            )
+            .unwrap()
+            .state = TaskState::Running;
+        rig.daemon
+            .release_batches
+            .insert("borsuk/release".to_string(), vec![3, 5]);
+
+        let release = rig.task("borsuk/release");
+        assert!(
+            rig.daemon.table.by_id.contains_key("borsuk/review-p3"),
+            "the running review must sort before the failed one"
+        );
+        assert_eq!(
+            rig.daemon.input_mode(&release),
+            InputMode::Closed {
+                reason: "The task \"borsuk/release\" waits for task \"borsuk/review-p5\" \
+                         to finish. That task failed. Press R on its pipeline row to retry it."
+                    .to_string()
+            },
+            "a failed blocker never ends by itself, so it wins over a running one"
+        );
     }
 
     #[test]
