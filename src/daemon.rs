@@ -1823,7 +1823,9 @@ impl Daemon {
     ///
     /// The requeue that leads into the last attempt also drops every saved
     /// session identity, so the last attempt starts fresh instead of
-    /// repeating a resume the harness already refused twice.
+    /// repeating a resume the harness already refused twice. A task that
+    /// holds a queued chat message keeps its session; see
+    /// [`Daemon::drop_saved_session`].
     fn fail_task(&mut self, id: &str, reason: &str) {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
@@ -1861,12 +1863,23 @@ impl Daemon {
 
     /// Drop every saved session identity of one task.
     ///
-    /// Two failed resumes mean the harness no longer knows the session: it
-    /// was purged, the worktree was rebuilt, or the harness was
-    /// reinstalled. The last attempt then starts a fresh session. The next
-    /// `Started` event saves the new identity again, so the session stays
-    /// resumable after a restart.
+    /// The task failed twice, and the second run carried the saved session.
+    /// The harness no longer knows that session: it was purged, the
+    /// worktree was rebuilt, or the harness was reinstalled. The last
+    /// attempt then starts a fresh session. The next `Started` event saves
+    /// the new identity again, so the session stays resumable after a
+    /// restart.
+    ///
+    /// A queued chat message names that same session, and
+    /// [`Daemon::resume_pending_chats`] discards every queued message of a
+    /// task it cannot resume. The drop therefore waits while a chat waits,
+    /// like the `Done` path and the cancel path that both keep the marker
+    /// for a pending chat. The retry resumes the saved session instead, and
+    /// the operator sees a stuck row when that resume fails again.
     fn drop_saved_session(&mut self, id: &str) {
+        if self.pending_chats.contains_key(id) {
+            return;
+        }
         let Some(task) = self.table.by_id.get_mut(id) else {
             return;
         };
@@ -5167,6 +5180,46 @@ mod tests {
         assert!(rig.decision("stuck:borsuk/implement-i142:3").is_some());
         assert_eq!(rig.task("borsuk/implement-i142").session_id, None);
         assert_eq!(marker(&rig), None);
+    }
+
+    #[test]
+    fn a_queued_chat_message_keeps_the_saved_session_of_the_last_attempt() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 3);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 2);
+
+        // The operator types while attempt 2 runs. A one-shot harness takes
+        // no live input, so the message waits for the next turn.
+        assert!(rig.daemon.chat("borsuk/implement-i142", "check the parser"));
+
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
+        assert_eq!(
+            rig.task("borsuk/implement-i142").session_id.as_deref(),
+            Some("ses-142"),
+            "the queued message names the saved session, so the drop waits"
+        );
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(
+            rig.job(2).prompt,
+            "check the parser",
+            "the last attempt carries the typed message, not a fresh stage prompt"
+        );
+        assert_eq!(
+            rig.job(2).resume.as_deref(),
+            Some("ses-142"),
+            "the follow-up turn resumes the session the message names"
+        );
+        assert!(
+            !rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the delivered message leaves no queue behind"
+        );
     }
 
     #[test]
