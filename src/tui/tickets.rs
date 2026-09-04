@@ -1720,6 +1720,7 @@ mod tests {
             log_path: format!("/tmp/{repo}-ticket-{number}.jsonl").into(),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+            binding: None,
         }
     }
 

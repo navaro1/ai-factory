@@ -3135,6 +3135,7 @@ mod tests {
             log_path: log_path.to_path_buf(),
             input: InputMode::Live,
             queued_messages: 0,
+            binding: None,
         }
     }
 

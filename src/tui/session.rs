@@ -61,7 +61,7 @@ use serde_json::Value;
 
 use super::theme::THEME;
 use crate::decisions::{Decision, DecisionKind};
-use crate::sock::{Action, InputMode, TaskView};
+use crate::sock::{Action, InputMode, RoleBindingView, TaskView};
 use crate::tui::transcript::{self, Entry};
 
 /// How many parsed items the transcript ring buffer keeps.
@@ -308,6 +308,16 @@ fn input_hint(mode: &InputMode) -> String {
         InputMode::Follow => "enter send · starts a follow-up turn".to_string(),
         InputMode::Closed { reason } => reason.clone(),
     }
+}
+
+/// The ` · harness · model` header segment of one bound role, plus
+/// ` · variant` when the harness takes one.
+fn binding_segment(binding: &RoleBindingView) -> String {
+    let mut text = format!(" · {} · {}", binding.harness.program(), binding.model);
+    if let Some(effort) = &binding.effort {
+        text.push_str(&format!(" · {effort}"));
+    }
+    text
 }
 
 /// The session view: the transcript, the input bar, and the pending asks.
@@ -653,8 +663,9 @@ impl SessionView {
     /// The one-row header above the transcript.
     ///
     /// With two or more live sessions the header is the tab strip: one
-    /// label per live session, the shown one bright, with its attempt and
-    /// queued count at the end. Every other case is the plain task line.
+    /// label per live session, the shown one bright, with its attempt,
+    /// queued count, and bound role at the end. Every other case is the
+    /// plain task line.
     ///
     /// A shown task with no live session takes the plain line too. The
     /// strip would highlight no label. It would also hang the attempt of
@@ -663,8 +674,19 @@ impl SessionView {
     ///
     /// A view with no shown task keeps the strip. The strip hides nothing
     /// there, and it lists where the tab keys lead.
+    ///
+    /// Both branches end with the bound role of the shown task: the
+    /// harness, the model, and the variant. The values come from
+    /// `self.task`, so every state push and every tab switch updates
+    /// them at once. A task without a binding, such as a queued task,
+    /// shows no role text.
     fn header_line(&self) -> Line<'static> {
         let dim = transcript::dim_style();
+        let binding = self
+            .task
+            .as_ref()
+            .and_then(|task| task.binding.as_ref())
+            .map(binding_segment);
         let shown_is_hidden = self
             .task
             .as_ref()
@@ -691,6 +713,9 @@ impl SessionView {
                     info.push_str(&format!(" · {} queued", task.queued_messages));
                 }
                 spans.push(Span::styled(info, dim));
+                if let Some(segment) = binding {
+                    spans.push(Span::styled(segment, dim));
+                }
             }
             return Line::from(spans);
         }
@@ -699,6 +724,9 @@ impl SessionView {
                 let mut text = format!("{} · {} · attempt {}", task.id, task.state, task.attempt);
                 if task.queued_messages > 0 {
                     text.push_str(&format!(" · {} queued", task.queued_messages));
+                }
+                if let Some(segment) = binding {
+                    text.push_str(&segment);
                 }
                 Line::styled(text, dim)
             }
@@ -850,6 +878,7 @@ mod tests {
             log_path: path.to_path_buf(),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+            binding: None,
         }
     }
 
@@ -1322,6 +1351,122 @@ mod tests {
         assert!(screen.contains("enter send"), "hint: {screen}");
     }
 
+    /// Render the view at `width` by `height` and return the screen text.
+    fn draw_screen(view: &SessionView, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, Rect::new(0, 0, width, height), &[]))
+            .unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// The sample task bound to one opencode role.
+    fn bound_task(path: &Path, effort: Option<&str>) -> TaskView {
+        let mut task = sample_task(path);
+        task.binding = Some(crate::sock::RoleBindingView {
+            harness: crate::config::Harness::Opencode,
+            model: "zai-coding-plan/glm-5.3-flash".to_string(),
+            effort: effort.map(|value| value.to_string()),
+        });
+        task
+    }
+
+    #[test]
+    fn the_header_shows_the_bound_harness_model_and_variant() {
+        let dir = TempDir::new("bound");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&bound_task(&log, Some("xhigh")));
+
+        let screen = draw_screen(&view, 120, 10);
+
+        assert!(
+            screen.contains("opencode · zai-coding-plan/glm-5.3-flash · xhigh"),
+            "header: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_header_ends_at_the_model_when_the_role_takes_no_variant() {
+        let dir = TempDir::new("no-variant");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&bound_task(&log, None));
+
+        let screen = draw_screen(&view, 120, 10);
+
+        assert!(
+            screen.contains("opencode · zai-coding-plan/glm-5.3-flash"),
+            "header: {screen}"
+        );
+        assert!(!screen.contains("xhigh"), "header: {screen}");
+    }
+
+    #[test]
+    fn the_header_shows_no_role_text_for_a_task_without_a_binding() {
+        let dir = TempDir::new("unbound");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+
+        let screen = draw_screen(&view, 120, 10);
+
+        assert!(!screen.contains("opencode"), "header: {screen}");
+        assert!(!screen.contains("glm-5.3-flash"), "header: {screen}");
+    }
+
+    #[test]
+    fn the_tab_strip_tails_with_the_shown_tasks_bound_role() {
+        let dir = TempDir::new("tabs");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&bound_task(&log, Some("xhigh")));
+        view.set_tabs(vec![
+            "borsuk/refine-i140".to_string(),
+            "borsuk/implement-i142".to_string(),
+        ]);
+
+        let screen = draw_screen(&view, 160, 10);
+
+        assert!(
+            screen.contains(" │ "),
+            "the header must be the strip: {screen}"
+        );
+        assert!(
+            screen.contains("opencode · zai-coding-plan/glm-5.3-flash · xhigh"),
+            "header: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_header_takes_the_role_of_the_task_the_next_show_brings() {
+        let dir = TempDir::new("swap");
+        let mut view = SessionView::new();
+        view.show(&bound_task(&dir.path().join("first.jsonl"), Some("xhigh")));
+        let screen = draw_screen(&view, 120, 10);
+        assert!(
+            screen.contains("opencode · zai-coding-plan/glm-5.3-flash · xhigh"),
+            "header: {screen}"
+        );
+
+        // Every state push and every tab switch calls `show` again. The
+        // header takes the new task's role and drops the old one.
+        let mut other = sample_task(&dir.path().join("second.jsonl"));
+        other.id = "borsuk/refine-i140".to_string();
+        other.binding = Some(crate::sock::RoleBindingView {
+            harness: crate::config::Harness::Claude,
+            model: "opus-5".to_string(),
+            effort: None,
+        });
+        view.show(&other);
+
+        let screen = draw_screen(&view, 120, 10);
+        assert!(screen.contains("claude · opus-5"), "header: {screen}");
+        assert!(!screen.contains("zai-coding-plan"), "header: {screen}");
+        assert!(!screen.contains("xhigh"), "header: {screen}");
+    }
+
     #[test]
     fn the_draw_marks_an_older_hidden_history() {
         let dir = TempDir::new("hidden");
@@ -1461,11 +1606,7 @@ mod tests {
 
     /// Render the view at 80 by 12 and return the visible text.
     fn drawn_screen(view: &SessionView) -> String {
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let area = Rect::new(0, 0, 80, 12);
-        terminal.draw(|frame| view.draw(frame, area, &[])).unwrap();
-        terminal.backend().to_string()
+        draw_screen(view, 80, 12)
     }
 
     /// Render the view and return the style of the input bar top border.

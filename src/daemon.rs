@@ -770,6 +770,7 @@ impl Daemon {
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
+            role_bindings: &self.role_bindings,
             now_ms: self.now_ms,
         };
         let mut view = match input.build() {
@@ -10958,6 +10959,50 @@ mod tests {
             .iter()
             .find(|task| task.id == id)
             .unwrap_or_else(|| panic!("the view must carry the task {id}"))
+    }
+
+    #[test]
+    fn the_pushed_view_carries_the_live_role_binding_of_each_task() {
+        let mut rig = Rig::make(vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+
+        // The poll queues the refine task, and the drive starts it. The
+        // start binds the role, and the view carries that binding.
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        let view = last_view(&push_rx);
+        let task = pushed_task(&view, "borsuk/refine-i142");
+        assert_eq!(task.state, TaskState::Running);
+        let binding = task
+            .binding
+            .as_ref()
+            .expect("a running task ships its binding");
+        assert_eq!(binding.harness, Harness::Claude);
+        assert_eq!(binding.model, "m");
+        assert_eq!(binding.effort, None);
+
+        // The issue flips to refined, and the turn ends in success. The
+        // task completes. The binding survives the end of the task, so a
+        // finished task still shows what it ran with.
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+        let view = last_view(&push_rx);
+        let task = pushed_task(&view, "borsuk/refine-i142");
+        assert_eq!(task.state, TaskState::Done);
+        assert!(task.binding.is_some());
+
+        // A refine request replaces the terminal task. The replacement
+        // holds no binding until its own first run.
+        rig.act(Action::Refine {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+        });
+        let view = last_view(&push_rx);
+        let task = pushed_task(&view, "borsuk/refine-i142");
+        assert_eq!(task.state, TaskState::Queued);
+        assert_eq!(task.binding, None);
     }
 
     #[test]

@@ -3686,6 +3686,7 @@ mod tests {
             log_path: PathBuf::from("borsuk-refine-i140.jsonl"),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+            binding: None,
         });
         run_messages(
             &mut surface,
@@ -3770,6 +3771,7 @@ mod tests {
             log_path: PathBuf::from("ryba-refine-i0.jsonl"),
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
+            binding: None,
         });
         run_messages(
             &mut surface,
