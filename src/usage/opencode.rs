@@ -31,6 +31,10 @@ pub(crate) fn probe_zen(_exec: &dyn Exec, _token: &str, _now_ms: u64) -> Result<
 /// A provider without a quota endpoint still gets a record: the factory
 /// spend always shows, and an admin environment variable may add the
 /// organization costs.
-pub(crate) fn probe_other_provider(_provider: &str, _now_ms: u64) -> Result<UsageRecord> {
+pub(crate) fn probe_other_provider(
+    _exec: &dyn Exec,
+    _provider: &str,
+    _now_ms: u64,
+) -> Result<UsageRecord> {
     Err(anyhow::anyhow!("not implemented"))
 }

@@ -312,7 +312,7 @@ pub fn run_probe(exec: &dyn Exec, identity: &Identity, now_ms: u64) -> Result<Us
                 .ok_or_else(|| anyhow!("no opencode auth entry for opencode"))?;
             opencode::probe_zen(exec, &token, now_ms)
         }
-        provider => opencode::probe_other_provider(provider, now_ms),
+        provider => opencode::probe_other_provider(exec, provider, now_ms),
     }
 }
 
