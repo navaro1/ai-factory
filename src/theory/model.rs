@@ -126,7 +126,7 @@ impl std::error::Error for ModelError {}
 #[serde(deny_unknown_fields)]
 struct RawModel {
     #[serde(default)]
-    entry: Vec<RawEntry>,
+    entry: Vec<toml::Value>,
 }
 
 /// The permissive input shape. Every field is optional, because the parser
@@ -181,14 +181,22 @@ pub fn parse(text: &str) -> Result<Model, ModelError> {
     })?;
     let mut ids = BTreeSet::new();
     let mut entries = Vec::with_capacity(raw.entry.len());
-    for (index, raw) in raw.entry.iter().enumerate() {
-        let id = match raw.id.as_deref() {
+    for (index, value) in raw.entry.into_iter().enumerate() {
+        let id = match value
+            .as_table()
+            .and_then(|table| table.get("id"))
+            .and_then(toml::Value::as_str)
+        {
             Some(id) if !id.trim().is_empty() => id.to_string(),
             _ => return Err(error(None, format!("entry {index}: id is required"))),
         };
         if !ids.insert(id.clone()) {
             return Err(error(Some(&id), "duplicate entry id"));
         }
+        let raw: RawEntry = value
+            .try_into()
+            .map_err(|e| error(Some(&id), format!("invalid entry: {e}")))?;
+        debug_assert_eq!(raw.id.as_deref(), Some(id.as_str()));
         let title = required_text(raw.title.as_deref(), &id, "title is required")?;
         let statement = required_text(raw.statement.as_deref(), &id, "statement is required")?;
         let kind = raw.kind.as_deref().unwrap_or_default().to_string();
@@ -251,10 +259,10 @@ pub fn parse(text: &str) -> Result<Model, ModelError> {
             }
             other => return Err(error(Some(&id), format!("unknown kind \"{other}\""))),
         };
-        reject_foreign_fields(raw, &entry)?;
+        reject_foreign_fields(&raw, &entry)?;
         entries.push(entry);
     }
-    check_references(&raw.entry, &entries)?;
+    check_references(&entries)?;
     Ok(Model { entries })
 }
 
@@ -302,7 +310,7 @@ fn two_sides(value: Option<&Vec<String>>, id: &str) -> Result<Vec<String>, Model
 }
 
 /// Check every reference against the ids of the first pass.
-fn check_references(_raw: &[RawEntry], entries: &[Entry]) -> Result<(), ModelError> {
+fn check_references(entries: &[Entry]) -> Result<(), ModelError> {
     let kinds: BTreeSet<(&str, &str)> = entries
         .iter()
         .map(|entry| (entry.id(), entry.kind_name()))
@@ -502,6 +510,24 @@ mod tests {
             )
         );
         assert_eq!(err(&text), "S-1: from is not allowed on kind state");
+    }
+
+    #[test]
+    fn a_later_deserialization_error_does_not_hide_an_earlier_entry_error() {
+        let first = "[[entry]]\nkind = \"state\"\nid = \"S-1\"\nstatement = \"statement\"\n";
+        let wrong_type = entry("state", "S-2", "").replace("title = \"S-2 title\"", "title = 2");
+        for later in [entry("state", "S-2", "typo = true"), wrong_type] {
+            assert_eq!(err(&format!("{first}{later}")), "S-1: title is required");
+        }
+    }
+
+    #[test]
+    fn an_entry_deserialization_error_names_its_id() {
+        let wrong_type = entry("state", "S-2", "").replace("title = \"S-2 title\"", "title = 2");
+        for text in [entry("state", "S-2", "typo = true"), wrong_type] {
+            let parsed = parse(&text).expect_err("the invalid entry must fail");
+            assert_eq!(parsed.entry.as_deref(), Some("S-2"));
+        }
     }
 
     #[test]
