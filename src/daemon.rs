@@ -2120,6 +2120,19 @@ impl Daemon {
     /// all. This line is the reason the operator sees there. A write failure
     /// goes to standard error and never masks the dispatch failure.
     fn log_dispatch_failure(&self, task: &Task, reason: &str) {
+        self.append_task_log(task, &format!("aif: dispatch failed: {reason}\n"));
+    }
+
+    /// Append one complete line to the log of the task.
+    ///
+    /// The caller supplies the trailing newline. The runner tees its own
+    /// output into the same file in append mode, so both writers add to the
+    /// end and neither one truncates the other. Every daemon-side append
+    /// goes through this one helper, so no site drifts.
+    ///
+    /// A failure goes to standard error and returns. The log is a record,
+    /// never a control path: a full disk must not fail a dispatch or a chat.
+    fn append_task_log(&self, task: &Task, line: &str) {
         if let Some(parent) = task.log_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = fs::create_dir_all(parent) {
@@ -2128,7 +2141,6 @@ impl Daemon {
                 }
             }
         }
-        let line = format!("aif: dispatch failed: {reason}\n");
         let opened = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2763,7 +2775,10 @@ impl Daemon {
     /// message while another task that owns the same exclusive worktree is
     /// active. It also refuses a task with no session id and no session
     /// marker.
-    /// The result is true when the daemon delivered or queued the message.
+    /// Every accepted message also gets one durable user line in the task
+    /// log, so the transcript keeps what the human typed across session
+    /// switches, refocus, and restarts. The result is true when the daemon
+    /// delivered or queued the message.
     fn chat(&mut self, id: &str, text: &str) -> bool {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             eprintln!("the chat message for {id}: no such task");
@@ -2778,6 +2793,7 @@ impl Daemon {
             if let Some(session) = self.sessions.get_mut(id) {
                 match session.send_user(text) {
                     Ok(()) => {
+                        self.log_chat_line(&task, text);
                         self.last_event_ms.insert(id.to_string(), self.now_ms);
                         if task.state == TaskState::AwaitingUser {
                             if let Err(error) =
@@ -2791,6 +2807,7 @@ impl Daemon {
                     }
                     Err(error) => {
                         eprintln!("the chat message for {id}: {error:#}");
+                        self.log_chat_line(&task, text);
                         // The process can exit before its event reaches the
                         // daemon. Keep the message for the resumed turn.
                         self.pending_chats
@@ -2830,6 +2847,7 @@ impl Daemon {
             .entry(id.to_string())
             .or_default()
             .push(text.to_string());
+        self.log_chat_line(&task, text);
         // The queued count rides on the state view, so the queueing marks
         // the state dirty even when the task state stays as it was.
         self.changed = true;
@@ -2842,6 +2860,34 @@ impl Daemon {
             self.decisions.drop_for_task(id);
         }
         true
+    }
+
+    /// Append one user line for an accepted chat message to the task log.
+    ///
+    /// The line uses the claude user shape, so the transcript parser of
+    /// every harness renders it as the human voice. The runner itself never
+    /// echoes a typed message into the log, so this line is the only
+    /// durable record of the text.
+    ///
+    /// `chat` calls this exactly once per accepted message: on the live
+    /// delivery success, on the live delivery failure, and on the queue
+    /// path. `resume_pending_chats` calls it never, because the queue path
+    /// already wrote the line. A refused message writes nothing.
+    ///
+    /// The daemon sends two messages of its own through `chat`: the ticket
+    /// refinement handoff and the applied-proposal note. The agent receives
+    /// both as user text, so both get the same line and the transcript
+    /// stays a true record of the conversation.
+    fn log_chat_line(&self, task: &Task, text: &str) {
+        // `serde_json` escapes the text, so a quotation mark, a backslash,
+        // or a newline stays inside one JSON line.
+        let content = serde_json::Value::String(text.to_string());
+        self.append_task_log(
+            task,
+            &format!(
+                "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":{content}}}}}\n"
+            ),
+        );
     }
 
     /// The item whose workspace a review task runs in.
@@ -6492,6 +6538,13 @@ mod tests {
                 .daemon
                 .pending_chats
                 .contains_key("borsuk/implement-i142"));
+            assert_eq!(
+                logged_lines(&first.task("borsuk/implement-i142").log_path),
+                vec![
+                    r#"{"type":"user","message":{"role":"user","content":"add a regression test"}}"#
+                ],
+                "the queue path logged the user line before the restart"
+            );
             first.drive();
         }
 
@@ -8207,7 +8260,17 @@ mod tests {
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 2);
         assert!(sends.iter().all(|text| text.contains("refinement")));
+        drop(sends);
         assert!(!rig.daemon.table.by_id.contains_key("borsuk/refine-i7"));
+        // The agent received each handoff as user text, so each handoff
+        // gets the same durable line as a typed message. The transcript
+        // stays a true record of the conversation.
+        let logged = logged_lines(&rig.task("borsuk/ticket-i7").log_path);
+        assert_eq!(logged.len(), 2, "each handoff wrote one user line");
+        assert!(
+            logged.iter().all(|line| line.contains("to-refine label")),
+            "the handoff text reaches the transcript: {logged:?}"
+        );
     }
 
     #[test]
@@ -10397,6 +10460,222 @@ mod tests {
         assert_eq!(rig.job_count(), 2, "the lift starts the follow-up");
         assert_eq!(rig.job(1).prompt, "add a regression test");
         assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
+    }
+
+    // ------------------------------------------------------------------
+    // The chat user line in the task log
+    // ------------------------------------------------------------------
+
+    /// The lines of one task log. A log that no writer created yet holds
+    /// no lines, so a refusal and an absent file read the same.
+    fn logged_lines(log: &Path) -> Vec<String> {
+        match fs::read_to_string(log) {
+            Ok(text) => text.lines().map(str::to_string).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("the task log {log:?} must be readable: {error}"),
+        }
+    }
+
+    #[test]
+    fn a_live_chat_writes_one_user_line_into_the_task_log() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "continue with Postgres".to_string(),
+        });
+
+        assert_eq!(
+            rig.session(0).sends.lock().unwrap().as_slice(),
+            &["continue with Postgres".to_string()]
+        );
+        let log = rig.task("borsuk/refine-i142").log_path;
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.ends_with('\n'), "the line ends with a newline");
+        assert_eq!(
+            logged_lines(&log),
+            vec![r#"{"type":"user","message":{"role":"user","content":"continue with Postgres"}}"#],
+            "the live success appends exactly one user line"
+        );
+    }
+
+    #[test]
+    fn a_failed_live_send_still_writes_one_user_line() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        rig.session(0).fail_send.store(true, Ordering::SeqCst);
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "queued for the resumed turn".to_string(),
+        });
+
+        assert!(rig.session(0).sends.lock().unwrap().is_empty());
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/refine-i142")
+                .map(Vec::as_slice),
+            Some(&["queued for the resumed turn".to_string()][..])
+        );
+        let log = rig.task("borsuk/refine-i142").log_path;
+        assert_eq!(
+            logged_lines(&log),
+            vec![
+                r#"{"type":"user","message":{"role":"user","content":"queued for the resumed turn"}}"#
+            ],
+            "the live failure appends exactly one user line"
+        );
+    }
+
+    #[test]
+    fn a_queued_chat_writes_one_user_line_into_the_task_log() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["add a regression test".to_string()][..])
+        );
+        let log = rig.task("borsuk/implement-i142").log_path;
+        assert_eq!(
+            logged_lines(&log),
+            vec![r#"{"type":"user","message":{"role":"user","content":"add a regression test"}}"#],
+            "the queue path appends exactly one user line"
+        );
+    }
+
+    #[test]
+    fn the_logged_chat_line_reads_back_as_the_typed_text() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        // A quotation mark, a backslash, a newline, and a wide character
+        // must all stay inside one JSON line.
+        let typed = "use \"psql\"\nnot C:\\tools\\psql — ok?";
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: typed.to_string(),
+        });
+
+        let lines = logged_lines(&rig.task("borsuk/refine-i142").log_path);
+        assert_eq!(lines.len(), 1, "the typed newline never splits the record");
+        assert_eq!(
+            crate::tui::transcript::parse(&lines[0]),
+            vec![crate::tui::transcript::Entry::User {
+                text: typed.to_string()
+            }],
+            "the session view reads back the exact typed text"
+        );
+    }
+
+    #[test]
+    fn a_chat_without_a_task_or_a_session_writes_no_user_line() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert!(
+            !rig.daemon.chat("borsuk/implement-i999", "no such task"),
+            "an unknown task takes no message"
+        );
+
+        // The run started, but no event reported a session id yet, and the
+        // worktree holds no session marker.
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.session_id, None);
+        assert!(
+            !rig.daemon
+                .chat("borsuk/implement-i142", "there is no session"),
+            "a task without a session takes no message"
+        );
+        assert!(
+            logged_lines(&task.log_path).is_empty(),
+            "a refused message leaves the log empty"
+        );
+    }
+
+    #[test]
+    fn a_worktree_hold_refuses_the_chat_and_writes_no_user_line() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.job_count(), 2, "the review gate opened");
+        // The review of the linked pull request owns the issue worktree.
+        rig.event(started("borsuk/review-p7", "sid-7"));
+
+        let task = rig.task("borsuk/implement-i142");
+        assert!(rig.daemon.sibling_refusal(&task).is_some());
+        assert!(
+            !rig.daemon
+                .chat("borsuk/implement-i142", "adjust the implementation"),
+            "the worktree hold takes no message"
+        );
+
+        assert!(
+            logged_lines(&task.log_path).is_empty(),
+            "the worktree hold leaves the log empty"
+        );
+    }
+
+    #[test]
+    fn a_closed_input_appends_no_second_user_line() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        // A ticket chat of the same issue works in the shared checkout, so
+        // it holds no worktree. It is a prior stage, so it holds the turn.
+        let chat_log = rig
+            .daemon
+            .log_path("borsuk", Stage::Refine, ItemKind::Issue, 142);
+        rig.daemon
+            .table
+            .upsert_ticket_chat("borsuk", 142, chat_log, rig.daemon.now_ms)
+            .unwrap();
+        rig.act(Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "extend the change".to_string(),
+        });
+        let log = rig.task("borsuk/implement-i142").log_path;
+        assert_eq!(logged_lines(&log).len(), 1, "the first chat wrote its line");
+
+        // The reopen queued the task. A queued task takes no message.
+        let queued = rig.task("borsuk/implement-i142");
+        assert_eq!(queued.state, TaskState::Queued);
+        assert!(matches!(
+            rig.daemon.input_mode(&queued),
+            InputMode::Closed { .. }
+        ));
+        assert!(
+            !rig.daemon
+                .chat("borsuk/implement-i142", "and one more thing"),
+            "the closed input takes no message"
+        );
+
+        assert_eq!(
+            logged_lines(&log),
+            vec![r#"{"type":"user","message":{"role":"user","content":"extend the change"}}"#],
+            "the closed input appends nothing to the earlier line"
+        );
     }
 
     // ------------------------------------------------------------------

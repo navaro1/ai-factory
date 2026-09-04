@@ -7,10 +7,12 @@
 //! [`crate::tui::transcript`] and keeps the last [`RING_CAP`] items in a
 //! ring buffer.
 //!
-//! The log carries no user lines: the claude CLI writes no typed message
-//! into its output stream. The view echoes each sent message into the ring
-//! itself, so the transcript shows what the human typed. The echo lives
-//! only in the ring; a task switch drops it.
+//! The daemon appends one user line to the log for every chat message it
+//! accepts, so the transcript keeps what the human typed across task
+//! switches, refocus, and restarts. The runner itself echoes no typed
+//! message into its output stream; the daemon's line is the only record.
+//! The view carries no local echo: the log tail delivers the user line at
+//! the next poll.
 //!
 //! The input bar states what a typed message will do. The daemon says the
 //! mode with [`TaskView::input`]; the bar renders a hint for that mode. A
@@ -521,9 +523,13 @@ impl SessionView {
     /// `page` is the visible transcript height in rows; the shell passes
     /// the pane height, and the view uses it as the PageUp and PageDown
     /// step. A focused bar takes the typing keys: typing feeds the input
-    /// bar, Enter sends one [`Action::Chat`] with the typed text and echoes
-    /// the text into the transcript, `ctrl-x` sends [`Action::Abort`],
-    /// PageUp and PageDown scroll, and End returns to following the tail.
+    /// bar, Enter sends one [`Action::Chat`] with the typed text, `ctrl-x`
+    /// sends [`Action::Abort`], PageUp and PageDown scroll, and End returns
+    /// to following the tail.
+    ///
+    /// Enter shows nothing at once. The daemon logs the accepted message,
+    /// and the log tail delivers that line to the transcript at the next
+    /// poll.
     ///
     /// An unfocused bar swallows typing and Enter and returns none,
     /// whatever the bar holds. `ctrl-x` and the scroll keys stay alive, so
@@ -549,11 +555,9 @@ impl SessionView {
                 if text.trim().is_empty() {
                     return None;
                 }
-                // The log file carries no user lines: the claude CLI never
-                // echoes a typed message into its output. The view echoes
-                // the sent text into the ring itself, so the transcript
-                // shows what the human typed.
-                self.ring.push(Entry::User { text: text.clone() });
+                // The daemon appends one user line to the log for every
+                // accepted message. The log tail delivers the line to the
+                // transcript at the next poll, so no local echo lives here.
                 Some(Action::Chat { task, text })
             }
             (KeyCode::Char(letter), modifiers)
@@ -1214,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_echoes_the_sent_message_into_the_transcript() {
+    fn enter_sends_the_chat_and_echoes_nothing_locally() {
         let dir = TempDir::new("echo");
         let log = dir.path().join("task.jsonl");
         let mut view = SessionView::new();
@@ -1237,17 +1241,14 @@ mod tests {
             })
         );
 
-        assert_eq!(view.ring.len(), 1);
-        assert_eq!(
-            view.ring.iter().next(),
-            Some(&Entry::User {
-                text: "steer".to_string()
-            })
+        assert!(
+            view.ring.is_empty(),
+            "the view echoes nothing; the daemon's log line is the only record"
         );
     }
 
     #[test]
-    fn the_draw_shows_the_sent_message_in_the_transcript() {
+    fn the_draw_shows_the_daemon_user_line_in_the_transcript() {
         let dir = TempDir::new("echo-draw");
         let log = dir.path().join("task.jsonl");
         let mut view = SessionView::new();
@@ -1257,10 +1258,90 @@ mod tests {
         }
         view.handle_key(key(KeyCode::Enter), 10);
 
+        // The daemon appends the user line for the accepted message; the
+        // log tail delivers it at the next poll.
+        fs::write(
+            &log,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        view.on_redraw(Instant::now());
+
+        assert_eq!(
+            view.ring.len(),
+            1,
+            "the tail delivers the user line exactly once"
+        );
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "hi".to_string()
+            }),
+            "the daemon line parses to the exact typed text"
+        );
+
         let screen = drawn_screen(&view);
         assert!(
             screen.contains("› hi"),
             "the sent message must show in the transcript: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_session_re_entry_keeps_the_user_line_and_renders_it_once() {
+        let dir = TempDir::new("re-entry");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        for press in [letter('h'), letter('i')] {
+            view.handle_key(press, 10);
+        }
+        view.handle_key(key(KeyCode::Enter), 10);
+        fs::write(
+            &log,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        view.on_redraw(Instant::now());
+        assert_eq!(view.ring.len(), 1);
+
+        // A switch to another session and back resets the ring, and the
+        // fresh tail of the same log restores the user line.
+        let mut other = sample_task(&dir.path().join("other.jsonl"));
+        other.id = "borsuk/refine-i7".to_string();
+        view.show(&other);
+        view.show(&sample_task(&log));
+        view.on_redraw(Instant::now());
+
+        assert_eq!(view.ring.len(), 1, "no duplicate after the re-entry");
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "hi".to_string()
+            })
+        );
+        let screen = drawn_screen(&view);
+        assert!(screen.contains("› hi"), "re-entry shows the line: {screen}");
+
+        // The ticket chat refocuses with a clear and a fresh show of the
+        // same task. That path restores the user line too.
+        view.clear();
+        assert!(view.ring.is_empty(), "the refocus empties the ring");
+        view.show(&sample_task(&log));
+        view.on_redraw(Instant::now());
+
+        assert_eq!(view.ring.len(), 1, "no duplicate after the refocus");
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "hi".to_string()
+            })
         );
     }
 
@@ -1727,12 +1808,9 @@ mod tests {
                 text: "hi".to_string(),
             })
         );
-        assert_eq!(
-            view.ring.iter().next(),
-            Some(&Entry::User {
-                text: "hi".to_string()
-            }),
-            "a queued message echoes into the transcript too"
+        assert!(
+            view.ring.is_empty(),
+            "the queued message leaves the echo to the daemon's log line"
         );
     }
 
