@@ -2844,6 +2844,7 @@ impl Daemon {
             return;
         };
         if let Err(error) = prompts::check(role, &text) {
+            self.refresh_prompts();
             self.push_settings_result(
                 request,
                 SettingsOperation::SavePrompt,
@@ -2854,6 +2855,7 @@ impl Daemon {
             return;
         }
         if let Err(error) = prompts::save(&self.prompts_dir, role, &text) {
+            self.refresh_prompts();
             self.push_settings_result(
                 request,
                 SettingsOperation::SavePrompt,
@@ -2864,7 +2866,9 @@ impl Daemon {
             return;
         }
         self.refresh_prompts();
-        let revision = config::file_revision(&text);
+        // The revision comes from the refreshed view, so the result and the
+        // view never name two different texts.
+        let revision = self.prompt_revision(role);
         self.push_settings_result(
             request,
             SettingsOperation::SavePrompt,
@@ -2904,11 +2908,12 @@ impl Daemon {
             return;
         }
         self.refresh_prompts();
+        debug_assert_eq!(self.prompt_revision(role), config::file_revision(builtin));
         self.push_settings_result(
             request,
             SettingsOperation::ResetPrompt,
             SettingsResultStatus::Saved,
-            config::file_revision(builtin),
+            self.prompt_revision(role),
             Some(format!(
                 "built-in prompt restored; the next {role} task uses it"
             )),
@@ -2931,6 +2936,13 @@ impl Daemon {
     ) -> Option<String> {
         let current = match prompts::load(&self.prompts_dir, role) {
             Ok(template) => template,
+            // An unreadable file has no revision to compare. A reset is the
+            // only way out of that state, so it proceeds and removes the
+            // file. A save still refuses: nothing may overwrite a file the
+            // daemon cannot read.
+            Err(_) if operation == SettingsOperation::ResetPrompt => {
+                return Some(self.prompt_revision(role))
+            }
             Err(error) => {
                 self.push_settings_result(
                     request.to_string(),
@@ -4117,6 +4129,14 @@ impl Daemon {
     ) -> Result<String> {
         let role = Self::execution_role(task);
         let template = self.prompt_template(role)?;
+        // A crash between the write and the rename can leave a blank file.
+        // An agent with no instructions is worse than a failed dispatch.
+        if template.trim().is_empty() {
+            bail!(
+                "the {role} prompt file {} is empty",
+                prompts::file_name(role).unwrap_or_default()
+            );
+        }
         let values = self.placeholder_values(task, repo_cfg, worktree)?;
         prompts::fill_template(&template, &values)
     }
@@ -12200,6 +12220,126 @@ mod tests {
         assert!(message.contains("{frobnicate}"), "{message}");
         assert!(message.contains("{pr_list}"), "{message}");
         assert!(!rig.prompts.join("release.md").exists());
+    }
+
+    /// A theory role has no prompt template. A client that outran the
+    /// daemon and sent a prompt action against one gets a named refusal,
+    /// and no file appears.
+    #[test]
+    fn a_prompt_action_against_a_theory_role_is_refused_by_name() {
+        let mut rig = Rig::make(vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        for (index, action) in [
+            Action::SavePrompt {
+                request: "theory-save".to_string(),
+                role: ExecutionRole::TheoryAudit,
+                base_revision: String::new(),
+                text: "audit the model\n".to_string(),
+            },
+            Action::ResetPrompt {
+                request: "theory-reset".to_string(),
+                role: ExecutionRole::TheoryChat,
+                base_revision: String::new(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rig.act(action);
+            let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+                panic!("the refusal must push a settings result");
+            };
+            assert_eq!(result.status, SettingsResultStatus::Failed);
+            let role = if index == 0 {
+                "theory.audit"
+            } else {
+                "theory.chat"
+            };
+            assert_eq!(
+                result.message.unwrap(),
+                format!("the {role} role has no prompt template")
+            );
+        }
+        assert!(!rig.prompts.exists(), "no prompt file was written");
+        assert!(rig
+            .daemon
+            .prompts
+            .iter()
+            .all(|view| prompts::file_name(view.role).is_some()));
+    }
+
+    /// A prompt file the daemon cannot read blocks a save, because nothing
+    /// may overwrite a text the daemon never saw. A reset still works: it
+    /// is the only way out of that state.
+    #[test]
+    fn a_reset_recovers_an_unreadable_prompt_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut rig = Rig::make(vec![]);
+        fs::create_dir_all(&rig.prompts).unwrap();
+        let path = rig.prompts.join("release.md");
+        fs::write(&path, "release {pr_list}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            // The root user reads every file, so the state under test
+            // cannot exist in this run.
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SavePrompt {
+            request: "unreadable-save".to_string(),
+            role: ExecutionRole::Release,
+            base_revision: config::file_revision(RELEASE_PROMPT),
+            text: "release {pr_list}\n".to_string(),
+        });
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the save must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Failed);
+        assert!(result.message.unwrap().contains("cannot read the prompt"));
+
+        rig.act(Action::ResetPrompt {
+            request: "unreadable-reset".to_string(),
+            role: ExecutionRole::Release,
+            base_revision: config::file_revision(RELEASE_PROMPT),
+        });
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the reset must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert!(!rig.prompts.join("release.md").exists());
+    }
+
+    /// A blank prompt file never starts an agent. A crash between the
+    /// write and the rename can leave one behind.
+    #[test]
+    fn an_empty_prompt_file_fails_the_dispatch_by_name() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("implement.md"), " \n\t").unwrap();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job_count(), 0, "an empty prompt blocks the dispatch");
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.attempt, 2, "the failed dispatch requeues the task");
+        assert_eq!(task.state, TaskState::Queued);
+        let log = fs::read_to_string(&task.log_path).unwrap();
+        assert!(
+            log.contains("implement.md is empty"),
+            "the dispatch must name the empty file: {log}"
+        );
     }
 
     #[test]
