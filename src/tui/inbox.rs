@@ -1308,7 +1308,19 @@ fn feed_message(decision: &Decision) -> String {
 }
 
 /// The short summary of one tool input.
+///
+/// A one-shot permission ask carries its patterns under `patterns`, so the
+/// feed names the pattern instead of printing the raw JSON.
 fn input_summary(input: &serde_json::Value) -> String {
+    if let Some(patterns) = input.get("patterns").and_then(serde_json::Value::as_array) {
+        let named: Vec<&str> = patterns
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if !named.is_empty() {
+            return named.join(", ").chars().take(60).collect();
+        }
+    }
     if let Some(path) = input.get("file_path").and_then(serde_json::Value::as_str) {
         return path.chars().take(60).collect();
     }
@@ -2607,6 +2619,26 @@ mod tests {
         assert!(
             screen.contains("Release 2 PRs: #7 #9?"),
             "message: {screen}"
+        );
+    }
+
+    /// The feed message of an auto-rejected opencode ask names the
+    /// permission and the pattern, so the operator reads the grant before
+    /// allowing it.
+    #[test]
+    fn a_patterns_ask_names_the_permission_and_the_pattern() {
+        let worker = worker();
+        let decision = Decision::permission(
+            &worker,
+            "rej-1",
+            "external_directory",
+            serde_json::json!({"patterns": ["/home/navaro/.cargo/registry/src/*"]}),
+            OPENED,
+        );
+
+        assert_eq!(
+            feed_message(&decision),
+            "Allow external_directory for /home/navaro/.cargo/registry/src/*?"
         );
     }
 
