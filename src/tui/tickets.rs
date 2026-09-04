@@ -158,7 +158,7 @@ impl Tickets {
     ///
     /// The call mirrors the `enter` key of the list. The nested state of
     /// the same issue survives; a different issue starts with a clean
-    /// state.
+    /// state. Every call starts the ticket pane at the top.
     pub fn open(&mut self, repo: &str, number: u64) -> Option<Action> {
         let key = (repo.to_string(), number);
         if self.focus_key.as_ref() != Some(&key) {
@@ -168,6 +168,7 @@ impl Tickets {
         self.focus_key = Some(key);
         self.details = None;
         self.result = None;
+        self.body_scroll.set(0);
         Some(Action::Ticket(TicketAction::Details {
             request: request_code(),
             repo: repo.to_string(),
@@ -569,20 +570,7 @@ impl Tickets {
             }
             KeyCode::Enter => {
                 let selected = self.filtered(state).get(self.selected).copied().cloned()?;
-                let key = (selected.repo.clone(), selected.number);
-                if self.focus_key.as_ref() != Some(&key) {
-                    self.clear_issue_state();
-                }
-                self.focus = true;
-                self.focus_key = Some(key);
-                self.details = None;
-                self.result = None;
-                self.body_scroll.set(0);
-                return Some(Action::Ticket(TicketAction::Details {
-                    request: request_code(),
-                    repo: selected.repo,
-                    number: selected.number,
-                }));
+                return self.open(&selected.repo, selected.number);
             }
             _ => {}
         }
@@ -619,13 +607,7 @@ impl Tickets {
         let repo = ticket.repo.clone();
         let number = ticket.number;
         self.selected = next as usize;
-        self.clear_issue_state();
-        self.focus_key = Some((repo.clone(), number));
-        Some(Action::Ticket(TicketAction::Details {
-            request: request_code(),
-            repo,
-            number,
-        }))
+        self.open(&repo, number)
     }
 
     /// Clear all nested data that belongs to the previous focused issue.
@@ -1981,6 +1963,39 @@ mod tests {
             Some(Action::Ticket(TicketAction::Details { .. }))
         ));
         assert_eq!(tickets.body_scroll.get(), 0, "l resets the offset");
+        assert_eq!(tickets.body_scroll_max.get(), 0);
+    }
+
+    #[test]
+    fn open_resets_the_focus_scroll() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        // The inbox reopens the very same ticket.
+        tickets.open("borsuk", 7);
+        assert_eq!(
+            tickets.body_scroll.get(),
+            0,
+            "the inbox path starts the pane at the top"
+        );
+
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        // The inbox opens another ticket.
+        tickets.open("borsuk", 142);
+        assert_eq!(tickets.body_scroll.get(), 0);
         assert_eq!(tickets.body_scroll_max.get(), 0);
     }
 
