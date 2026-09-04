@@ -12,6 +12,20 @@ use anyhow::{anyhow, Context};
 use crate::config::{Harness, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES};
 use crate::exec::Exec;
 
+/// The codex models that the value list offers.
+///
+/// The table mirrors the listed models of the codex CLI. A model outside the
+/// table stays reachable through the `custom value...` row.
+pub const CODEX_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+];
+
 /// One Settings field that a value list can edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListField {
@@ -48,12 +62,13 @@ pub fn fixed_values(harness: Harness, field: ListField) -> Vec<String> {
         ListField::Program => &[harness.program()],
         ListField::Model => match harness {
             Harness::Claude => &["fable", "opus", "sonnet"],
-            Harness::Opencode | Harness::Codex => none,
+            Harness::Codex => CODEX_MODELS,
+            Harness::Opencode => none,
         },
         ListField::Effort => match harness {
             Harness::Claude => &["low", "medium", "high", "xhigh", "max"],
             Harness::Opencode => &["minimal", "low", "medium", "high", "max"],
-            Harness::Codex => &["minimal", "low", "medium", "high", "xhigh"],
+            Harness::Codex => &["low", "medium", "high", "xhigh", "max"],
         },
         ListField::Agent => match harness {
             Harness::Opencode => &["build", "plan", "general"],
@@ -188,13 +203,15 @@ mod tests {
         );
         assert_eq!(
             fixed_values(Harness::Codex, ListField::Effort),
-            ["minimal", "low", "medium", "high", "xhigh"]
+            ["low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
             fixed_values(Harness::Opencode, ListField::Agent),
             ["build", "plan", "general"]
         );
         assert!(fixed_values(Harness::Claude, ListField::Agent).is_empty());
+        assert_eq!(fixed_values(Harness::Codex, ListField::Model), CODEX_MODELS);
+        assert!(fixed_values(Harness::Opencode, ListField::Model).is_empty());
         assert!(fixed_values(Harness::Codex, ListField::Profile).is_empty());
         assert_eq!(fixed_values(Harness::Codex, ListField::Program), ["codex"]);
         assert_eq!(

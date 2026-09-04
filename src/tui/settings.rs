@@ -627,6 +627,8 @@ impl Settings {
     ///
     /// The change sets the program, picks a default model, clears every
     /// harness-specific field, and leaves one notice line under the form.
+    /// The model comes from the same global role, else from the first row
+    /// of the fixed harness table, else from the sorted candidates.
     fn apply_harness(&mut self, state: &StateView, next: Harness) {
         if self
             .current_settings_ref(state)
@@ -649,6 +651,11 @@ impl Settings {
             }
         }
         let model = global_model
+            .or_else(|| {
+                catalog::fixed_values(next, ListField::Model)
+                    .into_iter()
+                    .next()
+            })
             .or_else(|| model_candidates.into_iter().next())
             .unwrap_or_default();
         self.ensure_draft(state);
@@ -2432,6 +2439,20 @@ mod tests {
         let current = settings.current_settings(&state).unwrap();
         assert_eq!(current.harness, Harness::Opencode);
         assert_eq!(current.model, "provider/a-model");
+    }
+
+    #[test]
+    fn a_codex_harness_change_takes_the_first_fixed_model() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).expect("the draft exists");
+        assert_eq!(current.harness, Harness::Codex);
+        assert_eq!(current.model, "gpt-5.6-sol");
+        let output = text(&settings, &state, 140, 30);
+        assert!(output.contains("model gpt-5.6-sol"), "{output}");
     }
 
     #[test]

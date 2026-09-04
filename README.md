@@ -380,7 +380,9 @@ stay toggles. The argument and tool lists keep the row editor, and `limit`
 keeps the text box.
 
 A harness change sets the program, picks a default model, and clears every
-field of the old harness. `auto approve` turns off under OpenCode. One
+field of the old harness. The model comes from the same global role, else
+from the first row of the fixed harness table, else from the first sorted
+candidate. `auto approve` turns off under OpenCode. One
 notice line under the form names the new harness and every field that the
 change reset. The line disappears at a save, a reload, a draft discard, or
 the next harness change.
