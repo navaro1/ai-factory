@@ -365,13 +365,23 @@ impl Decisions {
     /// the task. `NeedsHuman` and `ReleaseGate` rows belong to no task, so
     /// the call leaves them alone.
     pub fn drop_for_task(&mut self, task: &str) -> Vec<Decision> {
+        self.drop_for_task_keep_asks(task, false)
+    }
+
+    /// Remove the task's rows, but keep its ask rows when asked.
+    ///
+    /// `keep_asks` preserves the `Permission` and `Question` rows of a task
+    /// whose harness cannot answer a live ask, so a failure does not close
+    /// the question. The `Stuck` rows always drop: a fresh failure replaces
+    /// the row.
+    pub fn drop_for_task_keep_asks(&mut self, task: &str, keep_asks: bool) -> Vec<Decision> {
         let mut dropped = Vec::new();
         let mut kept = Vec::new();
         for row in self.open.drain(..) {
             let belongs = match &row.kind {
                 DecisionKind::Permission { task: row_task, .. }
-                | DecisionKind::Question { task: row_task, .. }
-                | DecisionKind::Stuck { task: row_task, .. } => row_task == task,
+                | DecisionKind::Question { task: row_task, .. } => row_task == task && !keep_asks,
+                DecisionKind::Stuck { task: row_task, .. } => row_task == task,
                 DecisionKind::NeedsHuman { .. } | DecisionKind::ReleaseGate { .. } => false,
             };
             if belongs {
@@ -688,6 +698,42 @@ mod tests {
         // A task with no rows drops nothing.
         assert!(queue.drop_for_task("borsuk/refine-i1").is_empty());
         assert_eq!(queue.open().len(), 3);
+    }
+
+    #[test]
+    fn keeping_asks_spares_the_ask_rows_and_drops_the_stuck_row() {
+        let mut queue = Decisions::new();
+        let a = task("borsuk", Stage::Implement, ItemKind::Issue, 142);
+        queue
+            .push(Decision::permission(
+                &a,
+                "rej-1",
+                "external_directory",
+                serde_json::json!({"patterns": ["/tmp/*"]}),
+                NOW,
+            ))
+            .unwrap();
+        queue
+            .push(Decision::question(&a, "rej-2", serde_json::json!([]), NOW))
+            .unwrap();
+        queue.push(Decision::stuck(&a, "3 failures", NOW)).unwrap();
+
+        let dropped = queue.drop_for_task_keep_asks(&a.id, true);
+        let dropped_ids: Vec<&str> = dropped.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(dropped_ids, vec!["stuck:borsuk/implement-i142:1"]);
+
+        let remaining: Vec<&str> = queue.open().iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            remaining,
+            vec![
+                "perm:borsuk/implement-i142:rej-1",
+                "perm:borsuk/implement-i142:rej-2",
+            ]
+        );
+
+        // The plain drop still removes everything.
+        assert_eq!(queue.drop_for_task(&a.id).len(), 2);
+        assert!(queue.open().is_empty());
     }
 
     #[test]

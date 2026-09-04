@@ -47,7 +47,8 @@ use crate::prompts::{
 #[cfg(test)]
 use crate::runner::Runner;
 use crate::runner::{
-    capabilities, Answer, DefaultRunnerFactory, Job, RunEvent, RunnerFactory, Session,
+    capabilities, AllowedPermission, Answer, DefaultRunnerFactory, Job, RunEvent, RunnerFactory,
+    Session,
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
@@ -157,6 +158,9 @@ pub struct Daemon {
     role_bindings: BTreeMap<String, ResolvedRoleSettings>,
     /// The decisions that wait for a human.
     decisions: Decisions,
+    /// The allowed permission rules of each one-shot task, armed for its
+    /// next dispatch.
+    allowed_permissions: BTreeMap<String, Vec<AllowedPermission>>,
     /// One release train per repository alias.
     trains: BTreeMap<String, Train>,
     /// The pull request set of each release task, for prompt rendering.
@@ -389,6 +393,24 @@ impl Daemon {
                 decisions.push(row);
             }
         }
+        // The ask rows of the one-shot tasks survive a restart, because the
+        // question they carry is the one thing a restart must not lose.
+        for row in runtime.asks {
+            let names_kept_task = match &row.kind {
+                DecisionKind::Permission { task, .. } | DecisionKind::Question { task, .. } => {
+                    restored_task_ids.contains(task.as_str())
+                }
+                _ => false,
+            };
+            if names_kept_task {
+                decisions.push(row);
+            }
+        }
+        let allowed_permissions: BTreeMap<String, Vec<AllowedPermission>> = runtime
+            .allowed_permissions
+            .into_iter()
+            .filter(|(id, _)| restored_task_ids.contains(id.as_str()))
+            .collect();
         let mut paused = Paused {
             global: runtime.paused.global,
             stages: runtime.paused.stages,
@@ -457,6 +479,7 @@ impl Daemon {
             table: restored_table,
             role_bindings,
             decisions,
+            allowed_permissions,
             trains,
             release_batches,
             links: BTreeMap::new(),
@@ -1652,6 +1675,11 @@ impl Daemon {
             yolo: settings.auto_approve == Some(true)
                 || settings.permission_mode.as_deref() == Some("bypassPermissions"),
             allowed_tools: (!settings.tools.is_empty()).then(|| settings.tools.clone()),
+            allowed_permissions: self
+                .allowed_permissions
+                .get(&task.id)
+                .cloned()
+                .unwrap_or_default(),
         };
         let mut runner = self.runner_factory.build(&role);
         let session = runner.start(&job, self.run_tx.clone())?;
@@ -1696,7 +1724,12 @@ impl Daemon {
             return;
         }
         self.changed = true;
-        self.decisions.drop_for_task(id);
+        // A one-shot harness cannot answer a live ask, so its permission
+        // and question rows survive the failure and wait in the inbox. A
+        // steerable claude task loses them, as before, and the stuck row
+        // always drops: the fresh failure replaces it.
+        let keep_asks = !self.task_capabilities(&task).permission_responses;
+        self.decisions.drop_for_task_keep_asks(id, keep_asks);
         if final_attempt {
             let failed = self.table.by_id.get(id).cloned().unwrap_or(task);
             eprintln!("task {id} is stuck on attempt {}: {reason}", failed.attempt);
@@ -1956,6 +1989,9 @@ impl Daemon {
             self.remove_task_session_marker(task);
         }
         self.decisions.drop_for_task(&task.id);
+        // The permission rules armed one retry; an agent that adapted
+        // without them, and a finished task, leave no rules behind.
+        self.allowed_permissions.remove(&task.id);
         match task.stage {
             Stage::Release => self.finish_train(&task.repo, true, false),
             Stage::Refine | Stage::Implement | Stage::Review => {}
@@ -2942,11 +2978,18 @@ impl Daemon {
         match (&decision.kind, &response) {
             (
                 DecisionKind::Permission {
-                    task, request_id, ..
+                    task,
+                    request_id,
+                    tool,
+                    input,
                 },
                 Response::Allow,
             ) => {
-                if let Err(error) = self.answer_session(
+                if self.task_is_one_shot(task) {
+                    // The row carries the rule the human granted; the
+                    // retried run receives it in the job.
+                    self.allow_one_shot_permission(task, tool, input);
+                } else if let Err(error) = self.answer_session(
                     task,
                     request_id,
                     Answer::Allow {
@@ -2964,7 +3007,10 @@ impl Daemon {
                 },
                 Response::Deny { message },
             ) => {
-                if let Err(error) = self.answer_session(
+                if self.task_is_one_shot(task) {
+                    // The row closes and the task keeps its state; the
+                    // operator can still retry it from the pipeline.
+                } else if let Err(error) = self.answer_session(
                     task,
                     request_id,
                     Answer::Deny {
@@ -2982,6 +3028,16 @@ impl Daemon {
                 },
                 Response::Answers { updated_input },
             ) => {
+                if self.task_is_one_shot(task) {
+                    // The row carries no option list, so the daemon cannot
+                    // fill an answers payload; it keeps the row open.
+                    eprintln!(
+                        "the answer for {}: a one-shot question row carries no options",
+                        decision.id
+                    );
+                    self.decisions.push(decision.clone());
+                    return;
+                }
                 if let Err(error) = self.answer_session(
                     task,
                     request_id,
@@ -2995,7 +3051,12 @@ impl Daemon {
                 }
             }
             (DecisionKind::Question { task, .. }, Response::Text { text }) => {
-                if let Err(error) = self.send_to_session(task, text) {
+                let result = if self.task_is_one_shot(task) {
+                    self.deliver_one_shot_chat(task, text)
+                } else {
+                    self.send_to_session(task, text)
+                };
+                if let Err(error) = result {
                     eprintln!("the chat message for {task}: {error:#}");
                     self.decisions.push(decision.clone());
                     return;
@@ -3043,6 +3104,96 @@ impl Daemon {
             .get_mut(task)
             .ok_or_else(|| anyhow!("no live session holds it"))?;
         session.answer(request_id, answer)
+    }
+
+    /// Whether the task's harness cannot answer a live permission ask.
+    ///
+    /// A one-shot harness such as opencode has no steering channel, so its
+    /// ask rows travel the rule-and-retry path instead.
+    fn task_is_one_shot(&self, task: &str) -> bool {
+        self.table
+            .by_id
+            .get(task)
+            .is_some_and(|task| !self.task_capabilities(task).permission_responses)
+    }
+
+    /// Whether one open row is the ask of a one-shot task.
+    ///
+    /// Only those rows persist: a claude ask belongs to a live session and
+    /// dies with it, so the state file never mirrors it.
+    fn row_is_one_shot_ask(&self, row: &Decision) -> bool {
+        match &row.kind {
+            DecisionKind::Permission { task, .. } | DecisionKind::Question { task, .. } => {
+                self.task_is_one_shot(task)
+            }
+            DecisionKind::Stuck { .. }
+            | DecisionKind::NeedsHuman { .. }
+            | DecisionKind::ReleaseGate { .. } => false,
+        }
+    }
+
+    /// Record one allowed permission rule of a one-shot task and requeue it.
+    ///
+    /// The recorded rules reach the next dispatch in the job, and the
+    /// opencode runner maps them to the `OPENCODE_PERMISSION` environment
+    /// value. A failed task requeues from attempt 1 through `retry_task`; a
+    /// task the auto-retry already requeued keeps its queue slot and simply
+    /// arms the rule for its next dispatch.
+    fn allow_one_shot_permission(&mut self, task: &str, tool: &str, input: &serde_json::Value) {
+        let patterns = input
+            .get("patterns")
+            .and_then(serde_json::Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|pattern| pattern.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rules = self
+            .allowed_permissions
+            .entry(task.to_string())
+            .or_default();
+        let rule = AllowedPermission {
+            permission: tool.to_string(),
+            patterns,
+        };
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+        let failed = self
+            .table
+            .by_id
+            .get(task)
+            .is_some_and(|task| matches!(task.state, TaskState::Failed(_)));
+        if failed {
+            self.retry_task(task);
+        }
+    }
+
+    /// Queue one question answer as the follow-up chat of a one-shot task.
+    ///
+    /// The text waits in `pending_chats`, the terminal task reopens, and
+    /// `resume_pending_chats` resumes the recorded session with the text. A
+    /// run that left no session marker refuses the text, so the caller
+    /// re-pushes the row and the answer is not lost.
+    fn deliver_one_shot_chat(&mut self, task: &str, text: &str) -> Result<()> {
+        let task_value = self
+            .table
+            .by_id
+            .get(task)
+            .ok_or_else(|| anyhow!("no task holds this answer"))?
+            .clone();
+        match self.followup_session_id(&task_value) {
+            Ok(Some(_)) => {}
+            Ok(None) => bail!("the run left no session marker to resume"),
+            Err(error) => return Err(anyhow!("cannot read the session marker: {error:#}")),
+        }
+        self.pending_chats
+            .entry(task.to_string())
+            .or_default()
+            .push(text.to_string());
+        self.reopen_for_pending_chat(task);
+        Ok(())
     }
 
     /// Forward a chat line to the live session of one task.
@@ -3199,6 +3350,7 @@ impl Daemon {
             }
         }
         let dropped = self.decisions.drop_for_task(id);
+        self.allowed_permissions.remove(id);
         if active || !dropped.is_empty() {
             self.changed = true;
         }
@@ -3826,6 +3978,14 @@ impl Daemon {
                 .filter(|row| matches!(row.kind, DecisionKind::Stuck { .. }))
                 .cloned()
                 .collect(),
+            asks: self
+                .decisions
+                .open()
+                .iter()
+                .filter(|row| self.row_is_one_shot_ask(row))
+                .cloned()
+                .collect(),
+            allowed_permissions: self.allowed_permissions.clone(),
         };
         DaemonState {
             stage_limits,
@@ -4031,6 +4191,7 @@ mod tests {
     use crate::config::{ExecutionRole, Harness, RoleSettings, StageConfig};
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
+    use crate::tasks::MAX_ATTEMPTS;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5339,6 +5500,363 @@ mod tests {
         });
         let sends = rig.session(0).sends.lock().unwrap().clone();
         assert_eq!(sends, vec!["use postgres".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // One-shot ask propagation
+    // ------------------------------------------------------------------
+
+    /// The ask row id of the implement task's `n`-th auto-rejected ask.
+    fn ask_row_id(n: usize) -> String {
+        format!("perm:borsuk/implement-i142:rej-{n}")
+    }
+
+    /// The auto-rejected ask event the opencode runner emits for one line.
+    fn opencode_ask(n: usize, tool: &str, patterns: &[&str]) -> RunEvent {
+        RunEvent::Ask {
+            task: "borsuk/implement-i142".to_string(),
+            request_id: format!("rej-{n}"),
+            tool: tool.to_string(),
+            input: json!({"patterns": patterns}),
+            suggestions: serde_json::Value::Null,
+            needs_human: tool == "question",
+        }
+    }
+
+    /// Run an opencode implement task to its final failure, with the ask
+    /// open from attempt 1. Each retry re-hits the ask, so the row
+    /// refreshes. The requeued runs start inside the event handling, so
+    /// every non-final failure consumes one dispatch.
+    fn opencode_rig_failed_with_ask(dir: &Path) -> Rig {
+        let mut rig = opencode_rig(dir, MAX_ATTEMPTS as usize);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(opencode_ask(
+            1,
+            "external_directory",
+            &["/home/navaro/.cargo/registry/src/*"],
+        ));
+        let opened = rig
+            .decision(&ask_row_id(1))
+            .expect("the ask opens a row")
+            .opened_ms;
+        for attempt in 1..=MAX_ATTEMPTS {
+            rig.event(exited(
+                "borsuk/implement-i142",
+                false,
+                "opencode exited with code 1",
+            ));
+            assert!(
+                rig.decision(&ask_row_id(1)).is_some(),
+                "attempt {attempt} keeps the ask row"
+            );
+            if attempt < MAX_ATTEMPTS {
+                let task = rig.task("borsuk/implement-i142");
+                assert_eq!(task.attempt, attempt + 1, "attempt {attempt} requeues");
+                assert_eq!(
+                    rig.job_count(),
+                    attempt as usize + 1,
+                    "the auto-retry of attempt {attempt} starts at once"
+                );
+                rig.event(started("borsuk/implement-i142", "ses-142"));
+                rig.event(opencode_ask(
+                    1,
+                    "external_directory",
+                    &["/home/navaro/.cargo/registry/src/*"],
+                ));
+            }
+        }
+        assert!(matches!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed(_)
+        ));
+        let row = rig
+            .decision(&ask_row_id(1))
+            .expect("the final failure keeps the ask row");
+        assert_eq!(row.opened_ms, opened, "the refresh keeps the open time");
+        assert!(
+            rig.decision(&format!("stuck:borsuk/implement-i142:{MAX_ATTEMPTS}"))
+                .is_some(),
+            "the final failure opens the stuck row"
+        );
+        rig
+    }
+
+    /// An opencode task that fails keeps its permission row open, and a
+    /// claude task that fails still loses its rows.
+    #[test]
+    fn an_opencode_failure_keeps_the_ask_row_and_a_claude_failure_loses_it() {
+        let dir = temp_root();
+        let rig = opencode_rig_failed_with_ask(&dir);
+        assert!(rig.daemon.allowed_permissions.is_empty());
+
+        // A claude task with a live ask loses the row on failure, as today.
+        let mut claude = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().yolo = false;
+        });
+        claude.poll(vec![issue(142, &["to-refine"])], vec![]);
+        claude.event(RunEvent::Ask {
+            task: "borsuk/refine-i142".to_string(),
+            request_id: "req-1".to_string(),
+            tool: "Bash".to_string(),
+            input: json!({"command": "ls"}),
+            suggestions: serde_json::Value::Null,
+            needs_human: false,
+        });
+        assert!(claude.decision("perm:borsuk/refine-i142:req-1").is_some());
+        claude.event(exited("borsuk/refine-i142", false, "boom"));
+        assert!(
+            claude.decision("perm:borsuk/refine-i142:req-1").is_none(),
+            "the claude failure still drops its ask row"
+        );
+    }
+
+    /// The kept ask row survives a `state.json` round trip.
+    #[test]
+    fn the_kept_ask_row_survives_a_restart() {
+        let dir = temp_root();
+        {
+            let mut rig = opencode_rig_failed_with_ask(&dir);
+            rig.drive();
+        }
+        let steps = reuse_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 142), &rig_gitdir(&dir));
+        let second = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
+        });
+        let row = second
+            .decision(&ask_row_id(1))
+            .expect("the ask row survives the restart");
+        assert!(matches!(row.kind, DecisionKind::Permission { .. }));
+        assert!(
+            second
+                .decision(&format!("stuck:borsuk/implement-i142:{MAX_ATTEMPTS}"))
+                .is_some(),
+            "the stuck row survives as before"
+        );
+    }
+
+    /// A completed task closes its ask row: an agent that adapted without
+    /// the permission leaves no inbox noise.
+    #[test]
+    fn a_completed_opencode_task_closes_its_ask_row() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, MAX_ATTEMPTS as usize);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(opencode_ask(1, "external_directory", &["/tmp/*"]));
+        rig.event(exited(
+            "borsuk/implement-i142",
+            false,
+            "opencode exited with code 1",
+        ));
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 2);
+        assert_eq!(rig.job_count(), 2, "the auto-retry starts at once");
+        assert!(rig.decision(&ask_row_id(1)).is_some());
+
+        // The retry adapts without the permission and finishes.
+        rig.event(started("borsuk/implement-i142", "ses-142b"));
+        rig.event(exited("borsuk/implement-i142", true, "done"));
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert!(
+            rig.decision(&ask_row_id(1)).is_none(),
+            "the success closes the ask row"
+        );
+    }
+
+    /// Cancelling the task closes its ask row.
+    #[test]
+    fn a_cancelled_opencode_task_closes_its_ask_row() {
+        let dir = temp_root();
+        let mut rig = opencode_rig_failed_with_ask(&dir);
+        assert!(rig.decision(&ask_row_id(1)).is_some());
+
+        rig.act(Action::Abort {
+            task: "borsuk/implement-i142".to_string(),
+        });
+
+        assert!(
+            rig.decision(&ask_row_id(1)).is_none(),
+            "the cancel closes the ask row"
+        );
+        assert!(
+            rig.daemon.allowed_permissions.is_empty(),
+            "the cancel clears the permission rules"
+        );
+    }
+
+    /// An `Allow` answer records the rule, requeues the failed task from
+    /// attempt 1, and the next dispatch carries the rule in the job.
+    #[test]
+    fn an_allow_answer_arms_the_rule_and_requeues_from_attempt_1() {
+        let dir = temp_root();
+        let mut rig = opencode_rig_failed_with_ask(&dir);
+
+        rig.act(Action::Answer {
+            decision_id: ask_row_id(1),
+            response: Response::Allow,
+        });
+
+        assert!(
+            rig.decision(&ask_row_id(1)).is_none(),
+            "the answer closes the row"
+        );
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.attempt, 1, "the requeue starts at attempt 1");
+        assert_eq!(rig.job_count(), 4, "the requeued task starts at once");
+        assert_eq!(
+            rig.daemon.allowed_permissions.get("borsuk/implement-i142"),
+            Some(&vec![AllowedPermission {
+                permission: "external_directory".to_string(),
+                patterns: vec!["/home/navaro/.cargo/registry/src/*".to_string()],
+            }]),
+        );
+
+        let job = rig.job(3);
+        assert_eq!(job.task, "borsuk/implement-i142");
+        assert_eq!(
+            job.allowed_permissions,
+            vec![AllowedPermission {
+                permission: "external_directory".to_string(),
+                patterns: vec!["/home/navaro/.cargo/registry/src/*".to_string()],
+            }],
+        );
+
+        // The granted run completes and leaves no rules behind.
+        rig.event(started("borsuk/implement-i142", "ses-142c"));
+        rig.event(exited("borsuk/implement-i142", true, "done"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert!(rig.daemon.allowed_permissions.is_empty());
+    }
+
+    /// A `Deny` answer closes the row and leaves the task state unchanged.
+    #[test]
+    fn a_deny_answer_closes_the_row_and_keeps_the_state() {
+        let dir = temp_root();
+        let mut rig = opencode_rig_failed_with_ask(&dir);
+
+        rig.act(Action::Answer {
+            decision_id: ask_row_id(1),
+            response: Response::Deny {
+                message: "not now".to_string(),
+            },
+        });
+
+        assert!(rig.decision(&ask_row_id(1)).is_none());
+        assert!(matches!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed(_)
+        ));
+        assert!(rig.daemon.allowed_permissions.is_empty());
+        assert_eq!(rig.job_count(), 3, "the deny requeues nothing");
+    }
+
+    /// A text answer to a one-shot question resumes the recorded session
+    /// with the text through the pending-chats path.
+    #[test]
+    fn a_text_answer_resumes_a_one_shot_task_with_a_session_marker() {
+        let dir = temp_root();
+        let mut rig = opencode_rig_failed_with_ask(&dir);
+        rig.event(opencode_ask(2, "question", &[]));
+        let row_id = ask_row_id(2);
+
+        rig.act(Action::Answer {
+            decision_id: row_id.clone(),
+            response: Response::Text {
+                text: "use the vendored sources".to_string(),
+            },
+        });
+
+        assert_eq!(rig.job_count(), 4, "the answer resumes the task at once");
+        let job = rig.job(3);
+        assert_eq!(job.task, "borsuk/implement-i142");
+        assert_eq!(job.prompt, "use the vendored sources");
+        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Running,
+            "the answer reopens the terminal task"
+        );
+        assert!(
+            !rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the resume delivers the queued text"
+        );
+        assert!(rig.decision(&row_id).is_none());
+    }
+
+    /// Without a session marker the row re-pushes and a log line names the
+    /// reason, so the text is not lost.
+    #[test]
+    fn a_text_answer_without_a_session_marker_keeps_the_row_open() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, MAX_ATTEMPTS as usize);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(opencode_ask(
+            1,
+            "external_directory",
+            &["/home/navaro/.cargo/registry/src/*"],
+        ));
+        for _ in 0..MAX_ATTEMPTS {
+            rig.event(exited(
+                "borsuk/implement-i142",
+                false,
+                "opencode exited with code 1",
+            ));
+        }
+        let question = opencode_ask(2, "question", &[]);
+        rig.event(question);
+        let row_id = ask_row_id(2);
+        assert!(matches!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed(_)
+        ));
+
+        rig.act(Action::Answer {
+            decision_id: row_id.clone(),
+            response: Response::Text {
+                text: "just pick one".to_string(),
+            },
+        });
+
+        assert!(
+            rig.decision(&row_id).is_some(),
+            "the row re-pushes when no session marker exists"
+        );
+        assert!(
+            !rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the daemon queues no chat it cannot deliver"
+        );
+        assert!(matches!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed(_)
+        ));
+    }
+
+    /// An `Answers` payload on a one-shot question row is refused: the row
+    /// carries no option list, so the inbox cannot produce picks.
+    #[test]
+    fn an_answers_answer_on_a_one_shot_row_is_refused() {
+        let dir = temp_root();
+        let mut rig = opencode_rig_failed_with_ask(&dir);
+        rig.event(opencode_ask(2, "question", &[]));
+        let row_id = ask_row_id(2);
+
+        rig.act(Action::Answer {
+            decision_id: row_id.clone(),
+            response: Response::Answers {
+                updated_input: json!({"answers": {"Database": "Postgres"}}),
+            },
+        });
+
+        assert!(
+            rig.decision(&row_id).is_some(),
+            "the refused answer re-pushes the row"
+        );
+        assert!(rig.daemon.pending_chats.is_empty());
     }
 
     #[test]
