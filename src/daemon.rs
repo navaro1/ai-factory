@@ -955,6 +955,8 @@ impl Daemon {
         self.pending_chats.remove(id);
         self.ticket_turn_text.remove(id);
         self.paused.tasks.remove(id);
+        self.interrupted.remove(id);
+        self.restored_ids.remove(id);
         self.decisions.drop_for_task(id);
         self.changed = true;
     }
@@ -6550,6 +6552,15 @@ mod tests {
                 .by_id
                 .contains_key("borsuk/implement-i142"),
             "the first poll cancels and then retires the restored task of the closed issue"
+        );
+        assert!(
+            !second.daemon.interrupted.contains("borsuk/implement-i142"),
+            "the retire drops the restart mark, so a later task of the same \
+             id never reads the restart notice"
+        );
+        assert!(
+            !second.daemon.restored_ids.contains("borsuk/implement-i142"),
+            "the retire drops the restore mark"
         );
         assert_eq!(second.job_count(), 0);
     }
