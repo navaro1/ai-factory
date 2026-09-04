@@ -1047,13 +1047,16 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
 /// The height of the usage band: at most one third of the body height.
 ///
 /// An empty usage list gives height zero, so the band hides while the view
-/// carries no usage rows.
+/// carries no usage rows. A third under three rows holds no border and no
+/// content, so a short board hides the band and keeps every row for the
+/// lanes.
 fn usage_band_height(usage_lines: &[Line<'_>], body_height: u16) -> u16 {
-    if usage_lines.is_empty() || body_height < 3 {
+    let cap = body_height / 3;
+    if usage_lines.is_empty() || cap < 3 {
         return 0;
     }
     let needed = (usage_lines.len() as u16).saturating_add(2);
-    needed.min(body_height / 3).max(3).min(body_height)
+    needed.min(cap)
 }
 
 /// Draw the bordered `USAGE` box with the usage rows and the overflow line.
@@ -1126,9 +1129,8 @@ fn usage_lines(state: &StateView, now_ms: u64) -> Vec<Line<'static>> {
             ]));
         }
         if let Some(error) = &row.error {
-            let age = format_age(now_ms.saturating_sub(row.updated_ms));
             lines.push(Line::from(Span::styled(
-                format!("  ! {error} · data {age} old"),
+                format!("  ! {error}{}", stale_suffix(row, now_ms)),
                 THEME.dim(),
             )));
         } else if row.windows.is_empty()
@@ -1173,6 +1175,22 @@ fn window_line(window: &crate::usage::UsageWindow, now_ms: u64) -> Line<'static>
         spans.push(Span::styled(format!(" · {label}"), THEME.dim()));
     }
     Line::from(spans)
+}
+
+/// The age suffix of one reason line, empty when no stale data exists.
+///
+/// A row without a good probe carries no read time, and a row read in this
+/// minute carries no age worth printing. Both cases give an empty suffix,
+/// so the line names the reason alone.
+fn stale_suffix(row: &crate::usage::UsageView, now_ms: u64) -> String {
+    if row.updated_ms == 0 {
+        return String::new();
+    }
+    let age_ms = now_ms.saturating_sub(row.updated_ms);
+    if age_ms < 60_000 {
+        return String::new();
+    }
+    format!(" · data {} old", format_age(age_ms))
 }
 
 /// The spend as `$1.25`.
@@ -2395,6 +2413,49 @@ mod tests {
     }
 
     #[test]
+    fn a_reason_row_prints_the_age_only_while_stale_data_exists() {
+        use crate::usage::{UsageMode, UsageView};
+        let row = |updated_ms, error: &str| UsageView {
+            identity: "opencode".to_string(),
+            harness: crate::config::Harness::Opencode,
+            mode: UsageMode::Unknown,
+            updated_ms,
+            error: Some(error.to_string()),
+            ..UsageView::default()
+        };
+        let mut state = empty_view();
+        state.usage = vec![
+            // A probe that never succeeded carries no read time.
+            row(0, "no credentials"),
+            // A reason the newest probe reported names itself alone.
+            row(NOW, "no OpenCode Go plan"),
+            // Stale data keeps its age, so the operator reads the numbers
+            // above it with the right doubt.
+            row(NOW - 300_000, "rate limited"),
+        ];
+
+        let text = render_board(state, 120, 40, NOW);
+
+        assert!(text.contains("! no credentials"), "board:\n{text}");
+        assert!(text.contains("! no OpenCode Go plan"), "board:\n{text}");
+        assert!(
+            text.contains("! rate limited · data 5m old"),
+            "board:\n{text}"
+        );
+        assert!(
+            !text.contains("just now old"),
+            "a fresh reason must print no age:\n{text}"
+        );
+        // Only the stale row carries an age, so the row without a read
+        // time never prints a nonsense age counted from the epoch.
+        assert_eq!(
+            text.matches("· data ").count(),
+            1,
+            "only the stale row may print an age:\n{text}"
+        );
+    }
+
+    #[test]
     fn the_usage_band_caps_at_one_third_and_ends_with_plus_n_more() {
         let mut state = empty_view();
         // Six identities with three lines each overflow the one-third cap.
@@ -2428,6 +2489,21 @@ mod tests {
                 || border_row.contains('┴'),
             "the last row must close the band:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_short_board_hides_the_band_and_keeps_every_row_for_the_lanes() {
+        let mut state = empty_view();
+        state.usage = usage_rows();
+
+        // A third of eight rows holds no border and no content, so the band
+        // never takes the whole board away from the lanes.
+        let short = render_board(state.clone(), 80, 8, NOW);
+        assert!(!short.contains("USAGE"), "board:\n{short}");
+
+        // Nine rows give a third of three: one border pair and one line.
+        let tall = render_board(state, 80, 9, NOW);
+        assert!(tall.contains("USAGE"), "board:\n{tall}");
     }
 
     #[test]

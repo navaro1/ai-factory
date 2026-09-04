@@ -297,10 +297,11 @@ Below the four lanes, the pipeline draws the `USAGE` band when the state
 carries usage rows. One row per billed identity shows the plan name, the
 quota windows as `N% left` with a bar and the reset time, and the factory
 spend as `factory $x`. A direct API row shows the spend instead of windows.
-A blocked window shows `0% left` in the alarm color. Every probe failure
-adds one dim reason line with the age of the last good data. The band takes
-at most one third of the board height, and overflow ends with one
-`+ n more` line. The band is read-only: it has no keys and no actions.
+A blocked window shows `0% left` in the alarm color. A probe failure and a
+probe reason both add one dim reason line, and stale data names its age.
+The band takes at most one third of the board height, and overflow ends
+with one `+ n more` line. The band is read-only: it has no keys and no
+actions.
 
 ### Session, view 2
 
