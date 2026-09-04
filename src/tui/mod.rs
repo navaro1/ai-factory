@@ -54,7 +54,7 @@ use crate::catalog;
 use crate::decisions::DecisionKind;
 use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
-use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
+use crate::sock::{Action, Client, Push, StateView, TaskView, TicketAction, WireProtocolMismatch};
 use crate::tasks::TaskState;
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
@@ -177,6 +177,13 @@ enum Confirm {
         /// The pull request numbers in the batch.
         prs: Vec<u64>,
     },
+    /// Add the `to-refine` label to one ticket.
+    Refine {
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
 }
 
 impl Confirm {
@@ -212,6 +219,20 @@ impl Confirm {
                         prs: prs.clone(),
                     },
                     format!("sent release {repo} {}", pr_text(&prs)),
+                );
+            }
+            Confirm::Refine { repo, number } => {
+                emit(
+                    app,
+                    sink,
+                    Action::Ticket(TicketAction::ToggleLabel {
+                        request: tickets::request_code(),
+                        repo: repo.clone(),
+                        number,
+                        label: crate::gates::TO_REFINE.to_string(),
+                        on: true,
+                    }),
+                    format!("sent to-refine {repo} #{number}"),
                 );
             }
         }
@@ -576,6 +597,16 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+                if key.code == KeyCode::Char('m') && self.tickets.focus_plain() {
+                    if let Some((repo, number)) = self.tickets.focus_key() {
+                        if self.tickets.focus_has_label(crate::gates::TO_REFINE) {
+                            self.show_toast("the ticket already has to-refine");
+                        } else {
+                            self.confirm = Some(Confirm::Refine { repo, number });
+                        }
+                    }
+                    return true;
                 }
                 let nested = self.tickets.focus_open() || self.tickets.typing();
                 if let Some(action) = self
@@ -1394,6 +1425,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let question = match confirm {
         Confirm::Abort { task } => format!("abort {task}?"),
         Confirm::Go { repo, prs } => format!("release {repo}: {}", pr_text(prs)),
+        Confirm::Refine { repo, number } => format!("add to-refine to {repo} #{number}?"),
     };
     let hint = "y confirm - esc cancel";
     let width = question.chars().count().max(hint.len()) as u16 + 6;
@@ -1438,8 +1470,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("h l", "switch session, chat unfocused"),
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ e l c a", "search and ticket actions"),
-        ("h l", "tickets repo / settings scope"),
+        ("/ e L c a m", "search and ticket keys"),
+        ("h l", "repo / ticket / settings scope"),
         ("j k", "settings role"),
         ("Tab", "select settings field"),
         ("Enter", "edit settings value"),
@@ -1576,6 +1608,55 @@ mod tests {
             1_000,
         );
         Decision::permission(&task, request_id, "Write", serde_json::json!({}), opened_ms)
+    }
+
+    /// One ticket summary for the shell ticket tests.
+    fn ticket_summary(repo: &str, number: u64) -> crate::sock::TicketSummary {
+        crate::sock::TicketSummary {
+            repo: repo.to_string(),
+            number,
+            title: "Improve the ticket list".to_string(),
+            labels: vec!["ui".to_string()],
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Untouched,
+        }
+    }
+
+    /// One full issue response for the shell ticket tests.
+    fn ticket_details(repo: &str, number: u64) -> crate::sock::TicketDetails {
+        crate::sock::TicketDetails {
+            request: "shell-details".to_string(),
+            repo: repo.to_string(),
+            issue: crate::model::Issue {
+                number,
+                node_id: format!("node-{number}"),
+                title: "Improve the ticket list".to_string(),
+                body: "Show every issue without leaving the terminal.".to_string(),
+                labels: vec!["ui".to_string()],
+                author: "piotr".to_string(),
+                assignees: Vec::new(),
+                updated_at: "2026-08-30T12:00:00Z".to_string(),
+                github_url: format!("https://github.com/acme/{repo}/issues/{number}"),
+                open: true,
+            },
+            proposal: None,
+            chat_error: None,
+        }
+    }
+
+    /// Open the plain ticket focus on one pushed ticket and clear the sink.
+    fn open_ticket_focus(surface: &mut CountingSurface, app: &mut App, sink: &mut FakeSink) {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tickets.push(ticket_summary("borsuk", 7));
+        run_messages(
+            surface,
+            app,
+            vec![Msg::State(state), key('4'), key_code(KeyCode::Enter)].into_iter(),
+            sink,
+        )
+        .unwrap();
+        sink.0.clear();
+        app.tickets.observe_details(ticket_details("borsuk", 7));
     }
 
     #[test]
@@ -2593,6 +2674,143 @@ mod tests {
         assert_eq!(
             app.visible_toast(),
             Some("release batch changed; press g again")
+        );
+    }
+
+    #[test]
+    fn m_asks_before_it_adds_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                app.confirm,
+                Some(Confirm::Refine { ref repo, number: 7 }) if repo == "borsuk"
+            ),
+            "m must open the confirm prompt"
+        );
+        assert!(sink.0.is_empty(), "the prompt must send nothing yet");
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains("add to-refine to borsuk #7?"),
+            "screen: {text}"
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.0.len(), 1);
+        let Some(Action::Ticket(TicketAction::ToggleLabel {
+            repo,
+            number,
+            label,
+            on,
+            ..
+        })) = sink.0.first()
+        else {
+            panic!("y must send the to-refine toggle");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(*number, 7);
+        assert_eq!(label, "to-refine");
+        assert!(*on);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.visible_toast(), Some("sent to-refine borsuk #7"));
+    }
+
+    #[test]
+    fn esc_cancels_the_to_refine_prompt() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m'), key_code(KeyCode::Esc), key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty(), "a cancelled prompt must send nothing");
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn m_reports_a_ticket_that_already_has_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let mut labeled = ticket_details("borsuk", 7);
+        labeled
+            .issue
+            .labels
+            .push(crate::gates::TO_REFINE.to_string());
+        app.tickets.observe_details(labeled);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(
+            app.confirm.is_none(),
+            "a labeled ticket must skip the prompt"
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("the ticket already has to-refine")
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn m_stays_out_of_the_nested_ticket_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('e'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the editor keeps the m key");
+        assert!(!app.tickets.focus_plain(), "the editor holds the keyboard");
+        let screen = render_to_string(&mut app);
+        let title_row = screen
+            .lines()
+            .position(|line| line.contains(" title "))
+            .expect("the editor title block is visible");
+        let draft = screen
+            .lines()
+            .nth(title_row + 1)
+            .expect("the title draft row is visible");
+        assert!(
+            draft.trim_end_matches([' ', '│']).ends_with('m'),
+            "m typed into the editor title: {draft}"
         );
     }
 
