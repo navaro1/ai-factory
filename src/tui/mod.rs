@@ -323,6 +323,7 @@ impl App {
     fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
+        self.tickets.delivery_failed(None);
         self.settings.delivery_failed(None);
     }
 
@@ -579,7 +580,10 @@ impl App {
                     .as_ref()
                     .and_then(|state| self.tickets.handle_key(state, key))
                 {
-                    emit(self, sink, action, "sent ticket request".to_string());
+                    let copy = action.clone();
+                    if !emit(self, sink, action, "sent ticket request".to_string()) {
+                        self.tickets.delivery_failed(Some(&copy));
+                    }
                 }
                 if key.code == KeyCode::Esc && !nested {
                     self.view = View::Pipeline;
@@ -2122,6 +2126,59 @@ mod tests {
         };
         assert_eq!(repo, "borsuk", "the form targets the first repository");
         assert_eq!(title, "1", "the digit went into the title");
+    }
+
+    #[test]
+    fn a_failed_ticket_send_keeps_the_draft_and_allows_a_retry() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(ctrl_s, &mut FailSink);
+
+        let mut sink = FakeSink::default();
+        app.handle_key(ctrl_s, &mut sink);
+
+        let [Action::Ticket(crate::sock::TicketAction::Create { title, .. })] = sink.0.as_slice()
+        else {
+            panic!("the retry must send the retained ticket draft");
+        };
+        assert_eq!(title, "x");
+    }
+
+    #[test]
+    fn a_disconnect_unlocks_a_pending_ticket_send() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(ctrl_s, &mut sink);
+
+        app.mark_disconnected("lost".to_string());
+        app.handle_key(ctrl_s, &mut sink);
+
+        assert_eq!(sink.0.len(), 2, "the disconnect must allow one retry");
     }
 
     #[test]

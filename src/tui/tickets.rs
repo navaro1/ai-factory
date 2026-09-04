@@ -164,6 +164,25 @@ impl Tickets {
             || self.chat_active
     }
 
+    /// Unlock a ticket creation after a failed send or socket disconnect.
+    pub fn delivery_failed(&mut self, action: Option<&Action>) {
+        let Some(form) = self.new_ticket.as_mut() else {
+            return;
+        };
+        let matches = match action {
+            Some(Action::Ticket(TicketAction::Create { request, .. })) => {
+                form.pending && form.request.as_deref() == Some(request.as_str())
+            }
+            Some(_) => false,
+            None => form.pending,
+        };
+        if matches {
+            form.request = None;
+            form.pending = false;
+            form.error = Some("The ticket request was not delivered.".to_string());
+        }
+    }
+
     /// True when the open focus has a ticket transcript to poll.
     pub fn needs_poll(&self) -> bool {
         self.focus && self.chat.task_id().is_some()
@@ -296,6 +315,7 @@ impl Tickets {
                     TicketResultKind::Success => self.new_ticket = None,
                     TicketResultKind::Failure => {
                         if let Some(form) = self.new_ticket.as_mut() {
+                            form.request = None;
                             form.pending = false;
                             form.error = Some(result.message.clone());
                         }

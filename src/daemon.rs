@@ -1861,10 +1861,13 @@ impl Daemon {
                     }
                 }
                 if let Some((repo, issue, _confirmed_ms)) = effects.confirmed {
-                    if let Some(items) = self.snapshot.repos.get_mut(&repo) {
-                        items.issues.insert(issue.number, issue);
-                        self.changed = true;
-                    }
+                    self.snapshot
+                        .repos
+                        .entry(repo.clone())
+                        .or_default()
+                        .issues
+                        .insert(issue.number, issue);
+                    self.changed = true;
                     if let Some(fresh) = self.snapshot.repos.get(&repo).cloned() {
                         self.complete_parked_refines(&repo, &fresh);
                         self.reconcile_unready(&repo, &fresh);
@@ -8677,6 +8680,57 @@ mod tests {
         // A quiet second drive publishes nothing.
         rig.drive();
         assert!(rx.try_recv().is_err(), "an unchanged drive must not push");
+    }
+
+    #[test]
+    fn a_ticket_created_before_the_first_poll_reaches_the_next_state() {
+        let created = json!({
+            "number": 12,
+            "node_id": "node-12",
+            "title": "Direct title",
+            "body": "Direct body",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-03T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk/issues/12"
+        });
+        let (mut rig, rx) = pushed_rig(vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Direct title",
+                "-f",
+                "body=Direct body",
+            ],
+            CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+        )]);
+        rig.drive();
+        let initial = rx.try_recv().expect("the first drive must publish");
+        assert!(initial.tickets.is_empty());
+
+        rig.act(Action::Ticket(TicketAction::Create {
+            request: "create-12".to_string(),
+            repo: "borsuk".to_string(),
+            title: "Direct title".to_string(),
+            body: "Direct body".to_string(),
+        }));
+
+        assert_eq!(
+            rig.daemon.snapshot.repos["borsuk"].issues[&12].title,
+            "Direct title"
+        );
+        let view = rx
+            .try_recv()
+            .expect("ticket creation must publish a fresh state");
+        assert_eq!(view.tickets.len(), 1);
+        assert_eq!(view.tickets[0].repo, "borsuk");
+        assert_eq!(view.tickets[0].number, 12);
     }
 
     #[test]
