@@ -7,6 +7,11 @@
 //! [`crate::tui::transcript`] and keeps the last [`RING_CAP`] items in a
 //! ring buffer.
 //!
+//! The log carries no user lines: the claude CLI writes no typed message
+//! into its output stream. The view echoes each sent message into the ring
+//! itself, so the transcript shows what the human typed. The echo lives
+//! only in the ring; a task switch drops it.
+//!
 //! The input bar states what a typed message will do. The daemon says the
 //! mode with [`TaskView::input`]; the bar renders a hint for that mode. A
 //! closed input takes no message: the bar shows the daemon's reason, and
@@ -483,9 +488,9 @@ impl SessionView {
     /// `page` is the visible transcript height in rows; the shell passes
     /// the pane height, and the view uses it as the PageUp and PageDown
     /// step. A focused bar takes the typing keys: typing feeds the input
-    /// bar, Enter sends one [`Action::Chat`] with the typed text, `ctrl-x`
-    /// sends [`Action::Abort`], PageUp and PageDown scroll, and End
-    /// returns to following the tail.
+    /// bar, Enter sends one [`Action::Chat`] with the typed text and echoes
+    /// the text into the transcript, `ctrl-x` sends [`Action::Abort`],
+    /// PageUp and PageDown scroll, and End returns to following the tail.
     ///
     /// An unfocused bar swallows typing and Enter and returns none,
     /// whatever the bar holds. `ctrl-x` and the scroll keys stay alive, so
@@ -511,6 +516,11 @@ impl SessionView {
                 if text.trim().is_empty() {
                     return None;
                 }
+                // The log file carries no user lines: the claude CLI never
+                // echoes a typed message into its output. The view echoes
+                // the sent text into the ring itself, so the transcript
+                // shows what the human typed.
+                self.ring.push(Entry::User { text: text.clone() });
                 Some(Action::Chat { task, text })
             }
             (KeyCode::Char(letter), modifiers)
@@ -1090,6 +1100,61 @@ mod tests {
         assert_eq!(view.handle_key(letter('a'), 10), None);
         assert_eq!(view.handle_key(key(KeyCode::Backspace), 10), None);
         assert_eq!(view.handle_key(key(KeyCode::Enter), 10), None);
+        assert!(
+            view.ring.is_empty(),
+            "a blank send echoes nothing into the transcript"
+        );
+    }
+
+    #[test]
+    fn enter_echoes_the_sent_message_into_the_transcript() {
+        let dir = TempDir::new("echo");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+
+        for press in [
+            letter('s'),
+            letter('t'),
+            letter('e'),
+            letter('e'),
+            letter('r'),
+        ] {
+            assert_eq!(view.handle_key(press, 10), None);
+        }
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter), 10),
+            Some(Action::Chat {
+                task: "borsuk/implement-i142".to_string(),
+                text: "steer".to_string(),
+            })
+        );
+
+        assert_eq!(view.ring.len(), 1);
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "steer".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn the_draw_shows_the_sent_message_in_the_transcript() {
+        let dir = TempDir::new("echo-draw");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        for press in [letter('h'), letter('i')] {
+            view.handle_key(press, 10);
+        }
+        view.handle_key(key(KeyCode::Enter), 10);
+
+        let screen = drawn_screen(&view);
+        assert!(
+            screen.contains("› hi"),
+            "the sent message must show in the transcript: {screen}"
+        );
     }
 
     #[test]
@@ -1306,7 +1371,12 @@ mod tests {
         assert_eq!(asks[0].options, vec!["a".to_string(), "b".to_string()]);
         assert!(asks[1].options.is_empty());
 
-        // A wrapped object and a wrong shape both yield nothing.
+        // The recorded tool input wraps the same list under `questions`.
+        let wrapped = ask_questions(&serde_json::json!({"questions": value}));
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].options, vec!["a".to_string(), "b".to_string()]);
+
+        // A wrong shape yields nothing.
         assert!(ask_questions(&serde_json::json!(null)).is_empty());
         assert!(ask_questions(&serde_json::json!("no")).is_empty());
     }
@@ -1437,6 +1507,13 @@ mod tests {
                 task: "borsuk/implement-i142".to_string(),
                 text: "hi".to_string(),
             })
+        );
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "hi".to_string()
+            }),
+            "a queued message echoes into the transcript too"
         );
     }
 

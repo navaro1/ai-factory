@@ -15,12 +15,14 @@
 //! `handle_key` for the inbox.
 //!
 //! A view that holds the keyboard for text input keeps a typed `q` away
-//! from the quit handler. The session view holds it while its chat bar is
-//! focused and open; `esc` or `tab` releases the focus, `h` and `l` then
-//! switch the live sessions, and `i` or `enter` takes the focus back.
-//! A session bar that cannot take text, and every other view, leaves the
-//! `1` through `5` view keys and `?` to the shell. The `!` inbox key and
-//! the ctrl-q and ctrl-c quit chords work from every view.
+//! from the quit handler and takes a typed `!` as a character. The session
+//! view holds the keyboard while its chat bar is focused and open; `esc`
+//! or `tab` releases the focus, `h` and `l` then switch the live sessions,
+//! and `i` or `enter` takes the focus back. A session bar that cannot take
+//! text, and every other view, leaves the `1` through `5` view keys and
+//! `?` to the shell. Every state without an open text input opens the
+//! inbox on `!`, and the ctrl-q and ctrl-c quit chords work from every
+//! view.
 
 pub mod inbox;
 pub mod markdown;
@@ -54,7 +56,7 @@ use crate::catalog;
 use crate::decisions::DecisionKind;
 use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
-use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
+use crate::sock::{Action, Client, Push, StateView, TaskView, TicketAction, WireProtocolMismatch};
 use crate::tasks::TaskState;
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
@@ -108,6 +110,8 @@ enum Msg {
     TicketLabels(crate::sock::TicketLabels),
     /// One ticket mutation result.
     TicketResult(crate::sock::TicketResult),
+    /// One fetched question for one `NeedsHuman` detail screen.
+    Ask(crate::sock::AskView),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
     /// The parsed `opencode models` probe result of this shell start.
@@ -177,6 +181,13 @@ enum Confirm {
         /// The pull request numbers in the batch.
         prs: Vec<u64>,
     },
+    /// Add the `to-refine` label to one ticket.
+    Refine {
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
 }
 
 impl Confirm {
@@ -212,6 +223,20 @@ impl Confirm {
                         prs: prs.clone(),
                     },
                     format!("sent release {repo} {}", pr_text(&prs)),
+                );
+            }
+            Confirm::Refine { repo, number } => {
+                emit(
+                    app,
+                    sink,
+                    Action::Ticket(TicketAction::ToggleLabel {
+                        request: tickets::request_code(),
+                        repo: repo.clone(),
+                        number,
+                        label: crate::gates::TO_REFINE.to_string(),
+                        on: true,
+                    }),
+                    format!("sent to-refine {repo} #{number}"),
                 );
             }
         }
@@ -263,12 +288,16 @@ impl App {
     /// count, and drops an expired toast. It feeds the inbox and follows
     /// the session task, so both views stay in step with the daemon.
     /// Send one mention-status request for a pull request detail whose
-    /// description just became visible.
+    /// description just became visible, and one ask request for a
+    /// `NeedsHuman` detail whose question just became visible.
     fn send_pending_pr_mention(&mut self, sink: &mut impl ActionSink) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
         if let Some(action) = self.inbox.take_pending_pr_mention(state) {
+            sink.send_action(action);
+        }
+        if let Some(action) = self.inbox.take_pending_ask(state) {
             sink.send_action(action);
         }
     }
@@ -327,6 +356,7 @@ impl App {
     fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
+        self.tickets.delivery_failed(None);
         self.settings.delivery_failed(None);
     }
 
@@ -354,6 +384,19 @@ impl App {
             View::Settings => self.settings.typing(),
             View::Pipeline => false,
         }
+    }
+
+    /// True when a typed character lands in an open text input now.
+    ///
+    /// The session bar takes text only while it is focused and open. A
+    /// closed bar and a bar with no task swallow the letters, so the
+    /// shell keeps the `!` inbox key there. Every other view takes text
+    /// while its own input is open.
+    fn types_text(&self) -> bool {
+        if matches!(self.view, View::Session) && !self.session.input_enabled() {
+            return false;
+        }
+        self.text_focus()
     }
 
     /// Enter the session view and give the chat bar the focus.
@@ -431,13 +474,16 @@ impl App {
 
     /// Apply one key press. Returns false when the app wants to quit.
     ///
-    /// The quit chords and the inbox key work in every state. A view that
-    /// holds text input keeps a typed `q` away from the quit handler.
+    /// The quit chords work in every state. An open text input takes the
+    /// typed `q` and `!` as characters; every other state quits on `q`
+    /// and opens the inbox on `!`.
     fn handle_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
         if quit_chord(key) {
             return false;
         }
-        if inbox_key(key) {
+        // An overlay covers the text input below it, so the global key
+        // still works while the overlay is open.
+        if inbox_key(key) && (self.help || self.confirm.is_some() || !self.types_text()) {
             self.confirm = None;
             self.help = false;
             self.open_inbox_oldest();
@@ -577,13 +623,26 @@ impl App {
                         _ => {}
                     }
                 }
+                if key.code == KeyCode::Char('m') && self.tickets.focus_plain() {
+                    if let Some((repo, number)) = self.tickets.focus_key() {
+                        if self.tickets.focus_has_label(crate::gates::TO_REFINE) {
+                            self.show_toast("the ticket already has to-refine");
+                        } else {
+                            self.confirm = Some(Confirm::Refine { repo, number });
+                        }
+                    }
+                    return true;
+                }
                 let nested = self.tickets.focus_open() || self.tickets.typing();
                 if let Some(action) = self
                     .state
                     .as_ref()
                     .and_then(|state| self.tickets.handle_key(state, key))
                 {
-                    emit(self, sink, action, "sent ticket request".to_string());
+                    let copy = action.clone();
+                    if !emit(self, sink, action, "sent ticket request".to_string()) {
+                        self.tickets.delivery_failed(Some(&copy));
+                    }
                 }
                 if key.code == KeyCode::Esc && !nested {
                     self.view = View::Pipeline;
@@ -674,7 +733,8 @@ impl App {
     /// Apply one key to the inbox and report whether an action crossed.
     ///
     /// A sent action toasts. An open-session outcome switches to the
-    /// session view of that task.
+    /// session view of that task. An open-ticket outcome switches to the
+    /// Tickets view focus of one issue.
     fn inbox_dispatch(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
         let Some(state) = self.state.as_ref() else {
             return false;
@@ -688,11 +748,20 @@ impl App {
         if sent {
             self.show_toast("sent");
         }
-        if let inbox::InboxOutcome::OpenSession(task) = outcome {
-            self.session_task = Some(task);
-            self.wanted = None;
-            self.enter_session();
-            self.show_session_task();
+        match outcome {
+            inbox::InboxOutcome::None => {}
+            inbox::InboxOutcome::OpenSession(task) => {
+                self.session_task = Some(task);
+                self.wanted = None;
+                self.enter_session();
+                self.show_session_task();
+            }
+            inbox::InboxOutcome::OpenTicket { repo, number } => {
+                self.view = View::Tickets;
+                if let Some(action) = self.tickets.open(&repo, number) {
+                    emit(self, sink, action, "sent ticket request".to_string());
+                }
+            }
         }
         sent
     }
@@ -1026,6 +1095,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::Ask(ask)) => {
+                                        if tx.send(Msg::Ask(ask)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Ok(Push::SettingsResult(result)) => {
                                         if tx.send(Msg::SettingsResult(result)).is_err() {
                                             return;
@@ -1138,6 +1212,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::TicketResult(result) => {
             app.tickets.observe_result(result);
+            Ok(true)
+        }
+        Msg::Ask(ask) => {
+            app.inbox.observe_ask(&ask);
             Ok(true)
         }
         Msg::SettingsResult(result) => {
@@ -1394,6 +1472,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let question = match confirm {
         Confirm::Abort { task } => format!("abort {task}?"),
         Confirm::Go { repo, prs } => format!("release {repo}: {}", pr_text(prs)),
+        Confirm::Refine { repo, number } => format!("add to-refine to {repo} #{number}?"),
     };
     let hint = "y confirm - esc cancel";
     let width = question.chars().count().max(hint.len()) as u16 + 6;
@@ -1436,10 +1515,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("End", "follow the tail"),
         ("esc tab i", "leave or take the chat focus"),
         ("h l", "switch session, chat unfocused"),
-        ("y n i t c", "inbox answers"),
+        ("y n i t c s w 1-9", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ e l c a", "search and ticket actions"),
-        ("h l", "tickets repo / settings scope"),
+        ("/ n e L c a m", "search and ticket keys"),
+        ("h l", "repo / ticket / settings scope"),
         ("j k", "settings role"),
         ("Tab", "select settings field"),
         ("Enter", "edit settings value"),
@@ -1576,6 +1655,55 @@ mod tests {
             1_000,
         );
         Decision::permission(&task, request_id, "Write", serde_json::json!({}), opened_ms)
+    }
+
+    /// One ticket summary for the shell ticket tests.
+    fn ticket_summary(repo: &str, number: u64) -> crate::sock::TicketSummary {
+        crate::sock::TicketSummary {
+            repo: repo.to_string(),
+            number,
+            title: "Improve the ticket list".to_string(),
+            labels: vec!["ui".to_string()],
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Untouched,
+        }
+    }
+
+    /// One full issue response for the shell ticket tests.
+    fn ticket_details(repo: &str, number: u64) -> crate::sock::TicketDetails {
+        crate::sock::TicketDetails {
+            request: "shell-details".to_string(),
+            repo: repo.to_string(),
+            issue: crate::model::Issue {
+                number,
+                node_id: format!("node-{number}"),
+                title: "Improve the ticket list".to_string(),
+                body: "Show every issue without leaving the terminal.".to_string(),
+                labels: vec!["ui".to_string()],
+                author: "piotr".to_string(),
+                assignees: Vec::new(),
+                updated_at: "2026-08-30T12:00:00Z".to_string(),
+                github_url: format!("https://github.com/acme/{repo}/issues/{number}"),
+                open: true,
+            },
+            proposal: None,
+            chat_error: None,
+        }
+    }
+
+    /// Open the plain ticket focus on one pushed ticket and clear the sink.
+    fn open_ticket_focus(surface: &mut CountingSurface, app: &mut App, sink: &mut FakeSink) {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tickets.push(ticket_summary("borsuk", 7));
+        run_messages(
+            surface,
+            app,
+            vec![Msg::State(state), key('4'), key_code(KeyCode::Enter)].into_iter(),
+            sink,
+        )
+        .unwrap();
+        sink.0.clear();
+        app.tickets.observe_details(ticket_details("borsuk", 7));
     }
 
     #[test]
@@ -2067,6 +2195,7 @@ mod tests {
             "PageUp PageDown",
             "PageDown",
             "End",
+            "/ n e L c a m",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
@@ -2174,6 +2303,94 @@ mod tests {
     }
 
     #[test]
+    fn the_new_ticket_form_types_a_digit_instead_of_switching_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let ctrl_s = Msg::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('4'),
+                key('n'),
+                key('1'),
+                ctrl_s,
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets, "1 must not switch the view");
+        assert!(app.tickets.typing(), "the form kept the keyboard");
+        let [crate::sock::Action::Ticket(crate::sock::TicketAction::Create { repo, title, .. })] =
+            sink.0.as_slice()
+        else {
+            panic!("ctrl-s must send the typed title: {:?}", sink.0);
+        };
+        assert_eq!(repo, "borsuk", "the form targets the first repository");
+        assert_eq!(title, "1", "the digit went into the title");
+    }
+
+    #[test]
+    fn a_failed_ticket_send_keeps_the_draft_and_allows_a_retry() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(ctrl_s, &mut FailSink);
+
+        let mut sink = FakeSink::default();
+        app.handle_key(ctrl_s, &mut sink);
+
+        let [Action::Ticket(crate::sock::TicketAction::Create { title, .. })] = sink.0.as_slice()
+        else {
+            panic!("the retry must send the retained ticket draft");
+        };
+        assert_eq!(title, "x");
+    }
+
+    #[test]
+    fn a_disconnect_unlocks_a_pending_ticket_send() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(ctrl_s, &mut sink);
+
+        app.mark_disconnected("lost".to_string());
+        app.handle_key(ctrl_s, &mut sink);
+
+        assert_eq!(sink.0.len(), 2, "the disconnect must allow one retry");
+    }
+
+    #[test]
     fn bang_enters_the_inbox_and_selects_the_oldest_row() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
@@ -2219,10 +2436,11 @@ mod tests {
         app.show_session_task();
         app.view = View::Session;
 
+        // esc releases the chat focus, so the shell takes the ! key.
         run_messages(
             &mut surface,
             &mut app,
-            vec![key('!')].into_iter(),
+            vec![key_code(KeyCode::Esc), key('!')].into_iter(),
             &mut sink,
         )
         .unwrap();
@@ -2232,6 +2450,151 @@ mod tests {
             app.inbox.selected_id(),
             Some("perm:borsuk/implement-i140:req-2")
         );
+    }
+
+    #[test]
+    fn a_focused_open_bar_types_bang_and_a_released_bar_leaves_it_to_the_shell() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Session,
+            "the focused open bar keeps the session view"
+        );
+        assert_eq!(app.session.input_text(), "!", "the bar took the ! as text");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Inbox,
+            "the released focus leaves ! to the shell"
+        );
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+    }
+
+    #[test]
+    fn bang_opens_the_inbox_when_the_session_bar_cannot_type() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        // A closed input disables the focused bar, so ! stays global.
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].input = crate::sock::InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "! left the closed session");
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+
+        // A session with no shown task disables the focused bar too.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = None;
+        app.session.clear();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "! left the taskless session");
+    }
+
+    #[test]
+    fn bang_types_into_the_inbox_reason_and_the_tickets_search() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('3'), key('n'), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "the reason input keeps the view");
+        assert!(app.inbox.typing(), "the reason input stays open");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("reason: !"), "screen: {text}");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('4'), key('/'), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Tickets, "the search keeps the view");
+        let text = render_to_string(&mut app);
+        assert!(text.contains(" /!▌"), "screen: {text}");
     }
 
     #[test]
@@ -2265,6 +2628,59 @@ mod tests {
             app.inbox.selected_id(),
             Some("perm:borsuk/implement-i140:oldest")
         );
+    }
+
+    #[test]
+    fn w_on_a_needs_human_issue_opens_the_tickets_focus_and_sends_details() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![Decision::needs_human(
+            "borsuk",
+            ItemKind::Issue,
+            142,
+            "Choose the storage",
+            1_000,
+        )];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('3'),
+                key_code(KeyCode::Enter),
+                key('w'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets);
+        assert!(app.tickets.focus_open());
+        let asks = sink
+            .0
+            .iter()
+            .filter(|action| matches!(action, Action::Ask { .. }))
+            .count();
+        assert_eq!(asks, 1, "the ask request must go out once: {:?}", sink.0);
+        let details: Vec<&Action> = sink
+            .0
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    Action::Ticket(crate::sock::TicketAction::Details { .. })
+                )
+            })
+            .collect();
+        assert_eq!(details.len(), 1, "sink: {:?}", sink.0);
+        assert!(matches!(
+            details[0],
+            Action::Ticket(crate::sock::TicketAction::Details { repo, number, .. })
+                if repo == "borsuk" && *number == 142
+        ));
     }
 
     #[test]
@@ -2594,6 +3010,261 @@ mod tests {
             app.visible_toast(),
             Some("release batch changed; press g again")
         );
+    }
+
+    #[test]
+    fn m_asks_before_it_adds_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                app.confirm,
+                Some(Confirm::Refine { ref repo, number: 7 }) if repo == "borsuk"
+            ),
+            "m must open the confirm prompt"
+        );
+        assert!(sink.0.is_empty(), "the prompt must send nothing yet");
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains("add to-refine to borsuk #7?"),
+            "screen: {text}"
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.0.len(), 1);
+        let Some(Action::Ticket(TicketAction::ToggleLabel {
+            repo,
+            number,
+            label,
+            on,
+            ..
+        })) = sink.0.first()
+        else {
+            panic!("y must send the to-refine toggle");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(*number, 7);
+        assert_eq!(label, "to-refine");
+        assert!(*on);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.visible_toast(), Some("sent to-refine borsuk #7"));
+    }
+
+    #[test]
+    fn esc_cancels_the_to_refine_prompt() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m'), key_code(KeyCode::Esc), key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty(), "a cancelled prompt must send nothing");
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn m_reports_a_ticket_that_already_has_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let mut labeled = ticket_details("borsuk", 7);
+        labeled
+            .issue
+            .labels
+            .push(crate::gates::TO_REFINE.to_string());
+        app.tickets.observe_details(labeled);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(
+            app.confirm.is_none(),
+            "a labeled ticket must skip the prompt"
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("the ticket already has to-refine")
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn m_stays_out_of_the_nested_ticket_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('e'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the editor keeps the m key");
+        assert!(!app.tickets.focus_plain(), "the editor holds the keyboard");
+        let screen = render_to_string(&mut app);
+        let title_row = screen
+            .lines()
+            .position(|line| line.contains(" title "))
+            .expect("the editor title block is visible");
+        let draft = screen
+            .lines()
+            .nth(title_row + 1)
+            .expect("the title draft row is visible");
+        assert!(
+            draft.trim_end_matches([' ', '│']).ends_with('m'),
+            "m typed into the editor title: {draft}"
+        );
+    }
+
+    #[test]
+    fn m_stays_out_of_the_label_picker_and_the_chat() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        // The label picker owns the keyboard.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('L'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.confirm.is_none(), "the label picker keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the label picker holds the keyboard"
+        );
+
+        // The new-label form owns the keyboard too.
+        app.tickets.observe_labels(crate::sock::TicketLabels {
+            request: "labels-1".to_string(),
+            repo: "borsuk".to_string(),
+            labels: vec![crate::sock::RepoLabel {
+                name: "ui".to_string(),
+                color: "ededed".to_string(),
+            }],
+            error: None,
+        });
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('n'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.confirm.is_none(), "the new-label form keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the new-label form holds the keyboard"
+        );
+
+        // The chat input owns the keyboard.
+        let mut chatting = App::default();
+        let mut chat_sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut chatting, &mut chat_sink);
+        run_messages(
+            &mut surface,
+            &mut chatting,
+            vec![key('c'), key('m')].into_iter(),
+            &mut chat_sink,
+        )
+        .unwrap();
+        assert!(chatting.confirm.is_none(), "the chat keeps the m key");
+        assert!(
+            !chatting.tickets.focus_plain(),
+            "the chat holds the keyboard"
+        );
+    }
+
+    #[test]
+    fn m_stays_out_of_the_ticket_conflict_view() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let details = ticket_details("borsuk", 7);
+        app.tickets.observe_result(crate::sock::TicketResult {
+            request: "content-1".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: crate::sock::TicketResultKind::Conflict,
+            message: "the issue changed on GitHub".to_string(),
+            issue: None,
+            conflict: Some(crate::sock::TicketConflict {
+                remote: details.issue.clone(),
+                pending: crate::sock::TicketContent {
+                    title: "A local title".to_string(),
+                    body: "A local body".to_string(),
+                },
+                source: crate::sock::TicketContentSource::Direct,
+            }),
+        });
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the conflict view keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the conflict view holds the keyboard"
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn the_help_overlay_names_the_new_ticket_keys() {
+        let mut app = App {
+            help: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        for entry in [
+            "/ n e L c a m",
+            "search and ticket keys",
+            "repo / ticket / settings scope",
+        ] {
+            assert!(text.contains(entry), "the help misses {entry}");
+        }
     }
 
     #[test]
