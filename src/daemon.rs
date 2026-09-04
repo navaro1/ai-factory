@@ -200,6 +200,9 @@ pub struct Daemon {
     /// The current probe wait of each identity, in minutes. A failure
     /// doubles the wait up to the cap; a success resets it.
     usage_wait_minutes: BTreeMap<String, u64>,
+    /// The home directory the probes read their credential files from.
+    /// Production leaves this unset, so the probes read the operator home.
+    usage_home: Option<PathBuf>,
     /// The outbound end of the usage probe channel; each probe thread gets
     /// a clone.
     usage_tx: Sender<(String, Result<UsageRecord, String>)>,
@@ -504,6 +507,7 @@ impl Daemon {
             usage_in_flight: BTreeSet::new(),
             usage_next_probe_ms: BTreeMap::new(),
             usage_wait_minutes: BTreeMap::new(),
+            usage_home: None,
             usage_tx,
             usage_rx: Some(usage_rx),
             sessions: BTreeMap::new(),
@@ -766,6 +770,24 @@ impl Daemon {
         self.ticket_pusher = Some(pusher);
     }
 
+    /// Point the usage probes at one home directory.
+    ///
+    /// Production never calls this. Tests point the probes at a temporary
+    /// home, so they never read the operator's real credentials.
+    pub fn set_usage_home(&mut self, home: PathBuf) {
+        self.usage_home = Some(home);
+    }
+
+    /// Take the inbound end of the usage probe channel.
+    ///
+    /// The event loop takes it when `run` starts, so a later call returns
+    /// None. Tests use this end to apply probe results without threads.
+    pub fn take_usage_receiver(
+        &mut self,
+    ) -> Option<Receiver<(String, Result<UsageRecord, String>)>> {
+        self.usage_rx.take()
+    }
+
     /// Build the state view from the live state and hand it to the pusher.
     ///
     /// The call runs at the end of every drive pass and pushes only when
@@ -851,12 +873,13 @@ impl Daemon {
         let exec = Arc::clone(&self.exec);
         let tx = self.usage_tx.clone();
         let now_ms = self.now_ms;
+        let home = self.usage_home.clone().unwrap_or_else(usage::home_dir);
         let id = identity.id.clone();
         let thread_identity = identity.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("aif-usage-{id}"))
             .spawn(move || {
-                let result = usage::run_probe(&*exec, &thread_identity, now_ms)
+                let result = usage::run_probe(&*exec, &thread_identity, &home, now_ms)
                     .map_err(|error| format!("{error:#}"));
                 let _ = tx.send((id, result));
             });

@@ -2026,6 +2026,41 @@ pub(crate) fn sample_view() -> StateView {
     }
 }
 
+/// Render one state view board into text with a pinned clock.
+///
+/// Test support for the usage end-to-end test in `src/usage/mod.rs`.
+#[cfg(test)]
+pub(crate) fn render_state_board(
+    state: &StateView,
+    width: u16,
+    height: u16,
+    now_ms: u64,
+) -> String {
+    let app = App {
+        state: Some(state.clone()),
+        connected: true,
+        ..App::default()
+    };
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(
+                frame,
+                &app,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                now_ms,
+            );
+        })
+        .unwrap();
+    buffer_text(terminal.backend().buffer())
+}
+
 /// Render the app into a test backend and return the visible text.
 ///
 /// Test support for this file and for the shell tests in `mod.rs`.

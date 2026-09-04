@@ -14,7 +14,7 @@
 //! a bearer token or an API key.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -295,20 +295,29 @@ pub fn identities(config: &Config) -> Vec<Identity> {
 ///
 /// The call is synchronous and may take seconds; the daemon runs it on a
 /// thread. Every probe takes the scripted [`Exec`], so a test never touches
-/// the network.
-pub fn run_probe(exec: &dyn Exec, identity: &Identity, now_ms: u64) -> Result<UsageRecord> {
+/// the network. The credential files are read under `home`, so a test
+/// points the probe at a temporary home instead of the operator's own.
+pub fn run_probe(
+    exec: &dyn Exec,
+    identity: &Identity,
+    home: &Path,
+    now_ms: u64,
+) -> Result<UsageRecord> {
     match identity.id.as_str() {
-        "claude" => {
-            claude::probe_claude(exec, &identity.program, &claude_credentials_path(), now_ms)
-        }
-        "codex" => codex::probe_codex(exec, &identity.program, &codex_auth_path(), now_ms),
+        "claude" => claude::probe_claude(
+            exec,
+            &identity.program,
+            &claude_credentials_path(home),
+            now_ms,
+        ),
+        "codex" => codex::probe_codex(exec, &identity.program, &codex_auth_path(home), now_ms),
         "zai-coding-plan" => {
-            let token = opencode::read_opencode_auth(&opencode_auth_path())?
+            let token = opencode::read_opencode_auth(&opencode_auth_path(home))?
                 .ok_or_else(|| anyhow!("no opencode auth entry for zai-coding-plan"))?;
             opencode::probe_zai(exec, &token, now_ms)
         }
         "opencode" => {
-            let token = opencode::read_opencode_auth(&opencode_auth_path())?
+            let token = opencode::read_opencode_auth(&opencode_auth_path(home))?
                 .ok_or_else(|| anyhow!("no opencode auth entry for opencode"))?;
             opencode::probe_zen(exec, &token, now_ms)
         }
@@ -317,7 +326,7 @@ pub fn run_probe(exec: &dyn Exec, identity: &Identity, now_ms: u64) -> Result<Us
 }
 
 /// The home directory of the operator, or an empty path without `HOME`.
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -325,19 +334,18 @@ fn home_dir() -> PathBuf {
 }
 
 /// The Claude OAuth credentials file the usage probe re-reads every time.
-pub(crate) fn claude_credentials_path() -> PathBuf {
-    home_dir().join(".claude").join(".credentials.json")
+pub(crate) fn claude_credentials_path(home: &Path) -> PathBuf {
+    home.join(".claude").join(".credentials.json")
 }
 
 /// The codex auth file that decides the plan or API mode.
-pub(crate) fn codex_auth_path() -> PathBuf {
-    home_dir().join(".codex").join("auth.json")
+pub(crate) fn codex_auth_path(home: &Path) -> PathBuf {
+    home.join(".codex").join("auth.json")
 }
 
 /// The OpenCode auth file that holds the provider tokens.
-pub(crate) fn opencode_auth_path() -> PathBuf {
-    home_dir()
-        .join(".local")
+pub(crate) fn opencode_auth_path(home: &Path) -> PathBuf {
+    home.join(".local")
         .join("share")
         .join("opencode")
         .join("auth.json")
@@ -584,6 +592,148 @@ model = "zai-coding-plan/glm-5.3"
         let error = curl_get(&exec, "https://example.test", "token", &[]).unwrap_err();
 
         assert!(error.to_string().contains("is not a number"));
+    }
+
+    #[test]
+    fn the_probe_result_pushes_and_draws_through_the_real_seams() {
+        use crate::daemon::{Daemon, Inbound};
+        use crate::exec::{CmdOut, ScriptExec};
+        use crate::runner::DefaultRunnerFactory;
+        use std::fs;
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aif-usage-e2e-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let credentials = dir.join(".claude").join(".credentials.json");
+        fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        fs::write(
+            &credentials,
+            r#"{"claudeAiOauth":{"accessToken":"e2e-secret-token"}}"#,
+        )
+        .unwrap();
+
+        // The probe reads the mode, then the usage endpoint through curl.
+        let exec = ScriptExec::new()
+            .expect(
+                |call| call.program == "claude" && call.argv() == ["auth", "status"],
+                CmdOut::ok("{\"subscriptionType\":\"max\"}"),
+            )
+            .expect(
+                |call| {
+                    call.program == "curl"
+                        && call
+                            .argv()
+                            .contains(&"https://api.anthropic.com/api/oauth/usage")
+                },
+                CmdOut::ok(
+                    "{\"five_hour\":{\"utilization\":0.42,\"resets_at\":6000000},\"seven_day\":null}\n200",
+                ),
+            );
+
+        let text = r#"
+schema_version = 1
+
+[stage.refine]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[stage.implement]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[stage.review]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[stage.release]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[ticket.create]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[ticket.chat]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[usage]
+enabled = true
+minutes = 10
+"#;
+        let config = crate::config::Config::parse(text).unwrap();
+        let (_poll_tx, poll_rx) = channel();
+        let (wake_tx, _wake_rx) = channel();
+        let mut wake = std::collections::BTreeMap::new();
+        wake.insert("borsuk".to_string(), wake_tx);
+        let (_action_tx, action_rx) = channel();
+        let mut daemon = Daemon::with_runner_factory(
+            config,
+            dir.join("factory.toml"),
+            String::new(),
+            std::sync::Arc::new(exec),
+            dir.join("state"),
+            dir.join("prompts"),
+            poll_rx,
+            wake,
+            action_rx,
+            std::sync::Arc::new(DefaultRunnerFactory),
+            false,
+        );
+        daemon.set_usage_home(dir.clone());
+        let (view_tx, view_rx) = channel();
+        daemon.set_pusher(Box::new(move |view| {
+            let _ = view_tx.send(view);
+        }));
+
+        // The drive polls the due identity and spawns exactly one probe.
+        daemon.drive();
+        let usage_rx = daemon.take_usage_receiver().unwrap();
+        let (identity, result) = usage_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the drive must spawn the claude probe");
+        assert_eq!(identity, "claude");
+        let record = result.expect("the scripted probe must succeed");
+        assert_eq!(record.mode, UsageMode::Plan);
+        assert_eq!(record.plan.as_deref(), Some("max"));
+        assert_eq!(record.windows.len(), 1);
+        assert_eq!(record.windows[0].used_percent, 42.0);
+        assert_eq!(record.windows[0].label, "5 hour");
+
+        // The daemon applies the result and pushes the usage row.
+        daemon.handle(Inbound::Usage {
+            identity,
+            result: Ok(record),
+        });
+        let mut view = None;
+        for _ in 0..8 {
+            let pushed = view_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the drive must push a state view");
+            // A view before the first result carries the placeholder row
+            // with no probe time yet.
+            if pushed.usage.iter().any(|row| row.updated_ms > 0) {
+                view = Some(pushed);
+                break;
+            }
+        }
+        let view = view.expect("a pushed view must carry the usage rows");
+        assert_eq!(view.usage.len(), 1);
+        assert_eq!(view.usage[0].identity, "claude");
+        assert_eq!(view.usage[0].windows[0].used_percent, 42.0);
+
+        // The drawn band carries the probed numbers.
+        let drawn = crate::tui::pipeline::render_state_board(&view, 120, 40, 5_000_000_000);
+        assert!(drawn.contains("USAGE"), "board:\n{drawn}");
+        assert!(drawn.contains("max plan"), "board:\n{drawn}");
+        assert!(drawn.contains("58% left"), "board:\n{drawn}");
+        assert!(drawn.contains("resets "), "board:\n{drawn}");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
