@@ -1820,6 +1820,12 @@ impl Daemon {
     /// belongs to a task that can use it, so the daemon stops the session
     /// of the failed task first. The task waits for the `Exit` event
     /// before a retry, like every replaced session.
+    ///
+    /// The requeue that leads into the last attempt also drops every saved
+    /// session identity, so the last attempt starts fresh instead of
+    /// repeating a resume the harness already refused twice. A task that
+    /// holds a queued chat message keeps its session; see
+    /// [`Daemon::drop_saved_session`].
     fn fail_task(&mut self, id: &str, reason: &str) {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
@@ -1845,7 +1851,53 @@ impl Daemon {
             self.decisions.push(row);
         } else if let Err(e) = self.table.transition(id, TaskState::Queued, self.now_ms) {
             eprintln!("task {id}: {e:#}");
+        } else if self
+            .table
+            .by_id
+            .get(id)
+            .is_some_and(|task| task.attempt == tasks::MAX_ATTEMPTS)
+        {
+            self.drop_saved_session(id);
         }
+    }
+
+    /// Drop every saved session identity of one task.
+    ///
+    /// The task failed twice, and the second run carried the saved session.
+    /// The harness no longer knows that session: it was purged, the
+    /// worktree was rebuilt, or the harness was reinstalled. The last
+    /// attempt then starts a fresh session. The next `Started` event saves
+    /// the new identity again, so the session stays resumable after a
+    /// restart.
+    ///
+    /// A queued chat message names that same session, and
+    /// [`Daemon::resume_pending_chats`] discards every queued message of a
+    /// task it cannot resume. The drop therefore waits while a chat waits,
+    /// like the `Done` path and the cancel path that both keep the marker
+    /// for a pending chat. The retry resumes the saved session instead, and
+    /// the operator sees a stuck row when that resume fails again.
+    fn drop_saved_session(&mut self, id: &str) {
+        if self.pending_chats.contains_key(id) {
+            return;
+        }
+        let Some(task) = self.table.by_id.get_mut(id) else {
+            return;
+        };
+        task.session_id = None;
+        let ticket_chat = task.purpose == TaskPurpose::TicketChat;
+        let ticket_key = (task.repo.clone(), task.number);
+        let marker_task = task.clone();
+        self.remove_task_session_marker(&marker_task);
+        if ticket_chat {
+            if let Some(conversation) = self.ticket_conversations.get_mut(&ticket_key) {
+                conversation.session_id = None;
+            }
+        }
+        self.changed = true;
+        eprintln!(
+            "task {id}: the saved session did not resume; attempt {} starts a fresh session",
+            tasks::MAX_ATTEMPTS
+        );
     }
 
     /// Close the release train of one repository after its release task.
@@ -5084,6 +5136,132 @@ mod tests {
     }
 
     #[test]
+    fn a_second_failed_resume_drops_the_saved_session_for_the_last_attempt() {
+        let dir = temp_root();
+        let wt = issue_wt(&dir, 142);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &wt, 142, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(&rig_repo(&dir), &wt, &rig_gitdir(&dir)))
+            .chain(reuse_issue_steps(&rig_repo(&dir), &wt, &rig_gitdir(&dir)))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "session-1"));
+        let marker = |rig: &Rig| {
+            rig.daemon
+                .worktrees
+                .read_task_session(&wt, "borsuk/implement-i142")
+                .unwrap()
+        };
+
+        // A failure on attempt 1 keeps the saved session for attempt 2.
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 2);
+        assert_eq!(
+            rig.task("borsuk/implement-i142").session_id.as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(marker(&rig), Some("session-1".to_string()));
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).resume.as_deref(), Some("session-1"));
+
+        // A second failure clears every saved identity: attempt 3 runs
+        // fresh instead of repeating the same failed resume.
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
+        assert_eq!(rig.task("borsuk/implement-i142").session_id, None);
+        assert_eq!(marker(&rig), None);
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).resume, None);
+
+        // The final failure opens the stuck row as today, and no session
+        // data survives the terminal state.
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert!(rig.decision("stuck:borsuk/implement-i142:3").is_some());
+        assert_eq!(rig.task("borsuk/implement-i142").session_id, None);
+        assert_eq!(marker(&rig), None);
+    }
+
+    #[test]
+    fn a_second_failed_ticket_chat_resume_clears_the_conversation_session() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, vec![], |_| {});
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
+        let key = ("borsuk".to_string(), 7);
+        let conversation = |rig: &Rig| rig.daemon.ticket_conversations[&key].session_id.clone();
+        let checkout = rig.repo.clone();
+        let marker = |rig: &Rig| {
+            rig.daemon
+                .worktrees
+                .read_task_session(&checkout, "borsuk/ticket-i7")
+                .unwrap()
+        };
+        assert_eq!(conversation(&rig).as_deref(), Some("session-ticket-7"));
+
+        // A failure on attempt 1 keeps every saved identity.
+        rig.event(exited("borsuk/ticket-i7", false, "boom"));
+        assert_eq!(rig.task("borsuk/ticket-i7").attempt, 2);
+        assert_eq!(conversation(&rig).as_deref(), Some("session-ticket-7"));
+        assert_eq!(marker(&rig).as_deref(), Some("session-ticket-7"));
+        assert_eq!(rig.job(1).resume.as_deref(), Some("session-ticket-7"));
+
+        // The requeue into the last attempt clears the task, the marker,
+        // and the conversation of the ticket chat.
+        rig.event(exited("borsuk/ticket-i7", false, "boom"));
+        assert_eq!(rig.task("borsuk/ticket-i7").attempt, 3);
+        assert_eq!(rig.task("borsuk/ticket-i7").session_id, None);
+        assert_eq!(conversation(&rig), None);
+        assert_eq!(marker(&rig), None);
+        assert_eq!(rig.job(2).resume, None, "the last attempt runs fresh");
+    }
+
+    #[test]
+    fn a_queued_chat_message_keeps_the_saved_session_of_the_last_attempt() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 3);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 2);
+
+        // The operator types while attempt 2 runs. A one-shot harness takes
+        // no live input, so the message waits for the next turn.
+        assert!(rig.daemon.chat("borsuk/implement-i142", "check the parser"));
+
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+
+        assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
+        assert_eq!(
+            rig.task("borsuk/implement-i142").session_id.as_deref(),
+            Some("ses-142"),
+            "the queued message names the saved session, so the drop waits"
+        );
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(
+            rig.job(2).prompt,
+            "check the parser",
+            "the last attempt carries the typed message, not a fresh stage prompt"
+        );
+        assert_eq!(
+            rig.job(2).resume.as_deref(),
+            Some("ses-142"),
+            "the follow-up turn resumes the session the message names"
+        );
+        assert!(
+            !rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the delivered message leaves no queue behind"
+        );
+    }
+
+    #[test]
     fn a_dispatch_failure_appends_its_reason_to_the_task_log() {
         let dir = temp_root();
         let steps = vec![git_step(
@@ -6172,6 +6350,53 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Pin the restart resume of one harness.
+    ///
+    /// The restored task dispatches with its saved session id, and the
+    /// dispatch binds the configured harness. The runner unit tests pin the
+    /// exact resume argv (`--resume <id>` for claude, `--session <id>` for
+    /// opencode, `exec resume <id>` for codex); this rig pins the dispatch
+    /// contract that feeds them.
+    ///
+    /// `set_role_harness` clears every field of another harness, so the role
+    /// binding that the first rig persists still validates when the second
+    /// rig loads the state file.
+    fn restart_resumes_for_harness(harness: Harness) {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir));
+        let mut first = Rig::make_in(dir.clone(), steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, harness);
+        });
+        first.poll(vec![issue(142, &["refined"])], vec![]);
+        first.event(started("borsuk/implement-i142", "session-142"));
+        drop(first);
+
+        let steps = reuse_issue_steps(&rig_repo(&dir), &worktree, &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, harness);
+        });
+        second.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert_eq!(second.job_count(), 1);
+        assert_eq!(second.job(0).resume.as_deref(), Some("session-142"));
+        assert_eq!(
+            second.roles.lock().unwrap()[0].settings.harness,
+            harness,
+            "the dispatch binds the configured harness"
+        );
+    }
+
+    #[test]
+    fn a_restart_resumes_the_opencode_session_of_the_same_task() {
+        restart_resumes_for_harness(Harness::Opencode);
+    }
+
+    #[test]
+    fn a_restart_resumes_the_codex_session_of_the_same_task() {
+        restart_resumes_for_harness(Harness::Codex);
     }
 
     #[test]
@@ -10231,13 +10456,30 @@ mod tests {
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
         rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(
+            rig.job(1).resume.as_deref(),
+            Some("ses-142"),
+            "the first retry keeps the session"
+        );
         rig.event(exited("borsuk/implement-i142", false, "boom"));
+        assert_eq!(
+            rig.task("borsuk/implement-i142").session_id,
+            None,
+            "the requeue into the last attempt drops the dead session"
+        );
+        // The fresh last attempt mints a new session, and its failure opens
+        // the stuck row while that new session stays saved.
+        rig.event(started("borsuk/implement-i142", "ses-3"));
         rig.event(exited("borsuk/implement-i142", false, "boom"));
         assert_eq!(
             rig.task("borsuk/implement-i142").state,
             TaskState::Failed("boom".to_string())
         );
         assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
+        assert_eq!(
+            rig.task("borsuk/implement-i142").session_id.as_deref(),
+            Some("ses-3")
+        );
         assert_eq!(rig.job_count(), 3);
         let stuck = rig.decision("stuck:borsuk/implement-i142:3");
         assert!(stuck.is_some(), "the finished run left a stuck row");
@@ -10257,7 +10499,7 @@ mod tests {
         rig.drive();
         assert_eq!(rig.job_count(), 4, "the follow-up turn starts once");
         let job = rig.job(3);
-        assert_eq!(job.resume.as_deref(), Some("ses-142"));
+        assert_eq!(job.resume.as_deref(), Some("ses-3"));
         assert_eq!(job.prompt, "try one more typed turn");
         rig.drive();
         assert_eq!(rig.job_count(), 4, "no second launch");
