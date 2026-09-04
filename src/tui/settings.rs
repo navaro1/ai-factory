@@ -308,6 +308,32 @@ impl Settings {
         self.text_editor.is_some() || self.list_editor.is_some() || self.value_list.is_some()
     }
 
+    /// The bottom-row hints of the settings state.
+    ///
+    /// An open editor names its own keys and shows no `? help`. The form
+    /// names the navigation keys and the keys of the active scope: the
+    /// repository scope removes its override, the global scope reloads.
+    /// On the form `j` and `k` step the execution role; inside the list
+    /// editor they step one row.
+    pub fn footer_hints(&self) -> String {
+        if let Some(editor) = self.list_editor.as_ref() {
+            if editor.row_editor.is_some() {
+                return "enter apply · esc cancel".to_string();
+            }
+            return "j k row · a add · d delete · enter edit · esc close".to_string();
+        }
+        if self.text_editor.is_some() {
+            return "enter apply · esc cancel".to_string();
+        }
+        if self.value_list.is_some() {
+            return "type filter · enter apply · esc close".to_string();
+        }
+        if self.scope > 0 {
+            return "j k role · tab field · enter open · s save · d remove · ? help".to_string();
+        }
+        "j k role · tab field · enter open · s save · r reload · ? help".to_string()
+    }
+
     /// Store the result of the `opencode models` probe and refresh an
     /// open model list.
     pub fn observe_models(&mut self, result: Result<Vec<String>, String>) {
@@ -1561,6 +1587,8 @@ fn role_label(role: ExecutionRole) -> &'static str {
         ExecutionRole::Release => "release",
         ExecutionRole::TicketCreate => "ticket creation",
         ExecutionRole::TicketChat => "ticket chat",
+        ExecutionRole::TheoryAudit => "theory audit",
+        ExecutionRole::TheoryChat => "theory chat",
     }
 }
 
@@ -1861,7 +1889,11 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 
 fn settings_panes(area: Rect, narrow: bool) -> [Rect; 2] {
     if narrow {
-        let panes = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(area);
+        let role_height = u16::try_from(ExecutionRole::ALL.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        let panes =
+            Layout::vertical([Constraint::Length(role_height), Constraint::Min(1)]).split(area);
         [panes[0], panes[1]]
     } else {
         let panes = Layout::horizontal([Constraint::Length(22), Constraint::Min(30)]).split(area);
@@ -1998,6 +2030,8 @@ mod tests {
                 "release",
                 "ticket creation",
                 "ticket chat",
+                "theory audit",
+                "theory chat",
             ]
             .map(|name| output.find(name).expect("the role must be visible"));
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
@@ -3108,5 +3142,66 @@ mod tests {
         settings.handle_key(&state, key(KeyCode::Esc));
         settings.handle_key(&state, key(KeyCode::Char('j')));
         assert_eq!(settings.selected_role(), ExecutionRole::Implement);
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_scope_and_the_open_editors() {
+        let state = state();
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.footer_hints(),
+            "j k role · tab field · enter open · s save · r reload · ? help"
+        );
+
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(settings.scope, 1);
+        assert_eq!(
+            settings.footer_hints(),
+            "j k role · tab field · enter open · s save · d remove · ? help"
+        );
+
+        settings.scope = 0;
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings.value_list.is_some());
+        assert_eq!(
+            settings.footer_hints(),
+            "type filter · enter apply · esc close"
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+
+        settings.text_editor = Some(TextEditor {
+            field: Field::Program,
+            buffer: String::new(),
+        });
+        assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
+        settings.text_editor = None;
+
+        settings.list_editor = Some(ListEditor {
+            field: Field::ExtraArgs,
+            selected: 0,
+            rows: Vec::new(),
+            row_editor: None,
+        });
+        assert_eq!(
+            settings.footer_hints(),
+            "j k row · a add · d delete · enter edit · esc close"
+        );
+        settings.list_editor = Some(ListEditor {
+            field: Field::ExtraArgs,
+            selected: 0,
+            rows: vec!["--verbose".to_string()],
+            row_editor: Some(String::new()),
+        });
+        assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
+
+        for hint in [
+            "j k role · tab field · enter open · s save · r reload · ? help",
+            "j k role · tab field · enter open · s save · d remove · ? help",
+            "j k row · a add · d delete · enter edit · esc close",
+            "type filter · enter apply · esc close",
+            "enter apply · esc cancel",
+        ] {
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
+        }
     }
 }
