@@ -171,6 +171,9 @@ struct PromptEditor {
     col: usize,
     /// True after one `Esc` on a changed buffer.
     discard_confirm: bool,
+    /// The identity of this editor's in-flight save, if any. A result for
+    /// another request never touches this buffer.
+    request: Option<String>,
 }
 
 impl PromptEditor {
@@ -184,6 +187,7 @@ impl PromptEditor {
             row: 0,
             col: 0,
             discard_confirm: false,
+            request: None,
         }
     }
 
@@ -508,6 +512,9 @@ impl Settings {
         };
         if matches {
             self.pending_request = None;
+            if let Some(editor) = self.prompt_editor.as_mut() {
+                editor.request = None;
+            }
             self.status = Some((
                 SettingsResultStatus::Failed,
                 "the settings request was not delivered".to_string(),
@@ -558,9 +565,14 @@ impl Settings {
 
     /// Apply the result of one prompt save or reset.
     ///
-    /// A save closes the editor. A stale result keeps the editor open and
-    /// takes the current revision, so the next `ctrl-s` overwrites the
-    /// file. Every other result keeps the editor and shows the message.
+    /// A save closes the editor that sent it. A stale result keeps that
+    /// editor open and takes the current revision, so the next `ctrl-s`
+    /// overwrites the file. Every other result keeps the editor and shows
+    /// the message.
+    ///
+    /// A result whose request no editor sent only shows its message. A
+    /// reset comes from the form, and an editor of another role holds text
+    /// that nobody asked to discard.
     fn observe_prompt_result(&mut self, result: SettingsResult) {
         let message =
             result
@@ -578,16 +590,37 @@ impl Settings {
                     (_, SettingsResultStatus::Invalid) => "the prompt is invalid".to_string(),
                     _ => "the prompt request failed".to_string(),
                 });
-        match result.status {
-            SettingsResultStatus::Saved => self.prompt_editor = None,
-            SettingsResultStatus::Stale => {
-                if let Some(editor) = self.prompt_editor.as_mut() {
-                    editor.base_revision = result.revision.clone();
+        let mine = self
+            .prompt_editor
+            .as_ref()
+            .is_some_and(|editor| editor.request.as_deref() == Some(result.request.as_str()));
+        if mine {
+            match result.status {
+                SettingsResultStatus::Saved => self.prompt_editor = None,
+                SettingsResultStatus::Stale => {
+                    if let Some(editor) = self.prompt_editor.as_mut() {
+                        editor.base_revision = result.revision.clone();
+                        editor.request = None;
+                    }
+                }
+                _ => {
+                    if let Some(editor) = self.prompt_editor.as_mut() {
+                        editor.request = None;
+                    }
                 }
             }
-            _ => {}
         }
         self.status = Some((result.status, message));
+    }
+
+    /// Drop every pending confirmation of the form.
+    ///
+    /// The shell calls this for a key it handles itself, such as a view
+    /// switch. Without it a `d` armed before the switch would delete the
+    /// prompt file on the first `d` after the operator comes back.
+    pub fn drop_confirmations(&mut self) {
+        self.reset_confirm = false;
+        self.discard_confirm = false;
     }
 
     /// Apply one Settings key and return a daemon action when needed.
@@ -725,7 +758,13 @@ impl Settings {
     }
 
     /// Open the prompt editor on the pushed prompt of the selected role.
+    ///
+    /// A pending request blocks the open: its result would land on the new
+    /// editor and close it, and the typed text would be gone.
     fn open_prompt_editor(&mut self, state: &StateView) {
+        if self.request_pending() {
+            return;
+        }
         let Some(view) = self.prompt_view(state) else {
             self.status = Some((
                 SettingsResultStatus::Failed,
@@ -758,6 +797,9 @@ impl Settings {
             return None;
         }
         let editor = self.prompt_editor.as_mut()?;
+        // The banner says any key keeps the prompt, so every key that is
+        // not `Esc` cancels the question, handled or not.
+        editor.discard_confirm = false;
         match key.code {
             KeyCode::Enter => editor.newline(),
             KeyCode::Backspace => editor.backspace(),
@@ -777,9 +819,8 @@ impl Settings {
             {
                 editor.insert(character);
             }
-            _ => return None,
+            _ => {}
         }
-        editor.discard_confirm = false;
         None
     }
 
@@ -801,12 +842,16 @@ impl Settings {
             ));
             return None;
         }
+        let (role, base_revision) = (editor.role, editor.base_revision.clone());
         let request = request_code();
         self.pending_request = Some(request.clone());
+        if let Some(editor) = self.prompt_editor.as_mut() {
+            editor.request = Some(request.clone());
+        }
         Some(Action::SavePrompt {
             request,
-            role: editor.role,
-            base_revision: editor.base_revision.clone(),
+            role,
+            base_revision,
             text,
         })
     }
@@ -1779,7 +1824,10 @@ impl Settings {
         .split(inner);
         let visible = usize::from(rows[0].height.max(1));
         let width = usize::from(rows[0].width.max(1));
-        let start = editor.row.saturating_sub(visible - 1);
+        // Centre the cursor line, then clamp to the ends. A window pinned
+        // to the cursor would hide every line after it.
+        let last_start = editor.lines.len().saturating_sub(visible);
+        let start = editor.row.saturating_sub(visible / 2).min(last_start);
         let x_offset = editor.col.saturating_sub(width - 1);
         let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
         let mut lines = Vec::new();
@@ -3866,6 +3914,124 @@ mod tests {
         });
         assert!(!settings.typing(), "a saved result closes the editor");
         assert!(text(&settings, &state, 100, 30).contains("prompt saved"));
+    }
+
+    /// A result belongs to the editor that sent it. A result for another
+    /// request must never close a buffer full of typed text.
+    #[test]
+    fn a_result_of_another_request_leaves_the_open_editor_alone() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Prompt);
+        settings.handle_key(&state, key(KeyCode::Char('d')));
+        let Some(Action::ResetPrompt { request, .. }) =
+            settings.handle_key(&state, key(KeyCode::Char('d')))
+        else {
+            panic!("the second d must send the reset");
+        };
+
+        // The reset is in flight, so the row refuses to open an editor.
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(!settings.typing(), "a pending request blocks the editor");
+        assert!(text(&settings, &state, 100, 30).contains("a settings request is pending"));
+
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::ResetPrompt,
+            status: SettingsResultStatus::Saved,
+            revision: "prompt-rev-fresh".to_string(),
+            message: None,
+        });
+
+        // A stale result of a foreign request touches neither the buffer
+        // nor the revision the next ctrl-s carries.
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        type_text(&mut settings, &state, "keep me ");
+        settings.observe_result(SettingsResult {
+            request: "someone-else".to_string(),
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Stale,
+            revision: "refine-revision".to_string(),
+            message: Some("refine.md changed on disk".to_string()),
+        });
+        assert!(settings.typing(), "the editor stays open");
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("keep me line one {number}\nline two\n")
+        );
+        let Some(Action::SavePrompt { base_revision, .. }) = settings.handle_key(&state, ctrl('s'))
+        else {
+            panic!("ctrl-s must send the prompt save");
+        };
+        assert_eq!(base_revision, "prompt-rev-stage.implement");
+    }
+
+    /// A failed delivery frees the editor, so the next `ctrl-s` sends.
+    #[test]
+    fn a_failed_delivery_frees_the_prompt_editor() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Review, &state);
+        type_text(&mut settings, &state, "x");
+        let action = settings
+            .handle_key(&state, ctrl('s'))
+            .expect("ctrl-s must send the prompt save");
+        settings.delivery_failed(Some(&action));
+        assert!(settings.typing(), "the editor keeps the text");
+        assert!(text(&settings, &state, 100, 30).contains("was not delivered"));
+        assert!(
+            settings.handle_key(&state, ctrl('s')).is_some(),
+            "the retry sends again"
+        );
+    }
+
+    /// The banner promises that any key keeps the prompt. A key the editor
+    /// does not act on must keep that promise.
+    #[test]
+    fn an_unhandled_key_cancels_the_discard_question() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Review, &state);
+        type_text(&mut settings, &state, "x");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(text(&settings, &state, 100, 30).contains("Esc again discards"));
+        settings.handle_key(&state, key(KeyCode::Insert));
+        assert!(
+            !text(&settings, &state, 100, 30).contains("Esc again discards"),
+            "an unhandled key cancels the question"
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(settings.typing(), "the editor asks again");
+    }
+
+    /// The editor window shows the lines after the cursor, so a long
+    /// prompt stays readable.
+    #[test]
+    fn the_editor_window_shows_the_lines_after_the_cursor() {
+        let mut state = state();
+        let body = (1..=40)
+            .map(|line| format!("line{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for view in &mut state.settings.prompts {
+            view.text = body.clone();
+        }
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        for _ in 0..20 {
+            settings.handle_key(&state, key(KeyCode::Down));
+        }
+        let output = text(&settings, &state, 40, 20);
+        assert!(output.contains("line21"), "the cursor line: {output}");
+        assert!(
+            output.contains("line25"),
+            "a line after the cursor: {output}"
+        );
+        assert!(
+            output.contains("line17"),
+            "a line before the cursor: {output}"
+        );
+
+        // The top of a prompt starts at its first line, not centred.
+        let settings = open_prompt(ExecutionRole::Refine, &state);
+        assert!(text(&settings, &state, 40, 20).contains("line01"));
     }
 
     #[test]
