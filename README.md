@@ -18,7 +18,7 @@ refine ──▶ implement ──▶ review ──▶ release
 |---|---|---|
 | refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
-| review | OpenCode, GPT-5.6 | The agent reviews the change and marks the pull request ready. |
+| review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
@@ -66,8 +66,10 @@ do not exist:
 | `factory.example.toml` | A portable reference copy of the example. |
 | `prompts/*.md` | The four stage prompts and the ticket chat prompt. |
 
-The installer never overwrites a file that exists. Edit
-`~/.config/aif/factory.toml` and set the path of every repository.
+The installer never overwrites a file that exists. The installer keeps an
+installed prompt file. After an upgrade, copy the new prompt files from
+`docs/v0.6/prompts/` by hand. Edit `~/.config/aif/factory.toml` and set the
+path of every repository.
 
 ## Configure
 
@@ -201,7 +203,8 @@ A queued ticket that a pause blocks shows `paused` instead of `queued`.
 
 ## The five views
 
-Keys `1` through `5` switch the views. `!` opens the oldest inbox row.
+Keys `1` through `5` switch the views. `!` opens the oldest inbox row,
+except while an open text input takes the `!` as a typed character.
 `?` opens the help overlay. `q` quits the UI.
 The status bar of every view shows the open decision count.
 
@@ -213,6 +216,14 @@ Each lane header shows its running and queued counts against the limit.
 The release lane puts the next, active, or retry batch inside a border.
 The waiting pull requests start below the border.
 The oldest request is at the top, and the newest request is at the bottom.
+
+One piece of work holds one row. A finished task loses its row as soon as a
+later lane shows the same work: a done refine yields to its implement, a done
+implement yields to the review of its pull request, and a done review yields
+to the release train that holds that pull request. A failed task keeps its row
+until a later lane picks the work up, so you can always retry it. The daemon
+drops the tasks of an issue or a pull request that left GitHub, so a merge
+leaves no row behind.
 
 | Key | Action |
 |---|---|
@@ -239,7 +250,8 @@ Lowercase `p` follows the selected row:
 The most specific state wins. The order is factory, stage, repository lane,
 and task. A second `p` changes the same state again. Uppercase `P` changes the
 whole factory and removes all narrower states. A pause blocks future task
-starts. It does not stop an active task.
+starts. It does not stop an active task. A pause stops the process of a
+parked task, and the task stays resumable.
 
 ### Session, view 2
 
@@ -264,7 +276,8 @@ task, and the bar never promises what the daemon refuses:
   output again.
 - The chat bar holds the keyboard while it is focused. Press `esc` or
   `tab` to release it, `h` and `l` to move to the previous or next live
-  session, and `i` or `enter` to take the keyboard back.
+  session, and `i` or `enter` to take the keyboard back. A focused and
+  open bar takes `!` as text; a released bar leaves `!` to the shell.
 - A bar that cannot take a message holds no keyboard. With no shown task,
   a closed input, or a released focus, keys `1` through `5` switch the
   views and `?` opens the help.
@@ -292,7 +305,10 @@ The selected item shows its choices and quick actions.
 Press `enter` to open the source context:
 
 - A release decision shows the pull request title and description.
-- A `needs-human` decision shows the issue or pull request description.
+- A `needs-human` decision opens the answer screen. It shows the GitHub
+  link, the question comment of the agent, the offered options, and the
+  item description. The daemon fetches the question once per row, when
+  you open the screen.
 - A task decision shows recent visible agent context from the exact task log.
 - Press `o` in a task detail to open the full session.
 - Press `esc` to return to the same feed item.
@@ -306,12 +322,27 @@ Each decision type has one answer path:
 | Permission | `y` allows. `n` denies, with a typed reason. |
 | Question | `1`–`9` picks an option. `s` submits. `i` types a free answer. |
 | Stuck | `r` retries. `c` cancels. |
-| Needs human | `t` writes a comment and clears the label. `c` clears the label. |
+| Needs human | `1`–`9` picks an offered option. `s` submits the option label as a comment. `t` writes a comment and clears the label. `c` clears the label. `w` opens the Tickets view focus of the issue. |
 | Release gate | `1`–`9` includes one pull request. Space changes all. `g` releases. |
 
 There is no "allow always" key. This is deliberate. The wire protocol can
 not carry a saved permission, and a key that promises more than it does
 would break trust.
+
+The agent tells you its question in one way. It adds the `needs-human`
+label, writes a comment, and ends that comment with one strict block:
+
+```
+<aif-ask-v1>
+{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
+</aif-ask-v1>
+```
+
+The JSON sits on one line between the tags. The question holds one to
+nine options, and each option holds a label and an optional
+description. When a comment holds no block, the screen shows the newest
+comment body as the question. A picked option posts its label as the
+comment and clears the label.
 
 ### Tickets, view 4
 
@@ -324,9 +355,13 @@ issues inside the active tab.
 |---|---|---|
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
+| List | `n` | Create a ticket in the active repository tab. |
 | List | `enter` | Open the selected issue. |
+| Issue | `j` / `k` or Down / Up | Scroll the issue pane by one line. |
+| Issue | `h` / `l` or Left / Right | Open the previous or the next issue of the tab. |
 | Issue | `e` | Edit the title and description. |
-| Issue | `l` | Open the repository label picker. |
+| Issue | `L` | Open the repository label picker. |
+| Issue | `m` | Add the label `to-refine`. A prompt asks first. |
 | Issue | `c` | Start or resume the configured ticket chat. |
 | Issue | `a` | Apply the latest shown agent proposal. |
 | Editor | `ctrl-s` | Save the content edit. |
@@ -337,6 +372,10 @@ issues inside the active tab.
 | Nested view | `esc` | Return one level. |
 
 The issue focus shows all issue details and the GitHub reference.
+A dim hint line under the pane names these keys.
+The issue move follows the order and the search filter of the list.
+It stops at the first issue and at the last issue of the tab.
+It never changes the repository tab.
 Wide terminals put the details and chat beside each other.
 Narrow terminals put the chat below the details.
 
@@ -426,6 +465,10 @@ Repository topology changes require a daemon restart.
 - An implement or review turn that already runs can not change course. A
   message waits for the next turn.
 - A release gate row refreshes at the poll after you stack a pull request.
+- A review push on a draft pull request can restart that review at the next
+  poll.
+- A review of a pull request from a fork takes the `needs-human` path before a
+  repair.
 
 ## Development
 

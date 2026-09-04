@@ -26,8 +26,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
     Config, ExecutionRole, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
@@ -49,7 +50,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 2;
+pub const WIRE_PROTOCOL_REVISION: u32 = 3;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -102,6 +103,9 @@ pub struct StateView {
     /// Compact open issue rows for the Tickets view.
     #[serde(default)]
     pub tickets: Vec<TicketSummary>,
+    /// Compact open pull request rows for readable pipeline names.
+    #[serde(default)]
+    pub prs: Vec<PrSummary>,
     /// The ticket-PR links of every configured repository.
     #[serde(default)]
     pub links: Vec<LinkView>,
@@ -114,14 +118,66 @@ pub struct StateView {
 }
 
 /// The editable factory settings and their current file revision.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsView {
     /// A stable digest of the complete `factory.toml` content.
     pub revision: String,
-    /// The six global role settings, in role order.
+    /// The configured global role settings, in role order.
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
+}
+
+#[derive(Serialize)]
+struct SettingsViewRef<'a> {
+    revision: &'a str,
+    global: Vec<&'a GlobalRoleSettingsView>,
+    repositories: &'a [RepositoryRoleSettingsView],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    theory_global: Vec<&'a GlobalRoleSettingsView>,
+}
+
+#[derive(Deserialize)]
+struct SettingsViewWire {
+    revision: String,
+    global: Vec<GlobalRoleSettingsView>,
+    repositories: Vec<RepositoryRoleSettingsView>,
+    #[serde(default)]
+    theory_global: Vec<GlobalRoleSettingsView>,
+}
+
+impl Serialize for SettingsView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (global, theory_global) = self
+            .global
+            .iter()
+            .partition(|value| value.role.overridable());
+        SettingsViewRef {
+            revision: &self.revision,
+            global,
+            repositories: &self.repositories,
+            theory_global,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SettingsView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut wire = SettingsViewWire::deserialize(deserializer)?;
+        wire.global.append(&mut wire.theory_global);
+        Ok(Self {
+            revision: wire.revision,
+            global: wire.global,
+            repositories: wire.repositories,
+        })
+    }
 }
 
 impl SettingsView {
@@ -129,15 +185,22 @@ impl SettingsView {
     pub fn from_config(config: &Config, revision: &str) -> Result<Self> {
         let global = ExecutionRole::ALL
             .into_iter()
-            .map(|role| GlobalRoleSettingsView {
-                role,
-                settings: config.roles[&role].clone(),
-                limit: role.stage().map(|stage| config.stage(stage).limit),
+            .filter_map(|role| {
+                let settings = config.roles.get(&role)?.clone();
+                Some(GlobalRoleSettingsView {
+                    role,
+                    settings,
+                    limit: role.stage().map(|stage| config.stage(stage).limit),
+                })
             })
             .collect();
         let mut repositories = Vec::new();
         for (alias, repo) in &config.repos {
-            for role in ExecutionRole::ALL {
+            for role in ExecutionRole::ALL
+                .iter()
+                .copied()
+                .filter(|role| role.overridable())
+            {
                 let resolved = config.resolved_role(Some(alias), role.table_name())?;
                 let override_settings = repo.role_overrides.get(&role);
                 repositories.push(RepositoryRoleSettingsView {
@@ -480,6 +543,18 @@ impl StateInput<'_> {
                 .then_with(|| left.repo.cmp(&right.repo))
                 .then_with(|| left.number.cmp(&right.number))
         });
+        let prs: Vec<PrSummary> = config
+            .repos
+            .keys()
+            .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
+            .flat_map(|(repo, items)| {
+                items.prs.values().filter(|pr| pr.open).map(|pr| PrSummary {
+                    repo: repo.clone(),
+                    number: pr.number,
+                    title: pr.title.clone(),
+                })
+            })
+            .collect();
         let links: Vec<LinkView> = links
             .iter()
             .filter(|(repo, _)| config.repos.contains_key(*repo))
@@ -531,6 +606,7 @@ impl StateInput<'_> {
             decisions: decisions.open().to_vec(),
             decision_items,
             tickets,
+            prs,
             links,
             trains,
             paused,
@@ -677,6 +753,17 @@ impl TicketGroup {
     }
 }
 
+/// One compact open pull request row for readable pipeline names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrSummary {
+    /// The repository alias.
+    pub repo: String,
+    /// The pull request number.
+    pub number: u64,
+    /// The current pull request title.
+    pub title: String,
+}
+
 /// The editable title and description of one issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketContent {
@@ -697,6 +784,30 @@ pub enum TicketContentSource {
         /// The proposal identity shown in the focus view.
         proposal_id: String,
     },
+}
+
+/// One fetched question for one `NeedsHuman` detail screen.
+///
+/// The daemon builds this view on demand, when the UI opens the detail of
+/// a row that carries the `needs-human` label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskView {
+    /// The repository alias.
+    pub repo: String,
+    /// Whether the item is an issue or a pull request.
+    pub kind: ItemKind,
+    /// The issue or pull request number.
+    pub number: u64,
+    /// The question text. Empty when no comment exists or a block held it.
+    pub question: String,
+    /// The offered answers, in file order. Empty without a valid block.
+    pub options: Vec<AskOption>,
+    /// The login of the comment author, when one comment exists.
+    pub author: Option<String>,
+    /// The comment creation time in RFC 3339 form, when one comment exists.
+    pub created_at: Option<String>,
+    /// A fetch error. The question and the option list stay empty.
+    pub error: Option<String>,
 }
 
 /// One repository label from the GitHub label catalog.
@@ -830,7 +941,9 @@ pub struct TicketResult {
     pub request: String,
     /// The repository alias.
     pub repo: String,
-    /// The issue number.
+    /// The issue number. A result for a ticket creation carries `0`, the
+    /// existing sentinel for a ticket with no number yet, until GitHub
+    /// answers; a success then carries the created number.
     pub number: u64,
     /// The result state.
     pub kind: TicketResultKind,
@@ -902,6 +1015,17 @@ pub enum TicketAction {
         name: String,
         /// The six-digit hexadecimal color.
         color: String,
+    },
+    /// Create one ticket from the direct form content.
+    Create {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The new ticket title.
+        title: String,
+        /// The new ticket description.
+        body: String,
     },
     /// Start or resume the Claude conversation for one issue.
     Chat {
@@ -1079,6 +1203,8 @@ pub enum Push {
     TicketLabels(TicketLabels),
     /// One ticket mutation state.
     TicketResult(TicketResult),
+    /// One fetched question for one `NeedsHuman` detail screen.
+    Ask(AskView),
     /// One settings save or reload result.
     SettingsResult(SettingsResult),
 }
@@ -1092,6 +1218,18 @@ pub enum Push {
 pub enum Action {
     /// Queue a refine task for one item.
     Refine {
+        /// The repository alias.
+        repo: String,
+        /// Whether the item is an issue or a pull request.
+        kind: ItemKind,
+        /// The issue or pull request number.
+        number: u64,
+    },
+    /// Fetch the question comment of one `needs-human` item.
+    ///
+    /// The daemon answers with one [`Push::Ask`]. The UI sends the action
+    /// once per row, when the operator opens its detail screen.
+    Ask {
         /// The repository alias.
         repo: String,
         /// Whether the item is an issue or a pull request.
@@ -1711,6 +1849,41 @@ impl Iterator for Pushes {
 mod tests {
     use super::*;
 
+    const LEGACY_WIRE_PROTOCOL_REVISION: u32 = 2;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyExecutionRole {
+        Refine,
+        Implement,
+        Review,
+        Release,
+        TicketCreate,
+        TicketChat,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyGlobalRoleSettingsView {
+        role: LegacyExecutionRole,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacySettingsView {
+        global: Vec<LegacyGlobalRoleSettingsView>,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyStateView {
+        protocol_revision: u32,
+        settings: LegacySettingsView,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyPush {
+        State(LegacyStateView),
+    }
+
     /// A temporary directory that removes itself on drop.
     struct TempDir(PathBuf);
 
@@ -1765,6 +1938,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -1778,6 +1952,11 @@ mod tests {
     fn every_action() -> Vec<Action> {
         vec![
             Action::Refine {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 142,
+            },
+            Action::Ask {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
                 number: 142,
@@ -2024,6 +2203,42 @@ mod tests {
     }
 
     #[test]
+    fn a_revision_two_client_decodes_the_initial_state_before_rejecting_revision_three() {
+        let text = format!(
+            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
+             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+        let mut view = sample_view(1);
+        view.settings = SettingsView::from_config(&config, "revision").unwrap();
+        let push = Push::State(view);
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+        let legacy = serde_json::from_str::<LegacyPush>(&text)
+            .expect("revision 2 must decode the state before it checks the revision");
+        let LegacyPush::State(legacy) = legacy;
+        assert_ne!(legacy.protocol_revision, LEGACY_WIRE_PROTOCOL_REVISION);
+        assert_eq!(
+            legacy
+                .settings
+                .global
+                .into_iter()
+                .map(|entry| entry.role)
+                .collect::<Vec<_>>(),
+            vec![
+                LegacyExecutionRole::Refine,
+                LegacyExecutionRole::Implement,
+                LegacyExecutionRole::Review,
+                LegacyExecutionRole::Release,
+                LegacyExecutionRole::TicketCreate,
+                LegacyExecutionRole::TicketChat,
+            ]
+        );
+    }
+
+    #[test]
     fn a_client_rejects_a_state_from_an_older_wire_protocol() {
         let mut old = serde_json::to_value(Push::State(sample_view(1))).unwrap();
         old.as_object_mut().unwrap().remove("protocol_revision");
@@ -2072,6 +2287,37 @@ mod tests {
     }
 
     #[test]
+    fn an_ask_push_round_trips_through_json_with_the_documented_tags() {
+        let push = Push::Ask(AskView {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+            question: "Which workload mode ships first?".to_string(),
+            options: vec![AskOption {
+                label: "Fast".to_string(),
+                description: "deterministic only".to_string(),
+            }],
+            author: Some("agent".to_string()),
+            created_at: Some("2026-09-01T10:00:00Z".to_string()),
+            error: None,
+        });
+        let text = serde_json::to_string(&push).unwrap();
+        assert!(text.contains("\"type\":\"ask\""), "line: {text}");
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+
+        let action_text = serde_json::to_string(&Action::Ask {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+        })
+        .unwrap();
+        assert_eq!(
+            action_text,
+            "{\"action\":\"ask\",\"repo\":\"borsuk\",\"kind\":\"issue\",\"number\":142}"
+        );
+    }
+
+    #[test]
     fn ticket_detail_actions_and_pushes_keep_the_request_identity() {
         let action = Action::Ticket(TicketAction::Details {
             request: "ticket-7".to_string(),
@@ -2093,6 +2339,23 @@ mod tests {
         });
         let push_text = serde_json::to_string(&push).unwrap();
         assert_eq!(serde_json::from_str::<Push>(&push_text).unwrap(), push);
+    }
+
+    #[test]
+    fn ticket_create_action_round_trips_through_one_json_line() {
+        assert_eq!(
+            WIRE_PROTOCOL_REVISION, 3,
+            "the create variant raised the revision"
+        );
+        let action = Action::Ticket(TicketAction::Create {
+            request: "create-7".to_string(),
+            repo: "borsuk".to_string(),
+            title: "Add a direct creation form".to_string(),
+            body: "The Tickets view needs one typed field.".to_string(),
+        });
+        let text = serde_json::to_string(&action).unwrap();
+        assert!(!text.contains('\n'), "a wire line must not hold a newline");
+        assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
     }
 
     #[test]
@@ -2483,6 +2746,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             links: vec![LinkView {
                 repo: "borsuk".to_string(),
                 ticket: 142,
@@ -2498,6 +2762,96 @@ mod tests {
         let text = serde_json::to_string(&view).unwrap();
         let back: StateView = serde_json::from_str(&text).unwrap();
         assert_eq!(back, view);
+    }
+
+    /// One pull request for a pr summary test.
+    fn test_pr(number: u64, title: &str) -> crate::model::Pr {
+        crate::model::Pr {
+            number,
+            node_id: format!("pr-{number}"),
+            title: title.to_string(),
+            body: format!("body {number}"),
+            labels: Vec::new(),
+            open: true,
+            draft: false,
+            head_sha: format!("sha-{number}"),
+            head_ref: format!("branch-{number}"),
+        }
+    }
+
+    #[test]
+    fn the_view_lists_open_pull_requests_of_every_repository_and_round_trips() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let input_modes = BTreeMap::new();
+        let mut closed = test_pr(4, "Closed pull request");
+        closed.open = false;
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            crate::model::RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [(4, closed), (9, test_pr(9, "Open pull request"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        snapshot.repos.insert(
+            "qubitsok".to_string(),
+            crate::model::RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [(2, test_pr(2, "Second pull request"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            settings_revision: "test-revision",
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            snapshot: &snapshot,
+            links: &BTreeMap::new(),
+            trains: &trains,
+            policies: &policies,
+            input_modes: &input_modes,
+            now_ms: 0,
+        }
+        .build()
+        .unwrap();
+
+        let rows: Vec<(&str, u64, &str)> = view
+            .prs
+            .iter()
+            .map(|pr| (pr.repo.as_str(), pr.number, pr.title.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("borsuk", 9, "Open pull request"),
+                ("qubitsok", 2, "Second pull request"),
+            ]
+        );
+
+        let push = Push::State(view.clone());
+        let text = serde_json::to_string(&push).unwrap();
+        assert!(text.contains("\"prs\":["), "line: {text}");
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_view_without_the_prs_field_parses_with_an_empty_list() {
+        let json = r#"{"repos":[],"stages":[],"lanes":[],"tasks":[],"decisions":[],"trains":[],"paused":{"global":false,"overrides":[]},"settings":{"revision":"","global":[],"repositories":[]}}"#;
+        let view: StateView = serde_json::from_str(json).unwrap();
+        assert!(view.prs.is_empty());
     }
 
     fn huge_view(label: usize) -> StateView {
