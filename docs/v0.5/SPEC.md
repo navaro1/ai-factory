@@ -902,15 +902,15 @@ pub enum Response { Allow, Deny { message: String },
 - A one-shot answer routes by the row kind. `Permission` + `Allow` records
   `AllowedPermission { permission, patterns }` for the task and requeues it from
   attempt 1; the next dispatch builds the job with the rule, and the rules clear
-  when the task completes, is cancelled, or is retired. `Permission` + `Deny` closes the row
-  and leaves the task state alone. `Question` + `Text` queues the text in
-  `pending_chats`, reopens the terminal task, and lets the pending-chats resume
-  carry it to the recorded session. The text obeys the same `input_mode` policy
-  as a chat message, so a run with no session marker, a task whose worktree a
-  sibling holds, and a queued task that never ran all re-push the row with the
-  reason; a queued task must refuse, because the resume uses the queued text as
-  the whole prompt. An accepted text writes one user line into the task log,
-  like every other queue-path message. `Question` + `Answers` is refused and
+  when the task completes, is cancelled, or is retired. `Permission` + `Deny`
+  closes the row and leaves the task state alone. `Question` + `Text` queues the
+  text in `pending_chats`, reopens the terminal task, and lets the pending-chats
+  resume carry it to the recorded session. The text obeys the same `input_mode`
+  policy as a chat message, so a run with no session marker, a task whose
+  worktree a sibling holds, and a queued task that never ran all re-push the row
+  with the reason; a queued task must refuse, because the resume uses the queued
+  text as the whole prompt. An accepted text writes one user line into the task
+  log, like every other queue-path message. `Question` + `Answers` is refused and
   re-pushes the row, because a one-shot row carries no option list.
 - The inbox names a one-shot row by its payload. A `Permission` row reads
   `Allow external_directory for /home/navaro/.cargo/registry/src/*?` from the
