@@ -2271,6 +2271,7 @@ mod tests {
         )
         .unwrap();
         app.session_task = None;
+        app.session.clear();
         run_messages(
             &mut surface,
             &mut app,
