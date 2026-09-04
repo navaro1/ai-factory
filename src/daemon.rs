@@ -6352,34 +6352,6 @@ mod tests {
         );
     }
 
-    /// Replace the implement role with one non-claude harness.
-    ///
-    /// The settings carry no field of another harness, so the binding the
-    /// first rig persists stays valid for the restart.
-    fn harness_role(harness: Harness, program: &str) -> impl FnOnce(&mut Config) {
-        let program = program.to_string();
-        move |config: &mut Config| {
-            let settings = RoleSettings {
-                harness,
-                program,
-                model: "m".to_string(),
-                effort: None,
-                extra_args: Vec::new(),
-                agent: None,
-                profile: None,
-                permission_mode: None,
-                permission_handler: None,
-                tools: Vec::new(),
-                disallowed_tools: Vec::new(),
-                strict_mcp: None,
-                auto_approve: None,
-                approval_policy: None,
-                sandbox: None,
-            };
-            config.roles.insert(ExecutionRole::Implement, settings);
-        }
-    }
-
     /// Pin the restart resume of one harness.
     ///
     /// The restored task dispatches with its saved session id, and the
@@ -6387,17 +6359,25 @@ mod tests {
     /// exact resume argv (`--resume <id>` for claude, `--session <id>` for
     /// opencode, `exec resume <id>` for codex); this rig pins the dispatch
     /// contract that feeds them.
-    fn restart_resumes_for_harness(harness: Harness, program: &str) {
+    ///
+    /// `set_role_harness` clears every field of another harness, so the role
+    /// binding that the first rig persists still validates when the second
+    /// rig loads the state file.
+    fn restart_resumes_for_harness(harness: Harness) {
         let dir = temp_root();
         let worktree = issue_wt(&dir, 142);
         let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir));
-        let mut first = Rig::make_in(dir.clone(), steps, harness_role(harness, program));
+        let mut first = Rig::make_in(dir.clone(), steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, harness);
+        });
         first.poll(vec![issue(142, &["refined"])], vec![]);
         first.event(started("borsuk/implement-i142", "session-142"));
         drop(first);
 
         let steps = reuse_issue_steps(&rig_repo(&dir), &worktree, &rig_gitdir(&dir));
-        let mut second = Rig::make_in(dir, steps, harness_role(harness, program));
+        let mut second = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, harness);
+        });
         second.poll(vec![issue(142, &["refined"])], vec![]);
 
         assert_eq!(second.job_count(), 1);
@@ -6411,12 +6391,12 @@ mod tests {
 
     #[test]
     fn a_restart_resumes_the_opencode_session_of_the_same_task() {
-        restart_resumes_for_harness(Harness::Opencode, "opencode");
+        restart_resumes_for_harness(Harness::Opencode);
     }
 
     #[test]
     fn a_restart_resumes_the_codex_session_of_the_same_task() {
-        restart_resumes_for_harness(Harness::Codex, "codex");
+        restart_resumes_for_harness(Harness::Codex);
     }
 
     #[test]
