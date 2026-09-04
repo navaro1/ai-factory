@@ -1524,11 +1524,17 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, panel);
 }
 
+/// The number of key rows in the help overlay.
+///
+/// Two columns split the rows, so an odd count would drop the middle one.
+const HELP_ROWS: usize = 34;
+
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(78, 19, area);
+    const { assert!(HELP_ROWS.is_multiple_of(2), "the help needs two columns") };
+    let panel = centered(78, HELP_ROWS as u16 / 2 + 2, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 34] = [
+    let rows: [(&str, &str); HELP_ROWS] = [
         ("1 2 3 4 5", "switch view"),
         ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
@@ -1566,9 +1572,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
     ];
     let mut sorted = rows.to_vec();
     sorted.sort_by_key(|(key, text)| std::cmp::Reverse(key.len() + text.len()));
-    assert!(sorted.len().is_multiple_of(2), "the help needs two columns");
     let mut lines = Vec::new();
-    for row in 0..sorted.len() / 2 {
+    for row in 0..HELP_ROWS / 2 {
         let mut spans = Vec::new();
         for (column, index) in [row, sorted.len() - 1 - row].into_iter().enumerate() {
             let (key, text) = sorted[index];
