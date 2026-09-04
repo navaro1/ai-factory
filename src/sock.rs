@@ -2253,6 +2253,52 @@ mod tests {
         assert!(view.prompts.is_empty());
     }
 
+    /// The settings view writes the theory roles into their own wire field
+    /// and the prompts into a third. One round trip must return every role
+    /// in role order and every prompt, so neither field eats the other.
+    #[test]
+    fn the_settings_view_round_trips_the_theory_roles_beside_the_prompts() {
+        let text = format!(
+            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
+             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+        let prompts = crate::prompts::ROLES
+            .into_iter()
+            .map(|role| PromptView {
+                role,
+                source: PromptSource::File,
+                text: format!("prompt of {role}\n"),
+                revision: format!("rev-{role}"),
+            })
+            .collect::<Vec<_>>();
+        let view = SettingsView::from_config(&config, "content-revision", &prompts).unwrap();
+        assert_eq!(view.global.len(), 8);
+        assert_eq!(view.prompts, prompts);
+
+        let wire = serde_json::to_string(&view).unwrap();
+        let parsed: SettingsView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed, view, "wire: {wire}");
+        assert_eq!(
+            parsed
+                .global
+                .iter()
+                .map(|value| value.role)
+                .collect::<Vec<_>>(),
+            crate::config::ExecutionRole::ALL.to_vec(),
+            "the theory roles come back in role order"
+        );
+        assert!(
+            !parsed.prompts.iter().any(|prompt| matches!(
+                prompt.role,
+                crate::config::ExecutionRole::TheoryAudit
+                    | crate::config::ExecutionRole::TheoryChat
+            )),
+            "a theory role carries no prompt"
+        );
+    }
+
     #[test]
     fn the_wire_shapes_use_the_documented_tags() {
         let text = serde_json::to_string(&Action::Stop).unwrap();
