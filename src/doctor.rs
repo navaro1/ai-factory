@@ -791,10 +791,10 @@ fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
         }
         for alias in config.repos.keys() {
             for role in ExecutionRole::ALL {
-                let settings = config
-                    .resolved_role(Some(alias), role.table_name())
-                    .expect("a parsed configuration has valid role settings")
-                    .settings;
+                let Ok(resolved) = config.resolved_role(Some(alias), role.table_name()) else {
+                    continue;
+                };
+                let settings = resolved.settings;
                 programs
                     .entry(settings.program)
                     .and_modify(|claude| *claude |= settings.harness == Harness::Claude)

@@ -1561,6 +1561,8 @@ fn role_label(role: ExecutionRole) -> &'static str {
         ExecutionRole::Release => "release",
         ExecutionRole::TicketCreate => "ticket creation",
         ExecutionRole::TicketChat => "ticket chat",
+        ExecutionRole::TheoryAudit => "theory audit",
+        ExecutionRole::TheoryChat => "theory chat",
     }
 }
 
@@ -1861,7 +1863,11 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 
 fn settings_panes(area: Rect, narrow: bool) -> [Rect; 2] {
     if narrow {
-        let panes = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(area);
+        let role_height = u16::try_from(ExecutionRole::ALL.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        let panes =
+            Layout::vertical([Constraint::Length(role_height), Constraint::Min(1)]).split(area);
         [panes[0], panes[1]]
     } else {
         let panes = Layout::horizontal([Constraint::Length(22), Constraint::Min(30)]).split(area);
@@ -1998,6 +2004,8 @@ mod tests {
                 "release",
                 "ticket creation",
                 "ticket chat",
+                "theory audit",
+                "theory chat",
             ]
             .map(|name| output.find(name).expect("the role must be visible"));
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));

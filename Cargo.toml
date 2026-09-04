@@ -18,6 +18,7 @@ path = "src/bin/aif.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
+globset = "0.4"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
