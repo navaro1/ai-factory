@@ -3057,6 +3057,124 @@ mod tests {
     }
 
     #[test]
+    fn m_stays_out_of_the_label_picker_and_the_chat() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        // The label picker owns the keyboard.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('L'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.confirm.is_none(), "the label picker keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the label picker holds the keyboard"
+        );
+
+        // The new-label form owns the keyboard too.
+        app.tickets.observe_labels(crate::sock::TicketLabels {
+            request: "labels-1".to_string(),
+            repo: "borsuk".to_string(),
+            labels: vec![crate::sock::RepoLabel {
+                name: "ui".to_string(),
+                color: "ededed".to_string(),
+            }],
+            error: None,
+        });
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('n'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.confirm.is_none(), "the new-label form keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the new-label form holds the keyboard"
+        );
+
+        // The chat input owns the keyboard.
+        let mut chatting = App::default();
+        let mut chat_sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut chatting, &mut chat_sink);
+        run_messages(
+            &mut surface,
+            &mut chatting,
+            vec![key('c'), key('m')].into_iter(),
+            &mut chat_sink,
+        )
+        .unwrap();
+        assert!(chatting.confirm.is_none(), "the chat keeps the m key");
+        assert!(
+            !chatting.tickets.focus_plain(),
+            "the chat holds the keyboard"
+        );
+    }
+
+    #[test]
+    fn m_stays_out_of_the_ticket_conflict_view() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let details = ticket_details("borsuk", 7);
+        app.tickets.observe_result(crate::sock::TicketResult {
+            request: "content-1".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: crate::sock::TicketResultKind::Conflict,
+            message: "the issue changed on GitHub".to_string(),
+            issue: None,
+            conflict: Some(crate::sock::TicketConflict {
+                remote: details.issue.clone(),
+                pending: crate::sock::TicketContent {
+                    title: "A local title".to_string(),
+                    body: "A local body".to_string(),
+                },
+                source: crate::sock::TicketContentSource::Direct,
+            }),
+        });
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the conflict view keeps the m key");
+        assert!(
+            !app.tickets.focus_plain(),
+            "the conflict view holds the keyboard"
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn the_help_overlay_names_the_new_ticket_keys() {
+        let mut app = App {
+            help: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        for entry in [
+            "/ e L c a m",
+            "search and ticket keys",
+            "repo / ticket / settings scope",
+        ] {
+            assert!(text.contains(entry), "the help misses {entry}");
+        }
+    }
+
+    #[test]
     fn enter_sends_the_session_chat_action() {
         let mut surface = CountingSurface { draws: 0 };
         let mut app = App::default();
