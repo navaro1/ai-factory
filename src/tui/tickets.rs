@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use crate::sock::{
@@ -147,12 +148,63 @@ pub struct Tickets {
     mentions: MentionStatuses,
     /// The last time the focus sent a mention-status refresh.
     status_polled_at: Option<Instant>,
+    /// The scroll offset of the focused ticket pane.
+    body_scroll: Cell<u16>,
+    /// The highest offset that the focused ticket pane accepts.
+    body_scroll_max: Cell<u16>,
 }
 
 impl Tickets {
     /// True when the focus view is open.
     pub fn focus_open(&self) -> bool {
         self.focus
+    }
+
+    /// True while the plain ticket focus holds the keyboard.
+    ///
+    /// The editor, the conflict comparison, the label picker, and the chat
+    /// keep their own keys in their nested views.
+    pub fn focus_plain(&self) -> bool {
+        self.focus
+            && !self.searching
+            && !self.label_picker_open
+            && !self.conflict_open
+            && !self.chat_active
+            && !self.editor.as_ref().is_some_and(|editor| editor.open)
+    }
+
+    /// The issue identity of the open focus.
+    pub fn focus_key(&self) -> Option<(String, u64)> {
+        self.focus_key.clone()
+    }
+
+    /// True when the focused issue carries the label.
+    pub fn focus_has_label(&self, label: &str) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| details.issue.labels.iter().any(|current| current == label))
+    }
+
+    /// Open the focus view of one issue and request its details.
+    ///
+    /// The call mirrors the `enter` key of the list. The nested state of
+    /// the same issue survives; a different issue starts with a clean
+    /// state. Every call starts the ticket pane at the top.
+    pub fn open(&mut self, repo: &str, number: u64) -> Option<Action> {
+        let key = (repo.to_string(), number);
+        if self.focus_key.as_ref() != Some(&key) {
+            self.clear_issue_state();
+        }
+        self.focus = true;
+        self.focus_key = Some(key);
+        self.details = None;
+        self.result = None;
+        self.body_scroll.set(0);
+        Some(Action::Ticket(TicketAction::Details {
+            request: request_code(),
+            repo: repo.to_string(),
+            number,
+        }))
     }
 
     /// True while this view owns text input.
@@ -489,7 +541,11 @@ impl Tickets {
                         }
                     }
                 }
-                KeyCode::Char('l') => {
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_body(1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_body(-1),
+                KeyCode::Char('h') | KeyCode::Left => return self.step_focus(state, -1),
+                KeyCode::Char('l') | KeyCode::Right => return self.step_focus(state, 1),
+                KeyCode::Char('L') => {
                     let (repo, _) = self.focus_key.clone()?;
                     self.label_picker_open = true;
                     self.label_selected = 0;
@@ -599,23 +655,44 @@ impl Tickets {
             }
             KeyCode::Enter => {
                 let selected = self.filtered(state).get(self.selected).copied().cloned()?;
-                let key = (selected.repo.clone(), selected.number);
-                if self.focus_key.as_ref() != Some(&key) {
-                    self.clear_issue_state();
-                }
-                self.focus = true;
-                self.focus_key = Some(key);
-                self.details = None;
-                self.result = None;
-                return Some(Action::Ticket(TicketAction::Details {
-                    request: request_code(),
-                    repo: selected.repo,
-                    number: selected.number,
-                }));
+                return self.open(&selected.repo, selected.number);
             }
             _ => {}
         }
         None
+    }
+
+    /// Scroll the focused ticket pane and clamp at both ends.
+    fn scroll_body(&self, step: i32) {
+        let current = i32::from(self.body_scroll.get());
+        let maximum = i32::from(self.body_scroll_max.get());
+        let next = (current + step).clamp(0, maximum);
+        self.body_scroll.set(next as u16);
+    }
+
+    /// Open the previous or the next ticket of the active tab.
+    ///
+    /// The move follows the filtered list and stops at both ends. It never
+    /// changes the repository tab.
+    fn step_focus(&mut self, state: &StateView, step: isize) -> Option<Action> {
+        let list = self.filtered(state);
+        let current = self
+            .focus_key
+            .as_ref()
+            .and_then(|(repo, number)| {
+                list.iter()
+                    .position(|ticket| ticket.repo == *repo && ticket.number == *number)
+            })
+            .unwrap_or(self.selected);
+        let next = current as isize + step;
+        if next < 0 {
+            return None;
+        }
+        let ticket = list.get(next as usize).copied()?;
+        let repo = ticket.repo.clone();
+        let number = ticket.number;
+        self.selected = next as usize;
+        self.open(&repo, number)
     }
 
     /// Clear all nested data that belongs to the previous focused issue.
@@ -636,6 +713,8 @@ impl Tickets {
         self.proposal_lines.clear();
         self.mentions.clear();
         self.status_polled_at = None;
+        self.body_scroll.set(0);
+        self.body_scroll_max.set(0);
     }
 
     /// Apply one key inside the direct editor.
@@ -1114,11 +1193,23 @@ impl Tickets {
                 THEME.dim(),
             ))],
         };
+        let focus_rows =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(panes[0]);
+        let content_area = focus_rows[0];
+        let paragraph = Paragraph::new(details)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title(" ticket // esc back "));
+        let line_count = paragraph.line_count(content_area.width.saturating_sub(2));
+        let maximum = line_count
+            .saturating_sub(usize::from(content_area.height))
+            .min(usize::from(u16::MAX)) as u16;
+        self.body_scroll_max.set(maximum);
+        let scroll = self.body_scroll.get().min(maximum);
+        self.body_scroll.set(scroll);
+        frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
         frame.render_widget(
-            Paragraph::new(details)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(Block::bordered().title(" ticket // esc back ")),
-            panes[0],
+            Paragraph::new("j k scroll · h l ticket · L labels · m to-refine").style(THEME.dim()),
+            focus_rows[1],
         );
         let (chat_title, chat_ready) = ticket_chat_identity(state, repo);
         let chat_block = Block::bordered().title(format!(" {chat_title} "));
@@ -1398,7 +1489,7 @@ fn repo_label_color(color: &str) -> Color {
 }
 
 /// Create one globally unique ticket request code.
-fn request_code() -> String {
+pub(super) fn request_code() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -1606,6 +1697,50 @@ mod tests {
             .collect()
     }
 
+    /// A state whose active tab holds the tickets `borsuk#7` and `borsuk#8`.
+    fn two_ticket_state() -> StateView {
+        let mut state = state();
+        state.tickets.insert(
+            1,
+            TicketSummary {
+                repo: "borsuk".to_string(),
+                number: 8,
+                title: "Second borsuk issue".to_string(),
+                labels: Vec::new(),
+                updated_at: "2026-08-31T12:00:00Z".to_string(),
+                group: TicketGroup::Untouched,
+            },
+        );
+        state
+    }
+
+    /// Details whose body spans more lines than one short pane shows.
+    fn long_body_details() -> TicketDetails {
+        let mut detail = details();
+        detail.issue.body = (0..60)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        detail
+    }
+
+    /// Render the view at an explicit size and return the screen rows.
+    fn render_focus(tickets: &Tickets, state: &StateView, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| tickets.draw(frame, frame.area(), state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     #[test]
     fn enter_opens_the_selected_issue_and_requests_its_details() {
         let mut tickets = Tickets::default();
@@ -1623,6 +1758,42 @@ mod tests {
         assert_eq!(repo, "borsuk");
         assert_eq!(number, 7);
         assert!(tickets.focus_open());
+    }
+
+    #[test]
+    fn open_focuses_one_issue_and_requests_its_details() {
+        let mut tickets = Tickets::default();
+
+        let action = tickets.open("borsuk", 142);
+
+        let Some(Action::Ticket(TicketAction::Details {
+            request,
+            repo,
+            number,
+        })) = action
+        else {
+            panic!("open must request ticket details");
+        };
+        assert!(!request.is_empty());
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 142);
+        assert!(tickets.focus_open());
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 142)));
+
+        // The same issue keeps its nested state; another issue clears it.
+        let state = state();
+        tickets.open("borsuk", 7);
+        tickets.observe_details(details());
+        tickets.handle_key(&state, key(KeyCode::Char('e')));
+        assert!(tickets.editor.as_ref().is_some_and(|editor| editor.open));
+        assert!(tickets.open("borsuk", 7).is_some());
+        assert!(
+            tickets.editor.as_ref().is_some_and(|editor| editor.open),
+            "the same issue keeps its editor"
+        );
+        assert!(tickets.open("borsuk", 142).is_some());
+        assert!(tickets.editor.is_none(), "another issue clears the state");
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 142)));
     }
 
     #[test]
@@ -1857,6 +2028,209 @@ mod tests {
     }
 
     #[test]
+    fn j_and_k_scroll_the_focused_ticket_body() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        assert!(
+            tickets.body_scroll_max.get() > 0,
+            "the long body must set a bound"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('j')));
+        assert_eq!(tickets.body_scroll.get(), 1);
+        tickets.handle_key(&state, key(KeyCode::Down));
+        assert_eq!(tickets.body_scroll.get(), 2);
+        tickets.handle_key(&state, key(KeyCode::Char('k')));
+        assert_eq!(tickets.body_scroll.get(), 1);
+        tickets.handle_key(&state, key(KeyCode::Up));
+        assert_eq!(tickets.body_scroll.get(), 0);
+        tickets.handle_key(&state, key(KeyCode::Char('k')));
+        assert_eq!(tickets.body_scroll.get(), 0, "k stops at 0");
+
+        for _ in 0..tickets.body_scroll_max.get() + 5 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            tickets.body_scroll.get(),
+            tickets.body_scroll_max.get(),
+            "j stops at the last rendered line"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_body_sets_the_scroll_bound() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        let mut detail = details();
+        detail.issue.body = "word ".repeat(200);
+        tickets.observe_details(detail);
+
+        render_focus(&tickets, &state, 104, 20);
+
+        assert!(
+            tickets.body_scroll_max.get() > 0,
+            "one wrapped paragraph line must still scroll"
+        );
+    }
+
+    #[test]
+    fn h_and_l_open_the_next_and_previous_ticket_of_the_repo() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 7)));
+
+        let next = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = next else {
+            panic!("l must open the next ticket of the tab");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 8);
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 8)));
+        assert_eq!(tickets.selected, 1);
+        assert!(
+            tickets.details.is_none(),
+            "the move clears the previous issue"
+        );
+
+        let at_end = tickets.handle_key(&state, key(KeyCode::Right));
+        assert!(
+            at_end.is_none(),
+            "the last ticket of the tab stops the move"
+        );
+
+        let previous = tickets.handle_key(&state, key(KeyCode::Left));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = previous else {
+            panic!("h must open the previous ticket of the tab");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 7);
+
+        let at_start = tickets.handle_key(&state, key(KeyCode::Char('h')));
+        assert!(
+            at_start.is_none(),
+            "the first ticket of the tab stops the move"
+        );
+        assert_eq!(
+            tickets.tab(&state).as_deref(),
+            Some("borsuk"),
+            "the move never changes the tab"
+        );
+
+        // The search text still controls the move.
+        let mut searching = Tickets {
+            query: "#8".to_string(),
+            focus: true,
+            focus_key: Some(("borsuk".to_string(), 8)),
+            ..Tickets::default()
+        };
+        assert!(searching
+            .handle_key(&state, key(KeyCode::Char('l')))
+            .is_none());
+        assert!(searching
+            .handle_key(&state, key(KeyCode::Char('h')))
+            .is_none());
+    }
+
+    #[test]
+    fn a_focus_move_resets_the_scroll() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(tickets.body_scroll.get(), 0, "enter resets the offset");
+
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        let moved = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert!(matches!(
+            moved,
+            Some(Action::Ticket(TicketAction::Details { .. }))
+        ));
+        assert_eq!(tickets.body_scroll.get(), 0, "l resets the offset");
+        assert_eq!(tickets.body_scroll_max.get(), 0);
+    }
+
+    #[test]
+    fn open_resets_the_focus_scroll() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        // The inbox reopens the very same ticket.
+        tickets.open("borsuk", 7);
+        assert_eq!(
+            tickets.body_scroll.get(),
+            0,
+            "the inbox path starts the pane at the top"
+        );
+
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        // The inbox opens another ticket.
+        tickets.open("borsuk", 142);
+        assert_eq!(tickets.body_scroll.get(), 0);
+        assert_eq!(tickets.body_scroll_max.get(), 0);
+    }
+
+    #[test]
+    fn a_focus_move_keeps_the_list_selection() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(tickets.selected, 1);
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(!tickets.focus_open());
+
+        let action = tickets.handle_key(&state, key(KeyCode::Enter));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = action else {
+            panic!("enter must reopen the ticket last read");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 8);
+    }
+
+    #[test]
+    fn the_focus_hint_line_names_the_new_keys() {
+        let screen = draw_focus(104);
+        let text = screen.join("\n");
+        assert!(
+            text.contains("j k scroll · h l ticket · L labels · m to-refine"),
+            "screen:\n{text}"
+        );
+    }
+
+    #[test]
     fn body_render_renders_markdown_once_per_update() {
         let mut tickets = Tickets::default();
         tickets.handle_key(&state(), key(KeyCode::Enter));
@@ -2056,12 +2430,27 @@ mod tests {
 
     #[test]
     fn label_picker_space_sends_one_immediate_toggle() {
-        let state = state();
+        let state = two_ticket_state();
         let mut tickets = Tickets::default();
         tickets.handle_key(&state, key(KeyCode::Enter));
         tickets.observe_details(details());
 
-        let catalog_action = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        let move_action = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert!(
+            matches!(
+                move_action,
+                Some(Action::Ticket(TicketAction::Details { number: 8, .. }))
+            ),
+            "l must move between tickets instead of the label picker"
+        );
+        let back = tickets.handle_key(&state, key(KeyCode::Char('h')));
+        assert!(matches!(
+            back,
+            Some(Action::Ticket(TicketAction::Details { number: 7, .. }))
+        ));
+        tickets.observe_details(details());
+
+        let catalog_action = tickets.handle_key(&state, key(KeyCode::Char('L')));
         assert!(matches!(
             catalog_action,
             Some(Action::Ticket(TicketAction::Labels { ref repo, .. })) if repo == "borsuk"
@@ -2186,7 +2575,7 @@ mod tests {
         let mut tickets = Tickets::default();
         tickets.handle_key(&state, key(KeyCode::Enter));
         tickets.observe_details(details());
-        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        tickets.handle_key(&state, key(KeyCode::Char('L')));
         tickets.observe_labels(TicketLabels {
             request: "labels-1".to_string(),
             repo: "borsuk".to_string(),

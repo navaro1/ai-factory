@@ -22,7 +22,11 @@ use doctor::DoctorEnv;
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long `aif stop` waits for the socket to disappear.
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// The daemon stops every live agent session before it exits. The wait
+/// covers the full stop ladder: the interrupt grace, `SIGTERM`, and
+/// `SIGKILL` in `src/proc.rs`, with room to spare.
+const STOP_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Command line for `aif`.
 #[derive(Parser)]
@@ -149,6 +153,10 @@ fn stop() -> i32 {
         eprintln!("aif stop: cannot send the stop action: {error}");
         return 1;
     }
+    println!(
+        "aif stop: the daemon stops its agent sessions; the wait can take up to {} s",
+        STOP_TIMEOUT.as_secs()
+    );
     if doctor::wait_socket_gone(&path, STOP_TIMEOUT) {
         doctor::cleanup_daemon_unit(&RealExec);
         println!("aif stop: the daemon stopped");
