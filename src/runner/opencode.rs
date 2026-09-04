@@ -8,17 +8,23 @@
 //! step ending is not the task ending; the task ends only when the process
 //! exits, as [`RunEvent::Exit`]. A malformed or unknown line is logged and
 //! skipped, never fatal.
+//!
+//! opencode without `--auto` cannot ask through stdout: it prints every
+//! permission ask on stderr and auto-rejects it. This runner reads those
+//! stderr lines and turns each one into a [`RunEvent::Ask`], so the daemon
+//! can open an inbox row and the human can grant the permission for the
+//! next dispatch through the `OPENCODE_PERMISSION` environment value.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[cfg(test)]
 use crate::config::Harness;
 use crate::config::RoleSettings;
 use crate::proc::{self, ProcEvent, ProcHandle, RunSpec};
-use crate::runner::{Job, RunEvent, Runner, Session};
+use crate::runner::{AllowedPermission, Job, RunEvent, Runner, Session};
 
 /// The program the runner starts.
 #[cfg(test)]
@@ -26,6 +32,19 @@ const PROGRAM: &str = "opencode";
 
 /// The summary length limit for a tool part without a usable title.
 const SUMMARY_CHARS: usize = 120;
+
+/// The environment variable that carries the inline permissions config.
+///
+/// opencode merges this JSON object over its own config, and the last
+/// value wins, so an inline allow overrides the same config key.
+const PERMISSION_ENV: &str = "OPENCODE_PERMISSION";
+
+/// The stderr shape of one auto-rejected permission ask.
+const AUTO_REJECT_PREFIX: &str = "permission requested: ";
+const AUTO_REJECT_SUFFIX: &str = "); auto-rejecting";
+
+/// The permission name of the agent-asks-user permission.
+const QUESTION_PERMISSION: &str = "question";
 
 /// Build the exact argument vector for one factory task.
 ///
@@ -100,14 +119,41 @@ impl OpenCodeRunner {
     }
 }
 
+/// Build the `OPENCODE_PERMISSION` environment value for one job.
+///
+/// Each rule contributes `{"<permission>": {"<pattern>": "allow"}}`, and
+/// the rules merge into one object. No rules produce no variable, so a
+/// plain run inherits the environment untouched.
+fn permission_env(rules: &[AllowedPermission]) -> Option<String> {
+    if rules.is_empty() {
+        return None;
+    }
+    let mut permissions = Map::new();
+    for rule in rules {
+        let entry = permissions
+            .entry(rule.permission.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(patterns) = entry else {
+            continue;
+        };
+        for pattern in &rule.patterns {
+            patterns.insert(pattern.clone(), Value::String("allow".to_string()));
+        }
+    }
+    Some(Value::Object(permissions).to_string())
+}
+
 impl Runner for OpenCodeRunner {
     fn start(&mut self, job: &Job, tx: Sender<RunEvent>) -> anyhow::Result<Box<dyn Session>> {
+        let env = permission_env(&job.allowed_permissions)
+            .map(|value| vec![(PERMISSION_ENV.to_string(), value)])
+            .unwrap_or_default();
         let spec = RunSpec {
             task: job.task.clone(),
             cwd: job.cwd.clone(),
             program: self.settings.program.clone(),
             args: build_args(job, &self.settings),
-            env: Vec::new(),
+            env,
             log: job.log.clone(),
         };
         let (proc_tx, proc_rx) = channel::<ProcEvent>();
@@ -150,6 +196,7 @@ impl Session for OpenCodeSession {
 /// one exit per run.
 fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
     let mut parser = NdjsonParser::new(task.as_str());
+    let mut rejects: usize = 0;
     let mut exited = false;
     for event in rx {
         match event {
@@ -159,6 +206,27 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
                         // The daemon dropped this run; stop feeding it.
                         return;
                     }
+                }
+            }
+            ProcEvent::StderrLine(line) => {
+                // opencode auto-rejects each permission ask on stderr. One
+                // matching line becomes one ask, counted in stream order,
+                // so the daemon can refresh the same row on a retry.
+                let Some((permission, patterns)) = parse_auto_reject(&strip_ansi(&line)) else {
+                    continue;
+                };
+                rejects += 1;
+                let needs_human = permission == QUESTION_PERMISSION;
+                let event = RunEvent::Ask {
+                    task: task.clone(),
+                    request_id: format!("rej-{rejects}"),
+                    tool: permission,
+                    input: serde_json::json!({ "patterns": patterns }),
+                    suggestions: Value::Null,
+                    needs_human,
+                };
+                if tx.send(event).is_err() {
+                    return;
                 }
             }
             ProcEvent::Exit { code, ok } => {
@@ -192,6 +260,65 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
             detail: "the opencode event stream ended without an exit".to_string(),
         });
     }
+}
+
+/// Remove the ANSI escape sequences from one line.
+///
+/// opencode colors its output and moves the cursor with `ESC [` sequences
+/// and can set titles with `ESC ]` ones. The scanner keeps the text and
+/// drops the escapes, so the auto-reject shape matches whatever the
+/// terminal settings are.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(current) = chars.next() {
+        match current {
+            '\x1b' => match chars.next() {
+                // A CSI sequence ends at its final byte, 0x40 to 0x7e.
+                Some('[') => {
+                    for last in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&last) {
+                            break;
+                        }
+                    }
+                }
+                // An OSC sequence ends at BEL or at ESC \.
+                Some(']') => {
+                    let mut previous = '\0';
+                    for last in chars.by_ref() {
+                        if last == '\u{07}' || (previous == '\x1b' && last == '\\') {
+                            break;
+                        }
+                        previous = last;
+                    }
+                }
+                // A lone escape with one byte, such as ESC 7, ends there.
+                Some(_) => {}
+                None => break,
+            },
+            _ => out.push(current),
+        }
+    }
+    out
+}
+
+/// Parse one auto-reject stderr line into its permission name and patterns.
+///
+/// The shape is `permission requested: <name> (<patterns>);
+/// auto-rejecting`, read after the ANSI escapes are gone. The patterns sit
+/// between the parentheses, separated by commas. A `question` ask carries
+/// an empty list. A line of any other shape parses to nothing.
+fn parse_auto_reject(line: &str) -> Option<(String, Vec<String>)> {
+    let rest = line.trim().strip_prefix(AUTO_REJECT_PREFIX)?;
+    let (name, tail) = rest.split_once(" (")?;
+    let patterns_text = tail.strip_suffix(AUTO_REJECT_SUFFIX)?;
+    let patterns = patterns_text
+        .split(',')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(String::from)
+        .collect();
+    Some((name.trim().to_string(), patterns))
 }
 
 /// The NDJSON parser for one opencode run.
@@ -450,6 +577,7 @@ not json at all
             resume: None,
             yolo: true,
             allowed_tools: None,
+            allowed_permissions: Vec::new(),
         }
     }
 
@@ -763,6 +891,65 @@ not json at all
         );
     }
 
+    #[test]
+    fn an_auto_reject_line_parses_to_its_permission_and_patterns() {
+        let (name, patterns) = parse_auto_reject(
+            "permission requested: external_directory (/home/navaro/.cargo/registry/src/*); \
+             auto-rejecting",
+        )
+        .unwrap();
+        assert_eq!(name, "external_directory");
+        assert_eq!(
+            patterns,
+            vec!["/home/navaro/.cargo/registry/src/*".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_auto_reject_line_with_ansi_escapes_parses_the_same() {
+        let Some((name, patterns)) = parse_auto_reject(&strip_ansi(
+            "\u{1b}[2mpermission requested: bash (\u{1b}[31mgit push, curl example.com\u{1b}[0m); \
+             auto-rejecting\u{1b}[0m",
+        )) else {
+            panic!("the ANSI-wrapped line must match");
+        };
+        assert_eq!(name, "bash");
+        assert_eq!(
+            patterns,
+            vec!["git push".to_string(), "curl example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_question_auto_reject_carries_an_empty_pattern_list() {
+        let (name, patterns) =
+            parse_auto_reject("permission requested: question (); auto-rejecting").unwrap();
+        assert_eq!(name, "question");
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn a_stderr_line_of_any_other_shape_produces_no_ask() {
+        for line in [
+            "",
+            "opencode v1.18.27 started",
+            "permission requested: external_directory (/tmp/*)",
+            "permission denied: bash (git push); auto-rejecting",
+            "auto-rejecting permission requested: bash (git push)",
+        ] {
+            assert!(parse_auto_reject(line).is_none(), "line: {line}");
+        }
+    }
+
+    #[test]
+    fn strip_ansi_keeps_the_plain_text_and_drops_the_escapes() {
+        assert_eq!(strip_ansi("plain line"), "plain line");
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+        assert_eq!(strip_ansi("a\u{1b}[?25hb"), "ab");
+        assert_eq!(strip_ansi("\u{1b}]0;title\u{07}tail"), "tail");
+        assert_eq!(strip_ansi("cut\u{1b}"), "cut");
+    }
+
     /// Start the run, retrying the transient `Text file busy` race.
     ///
     /// The test writes its fake child and executes it at once. On this
@@ -916,6 +1103,110 @@ not json at all
         // A second stop after the child is gone is a no-op.
         session.stop().unwrap();
         drop(path);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn permission_env_builds_one_allow_object_and_skips_the_empty_set() {
+        assert_eq!(permission_env(&[]), None);
+        assert_eq!(
+            permission_env(&[AllowedPermission {
+                permission: "bash".to_string(),
+                patterns: vec!["git push".to_string(), "gh pr *".to_string()],
+            }]),
+            Some(r#"{"bash":{"gh pr *":"allow","git push":"allow"}}"#.to_string()),
+        );
+    }
+
+    /// The auto-reject asks of one run travel as `rej-1` and `rej-2`, an
+    /// ANSI-wrapped line included, and a `question` ask carries the
+    /// human flag with an empty pattern list.
+    #[test]
+    fn auto_rejected_stderr_asks_reach_the_caller_as_asks() {
+        let dir = temp_dir("stderr-asks");
+        script(
+            &dir,
+            PROGRAM,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"step_start","sessionID":"ses_rej1","part":{"type":"step-start"}}'
+printf '\033[2mpermission requested: external_directory (/home/navaro/.cargo/registry/src/*); auto-rejecting\033[0m\n' >&2
+printf 'permission requested: question (); auto-rejecting\n' >&2
+exit 1
+"#,
+        );
+        let job = job(&dir, None);
+        let path = PathGuard::prepend(&dir);
+        let mut runner = OpenCodeRunner::new(legacy_settings(&job));
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let events = collect_until_exit(&rx);
+        session.stop().unwrap();
+        drop(path);
+
+        let asks: Vec<RunEvent> = events
+            .into_iter()
+            .filter(|event| matches!(event, RunEvent::Ask { .. }))
+            .collect();
+        assert_eq!(
+            asks,
+            vec![
+                RunEvent::Ask {
+                    task: TASK.to_string(),
+                    request_id: "rej-1".to_string(),
+                    tool: "external_directory".to_string(),
+                    input: serde_json::json!({"patterns": ["/home/navaro/.cargo/registry/src/*"]}),
+                    suggestions: Value::Null,
+                    needs_human: false,
+                },
+                RunEvent::Ask {
+                    task: TASK.to_string(),
+                    request_id: "rej-2".to_string(),
+                    tool: "question".to_string(),
+                    input: serde_json::json!({"patterns": []}),
+                    suggestions: Value::Null,
+                    needs_human: true,
+                },
+            ]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The allowed rules of one job reach the child as the inline
+    /// permissions config in `OPENCODE_PERMISSION`.
+    #[test]
+    fn allowed_permissions_reach_the_child_as_the_open_code_permission_env() {
+        let dir = temp_dir("permission-env");
+        script(
+            &dir,
+            PROGRAM,
+            "#!/bin/sh\nprintf '%s' \"$OPENCODE_PERMISSION\" > env.txt\nexit 0\n",
+        );
+        let mut job = job(&dir, None);
+        job.allowed_permissions = vec![AllowedPermission {
+            permission: "external_directory".to_string(),
+            patterns: vec!["/home/navaro/.cargo/registry/src/*".to_string()],
+        }];
+        let path = PathGuard::prepend(&dir);
+        let mut runner = OpenCodeRunner::new(legacy_settings(&job));
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let events = collect_until_exit(&rx);
+        session.stop().unwrap();
+        drop(path);
+
+        assert_eq!(
+            events.last(),
+            Some(&RunEvent::Exit {
+                task: TASK.to_string(),
+                ok: true,
+                detail: "opencode exited with code 0".to_string(),
+            })
+        );
+        let env = fs::read_to_string(dir.join("env.txt")).unwrap();
+        assert_eq!(
+            env,
+            r#"{"external_directory":{"/home/navaro/.cargo/registry/src/*":"allow"}}"#
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

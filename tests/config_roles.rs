@@ -56,6 +56,14 @@ fn the_installer_example_keeps_the_six_roles_and_read_only_ticket_chat() {
         Harness::Opencode
     );
     assert_eq!(
+        config.roles[&ExecutionRole::Implement].auto_approve,
+        Some(true)
+    );
+    assert_eq!(
+        config.roles[&ExecutionRole::Review].auto_approve,
+        Some(true)
+    );
+    assert_eq!(
         config.roles[&ExecutionRole::TicketChat].tools,
         ["Read", "Glob", "Grep"]
     );

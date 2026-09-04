@@ -22,16 +22,20 @@ pub enum ExecutionRole {
     Release,
     TicketCreate,
     TicketChat,
+    TheoryAudit,
+    TheoryChat,
 }
 
 impl ExecutionRole {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Refine,
         Self::Implement,
         Self::Review,
         Self::Release,
         Self::TicketCreate,
         Self::TicketChat,
+        Self::TheoryAudit,
+        Self::TheoryChat,
     ];
     pub const fn table_name(self) -> &'static str {
         match self {
@@ -41,6 +45,8 @@ impl ExecutionRole {
             Self::Release => "stage.release",
             Self::TicketCreate => "ticket.create",
             Self::TicketChat => "ticket.chat",
+            Self::TheoryAudit => "theory.audit",
+            Self::TheoryChat => "theory.chat",
         }
     }
     pub const fn stage(self) -> Option<Stage> {
@@ -50,7 +56,13 @@ impl ExecutionRole {
             Self::Review => Some(Stage::Review),
             Self::Release => Some(Stage::Release),
             Self::TicketCreate | Self::TicketChat => None,
+            Self::TheoryAudit | Self::TheoryChat => None,
         }
+    }
+    /// False for the theory roles: `[repo.{alias}.theory]` is the shadow
+    /// repository table, so a theory role takes no repository override.
+    pub const fn overridable(self) -> bool {
+        !matches!(self, Self::TheoryAudit | Self::TheoryChat)
     }
 }
 impl Display for ExecutionRole {
@@ -197,6 +209,122 @@ impl Default for UsageConfig {
     }
 }
 
+/// Whether the theory governor runs for one repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Governor {
+    #[default]
+    On,
+    Off,
+}
+impl Governor {
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+}
+
+/// One day of the week, as the interview schedule needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Weekday {
+    #[default]
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+/// The separate theory repository of one governed code repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TheoryRepo {
+    /// The `owner/name` of the theory repository on GitHub.
+    pub repo: Option<String>,
+    /// The local checkout that holds `theory/`.
+    pub path: PathBuf,
+}
+
+/// How often the recall sweep runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sweep {
+    pub days: u64,
+    pub after_train: bool,
+}
+impl Default for Sweep {
+    fn default() -> Self {
+        Self {
+            days: 7,
+            after_train: true,
+        }
+    }
+}
+
+/// The flashcard schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cards {
+    pub per_day: usize,
+    pub stale_days: u64,
+}
+impl Default for Cards {
+    fn default() -> Self {
+        Self {
+            per_day: 3,
+            stale_days: 30,
+        }
+    }
+}
+
+/// The interview schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interview {
+    pub weekday: Weekday,
+    pub minutes: u64,
+}
+impl Default for Interview {
+    fn default() -> Self {
+        Self {
+            weekday: Weekday::Monday,
+            minutes: 20,
+        }
+    }
+}
+
+/// The per-repository theory settings of `factory.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TheoryConfig {
+    /// Whether the governor runs for this repository.
+    pub governor: Governor,
+    /// The cap on open deltas plus open theory events.
+    pub window: usize,
+    /// The theory repository. Absent means in-repository mode.
+    pub theory: Option<TheoryRepo>,
+    pub sweep: Sweep,
+    pub cards: Cards,
+    pub interview: Interview,
+}
+impl Default for TheoryConfig {
+    fn default() -> Self {
+        Self {
+            governor: Governor::On,
+            window: 3,
+            theory: None,
+            sweep: Sweep::default(),
+            cards: Cards::default(),
+            interview: Interview::default(),
+        }
+    }
+}
+impl TheoryConfig {
+    /// The checkout that holds `theory/`: the theory path when set, else the repository path.
+    pub fn checkout(&self, repo_path: &Path) -> PathBuf {
+        self.theory
+            .as_ref()
+            .map_or_else(|| repo_path.to_path_buf(), |value| value.path.clone())
+    }
+}
+
 /// Temporary stage data for callers that still use the old runner interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageConfig {
@@ -223,6 +351,7 @@ pub struct RepoConfig {
     pub owner_repo: String,
     pub lanes: BTreeMap<Stage, usize>,
     pub release: ReleasePolicy,
+    pub theory: TheoryConfig,
     pub role_overrides: BTreeMap<ExecutionRole, RoleOverride>,
 }
 
@@ -324,6 +453,19 @@ impl Config {
             let settings = raw_role.into_settings(&role.to_string())?;
             roles.insert(role, settings);
         }
+        for (role, raw_role) in [
+            (ExecutionRole::TheoryAudit, raw.theory.audit),
+            (ExecutionRole::TheoryChat, raw.theory.chat),
+        ] {
+            let Some(raw_role) = raw_role else {
+                continue;
+            };
+            if raw_role.limit.is_some() {
+                bail!("{role}.limit is allowed only on a global stage table");
+            }
+            let settings = raw_role.into_settings(&role.to_string())?;
+            roles.insert(role, settings);
+        }
         let mut stages = BTreeMap::new();
         for (index, role) in [
             ExecutionRole::Refine,
@@ -364,6 +506,7 @@ impl Config {
                 bail!("repo.{alias}.path must not be empty");
             }
             validate_release(&raw_repo.release, &alias)?;
+            let theory = theory_config(&raw_repo, &alias)?;
             let raw_overrides = raw_repo.overrides();
             let mut lanes = BTreeMap::new();
             for (name, count) in raw_repo.lanes {
@@ -391,6 +534,7 @@ impl Config {
                     owner_repo: String::new(),
                     lanes,
                     release: raw_repo.release,
+                    theory,
                     role_overrides,
                 },
             );
@@ -464,9 +608,17 @@ struct RawConfig {
     #[serde(default)]
     ticket: RawTickets,
     #[serde(default)]
+    theory: RawTheory,
+    #[serde(default)]
     repo: BTreeMap<String, RawRepo>,
     #[serde(default)]
     usage: UsageConfig,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTheory {
+    audit: Option<RawRole>,
+    chat: Option<RawRole>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -583,10 +735,40 @@ struct RawRepo {
     lanes: BTreeMap<String, usize>,
     #[serde(default)]
     release: ReleasePolicy,
+    governor: Option<String>,
+    window: Option<usize>,
+    theory: Option<RawTheoryRepo>,
+    sweep: Option<RawSweep>,
+    cards: Option<RawCards>,
+    interview: Option<RawInterview>,
     #[serde(default)]
     stage: RawStageOverrides,
     #[serde(default)]
     ticket: RawTicketOverrides,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTheoryRepo {
+    repo: Option<String>,
+    path: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSweep {
+    days: Option<u64>,
+    after_train: Option<bool>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCards {
+    per_day: Option<usize>,
+    stale_days: Option<u64>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInterview {
+    weekday: Option<String>,
+    minutes: Option<u64>,
 }
 impl RawRepo {
     fn overrides(&self) -> [(ExecutionRole, Option<RawRole>); 6] {
@@ -1014,6 +1196,8 @@ fn parse_role(value: &str) -> Result<ExecutionRole> {
         "stage.release" => Ok(ExecutionRole::Release),
         "ticket.create" => Ok(ExecutionRole::TicketCreate),
         "ticket.chat" => Ok(ExecutionRole::TicketChat),
+        "theory.audit" => Ok(ExecutionRole::TheoryAudit),
+        "theory.chat" => Ok(ExecutionRole::TheoryChat),
         _ => bail!("{value}: unknown execution role"),
     }
 }
@@ -1036,6 +1220,109 @@ fn validate_usage(value: &UsageConfig) -> Result<()> {
         bail!("usage.minutes must be at most 1440");
     }
     Ok(())
+}
+fn theory_config(raw: &RawRepo, alias: &str) -> Result<TheoryConfig> {
+    let governor = match raw.governor.as_deref() {
+        None | Some("on") => Governor::On,
+        Some("off") => Governor::Off,
+        Some(_) => bail!("repo.{alias}.governor must be \"on\" or \"off\""),
+    };
+    let window = raw.window.unwrap_or(3);
+    if window == 0 {
+        bail!("repo.{alias}.window must be at least 1");
+    }
+    let theory = match &raw.theory {
+        None => None,
+        Some(raw) => {
+            let path = raw
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow!("repo.{alias}.theory.path is required"))?;
+            if path.trim().is_empty() {
+                bail!("repo.{alias}.theory.path must not be empty");
+            }
+            if let Some(repo) = raw.repo.as_deref() {
+                let mut parts = repo.split('/');
+                let valid = matches!(
+                    (parts.next(), parts.next(), parts.next()),
+                    (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
+                );
+                if !valid {
+                    bail!("repo.{alias}.theory.repo must be owner/name");
+                }
+            }
+            Some(TheoryRepo {
+                repo: raw.repo.clone(),
+                path: PathBuf::from(path),
+            })
+        }
+    };
+    let sweep = match &raw.sweep {
+        None => Sweep::default(),
+        Some(raw) => {
+            let days = raw.days.unwrap_or(7);
+            if days == 0 {
+                bail!("repo.{alias}.sweep.days must be at least 1");
+            }
+            Sweep {
+                days,
+                after_train: raw.after_train.unwrap_or(true),
+            }
+        }
+    };
+    let cards = match &raw.cards {
+        None => Cards::default(),
+        Some(raw) => {
+            let per_day = raw.per_day.unwrap_or(3);
+            if per_day == 0 {
+                bail!("repo.{alias}.cards.per_day must be at least 1");
+            }
+            let stale_days = raw.stale_days.unwrap_or(30);
+            if stale_days == 0 {
+                bail!("repo.{alias}.cards.stale_days must be at least 1");
+            }
+            Cards {
+                per_day,
+                stale_days,
+            }
+        }
+    };
+    let interview = match &raw.interview {
+        None => Interview::default(),
+        Some(raw) => {
+            let weekday = match raw.weekday.as_deref() {
+                None => Weekday::Monday,
+                Some(name) => parse_weekday(Some(name)).ok_or_else(|| {
+                    anyhow!("repo.{alias}.interview.weekday must be a weekday name")
+                })?,
+            };
+            let minutes = raw.minutes.unwrap_or(20);
+            if minutes == 0 {
+                bail!("repo.{alias}.interview.minutes must be at least 1");
+            }
+            Interview { weekday, minutes }
+        }
+    };
+    Ok(TheoryConfig {
+        governor,
+        window,
+        theory,
+        sweep,
+        cards,
+        interview,
+    })
+}
+fn parse_weekday(value: Option<&str>) -> Option<Weekday> {
+    match value? {
+        "monday" => Some(Weekday::Monday),
+        "tuesday" => Some(Weekday::Tuesday),
+        "wednesday" => Some(Weekday::Wednesday),
+        "thursday" => Some(Weekday::Thursday),
+        "friday" => Some(Weekday::Friday),
+        "saturday" => Some(Weekday::Saturday),
+        "sunday" => Some(Weekday::Sunday),
+        _ => None,
+    }
 }
 fn validate_lane_sums(
     stages: &BTreeMap<Stage, StageConfig>,
@@ -1178,6 +1465,9 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
             role,
             settings,
         } => {
+            if !role.overridable() {
+                bail!("repo.{repository}.{role}: a theory role takes no repository override");
+            }
             if !valid_alias(repository) {
                 bail!("repo.\"{repository}\": alias must match [a-z0-9._-]+");
             }
@@ -1329,6 +1619,8 @@ fn role_parts(role: ExecutionRole) -> (&'static str, &'static str) {
         ExecutionRole::Release => ("stage", "release"),
         ExecutionRole::TicketCreate => ("ticket", "create"),
         ExecutionRole::TicketChat => ("ticket", "chat"),
+        ExecutionRole::TheoryAudit => ("theory", "audit"),
+        ExecutionRole::TheoryChat => ("theory", "chat"),
     }
 }
 

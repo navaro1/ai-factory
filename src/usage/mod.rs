@@ -1,7 +1,7 @@
 //! The usage probe contract: one normalized record per billed identity.
 //!
-//! The daemon derives the identity set from the six resolved execution
-//! roles, runs at most one probe per identity at a time, and keeps the last
+//! The daemon derives the identity set from the resolved execution roles,
+//! runs at most one probe per identity at a time, and keeps the last
 //! good result. A probe never blocks the event loop: the daemon spawns it on
 //! a thread and applies the result when the [`Inbound::Usage`] message
 //! arrives. HTTP goes through `curl` as a child process, the same pattern
@@ -245,11 +245,13 @@ fn harness_rank(harness: Harness) -> u8 {
     }
 }
 
-/// Derive the billed identity set from the six resolved execution roles.
+/// Derive the billed identity set from the resolved execution roles.
 ///
-/// The set covers the global roles and every repository override. The list
-/// is sorted claude first, OpenCode providers second, codex last; within a
-/// harness the identity keys sort alphabetically.
+/// The set covers every configured global role and every repository
+/// override. A theory role that the configuration omits adds nothing, and
+/// a theory role never takes a repository override. The list is sorted
+/// claude first, OpenCode providers second, codex last; within a harness
+/// the identity keys sort alphabetically.
 pub fn identities(config: &Config) -> Vec<Identity> {
     type IdentityParts = (Harness, BTreeMap<String, ()>, String);
     let mut pairs: BTreeMap<(u8, String), IdentityParts> = BTreeMap::new();
@@ -261,22 +263,22 @@ pub fn identities(config: &Config) -> Vec<Identity> {
         entry.1.insert(model.to_string(), ());
     };
     for role in ExecutionRole::ALL {
-        let settings = &config.roles[&role];
+        let Some(settings) = config.roles.get(&role) else {
+            continue;
+        };
         record(settings.harness, &settings.model, &settings.program);
     }
     for repo in config.repos.values() {
         for role in ExecutionRole::ALL {
-            let settings = &config.roles[&role];
-            let settings = repo
-                .role_overrides
-                .get(&role)
-                .map(|_| {
-                    config
-                        .resolved_role(Some(&repo.alias), role.table_name())
-                        .map(|resolved| resolved.settings)
-                        .unwrap_or_else(|_| settings.clone())
-                })
-                .unwrap_or_else(|| settings.clone());
+            if !role.overridable() || !repo.role_overrides.contains_key(&role) {
+                continue;
+            }
+            let Some(global) = config.roles.get(&role) else {
+                continue;
+            };
+            let settings = config
+                .resolved_role(Some(&repo.alias), role.table_name())
+                .map_or_else(|_| global.clone(), |resolved| resolved.settings);
             record(settings.harness, &settings.model, &settings.program);
         }
     }
@@ -462,8 +464,8 @@ pub(crate) fn fixture(name: &str) -> String {
 mod tests {
     use super::*;
 
-    fn config_with_overrides() -> Config {
-        let text = r#"
+    /// The six required roles with one repository override, as TOML.
+    const OVERRIDES_TEXT: &str = r#"
 schema_version = 1
 
 [stage.refine]
@@ -499,7 +501,9 @@ path = "/tmp/demo"
 harness = "opencode"
 model = "zai-coding-plan/glm-5.3"
 "#;
-        Config::parse(text).unwrap()
+
+    fn config_with_overrides() -> Config {
+        Config::parse(OVERRIDES_TEXT).unwrap()
     }
 
     #[test]
@@ -535,6 +539,32 @@ model = "zai-coding-plan/glm-5.3"
         let codex = &identities[3];
         assert_eq!(codex.harness, Harness::Codex);
         assert_eq!(codex.program, "codex");
+    }
+
+    #[test]
+    fn the_optional_theory_roles_add_their_identity_only_when_configured() {
+        // The two theory roles are optional global tables. A config without
+        // them must still derive its identity set.
+        let without = config_with_overrides();
+        assert!(!without.roles.contains_key(&ExecutionRole::TheoryAudit));
+        let ids: Vec<String> = identities(&without).into_iter().map(|one| one.id).collect();
+        assert_eq!(ids, ["claude", "openai", "zai-coding-plan", "codex"]);
+
+        let with = Config::parse(&format!(
+            "{OVERRIDES_TEXT}\n[theory.audit]\nharness = \"opencode\"\n\
+             model = \"grok/grok-5\"\n[theory.chat]\nharness = \"opencode\"\n\
+             model = \"grok/grok-5\"\n"
+        ))
+        .unwrap();
+
+        let identities = identities(&with);
+
+        let grok = identities
+            .iter()
+            .find(|one| one.id == "grok")
+            .expect("a theory role bills its own identity");
+        assert_eq!(grok.harness, Harness::Opencode);
+        assert_eq!(grok.models, ["grok/grok-5"]);
     }
 
     #[test]

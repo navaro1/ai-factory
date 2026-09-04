@@ -38,7 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
@@ -1136,16 +1136,32 @@ struct QuestionView {
     multi_select: bool,
 }
 
-/// Parse the `questions` array of a `Question` decision.
+/// Parse the questions of a `Question` decision.
+///
+/// The payload carries the question list in one of two shapes, and the
+/// reader accepts both, whichever harness recorded it. A bare array is the
+/// list itself. An object is the whole tool input, so the list sits under
+/// its `questions` key. The claude runner stores the tool input verbatim,
+/// so the object shape is the one the daemon writes today.
 ///
 /// An entry can omit a question text, a header, or readable option labels.
-/// The parser uses the data that the entry contains. A value that is not an
-/// array produces no questions.
+/// The parser uses the data that the entry contains. Every other value
+/// produces no questions.
 fn parse_questions(value: &serde_json::Value) -> Vec<QuestionView> {
-    let Some(entries) = value.as_array() else {
+    let Some(entries) = question_entries(value) else {
         return Vec::new();
     };
     entries.iter().filter_map(parse_question).collect()
+}
+
+/// Find the question list inside one `Question` decision payload.
+///
+/// The list is the value itself when the value is an array. Otherwise the
+/// list is the `questions` member of the value.
+fn question_entries(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    value
+        .as_array()
+        .or_else(|| value.get("questions").and_then(serde_json::Value::as_array))
 }
 
 /// Parse one question object of the array.
@@ -1292,7 +1308,19 @@ fn feed_message(decision: &Decision) -> String {
 }
 
 /// The short summary of one tool input.
+///
+/// A one-shot permission ask carries its patterns under `patterns`, so the
+/// feed names the pattern instead of printing the raw JSON.
 fn input_summary(input: &serde_json::Value) -> String {
+    if let Some(patterns) = input.get("patterns").and_then(serde_json::Value::as_array) {
+        let named: Vec<&str> = patterns
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if !named.is_empty() {
+            return named.join(", ").chars().take(60).collect();
+        }
+    }
     if let Some(path) = input.get("file_path").and_then(serde_json::Value::as_str) {
         return path.chars().take(60).collect();
     }
@@ -1303,9 +1331,17 @@ fn input_summary(input: &serde_json::Value) -> String {
 }
 
 /// The primary message of one question decision.
+///
+/// A one-shot harness records the ask as a pattern list, never as an
+/// option list, because the harness auto-rejects the ask and keeps the
+/// question text on its own log. That row names the log instead of
+/// blaming the payload.
 fn question_message(questions: &serde_json::Value) -> String {
     let parsed = parse_questions(questions);
     let Some(first) = parsed.first() else {
+        if questions.get("patterns").is_some() {
+            return "The agent asked a question. Read the task log for its text.".to_string();
+        }
         return "The agent sent a question with unreadable options.".to_string();
     };
     if parsed.len() == 1 {
@@ -1391,8 +1427,7 @@ fn draw_train_detail(
     train: &crate::sock::TrainView,
     detail: &DetailState,
 ) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     let prs = train_detail_prs(train);
     let Some(number) = detail
         .item_number
@@ -1401,33 +1436,19 @@ fn draw_train_detail(
     else {
         return draw_missing_item_detail(
             f,
-            rows[0],
-            rows[1],
-            state,
-            inbox,
+            area,
             detail,
             format!("PR · {}", train.repo),
             "The train queue is empty.".to_string(),
         );
     };
-    draw_item_detail(
-        f,
-        rows[0],
-        rows[1],
-        state,
-        inbox,
-        detail,
-        &train.repo,
-        number,
-        width,
-    );
+    draw_item_detail(f, area, state, inbox, detail, &train.repo, number, width);
 }
 /// Draw one repository item detail, or the missing-item notice.
 #[allow(clippy::too_many_arguments)]
 fn draw_item_detail(
     f: &mut Frame,
     content_area: Rect,
-    footer_area: Rect,
     state: &StateView,
     inbox: &Inbox,
     detail: &DetailState,
@@ -1448,9 +1469,6 @@ fn draw_item_detail(
         return draw_missing_item_detail(
             f,
             content_area,
-            footer_area,
-            state,
-            inbox,
             detail,
             title,
             "The PR description is unavailable.".to_string(),
@@ -1461,7 +1479,6 @@ fn draw_item_detail(
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
     f.render_widget(content, content_area);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
 }
 
 /// The pull requests of one train detail, in release lane order.
@@ -1474,10 +1491,9 @@ fn train_detail_prs(train: &crate::sock::TrainView) -> Vec<u64> {
 
 /// Draw the oldest-first decision feed.
 fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms: u64) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_span = None;
-    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     if state.decisions.is_empty() {
         lines.push(Line::from(
             "No open decisions. The factory asks here when an agent needs you.",
@@ -1493,7 +1509,7 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms
         lines.push(Line::from(""));
     }
     let title = format!("decisions · {} open · oldest first", state.decisions.len());
-    let inner_height = usize::from(rows[0].height.saturating_sub(2));
+    let inner_height = usize::from(area.height.saturating_sub(2));
     let scroll = selected_span
         .filter(|_| inner_height > 0)
         .map(|(start, end)| {
@@ -1521,8 +1537,7 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms
     let list = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
-    f.render_widget(list, rows[0]);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
+    f.render_widget(list, area);
 }
 
 /// Build one content-first feed item.
@@ -1655,12 +1670,9 @@ fn draw_detail(
     detail: &DetailState,
     now_ms: u64,
 ) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     if matches!(decision.kind, DecisionKind::NeedsHuman { .. }) {
-        return draw_ask_detail(
-            f, rows[0], rows[1], state, inbox, decision, detail, now_ms, width,
-        );
+        return draw_ask_detail(f, area, state, inbox, decision, detail, now_ms, width);
     }
     let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
@@ -1675,10 +1687,7 @@ fn draw_detail(
             else {
                 return draw_missing_item_detail(
                     f,
-                    rows[0],
-                    rows[1],
-                    state,
-                    inbox,
+                    area,
                     detail,
                     title,
                     format!("The {} description is unavailable.", kind.noun()),
@@ -1686,14 +1695,13 @@ fn draw_detail(
             };
             (title, lines)
         }
-        None => agent_detail_lines(state, decision, now_ms, width),
+        None => agent_detail_lines(state, inbox, decision, now_ms, width),
     };
-    let scroll = clamped_detail_scroll(detail, lines.len(), rows[0]);
+    let scroll = clamped_detail_scroll(detail, lines.len(), area);
     let content = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
-    f.render_widget(content, rows[0]);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
+    f.render_widget(content, area);
 }
 
 /// Draw the question screen of one `NeedsHuman` decision.
@@ -1704,7 +1712,6 @@ fn draw_detail(
 fn draw_ask_detail(
     f: &mut Frame,
     content_area: Rect,
-    footer_area: Rect,
     state: &StateView,
     inbox: &Inbox,
     decision: &Decision,
@@ -1819,7 +1826,6 @@ fn draw_ask_detail(
         )))
         .scroll((scroll, 0));
     f.render_widget(content, content_area);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
 }
 
 /// The wrapped display lines of one ask option.
@@ -1835,13 +1841,9 @@ fn ask_option_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>
 }
 
 /// Draw a repository detail whose latest item snapshot is absent.
-#[allow(clippy::too_many_arguments)]
 fn draw_missing_item_detail(
     f: &mut Frame,
     content_area: Rect,
-    footer_area: Rect,
-    state: &StateView,
-    inbox: &Inbox,
     detail: &DetailState,
     title: String,
     message: String,
@@ -1851,7 +1853,6 @@ fn draw_missing_item_detail(
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
     f.render_widget(content, content_area);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
 }
 
 /// Clamp a detail offset to the content height from this draw.
@@ -1867,8 +1868,13 @@ fn clamped_detail_scroll(detail: &DetailState, line_count: usize, area: Rect) ->
 }
 
 /// Build the initial task context screen until transcript context is available.
+///
+/// The screen repeats the choices of the row, so the human can pick an
+/// option from the context screen as well as from the feed. The footer
+/// names the keys that act on them.
 fn agent_detail_lines(
     state: &StateView,
+    inbox: &Inbox,
     decision: &Decision,
     now_ms: u64,
     width: usize,
@@ -1885,6 +1891,17 @@ fn agent_detail_lines(
         "",
         Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
     );
+    let choices = choice_lines(
+        state,
+        decision,
+        inbox,
+        width,
+        Style::default().fg(THEME.text),
+    );
+    if !choices.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(choices);
+    }
     lines.push(Line::from(""));
     lines.push(Line::styled("Recent agent context", THEME.dim()));
     let Some(task_id) = task_id(decision) else {
@@ -2261,7 +2278,11 @@ fn option_picked(inbox: &Inbox, id: &str, question_index: usize, option_index: u
 }
 
 /// Build the footer line: the key map, a hint, or the text input.
-fn footer_text(state: &StateView, inbox: &Inbox) -> String {
+///
+/// The shell renders this line on the bottom row while the inbox view is
+/// open. Every key map stays at or under 64 characters, so the row fits
+/// the left footer side of an 80-column terminal.
+pub(super) fn footer_text(state: &StateView, inbox: &Inbox) -> String {
     if let Some(hint) = inbox.hint {
         return hint.to_string();
     }
@@ -2281,30 +2302,36 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
                 };
                 match decision.kind {
                     DecisionKind::ReleaseGate { .. } => {
-                        "esc back · j k scroll · h l PR · space include/exclude · g release"
-                            .to_string()
+                        "esc back · j k scroll · h l PR · space toggle · g release".to_string()
                     }
                     DecisionKind::Permission { .. } => {
                         "esc back · j k scroll · y allow · n deny · o session".to_string()
                     }
                     DecisionKind::Question { .. } => {
-                        "esc back · j k scroll · 1-9 pick · s submit · i write · o session"
+                        "esc back · j k scroll · 1-9 pick · s submit · i type · o session"
                             .to_string()
                     }
                     DecisionKind::Stuck { .. } => {
                         "esc back · j k scroll · r retry · c cancel · o session".to_string()
                     }
                     DecisionKind::NeedsHuman { kind, .. } => {
-                        let mut parts =
-                            vec!["esc back", "j k scroll", "t comment", "c clear label"];
-                        if inbox
+                        // The bottom row holds 64 characters. A fetched
+                        // option list takes the two answer keys and gives
+                        // up the scroll hint, so the longest row still
+                        // fits beside the inbox badge.
+                        let picks = inbox
                             .asks
                             .get(id)
-                            .is_some_and(|ask| !ask.options.is_empty())
-                        {
+                            .is_some_and(|ask| !ask.options.is_empty());
+                        let mut parts = vec!["esc back"];
+                        if picks {
                             parts.push("1-9 pick");
                             parts.push("s submit");
+                        } else {
+                            parts.push("j k scroll");
                         }
+                        parts.push("t comment");
+                        parts.push("c clear");
                         if kind == ItemKind::Issue {
                             parts.push("w tickets");
                         }
@@ -2326,18 +2353,16 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
             "PgUp PgDn scroll · j k move · y allow · n deny · enter details".to_string()
         }
         DecisionKind::Question { .. } => {
-            "PgUp PgDn scroll · j k move · 1-9 pick · s submit · i write · enter details"
-                .to_string()
+            "PgUp PgDn · j k move · 1-9 pick · s submit · enter details".to_string()
         }
         DecisionKind::Stuck { .. } => {
             "PgUp PgDn scroll · j k move · r retry · c cancel · enter details".to_string()
         }
         DecisionKind::NeedsHuman { .. } => {
-            "PgUp PgDn scroll · j k move · t comment · c clear label · enter details".to_string()
+            "PgUp PgDn · j k move · t comment · c clear label · enter details".to_string()
         }
         DecisionKind::ReleaseGate { .. } => {
-            "PgUp PgDn scroll · j k move · 1-9 include · space all or none · g release · enter details"
-                .to_string()
+            "j k move · 1-9 include · space all · g release · enter details".to_string()
         }
     }
 }
@@ -2423,6 +2448,7 @@ mod tests {
             decisions,
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -2576,6 +2602,62 @@ mod tests {
         assert!(
             screen.contains("Release 2 PRs: #7 #9?"),
             "message: {screen}"
+        );
+    }
+
+    /// The feed message of an auto-rejected opencode ask names the
+    /// permission and the pattern, so the operator reads the grant before
+    /// allowing it.
+    #[test]
+    fn a_patterns_ask_names_the_permission_and_the_pattern() {
+        let worker = worker();
+        let decision = Decision::permission(
+            &worker,
+            "rej-1",
+            "external_directory",
+            serde_json::json!({"patterns": ["/home/navaro/.cargo/registry/src/*"]}),
+            OPENED,
+        );
+
+        assert_eq!(
+            feed_message(&decision),
+            "Allow external_directory for /home/navaro/.cargo/registry/src/*?"
+        );
+    }
+
+    /// A one-shot question row carries a pattern list, never an option
+    /// list. The feed points at the task log instead of blaming the
+    /// payload, and the row still offers the text input.
+    #[test]
+    fn a_one_shot_question_row_points_at_the_task_log() {
+        let worker = worker();
+        let decision = Decision::question(
+            &worker,
+            "rej-2",
+            serde_json::json!({"patterns": []}),
+            OPENED,
+        );
+
+        assert_eq!(
+            feed_message(&decision),
+            "The agent asked a question. Read the task log for its text."
+        );
+        assert_eq!(
+            feed_actions(&decision),
+            "[1-9] pick · [s] submit · [i] write · [enter] details"
+        );
+    }
+
+    /// A malformed claude payload keeps the old message: nothing points at
+    /// a pattern list there, so the row still blames the options.
+    #[test]
+    fn a_malformed_question_payload_still_names_the_unreadable_options() {
+        let worker = worker();
+        let decision = Decision::question(&worker, "q-1", serde_json::json!({"nope": 1}), OPENED);
+
+        assert_eq!(
+            feed_message(&decision),
+            "The agent sent a question with unreadable options."
         );
     }
 
@@ -2738,7 +2820,7 @@ mod tests {
             screen.contains("Require a current release state before the train starts."),
             "screen: {screen}"
         );
-        assert!(screen.contains("esc back"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).starts_with("esc back"));
     }
 
     #[test]
@@ -3026,7 +3108,7 @@ mod tests {
             "screen: {screen}"
         );
         assert!(screen.contains("narrow terminal."), "screen: {screen}");
-        assert!(screen.contains("esc back"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).contains("esc back"));
         assert!(
             screen.lines().all(|line| line.chars().count() == 44),
             "screen: {screen}"
@@ -3130,6 +3212,7 @@ mod tests {
             log_path: log_path.to_path_buf(),
             input: InputMode::Live,
             queued_messages: 0,
+            binding: None,
         }
     }
 
@@ -3205,9 +3288,9 @@ mod tests {
             screen.contains("2. [ ] postgres server"),
             "screen: {screen}"
         );
-        assert!(
-            screen.contains("1-9 pick · s submit · i write · enter details"),
-            "footer: {screen}"
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "PgUp PgDn · j k move · 1-9 pick · s submit · enter details"
         );
     }
 
@@ -3219,9 +3302,9 @@ mod tests {
 
         assert!(screen.contains("1. [x] #7"), "screen: {screen}");
         assert!(screen.contains("2. [x] #9"), "screen: {screen}");
-        assert!(
-            screen.contains("1-9 include · space all or none · g release · enter details"),
-            "footer: {screen}"
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "j k move · 1-9 include · space all · g release · enter details"
         );
 
         let mut inbox = selected(&state, 4);
@@ -3344,8 +3427,11 @@ mod tests {
             rx.try_recv().is_err(),
             "an unanswered question sends nothing"
         );
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("answer every question"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("answer every question"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
     }
 
     #[test]
@@ -3371,8 +3457,11 @@ mod tests {
         inbox.handle_key(&state, press('s'), &mut tx);
 
         assert!(rx.try_recv().is_err(), "an empty choice sent an answer");
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("answer every question"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("answer every question"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
     }
 
     #[test]
@@ -3461,6 +3550,125 @@ mod tests {
 
         assert_eq!(parsed[0].key, "Storage");
         assert_eq!(parsed[1].key, "Which cache?");
+    }
+
+    /// The `AskUserQuestion` input as the claude runner records it: the
+    /// whole tool input, so the question list sits under `questions`.
+    fn recorded_tool_input() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "A Failed prior task: does it block the next stage?",
+                "header": "Gate rule",
+                "options": [
+                    {"label": "Split by stage", "description": "a terminal refine frees implement"},
+                    {"label": "main wins", "description": "a failed refine blocks implement"},
+                ],
+                "multiSelect": false,
+            }]
+        })
+    }
+
+    #[test]
+    fn parse_questions_reads_a_bare_array_and_a_recorded_tool_input() {
+        let bare = parse_questions(&serde_json::json!([
+            {"question": "Which database?", "header": "Storage", "options": []},
+        ]));
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].key, "Storage");
+
+        let recorded = parse_questions(&recorded_tool_input());
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].key, "Gate rule");
+        assert_eq!(recorded[0].options.len(), 2);
+        assert_eq!(recorded[0].options[0].0, "Split by stage");
+        assert!(!recorded[0].multi_select);
+
+        // Every other shape carries no question list.
+        for other in [
+            serde_json::json!(null),
+            serde_json::json!("no"),
+            serde_json::json!({"questions": "no"}),
+            serde_json::json!({}),
+        ] {
+            assert!(parse_questions(&other).is_empty(), "shape: {other}");
+        }
+    }
+
+    #[test]
+    fn a_recorded_tool_input_question_shows_its_options_and_submits_a_pick() {
+        let decision = Decision::question(&worker(), "req-ask", recorded_tool_input(), OPENED);
+        let state = state_with(vec![decision]);
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(
+            !screen.contains("unreadable"),
+            "the options must read: {screen}"
+        );
+        assert!(
+            screen.contains("A Failed prior task: does it block the next stage?"),
+            "message: {screen}"
+        );
+        assert!(screen.contains("1. [ ] Split by stage"), "screen: {screen}");
+        assert!(screen.contains("2. [ ] main wins"), "screen: {screen}");
+
+        inbox.handle_key(&state, press('1'), &mut tx);
+        assert!(
+            render(&state, &inbox, OPENED).contains("1. [x] Split by stage"),
+            "the pick must show"
+        );
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "perm:borsuk/implement-i142:req-ask".to_string(),
+                response: Response::Answers {
+                    updated_input: serde_json::json!({
+                        "answers": {"Gate rule": "Split by stage"},
+                    }),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn the_question_context_screen_shows_the_options_and_takes_a_pick() {
+        let decision = Decision::question(&worker(), "req-ask", recorded_tool_input(), OPENED);
+        let state = state_with(vec![decision]);
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(inbox.detail_open());
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("QUESTION · borsuk"), "title: {screen}");
+        assert!(screen.contains("1. [ ] Split by stage"), "screen: {screen}");
+        assert!(screen.contains("2. [ ] main wins"), "screen: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("1-9 pick · s submit"),
+            "the bottom row names the keys: {}",
+            footer_text(&state, &inbox)
+        );
+
+        inbox.handle_key(&state, press('2'), &mut tx);
+        assert!(
+            render(&state, &inbox, OPENED).contains("2. [x] main wins"),
+            "the context screen shows the pick"
+        );
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "perm:borsuk/implement-i142:req-ask".to_string(),
+                response: Response::Answers {
+                    updated_input: serde_json::json!({"answers": {"Gate rule": "main wins"}}),
+                },
+            }
+        );
     }
 
     #[test]
@@ -3575,8 +3783,11 @@ mod tests {
         inbox.handle_key(&state, press('2'), &mut tx);
         inbox.handle_key(&state, press('g'), &mut tx);
         assert!(rx.try_recv().is_err());
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("select at least one PR"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("select at least one PR"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
 
         // Space brings the whole batch back.
         inbox.handle_key(&state, press(' '), &mut tx);
@@ -3644,12 +3855,10 @@ mod tests {
 
         inbox.handle_key(&state, press('n'), &mut tx);
         type_text(&mut inbox, &state, "ab", &mut tx);
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("reason: ab_"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).contains("reason: ab_"));
 
         inbox.handle_key(&state, press_code(KeyCode::Backspace), &mut tx);
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("reason: a_"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).contains("reason: a_"));
 
         inbox.handle_key(&state, press_code(KeyCode::Esc), &mut tx);
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
@@ -3666,8 +3875,11 @@ mod tests {
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
 
         assert!(rx.try_recv().is_err());
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("type the text first"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("type the text first"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
 
         type_text(&mut inbox, &state, "later", &mut tx);
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
@@ -3754,8 +3966,11 @@ mod tests {
         inbox.handle_key(&changed_state, press('s'), &mut tx);
 
         assert!(rx.try_recv().is_err(), "a stale option sent an answer");
-        let screen = render(&changed_state, &inbox, OPENED);
-        assert!(screen.contains("answer every question"), "hint: {screen}");
+        assert!(
+            footer_text(&changed_state, &inbox).contains("answer every question"),
+            "hint: {}",
+            footer_text(&changed_state, &inbox)
+        );
     }
 
     #[test]
@@ -3945,16 +4160,72 @@ mod tests {
     fn the_footer_shows_the_key_map_of_the_selected_kind() {
         let state = full_state();
         let cases: [(usize, &str); 5] = [
-            (0, "y allow · n deny"),
-            (1, "1-9 pick · s submit · i write · enter details"),
-            (2, "r retry · c cancel"),
-            (3, "t comment · c clear label · enter details"),
-            (4, "1-9 include · space all or none · g release"),
+            (
+                0,
+                "PgUp PgDn scroll · j k move · y allow · n deny · enter details",
+            ),
+            (
+                1,
+                "PgUp PgDn · j k move · 1-9 pick · s submit · enter details",
+            ),
+            (
+                2,
+                "PgUp PgDn scroll · j k move · r retry · c cancel · enter details",
+            ),
+            (
+                3,
+                "PgUp PgDn · j k move · t comment · c clear label · enter details",
+            ),
+            (
+                4,
+                "j k move · 1-9 include · space all · g release · enter details",
+            ),
         ];
         for (index, expected) in cases {
             let inbox = selected(&state, index);
-            let screen = render(&state, &inbox, OPENED);
-            assert!(screen.contains(expected), "row {index}: {screen}");
+            assert_eq!(footer_text(&state, &inbox), expected, "row {index}");
+        }
+    }
+
+    #[test]
+    fn every_footer_key_map_stays_within_the_bottom_row_cap() {
+        let state = full_state();
+        for index in 0..open_count(&state) {
+            let inbox = selected(&state, index);
+            let text = footer_text(&state, &inbox);
+            assert!(
+                text.chars().count() <= crate::tui::HINT_CAP,
+                "row {index} is too long: {text}"
+            );
+        }
+        for index in 0..open_count(&state) {
+            let mut inbox = selected(&state, index);
+            let (mut tx, _rx) = fake_sink();
+            inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+            let text = footer_text(&state, &inbox);
+            assert!(
+                text.chars().count() <= crate::tui::HINT_CAP,
+                "detail {index} is too long: {text}"
+            );
+        }
+
+        // The answer screen adds the pick, submit, and tickets keys. Its
+        // longest form belongs to an issue with a fetched option list.
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        for ask in [ask_view(), pr_ask_view()] {
+            let mut without = ask.clone();
+            without.options.clear();
+            for view in [ask, without] {
+                inbox.observe_ask(&view);
+                let text = footer_text(&state, &inbox);
+                assert!(
+                    text.chars().count() <= crate::tui::HINT_CAP,
+                    "the answer screen is too long: {text}"
+                );
+            }
         }
     }
 
@@ -4006,6 +4277,7 @@ mod tests {
             decisions,
             decision_items: items,
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: vec![TrainView {
                 repo: "borsuk".to_string(),
                 queue,
@@ -4040,9 +4312,9 @@ mod tests {
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
         assert!(screen.contains("pr 9"), "body:\n{screen}");
-        assert!(
-            screen.contains("space include/exclude · g release"),
-            "footer:\n{screen}"
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · j k scroll · h l PR · space toggle · g release"
         );
     }
 
@@ -4056,7 +4328,10 @@ mod tests {
         assert!(inbox.detail_open());
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
-        assert!(screen.contains("h l PR"), "footer:\n{screen}");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · j k scroll · h l PR"
+        );
 
         // Left moves through the train queue; Esc closes the detail.
         let (mut tx, rx) = fake_sink();
@@ -4143,6 +4418,14 @@ mod tests {
             // 1970-01-01T02:46:40Z is exactly `OPENED`.
             created_at: Some("1970-01-01T02:46:40Z".to_string()),
             error: None,
+        }
+    }
+
+    /// The same fetched ask on a pull request instead of an issue.
+    fn pr_ask_view() -> AskView {
+        AskView {
+            kind: ItemKind::Pr,
+            ..ask_view()
         }
     }
 
@@ -4264,10 +4547,10 @@ mod tests {
             rx.try_recv().is_err(),
             "a submit without a pick sent an answer"
         );
-        let screen = render(&state, &inbox, OPENED);
         assert!(
-            screen.contains("pick an option, or press t to write"),
-            "hint: {screen}"
+            footer_text(&state, &inbox).contains("pick an option, or press t to write"),
+            "hint: {}",
+            footer_text(&state, &inbox)
         );
     }
 
@@ -4279,19 +4562,21 @@ mod tests {
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
         inbox.observe_ask(&ask_view());
 
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("1-9 pick · s submit"), "footer: {screen}");
-        assert!(screen.contains("t comment"), "footer: {screen}");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · 1-9 pick · s submit · t comment · c clear · w tickets"
+        );
 
-        // Without options the pick and submit keys leave the footer.
+        // Without options the pick and submit keys leave the row, and the
+        // scroll hint takes their place.
         let mut without = ask_view();
         without.options.clear();
         inbox.observe_ask(&without);
 
-        let screen = render(&state, &inbox, OPENED);
-        assert!(!screen.contains("1-9 pick"), "footer: {screen}");
-        assert!(!screen.contains("s submit"), "footer: {screen}");
-        assert!(screen.contains("t comment"), "footer: {screen}");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · j k scroll · t comment · c clear · w tickets"
+        );
     }
 
     #[test]
@@ -4344,11 +4629,12 @@ mod tests {
 
         assert_eq!(outcome, InboxOutcome::None);
         assert!(rx.try_recv().is_err(), "w on a pull request sent an action");
-        let screen = render(&pr, &inbox, OPENED);
         assert!(
-            screen.contains("the tickets view holds issues only; open the link"),
-            "hint: {screen}"
+            footer_text(&pr, &inbox).contains("the tickets view holds issues only; open the link"),
+            "hint: {}",
+            footer_text(&pr, &inbox)
         );
+        let screen = render(&pr, &inbox, OPENED);
         assert!(
             screen.contains("https://github.com/acme/borsuk/issues/7"),
             "screen: {screen}"

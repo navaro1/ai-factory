@@ -7,9 +7,12 @@ harness = "claude"
 model = "claude-opus-5[1m]"
 limit = 3
 
+# auto_approve = true passes --auto to opencode. Without it, an unattended
+# opencode run auto-rejects every permission request and its tools fail.
 [stage.implement]
 harness = "opencode"
 model = "zai-coding-plan/glm-5.3-flash"
+auto_approve = true
 limit = 3
 
 [stage.review]
@@ -17,6 +20,7 @@ harness = "opencode"
 model = "openai/gpt-5.6-sol"
 effort = "xhigh"
 extra_args = []
+auto_approve = true
 limit = 7
 
 [stage.release]

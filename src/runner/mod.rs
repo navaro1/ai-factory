@@ -65,6 +65,19 @@ impl RunnerFactory for DefaultRunnerFactory {
     }
 }
 
+/// One permission rule a job grants before its first run.
+///
+/// A one-shot harness cannot answer a live ask, so the daemon records the
+/// rules a human allowed and hands them to the next dispatch. The opencode
+/// runner maps them to the `OPENCODE_PERMISSION` environment value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AllowedPermission {
+    /// The permission name, for example `external_directory` or `bash`.
+    pub permission: String,
+    /// The patterns the rule covers, for example a path glob.
+    pub patterns: Vec<String>,
+}
+
 /// One unit of work a runner starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -90,6 +103,9 @@ pub struct Job {
     pub yolo: bool,
     /// The exact Claude tool allowlist, when this job restricts tools.
     pub allowed_tools: Option<Vec<String>>,
+    /// The permission rules the run grants, when the harness takes them
+    /// from the environment. Empty for a harness that answers live asks.
+    pub allowed_permissions: Vec<AllowedPermission>,
 }
 
 /// One asynchronous report from a running agent.

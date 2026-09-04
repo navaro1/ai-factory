@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ReleasePolicy, ResolvedRoleSettings};
 use crate::decisions::{Decision, DecisionKind};
 use crate::model::Stage;
+use crate::runner::AllowedPermission;
 use crate::sock::TicketProposal;
 use crate::tasks::{Task, MAX_ATTEMPTS};
 use crate::usage::{SpendTotals, UsageRecord};
@@ -111,6 +112,13 @@ pub struct RuntimeState {
     /// The accumulated factory spend of each billed identity.
     #[serde(default)]
     pub spend: BTreeMap<String, SpendTotals>,
+    /// The open ask rows of the one-shot tasks, which a failure keeps.
+    #[serde(default)]
+    pub asks: Vec<Decision>,
+    /// The allowed permission rules of each task, armed for its next
+    /// dispatch.
+    #[serde(default)]
+    pub allowed_permissions: BTreeMap<String, Vec<AllowedPermission>>,
 }
 
 /// The on-disk shape of `state.json`.
@@ -321,6 +329,23 @@ fn invalid_state(file: &StateFile) -> Option<String> {
             }
         }
     }
+    for row in &runtime.asks {
+        if let DecisionKind::Permission { task, .. } | DecisionKind::Question { task, .. } =
+            &row.kind
+        {
+            if !task_ids.contains(task.as_str()) {
+                return Some(format!(
+                    "the ask row {} names the unknown task {task}",
+                    row.id
+                ));
+            }
+        }
+    }
+    for id in runtime.allowed_permissions.keys() {
+        if !task_ids.contains(id.as_str()) {
+            return Some(format!("an allowed permission names the unknown task {id}"));
+        }
+    }
     None
 }
 
@@ -371,6 +396,8 @@ mod tests {
         assert!(runtime.review_tickets.is_empty());
         assert!(runtime.release_batches.is_empty());
         assert!(runtime.stuck.is_empty());
+        assert!(runtime.asks.is_empty());
+        assert!(runtime.allowed_permissions.is_empty());
         assert_eq!(
             DaemonState::default().runtime,
             RuntimeState::default(),
@@ -488,6 +515,79 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// One auto-rejected ask row of a one-shot task.
+    fn ask_row(worker: &Task, n: usize) -> Decision {
+        Decision::permission(
+            worker,
+            &format!("rej-{n}"),
+            "external_directory",
+            serde_json::json!({"patterns": ["/home/navaro/.cargo/registry/src/*"]}),
+            2_000,
+        )
+    }
+
+    #[test]
+    fn the_runtime_ask_rows_and_permission_rules_round_trip() {
+        let dir = temp_dir("ask-rows");
+        let path = dir.join("state.json");
+        let failed = task("borsuk/implement-i9", "borsuk", 9, MAX_ATTEMPTS);
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![failed.clone()];
+        state.runtime.asks = vec![ask_row(&failed, 1)];
+        state.runtime.allowed_permissions = BTreeMap::from([(
+            "borsuk/implement-i9".to_string(),
+            vec![AllowedPermission {
+                permission: "external_directory".to_string(),
+                patterns: vec!["/home/navaro/.cargo/registry/src/*".to_string()],
+            }],
+        )]);
+
+        state.save(&path).unwrap();
+
+        let loaded = DaemonState::load(&path);
+        assert_eq!(loaded.runtime.asks, state.runtime.asks);
+        assert_eq!(
+            loaded.runtime.allowed_permissions,
+            state.runtime.allowed_permissions
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_runtime_with_an_unknown_ask_task_discards_the_complete_state() {
+        let dir = temp_dir("unknown-ask");
+        let path = dir.join("state.json");
+        let failed = task("borsuk/implement-i9", "borsuk", 9, MAX_ATTEMPTS);
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![task("borsuk/refine-i3", "borsuk", 3, 1)];
+        state.runtime.asks = vec![ask_row(&failed, 1)];
+
+        state.save(&path).unwrap();
+
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_runtime_with_an_unknown_allowed_permission_task_discards_the_complete_state() {
+        let dir = temp_dir("unknown-rule");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![task("borsuk/refine-i3", "borsuk", 3, 1)];
+        state.runtime.allowed_permissions = BTreeMap::from([(
+            "borsuk/implement-i9".to_string(),
+            vec![AllowedPermission {
+                permission: "bash".to_string(),
+                patterns: vec!["git push".to_string()],
+            }],
+        )]);
+
+        state.save(&path).unwrap();
+
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_runtime_with_two_tasks_of_one_id_discards_the_complete_state() {
         let dir = temp_dir("duplicate-task");
@@ -592,6 +692,8 @@ mod tests {
                 stuck: Vec::new(),
                 usage: BTreeMap::new(),
                 spend: BTreeMap::new(),
+                asks: Vec::new(),
+                allowed_permissions: BTreeMap::new(),
             },
         };
         state.save(&path).unwrap();

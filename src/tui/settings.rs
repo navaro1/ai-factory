@@ -14,9 +14,16 @@ use crate::config::{
     validate_extra_args, ExecutionRole, Harness, RoleOverride, RoleSettings, SettingsEdit,
     SettingsSource, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES,
 };
-use crate::sock::{Action, RoleFieldSources, SettingsResult, SettingsResultStatus, StateView};
+use crate::prompts;
+use crate::sock::{
+    Action, PromptSource, PromptView, RoleFieldSources, SettingsOperation, SettingsResult,
+    SettingsResultStatus, StateView,
+};
 
 use super::theme::THEME;
+
+/// The line step of `PageUp` and `PageDown` in the prompt editor.
+const PROMPT_PAGE_LINES: usize = 20;
 
 /// One editable field in its stable display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,6 +44,7 @@ enum Field {
     ApprovalPolicy,
     Sandbox,
     Limit,
+    Prompt,
 }
 
 impl Field {
@@ -58,6 +66,7 @@ impl Field {
             Self::ApprovalPolicy => "approval policy",
             Self::Sandbox => "sandbox",
             Self::Limit => "limit",
+            Self::Prompt => "prompt",
         }
     }
 
@@ -139,6 +148,138 @@ struct ListEditor {
     rows: Vec<String>,
     selected: usize,
     row_editor: Option<String>,
+}
+
+/// The multi-line editor of one role prompt.
+///
+/// The buffer holds one string per line and a cursor as a line index and
+/// a character column. `ctrl-s` sends the joined lines to the daemon
+/// against the revision the edit started from.
+#[derive(Debug, Clone)]
+struct PromptEditor {
+    role: ExecutionRole,
+    /// Where the shown prompt came from when the editor opened.
+    source: PromptSource,
+    /// The prompt revision the edit started from. A stale result replaces
+    /// it, so the next `ctrl-s` overwrites the file.
+    base_revision: String,
+    /// The text when the editor opened, for the change check.
+    original: String,
+    lines: Vec<String>,
+    row: usize,
+    /// The character column inside the current line.
+    col: usize,
+    /// True after one `Esc` on a changed buffer.
+    discard_confirm: bool,
+    /// The identity of this editor's in-flight save, if any. A result for
+    /// another request never touches this buffer.
+    request: Option<String>,
+}
+
+impl PromptEditor {
+    fn new(view: &PromptView) -> Self {
+        Self {
+            role: view.role,
+            source: view.source,
+            base_revision: view.revision.clone(),
+            original: view.text.clone(),
+            lines: view.text.split('\n').map(str::to_string).collect(),
+            row: 0,
+            col: 0,
+            discard_confirm: false,
+            request: None,
+        }
+    }
+
+    /// The buffer as one text. The split at open and this join keep the
+    /// text byte for byte, a final newline included.
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn changed(&self) -> bool {
+        self.text() != self.original
+    }
+
+    fn line_len(&self, row: usize) -> usize {
+        self.lines.get(row).map_or(0, |line| line.chars().count())
+    }
+
+    /// The byte index of character `col` in `line`, or the end.
+    fn byte_at(line: &str, col: usize) -> usize {
+        line.char_indices()
+            .nth(col)
+            .map_or(line.len(), |(index, _)| index)
+    }
+
+    fn insert(&mut self, character: char) {
+        let line = &mut self.lines[self.row];
+        let at = Self::byte_at(line, self.col);
+        line.insert(at, character);
+        self.col += 1;
+    }
+
+    fn newline(&mut self) {
+        let line = &mut self.lines[self.row];
+        let at = Self::byte_at(line, self.col);
+        let rest = line.split_off(at);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            let line = &mut self.lines[self.row];
+            let at = Self::byte_at(line, self.col - 1);
+            line.remove(at);
+            self.col -= 1;
+        } else if self.row > 0 {
+            let line = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.line_len(self.row);
+            self.lines[self.row].push_str(&line);
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.col < self.line_len(self.row) {
+            let line = &mut self.lines[self.row];
+            let at = Self::byte_at(line, self.col);
+            line.remove(at);
+        } else if self.row + 1 < self.lines.len() {
+            let line = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&line);
+        }
+    }
+
+    fn left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.line_len(self.row);
+        }
+    }
+
+    fn right(&mut self) {
+        if self.col < self.line_len(self.row) {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    fn up(&mut self, lines: usize) {
+        self.row = self.row.saturating_sub(lines);
+        self.col = self.col.min(self.line_len(self.row));
+    }
+
+    fn down(&mut self, lines: usize) {
+        self.row = (self.row + lines).min(self.lines.len() - 1);
+        self.col = self.col.min(self.line_len(self.row));
+    }
 }
 
 /// The state of the one `opencode models` probe per shell start.
@@ -292,6 +433,8 @@ pub struct Settings {
     text_editor: Option<TextEditor>,
     list_editor: Option<ListEditor>,
     value_list: Option<ValueList>,
+    /// The open prompt editor, over the whole view.
+    prompt_editor: Option<PromptEditor>,
     /// The state of the one `opencode models` probe per shell start.
     models: ModelDiscovery,
     /// The notice line that a harness change leaves under the form.
@@ -300,12 +443,46 @@ pub struct Settings {
     pending_request: Option<String>,
     status: Option<(SettingsResultStatus, String)>,
     discard_confirm: bool,
+    /// True after one `d` on the prompt row. The next `d` sends the reset.
+    reset_confirm: bool,
 }
 
 impl Settings {
     /// True while the settings view owns typed characters.
     pub fn typing(&self) -> bool {
-        self.text_editor.is_some() || self.list_editor.is_some() || self.value_list.is_some()
+        self.text_editor.is_some()
+            || self.list_editor.is_some()
+            || self.value_list.is_some()
+            || self.prompt_editor.is_some()
+    }
+
+    /// The bottom-row hints of the settings state.
+    ///
+    /// An open editor names its own keys and shows no `? help`. The form
+    /// names the navigation keys and the keys of the active scope: the
+    /// repository scope removes its override, the global scope reloads.
+    /// On the form `j` and `k` step the execution role; inside the list
+    /// editor they step one row.
+    pub fn footer_hints(&self) -> String {
+        if self.prompt_editor.is_some() {
+            return "ctrl-s save · esc close · arrows move".to_string();
+        }
+        if let Some(editor) = self.list_editor.as_ref() {
+            if editor.row_editor.is_some() {
+                return "enter apply · esc cancel".to_string();
+            }
+            return "j k row · a add · d delete · enter edit · esc close".to_string();
+        }
+        if self.text_editor.is_some() {
+            return "enter apply · esc cancel".to_string();
+        }
+        if self.value_list.is_some() {
+            return "type filter · enter apply · esc close".to_string();
+        }
+        if self.scope > 0 {
+            return "j k role · tab field · enter open · s save · d remove · ? help".to_string();
+        }
+        "j k role · tab field · enter open · s save · r reload · ? help".to_string()
     }
 
     /// Store the result of the `opencode models` probe and refresh an
@@ -324,14 +501,20 @@ impl Settings {
     /// Unlock a settings request after a failed send or socket disconnect.
     pub fn delivery_failed(&mut self, action: Option<&Action>) {
         let matches = match action {
-            Some(Action::SaveSettings { request, .. } | Action::ReloadSettings { request }) => {
-                self.pending_request.as_deref() == Some(request.as_str())
-            }
+            Some(
+                Action::SaveSettings { request, .. }
+                | Action::ReloadSettings { request }
+                | Action::SavePrompt { request, .. }
+                | Action::ResetPrompt { request, .. },
+            ) => self.pending_request.as_deref() == Some(request.as_str()),
             Some(_) => false,
             None => self.pending_request.is_some(),
         };
         if matches {
             self.pending_request = None;
+            if let Some(editor) = self.prompt_editor.as_mut() {
+                editor.request = None;
+            }
             self.status = Some((
                 SettingsResultStatus::Failed,
                 "the settings request was not delivered".to_string(),
@@ -345,6 +528,13 @@ impl Settings {
             return;
         }
         self.pending_request = None;
+        if matches!(
+            result.operation,
+            SettingsOperation::SavePrompt | SettingsOperation::ResetPrompt
+        ) {
+            self.observe_prompt_result(result);
+            return;
+        }
         let message = result
             .message
             .clone()
@@ -373,10 +563,73 @@ impl Settings {
         self.status = Some((result.status, message));
     }
 
+    /// Apply the result of one prompt save or reset.
+    ///
+    /// A save closes the editor that sent it. A stale result keeps that
+    /// editor open and takes the current revision, so the next `ctrl-s`
+    /// overwrites the file. Every other result keeps the editor and shows
+    /// the message.
+    ///
+    /// A result whose request no editor sent only shows its message. A
+    /// reset comes from the form, and an editor of another role holds text
+    /// that nobody asked to discard.
+    fn observe_prompt_result(&mut self, result: SettingsResult) {
+        let message =
+            result
+                .message
+                .clone()
+                .unwrap_or_else(|| match (result.operation, result.status) {
+                    (SettingsOperation::ResetPrompt, SettingsResultStatus::Saved) => {
+                        "built-in prompt restored".to_string()
+                    }
+                    (_, SettingsResultStatus::Saved) => "prompt saved".to_string(),
+                    (_, SettingsResultStatus::Stale) => {
+                        "the prompt file changed on disk; repeat the action to overwrite it"
+                            .to_string()
+                    }
+                    (_, SettingsResultStatus::Invalid) => "the prompt is invalid".to_string(),
+                    _ => "the prompt request failed".to_string(),
+                });
+        let mine = self
+            .prompt_editor
+            .as_ref()
+            .is_some_and(|editor| editor.request.as_deref() == Some(result.request.as_str()));
+        if mine {
+            match result.status {
+                SettingsResultStatus::Saved => self.prompt_editor = None,
+                SettingsResultStatus::Stale => {
+                    if let Some(editor) = self.prompt_editor.as_mut() {
+                        editor.base_revision = result.revision.clone();
+                        editor.request = None;
+                    }
+                }
+                _ => {
+                    if let Some(editor) = self.prompt_editor.as_mut() {
+                        editor.request = None;
+                    }
+                }
+            }
+        }
+        self.status = Some((result.status, message));
+    }
+
+    /// Drop every pending confirmation of the form.
+    ///
+    /// The shell calls this for a key it handles itself, such as a view
+    /// switch. Without it a `d` armed before the switch would delete the
+    /// prompt file on the first `d` after the operator comes back.
+    pub fn drop_confirmations(&mut self) {
+        self.reset_confirm = false;
+        self.discard_confirm = false;
+    }
+
     /// Apply one Settings key and return a daemon action when needed.
     pub fn handle_key(&mut self, state: &StateView, key: KeyEvent) -> Option<Action> {
         if key.kind != crossterm::event::KeyEventKind::Press {
             return None;
+        }
+        if self.prompt_editor.is_some() {
+            return self.handle_prompt_key(key);
         }
         if self.text_editor.is_some() {
             self.handle_text_key(state, key);
@@ -391,6 +644,9 @@ impl Settings {
             return None;
         }
         self.clamp(state);
+        // A second `d` on the prompt row confirms the reset. Any other key
+        // drops the pending confirmation.
+        let reset_pending = std::mem::take(&mut self.reset_confirm);
         if self.draft.is_some()
             && matches!(
                 key.code,
@@ -439,6 +695,11 @@ impl Settings {
             KeyCode::Enter => self.enter_field(state),
             KeyCode::Char('s') => return self.save(state),
             KeyCode::Char('r') => return self.reload(),
+            KeyCode::Char('d')
+                if self.scope == 0 && self.selected_field_for(Some(state)) == Field::Prompt =>
+            {
+                return self.reset_prompt(state, reset_pending)
+            }
             KeyCode::Char('d') if self.scope > 0 => return self.remove_override(state),
             KeyCode::Esc if self.draft.is_some() => {
                 if self.discard_confirm {
@@ -461,6 +722,10 @@ impl Settings {
 
     fn enter_field(&mut self, state: &StateView) {
         let field = self.selected_field_for(Some(state));
+        if field == Field::Prompt {
+            self.open_prompt_editor(state);
+            return;
+        }
         if let Some(list_field) = field.list_field() {
             self.open_value_list(state, field, list_field);
             return;
@@ -484,6 +749,152 @@ impl Settings {
             field,
             buffer: original,
         });
+    }
+
+    /// The pushed prompt view of the selected role.
+    fn prompt_view<'a>(&self, state: &'a StateView) -> Option<&'a PromptView> {
+        let role = self.selected_role_for();
+        state.settings.prompts.iter().find(|view| view.role == role)
+    }
+
+    /// Open the prompt editor on the pushed prompt of the selected role.
+    ///
+    /// A pending request blocks the open: its result would land on the new
+    /// editor and close it, and the typed text would be gone.
+    fn open_prompt_editor(&mut self, state: &StateView) {
+        if self.request_pending() {
+            return;
+        }
+        let Some(view) = self.prompt_view(state) else {
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                "the daemon sent no prompt for this role; restart the daemon".to_string(),
+            ));
+            return;
+        };
+        self.prompt_editor = Some(PromptEditor::new(view));
+        self.status = None;
+        self.discard_confirm = false;
+    }
+
+    /// Apply one key while the prompt editor is open.
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // The banner says any key keeps the prompt, so every key that is
+        // not `Esc` cancels the question, `ctrl-s` and an unhandled key
+        // included.
+        if key.code != KeyCode::Esc {
+            if let Some(editor) = self.prompt_editor.as_mut() {
+                editor.discard_confirm = false;
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            return self.save_prompt();
+        }
+        if key.code == KeyCode::Esc {
+            let changed = self
+                .prompt_editor
+                .as_ref()
+                .is_some_and(|editor| editor.changed() && !editor.discard_confirm);
+            if changed {
+                if let Some(editor) = self.prompt_editor.as_mut() {
+                    editor.discard_confirm = true;
+                }
+            } else {
+                self.prompt_editor = None;
+            }
+            return None;
+        }
+        let editor = self.prompt_editor.as_mut()?;
+        match key.code {
+            KeyCode::Enter => editor.newline(),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Delete => editor.delete(),
+            KeyCode::Left => editor.left(),
+            KeyCode::Right => editor.right(),
+            KeyCode::Up => editor.up(1),
+            KeyCode::Down => editor.down(1),
+            KeyCode::PageUp => editor.up(PROMPT_PAGE_LINES),
+            KeyCode::PageDown => editor.down(PROMPT_PAGE_LINES),
+            KeyCode::Home => editor.col = 0,
+            KeyCode::End => editor.col = editor.line_len(editor.row),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.insert(character);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Send the prompt editor buffer to the daemon.
+    ///
+    /// The placeholder check runs here first, so an unknown placeholder
+    /// shows at once and never leaves the shell. The daemon repeats the
+    /// check before it writes the file.
+    fn save_prompt(&mut self) -> Option<Action> {
+        if self.request_pending() {
+            return None;
+        }
+        let editor = self.prompt_editor.as_ref()?;
+        let text = editor.text();
+        if let Err(error) = prompts::check(editor.role, &text) {
+            self.status = Some((
+                SettingsResultStatus::Invalid,
+                format!("the prompt is invalid: {error:#}"),
+            ));
+            return None;
+        }
+        let (role, base_revision) = (editor.role, editor.base_revision.clone());
+        let request = request_code();
+        self.pending_request = Some(request.clone());
+        if let Some(editor) = self.prompt_editor.as_mut() {
+            editor.request = Some(request.clone());
+        }
+        Some(Action::SavePrompt {
+            request,
+            role,
+            base_revision,
+            text,
+        })
+    }
+
+    /// Ask for a second `d`, then send the prompt reset of the selected role.
+    fn reset_prompt(&mut self, state: &StateView, confirmed: bool) -> Option<Action> {
+        let Some(view) = self.prompt_view(state) else {
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                "the daemon sent no prompt for this role; restart the daemon".to_string(),
+            ));
+            return None;
+        };
+        if view.source == PromptSource::Builtin {
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                "the prompt is already the built-in".to_string(),
+            ));
+            return None;
+        }
+        if !confirmed {
+            self.reset_confirm = true;
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                "press d again to restore the built-in prompt".to_string(),
+            ));
+            return None;
+        }
+        if self.request_pending() {
+            return None;
+        }
+        let request = request_code();
+        self.pending_request = Some(request.clone());
+        Some(Action::ResetPrompt {
+            request,
+            role: view.role,
+            base_revision: view.revision.clone(),
+        })
     }
 
     /// Open the value list of one field.
@@ -1028,6 +1439,11 @@ impl Settings {
         if self.scope == 0 && self.selected_role_for().stage().is_some() {
             fields.push(Field::Limit);
         }
+        // Prompts have no repository scope; the file is one per role. The
+        // theory roles carry no template, so they get no prompt row.
+        if self.scope == 0 && prompts::file_name(self.selected_role_for()).is_some() {
+            fields.push(Field::Prompt);
+        }
         fields
     }
 
@@ -1086,6 +1502,16 @@ impl Settings {
             Field::ExtraArgs => format!("[{} rows]", settings.extra_args.len()),
             Field::Tools => format!("[{} rows]", settings.tools.len()),
             Field::DisallowedTools => format!("[{} rows]", settings.disallowed_tools.len()),
+            Field::Prompt => self.prompt_view(state).map_or_else(
+                || "unavailable; restart the daemon".to_string(),
+                |view| {
+                    format!(
+                        "{} · {} lines",
+                        prompt_source_label(view.role, view.source),
+                        view.text.lines().count()
+                    )
+                },
+            ),
             Field::Limit => {
                 if let Some(draft) = self.draft.as_ref().filter(|draft| {
                     draft.scope == self.scope && draft.role == self.selected_role_for()
@@ -1248,6 +1674,16 @@ impl Settings {
                 "Esc discard draft   any key keep draft",
                 Style::default().fg(THEME.warn),
             )));
+        } else if self.reset_confirm {
+            lines.push(Line::from(Span::styled(
+                "d restore the built-in prompt   any key keep the file",
+                Style::default().fg(THEME.warn),
+            )));
+        } else if self.selected_field_for(Some(state)) == Field::Prompt {
+            lines.push(Line::from(Span::styled(
+                "h/l scope  j/k role  Tab field  Enter edit prompt  d restore built-in",
+                THEME.dim(),
+            )));
         } else {
             lines.push(Line::from(Span::styled(
                 "h/l scope  j/k role  Tab field  Enter edit  s save  r reload  d remove",
@@ -1261,7 +1697,9 @@ impl Settings {
     }
 
     fn draw_editor(&self, frame: &mut Frame<'_>, area: Rect) {
-        if let Some(editor) = &self.text_editor {
+        if let Some(editor) = &self.prompt_editor {
+            self.draw_prompt_editor(frame, area, editor);
+        } else if let Some(editor) = &self.text_editor {
             let panel = centered(58, 5, area);
             frame.render_widget(Clear, panel);
             let lines = vec![
@@ -1366,6 +1804,92 @@ impl Settings {
                 panel,
             );
         }
+    }
+
+    /// Draw the prompt editor over the whole view.
+    ///
+    /// The text pane shows a window of lines that keeps the cursor line
+    /// visible, and a horizontal offset that keeps the cursor column
+    /// visible. The cursor cell renders reversed. One status row shows the
+    /// last result or the change state, and one hint row lists the keys.
+    fn draw_prompt_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &PromptEditor) {
+        frame.render_widget(Clear, area);
+        let block = Block::bordered().title(format!(
+            " prompt · {} · {} ",
+            role_label(editor.role),
+            prompt_source_label(editor.role, editor.source)
+        ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let rows = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        let visible = usize::from(rows[0].height.max(1));
+        let width = usize::from(rows[0].width.max(1));
+        // Centre the cursor line, then clamp to the ends. A window pinned
+        // to the cursor would hide every line after it.
+        let last_start = editor.lines.len().saturating_sub(visible);
+        let start = editor.row.saturating_sub(visible / 2).min(last_start);
+        let x_offset = editor.col.saturating_sub(width - 1);
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+        let mut lines = Vec::new();
+        for (index, line) in editor.lines.iter().enumerate().skip(start).take(visible) {
+            let chars: Vec<char> = line.chars().skip(x_offset).take(width).collect();
+            if index == editor.row {
+                let cursor = editor.col - x_offset;
+                let before: String = chars.iter().take(cursor).collect();
+                let under = chars
+                    .get(cursor)
+                    .map_or_else(|| " ".to_string(), char::to_string);
+                let after: String = chars.iter().skip(cursor + 1).collect();
+                lines.push(Line::from(vec![
+                    Span::raw(before),
+                    Span::styled(under, cursor_style),
+                    Span::raw(after),
+                ]));
+            } else {
+                lines.push(Line::from(chars.into_iter().collect::<String>()));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), rows[0]);
+        let status = if editor.discard_confirm {
+            Line::from(Span::styled(
+                "Esc again discards the changed prompt   any key keeps it",
+                Style::default().fg(THEME.warn),
+            ))
+        } else if let Some((status, message)) = &self.status {
+            let color = match status {
+                SettingsResultStatus::Saved | SettingsResultStatus::Reloaded => THEME.ok,
+                SettingsResultStatus::Stale
+                | SettingsResultStatus::Invalid
+                | SettingsResultStatus::RestartRequired
+                | SettingsResultStatus::Failed => THEME.error,
+            };
+            Line::from(Span::styled(message.clone(), Style::default().fg(color)))
+        } else if editor.changed() {
+            Line::from(Span::styled("changed, not saved", THEME.dim()))
+        } else {
+            Line::from(Span::styled(
+                "the next task of this role reads the saved file",
+                THEME.dim(),
+            ))
+        };
+        frame.render_widget(Paragraph::new(status), rows[1]);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "ctrl-s save   Esc close   arrows Home End PageUp PageDown move   line {}/{} col {}",
+                    editor.row + 1,
+                    editor.lines.len(),
+                    editor.col + 1
+                ),
+                THEME.dim(),
+            ))),
+            rows[2],
+        );
     }
 
     fn field_source(&self, state: &StateView, field: Field) -> Option<SettingsSource> {
@@ -1479,7 +2003,20 @@ impl Settings {
             Field::DisallowedTools => 9,
             Field::StrictMcp => 10,
             Field::Limit => 11,
+            Field::Prompt => 12,
         };
+    }
+
+    #[cfg(test)]
+    fn prompt_editor_text(&self) -> Option<String> {
+        self.prompt_editor.as_ref().map(PromptEditor::text)
+    }
+
+    #[cfg(test)]
+    fn prompt_editor_cursor(&self) -> Option<(usize, usize)> {
+        self.prompt_editor
+            .as_ref()
+            .map(|editor| (editor.row, editor.col))
     }
 
     #[cfg(test)]
@@ -1553,6 +2090,15 @@ fn request_code() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// The source text of the prompt row: `built-in` or the prompt file path
+/// under the config directory.
+fn prompt_source_label(role: ExecutionRole, source: PromptSource) -> String {
+    match (source, prompts::file_name(role)) {
+        (PromptSource::File, Some(name)) => format!("prompts/{name}"),
+        _ => "built-in".to_string(),
+    }
+}
+
 fn role_label(role: ExecutionRole) -> &'static str {
     match role {
         ExecutionRole::Refine => "refine",
@@ -1561,6 +2107,8 @@ fn role_label(role: ExecutionRole) -> &'static str {
         ExecutionRole::Release => "release",
         ExecutionRole::TicketCreate => "ticket creation",
         ExecutionRole::TicketChat => "ticket chat",
+        ExecutionRole::TheoryAudit => "theory audit",
+        ExecutionRole::TheoryChat => "theory chat",
     }
 }
 
@@ -1686,7 +2234,7 @@ fn sync_override(draft: &mut Draft, field: Field) {
             override_settings.approval_policy = settings.approval_policy.clone()
         }
         Field::Sandbox => override_settings.sandbox = settings.sandbox.clone(),
-        Field::Harness | Field::Limit => {}
+        Field::Harness | Field::Limit | Field::Prompt => {}
     }
 }
 
@@ -1820,7 +2368,7 @@ fn source_for_field(sources: &RoleFieldSources, field: Field) -> &SettingsSource
         Field::AutoApprove => &sources.auto_approve,
         Field::ApprovalPolicy => &sources.approval_policy,
         Field::Sandbox => &sources.sandbox,
-        Field::Limit => &sources.harness,
+        Field::Limit | Field::Prompt => &sources.harness,
     }
 }
 
@@ -1861,7 +2409,11 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 
 fn settings_panes(area: Rect, narrow: bool) -> [Rect; 2] {
     if narrow {
-        let panes = Layout::vertical([Constraint::Length(8), Constraint::Min(1)]).split(area);
+        let role_height = u16::try_from(ExecutionRole::ALL.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        let panes =
+            Layout::vertical([Constraint::Length(role_height), Constraint::Min(1)]).split(area);
         [panes[0], panes[1]]
     } else {
         let panes = Layout::horizontal([Constraint::Length(22), Constraint::Min(30)]).split(area);
@@ -1874,9 +2426,26 @@ mod tests {
     use super::*;
     use crate::config::{ExecutionRole, Harness, RoleSettings, SettingsSource};
     use crate::sock::{
-        Action, GlobalRoleSettingsView, RepositoryRoleSettingsView, RoleFieldSources,
-        SettingsOperation, SettingsResult, SettingsResultStatus, SettingsView, StateView,
+        Action, GlobalRoleSettingsView, PromptSource, PromptView, RepositoryRoleSettingsView,
+        RoleFieldSources, SettingsOperation, SettingsResult, SettingsResultStatus, SettingsView,
+        StateView,
     };
+
+    /// The prompt text every test role starts with.
+    const PROMPT_TEXT: &str = "line one {number}\nline two\n";
+
+    fn prompt(role_name: ExecutionRole) -> PromptView {
+        PromptView {
+            role: role_name,
+            source: if role_name == ExecutionRole::Refine {
+                PromptSource::File
+            } else {
+                PromptSource::Builtin
+            },
+            text: PROMPT_TEXT.to_string(),
+            revision: format!("prompt-rev-{}", role_name.table_name()),
+        }
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1961,8 +2530,31 @@ mod tests {
                     overridden: true,
                 })
                 .collect(),
+            prompts: prompts::ROLES.into_iter().map(prompt).collect(),
         };
         state
+    }
+
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    /// Type every character of `text` into the settings view.
+    fn type_text(settings: &mut Settings, state: &StateView, text: &str) {
+        for character in text.chars() {
+            settings.handle_key(state, key(KeyCode::Char(character)));
+        }
+    }
+
+    /// A settings view with the prompt editor of `role_name` open.
+    fn open_prompt(role_name: ExecutionRole, state: &StateView) -> Settings {
+        let mut settings = Settings::default();
+        settings.set_role(role_name);
+        settings.set_field(Field::Prompt);
+        assert_eq!(settings.selected_field_for(Some(state)), Field::Prompt);
+        settings.handle_key(state, key(KeyCode::Enter));
+        assert!(settings.typing(), "the prompt editor owns the keys");
+        settings
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1998,6 +2590,8 @@ mod tests {
                 "release",
                 "ticket creation",
                 "ticket chat",
+                "theory audit",
+                "theory chat",
             ]
             .map(|name| output.find(name).expect("the role must be visible"));
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
@@ -3108,5 +3702,544 @@ mod tests {
         settings.handle_key(&state, key(KeyCode::Esc));
         settings.handle_key(&state, key(KeyCode::Char('j')));
         assert_eq!(settings.selected_role(), ExecutionRole::Implement);
+    }
+
+    // ------------------------------------------------------------------
+    // The prompt of a role
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_prompt_row_is_the_last_global_field_of_every_role_and_absent_in_a_repository() {
+        let state = state();
+        let mut settings = Settings::default();
+        for role_name in prompts::ROLES {
+            settings.set_role(role_name);
+            let fields = settings.visible_fields(&state);
+            assert_eq!(fields.last(), Some(&Field::Prompt), "{role_name}");
+        }
+        settings.set_role(ExecutionRole::Refine);
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(settings.scope_label(&state), "borsuk");
+        assert!(!settings.visible_fields(&state).contains(&Field::Prompt));
+    }
+
+    /// A theory role carries no prompt template, so the form shows no
+    /// prompt row and `d` on it never sends a reset.
+    #[test]
+    fn a_theory_role_has_no_prompt_row() {
+        let state = state();
+        let mut settings = Settings::default();
+        for role_name in [ExecutionRole::TheoryAudit, ExecutionRole::TheoryChat] {
+            settings.set_role(role_name);
+            let fields = settings.visible_fields(&state);
+            assert!(!fields.contains(&Field::Prompt), "{role_name}: {fields:?}");
+            settings.set_field(Field::Prompt);
+            assert_ne!(
+                settings.selected_field_for(Some(&state)),
+                Field::Prompt,
+                "{role_name} must not select the prompt row"
+            );
+            assert!(
+                settings
+                    .handle_key(&state, key(KeyCode::Char('d')))
+                    .is_none(),
+                "{role_name}"
+            );
+            assert!(settings.handle_key(&state, key(KeyCode::Enter)).is_none());
+            assert!(!settings.typing(), "{role_name} opens no prompt editor");
+        }
+    }
+
+    #[test]
+    fn the_prompt_row_names_its_source_and_line_count() {
+        let state = state();
+        let mut settings = Settings::default();
+        let output = text(&settings, &state, 100, 30);
+        assert!(
+            output.contains("prompts/refine.md · 2 lines"),
+            "the refine prompt comes from a file: {output}"
+        );
+        settings.set_role(ExecutionRole::TicketChat);
+        settings.set_field(Field::Prompt);
+        let output = text(&settings, &state, 100, 30);
+        assert!(
+            output.contains("built-in · 2 lines"),
+            "the ticket chat prompt is the built-in: {output}"
+        );
+        assert!(output.contains("Enter edit prompt  d restore built-in"));
+    }
+
+    #[test]
+    fn enter_opens_the_editor_and_ctrl_s_sends_the_edited_prompt_with_its_revision() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        assert_eq!(settings.prompt_editor_text().as_deref(), Some(PROMPT_TEXT));
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 0)));
+
+        type_text(&mut settings, &state, "Go: ");
+        settings.handle_key(&state, key(KeyCode::Down));
+        settings.handle_key(&state, key(KeyCode::End));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        type_text(&mut settings, &state, "line three");
+        let action = settings.handle_key(&state, ctrl('s'));
+        let Some(Action::SavePrompt {
+            role: role_name,
+            base_revision,
+            text: sent,
+            ..
+        }) = action
+        else {
+            panic!("ctrl-s must send the prompt save, got {action:?}");
+        };
+        assert_eq!(role_name, ExecutionRole::Implement);
+        assert_eq!(base_revision, "prompt-rev-stage.implement");
+        assert_eq!(sent, "Go: line one {number}\nline two\nline three\n");
+        assert!(
+            settings.handle_key(&state, ctrl('s')).is_none(),
+            "a second ctrl-s waits for the pending result"
+        );
+    }
+
+    #[test]
+    fn the_editor_moves_and_edits_at_the_cursor() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        settings.handle_key(&state, key(KeyCode::Right));
+        settings.handle_key(&state, key(KeyCode::Right));
+        settings.handle_key(&state, key(KeyCode::Delete));
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("lie one {number}\nline two\n")
+        );
+        settings.handle_key(&state, key(KeyCode::Backspace));
+        settings.handle_key(&state, key(KeyCode::Backspace));
+        settings.handle_key(&state, key(KeyCode::Backspace));
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 0)));
+        settings.handle_key(&state, key(KeyCode::Down));
+        settings.handle_key(&state, key(KeyCode::Home));
+        settings.handle_key(&state, key(KeyCode::Backspace));
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("e one {number}line two\n"),
+            "backspace at a line start joins the lines"
+        );
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 14)));
+        settings.handle_key(&state, key(KeyCode::Left));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("e one {number\n}line two\n")
+        );
+        settings.handle_key(&state, key(KeyCode::PageDown));
+        assert_eq!(settings.prompt_editor_cursor(), Some((2, 0)));
+        settings.handle_key(&state, key(KeyCode::Up));
+        settings.handle_key(&state, key(KeyCode::End));
+        settings.handle_key(&state, key(KeyCode::Right));
+        assert_eq!(
+            settings.prompt_editor_cursor(),
+            Some((2, 0)),
+            "right at a line end moves to the next line"
+        );
+        settings.handle_key(&state, key(KeyCode::Left));
+        assert_eq!(settings.prompt_editor_cursor(), Some((1, 9)));
+        settings.handle_key(&state, key(KeyCode::PageUp));
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 9)));
+    }
+
+    #[test]
+    fn escape_closes_an_unchanged_editor_at_once_and_a_changed_one_after_two_presses() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Review, &state);
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(!settings.typing(), "an unchanged editor closes at once");
+
+        let mut settings = open_prompt(ExecutionRole::Review, &state);
+        type_text(&mut settings, &state, "x");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(settings.typing(), "a changed editor asks first");
+        assert!(text(&settings, &state, 100, 30).contains("Esc again discards the changed prompt"));
+        type_text(&mut settings, &state, "y");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(settings.typing(), "another key cancels the question");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(!settings.typing());
+    }
+
+    #[test]
+    fn an_unknown_placeholder_never_leaves_the_shell() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Release, &state);
+        type_text(&mut settings, &state, "{frobnicate} ");
+        assert!(settings.handle_key(&state, ctrl('s')).is_none());
+        let output = text(&settings, &state, 100, 30);
+        assert!(output.contains("{frobnicate}"), "{output}");
+        assert!(settings.typing(), "the editor stays open");
+        assert!(
+            settings
+                .handle_key(&state, key(KeyCode::Backspace))
+                .is_none()
+                && settings.typing(),
+            "the editor keeps taking keys after a local rejection"
+        );
+    }
+
+    #[test]
+    fn a_saved_result_closes_the_editor_and_a_stale_one_keeps_it_with_the_new_revision() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        type_text(&mut settings, &state, "x");
+        let Some(Action::SavePrompt { request, .. }) = settings.handle_key(&state, ctrl('s'))
+        else {
+            panic!("ctrl-s must send the prompt save");
+        };
+        settings.observe_result(SettingsResult {
+            request: request.clone(),
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Stale,
+            revision: "prompt-rev-fresh".to_string(),
+            message: Some("refine.md changed on disk".to_string()),
+        });
+        assert!(settings.typing(), "a stale result keeps the editor open");
+        assert!(text(&settings, &state, 100, 30).contains("refine.md changed on disk"));
+        let Some(Action::SavePrompt {
+            request,
+            base_revision,
+            ..
+        }) = settings.handle_key(&state, ctrl('s'))
+        else {
+            panic!("the retry must send the prompt save");
+        };
+        assert_eq!(base_revision, "prompt-rev-fresh");
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Saved,
+            revision: "prompt-rev-saved".to_string(),
+            message: None,
+        });
+        assert!(!settings.typing(), "a saved result closes the editor");
+        assert!(text(&settings, &state, 100, 30).contains("prompt saved"));
+    }
+
+    /// A daemon that sends no prompt leaves the row readable and every
+    /// prompt key inert. The wire revision refuses such a daemon, so this
+    /// is the last guard, not the first.
+    #[test]
+    fn a_state_without_prompts_shows_the_row_and_refuses_every_prompt_key() {
+        let mut state = state();
+        state.settings.prompts.clear();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Prompt);
+        assert_eq!(settings.selected_field_for(Some(&state)), Field::Prompt);
+        assert!(text(&settings, &state, 100, 30).contains("unavailable; restart the daemon"));
+
+        assert!(settings.handle_key(&state, key(KeyCode::Enter)).is_none());
+        assert!(!settings.typing(), "no editor opens without a prompt");
+        assert!(text(&settings, &state, 100, 30).contains("the daemon sent no prompt"));
+
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        assert!(text(&settings, &state, 100, 30).contains("the daemon sent no prompt"));
+    }
+
+    /// A result belongs to the editor that sent it. A result for another
+    /// request must never close a buffer full of typed text.
+    #[test]
+    fn a_result_of_another_request_leaves_the_open_editor_alone() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Prompt);
+        settings.handle_key(&state, key(KeyCode::Char('d')));
+        let Some(Action::ResetPrompt { request, .. }) =
+            settings.handle_key(&state, key(KeyCode::Char('d')))
+        else {
+            panic!("the second d must send the reset");
+        };
+
+        // The reset is in flight, so the row refuses to open an editor.
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(!settings.typing(), "a pending request blocks the editor");
+        assert!(text(&settings, &state, 100, 30).contains("a settings request is pending"));
+
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::ResetPrompt,
+            status: SettingsResultStatus::Saved,
+            revision: "prompt-rev-fresh".to_string(),
+            message: None,
+        });
+
+        // A stale result of a foreign request touches neither the buffer
+        // nor the revision the next ctrl-s carries.
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        type_text(&mut settings, &state, "keep me ");
+        settings.observe_result(SettingsResult {
+            request: "someone-else".to_string(),
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Stale,
+            revision: "refine-revision".to_string(),
+            message: Some("refine.md changed on disk".to_string()),
+        });
+        assert!(settings.typing(), "the editor stays open");
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("keep me line one {number}\nline two\n")
+        );
+        let Some(Action::SavePrompt { base_revision, .. }) = settings.handle_key(&state, ctrl('s'))
+        else {
+            panic!("ctrl-s must send the prompt save");
+        };
+        assert_eq!(base_revision, "prompt-rev-stage.implement");
+    }
+
+    /// A failed delivery frees the editor, so the next `ctrl-s` sends.
+    #[test]
+    fn a_failed_delivery_frees_the_prompt_editor() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Review, &state);
+        type_text(&mut settings, &state, "x");
+        let action = settings
+            .handle_key(&state, ctrl('s'))
+            .expect("ctrl-s must send the prompt save");
+        settings.delivery_failed(Some(&action));
+        assert!(settings.typing(), "the editor keeps the text");
+        assert!(text(&settings, &state, 100, 30).contains("was not delivered"));
+        assert!(
+            settings.handle_key(&state, ctrl('s')).is_some(),
+            "the retry sends again"
+        );
+    }
+
+    /// The banner promises that any key keeps the prompt. A key the editor
+    /// does not act on must keep that promise.
+    #[test]
+    fn an_unhandled_key_cancels_the_discard_question() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Review, &state);
+        type_text(&mut settings, &state, "x");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(text(&settings, &state, 100, 30).contains("Esc again discards"));
+        settings.handle_key(&state, key(KeyCode::Insert));
+        assert!(
+            !text(&settings, &state, 100, 30).contains("Esc again discards"),
+            "an unhandled key cancels the question"
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(settings.typing(), "the editor asks again");
+
+        // A local ctrl-s rejection also cancels the question.
+        type_text(&mut settings, &state, "{frobnicate}");
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(text(&settings, &state, 100, 30).contains("Esc again discards"));
+        assert!(settings.handle_key(&state, ctrl('s')).is_none());
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(settings.typing(), "the editor asks again after ctrl-s");
+    }
+
+    /// The editor window shows the lines after the cursor, so a long
+    /// prompt stays readable.
+    #[test]
+    fn the_editor_window_shows_the_lines_after_the_cursor() {
+        let mut state = state();
+        let body = (1..=40)
+            .map(|line| format!("line{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for view in &mut state.settings.prompts {
+            view.text = body.clone();
+        }
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        for _ in 0..20 {
+            settings.handle_key(&state, key(KeyCode::Down));
+        }
+        let output = text(&settings, &state, 40, 20);
+        assert!(output.contains("line21"), "the cursor line: {output}");
+        assert!(
+            output.contains("line25"),
+            "a line after the cursor: {output}"
+        );
+        assert!(
+            output.contains("line17"),
+            "a line before the cursor: {output}"
+        );
+
+        // The top of a prompt starts at its first line, not centred.
+        let settings = open_prompt(ExecutionRole::Refine, &state);
+        assert!(text(&settings, &state, 40, 20).contains("line01"));
+    }
+
+    #[test]
+    fn d_on_the_prompt_row_asks_twice_and_then_sends_the_reset() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Prompt);
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        assert!(text(&settings, &state, 100, 30).contains("press d again to restore"));
+        let action = settings.handle_key(&state, key(KeyCode::Char('d')));
+        assert_eq!(
+            action.map(|action| match action {
+                Action::ResetPrompt {
+                    role: role_name,
+                    base_revision,
+                    ..
+                } => (role_name, base_revision),
+                other => panic!("unexpected action {other:?}"),
+            }),
+            Some((ExecutionRole::Refine, "prompt-rev-stage.refine".to_string()))
+        );
+
+        let mut settings = Settings::default();
+        settings.set_field(Field::Prompt);
+        settings.handle_key(&state, key(KeyCode::Char('d')));
+        settings.handle_key(&state, key(KeyCode::Tab));
+        settings.handle_key(&state, key(KeyCode::BackTab));
+        assert!(
+            settings
+                .handle_key(&state, key(KeyCode::Char('d')))
+                .is_none(),
+            "another key drops the pending confirmation"
+        );
+
+        let mut settings = Settings::default();
+        settings.set_role(ExecutionRole::Implement);
+        settings.set_field(Field::Prompt);
+        settings.handle_key(&state, key(KeyCode::Char('d')));
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        assert!(text(&settings, &state, 100, 30).contains("already the built-in"));
+    }
+
+    /// The editor keeps a template byte for byte through an open, a move,
+    /// and a save, and its cursor math counts characters, not bytes.
+    #[test]
+    fn the_editor_keeps_multibyte_text_byte_for_byte() {
+        let mut state = state();
+        let text_with_accents = "napraw zażółć #{number}\nkoniec\n";
+        for view in &mut state.settings.prompts {
+            view.text = text_with_accents.to_string();
+        }
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        settings.handle_key(&state, key(KeyCode::End));
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 23)));
+        settings.handle_key(&state, key(KeyCode::Left));
+        settings.handle_key(&state, key(KeyCode::Backspace));
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("napraw zażółć #{numbe}\nkoniec\n")
+        );
+        settings.handle_key(&state, key(KeyCode::Home));
+        for character in "łąka ".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 5)));
+
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        let Some(Action::SavePrompt { text: sent, .. }) = settings.handle_key(&state, ctrl('s'))
+        else {
+            panic!("ctrl-s on an unchanged prompt must still send it");
+        };
+        assert_eq!(sent, text_with_accents, "the round trip changes no byte");
+    }
+
+    /// A one-cell pane draws the editor without a panic, and so does a pane
+    /// narrower than the cursor column.
+    #[test]
+    fn the_prompt_editor_draws_in_a_tiny_pane() {
+        let mut state = state();
+        for view in &mut state.settings.prompts {
+            view.text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbb\ncc\ndd\n".to_string();
+        }
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        settings.handle_key(&state, key(KeyCode::End));
+        settings.handle_key(&state, key(KeyCode::PageDown));
+        settings.handle_key(&state, key(KeyCode::Up));
+        for (width, height) in [(1, 1), (2, 3), (4, 2), (20, 5), (100, 30)] {
+            text(&settings, &state, width, height);
+        }
+    }
+
+    #[test]
+    fn the_prompt_editor_draws_the_text_the_source_and_the_keys() {
+        let state = state();
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        let output = text(&settings, &state, 100, 30);
+        assert!(
+            output.contains("prompt · refine · prompts/refine.md"),
+            "{output}"
+        );
+        assert!(output.contains("line one {number}"));
+        assert!(output.contains("line two"));
+        assert!(output.contains("ctrl-s save   Esc close"));
+        assert!(output.contains("line 1/3 col 1"));
+        type_text(&mut settings, &state, "!");
+        assert!(text(&settings, &state, 100, 30).contains("changed, not saved"));
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_scope_and_the_open_editors() {
+        let state = state();
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.footer_hints(),
+            "j k role · tab field · enter open · s save · r reload · ? help"
+        );
+
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(settings.scope, 1);
+        assert_eq!(
+            settings.footer_hints(),
+            "j k role · tab field · enter open · s save · d remove · ? help"
+        );
+
+        settings.scope = 0;
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings.value_list.is_some());
+        assert_eq!(
+            settings.footer_hints(),
+            "type filter · enter apply · esc close"
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+
+        settings.text_editor = Some(TextEditor {
+            field: Field::Program,
+            buffer: String::new(),
+        });
+        assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
+        settings.text_editor = None;
+
+        settings.list_editor = Some(ListEditor {
+            field: Field::ExtraArgs,
+            selected: 0,
+            rows: Vec::new(),
+            row_editor: None,
+        });
+        assert_eq!(
+            settings.footer_hints(),
+            "j k row · a add · d delete · enter edit · esc close"
+        );
+        settings.list_editor = Some(ListEditor {
+            field: Field::ExtraArgs,
+            selected: 0,
+            rows: vec!["--verbose".to_string()],
+            row_editor: Some(String::new()),
+        });
+        assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
+
+        for hint in [
+            "j k role · tab field · enter open · s save · r reload · ? help",
+            "j k role · tab field · enter open · s save · d remove · ? help",
+            "j k row · a add · d delete · enter edit · esc close",
+            "type filter · enter apply · esc close",
+            "enter apply · esc cancel",
+        ] {
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
+        }
     }
 }

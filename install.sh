@@ -50,7 +50,7 @@ fi
 
 # The default prompts. The daemon falls back to built-in prompts when these
 # files are absent, so they exist only to give you a starting point to edit.
-for prompt in refine implement review release ticket-chat; do
+for prompt in refine implement review release ticket ticket-chat; do
     if [[ ! -f "${config_dir}/prompts/${prompt}.md" ]]; then
         install -m 644 "${here}/docs/v0.6/prompts/${prompt}.md" "${config_dir}/prompts/${prompt}.md"
         printf 'Wrote %s\n' "${config_dir}/prompts/${prompt}.md"

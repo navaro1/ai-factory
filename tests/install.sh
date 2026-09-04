@@ -40,7 +40,7 @@ done
 config_dir="${test_home}/.config/aif"
 for file in factory.example.toml factory.toml prompts/refine.md \
     prompts/implement.md prompts/review.md prompts/release.md \
-    prompts/ticket-chat.md; do
+    prompts/ticket.md prompts/ticket-chat.md; do
     [[ -f "${config_dir}/${file}" ]] || {
         printf 'missing installed config file: %s\n' "${file}" >&2
         exit 1
@@ -51,6 +51,8 @@ grep -Fq '| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave
     "${config_dir}/prompts/refine.md"
 grep -Fq 'start all agents for that wave in one tool turn' \
     "${config_dir}/prompts/implement.md"
+grep -Fq 'Push once, at the end of the run' \
+    "${config_dir}/prompts/review.md"
 grep -Fq 'Run without the operator.' "${config_dir}/prompts/release.md"
 
 for file in factory.example.toml factory.toml; do

@@ -26,12 +26,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
-    Config, ExecutionRole, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
+    Config, ExecutionRole, Harness, ReleasePolicy, ResolvedRoleSettings, RoleOverride,
+    RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
 use crate::links::Links;
@@ -51,7 +52,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 3;
+pub const WIRE_PROTOCOL_REVISION: u32 = 4;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -104,6 +105,9 @@ pub struct StateView {
     /// Compact open issue rows for the Tickets view.
     #[serde(default)]
     pub tickets: Vec<TicketSummary>,
+    /// Compact open pull request rows for readable pipeline names.
+    #[serde(default)]
+    pub prs: Vec<PrSummary>,
     /// The ticket-PR links of every configured repository.
     #[serde(default)]
     pub links: Vec<LinkView>,
@@ -119,30 +123,124 @@ pub struct StateView {
 }
 
 /// The editable factory settings and their current file revision.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsView {
     /// A stable digest of the complete `factory.toml` content.
     pub revision: String,
-    /// The six global role settings, in role order.
+    /// The configured global role settings, in role order.
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
+    /// The effective prompt template of every role that has one, in role
+    /// order. The theory roles carry no template, so they are absent.
+    pub prompts: Vec<PromptView>,
+}
+
+/// Where the effective prompt text of one role comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    /// The built-in template of the crate.
+    Builtin,
+    /// The prompt file of the role in the prompts directory.
+    File,
+}
+
+/// The effective prompt template of one role.
+///
+/// The daemon reads the file again at each task start, so the view shows
+/// the template the next task of the role gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptView {
+    /// The role identity.
+    pub role: ExecutionRole,
+    /// Where the text comes from.
+    pub source: PromptSource,
+    /// The effective template text.
+    pub text: String,
+    /// A stable digest of the effective text. A prompt save names it.
+    pub revision: String,
+}
+
+#[derive(Serialize)]
+struct SettingsViewRef<'a> {
+    revision: &'a str,
+    global: Vec<&'a GlobalRoleSettingsView>,
+    repositories: &'a [RepositoryRoleSettingsView],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    theory_global: Vec<&'a GlobalRoleSettingsView>,
+    prompts: &'a [PromptView],
+}
+
+#[derive(Deserialize)]
+struct SettingsViewWire {
+    revision: String,
+    global: Vec<GlobalRoleSettingsView>,
+    repositories: Vec<RepositoryRoleSettingsView>,
+    #[serde(default)]
+    theory_global: Vec<GlobalRoleSettingsView>,
+    #[serde(default)]
+    prompts: Vec<PromptView>,
+}
+
+impl Serialize for SettingsView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (global, theory_global) = self
+            .global
+            .iter()
+            .partition(|value| value.role.overridable());
+        SettingsViewRef {
+            revision: &self.revision,
+            global,
+            repositories: &self.repositories,
+            theory_global,
+            prompts: &self.prompts,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SettingsView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut wire = SettingsViewWire::deserialize(deserializer)?;
+        wire.global.append(&mut wire.theory_global);
+        Ok(Self {
+            revision: wire.revision,
+            global: wire.global,
+            repositories: wire.repositories,
+            prompts: wire.prompts,
+        })
+    }
 }
 
 impl SettingsView {
-    /// Build the socket view from one validated configuration.
-    pub fn from_config(config: &Config, revision: &str) -> Result<Self> {
+    /// Build the socket view from one validated configuration and the
+    /// effective prompt templates.
+    pub fn from_config(config: &Config, revision: &str, prompts: &[PromptView]) -> Result<Self> {
         let global = ExecutionRole::ALL
             .into_iter()
-            .map(|role| GlobalRoleSettingsView {
-                role,
-                settings: config.roles[&role].clone(),
-                limit: role.stage().map(|stage| config.stage(stage).limit),
+            .filter_map(|role| {
+                let settings = config.roles.get(&role)?.clone();
+                Some(GlobalRoleSettingsView {
+                    role,
+                    settings,
+                    limit: role.stage().map(|stage| config.stage(stage).limit),
+                })
             })
             .collect();
         let mut repositories = Vec::new();
         for (alias, repo) in &config.repos {
-            for role in ExecutionRole::ALL {
+            for role in ExecutionRole::ALL
+                .iter()
+                .copied()
+                .filter(|role| role.overridable())
+            {
                 let resolved = config.resolved_role(Some(alias), role.table_name())?;
                 let override_settings = repo.role_overrides.get(&role);
                 repositories.push(RepositoryRoleSettingsView {
@@ -158,6 +256,7 @@ impl SettingsView {
             revision: revision.to_string(),
             global,
             repositories,
+            prompts: prompts.to_vec(),
         })
     }
 }
@@ -352,6 +451,10 @@ pub struct StateInput<'a> {
     pub input_modes: &'a BTreeMap<String, InputMode>,
     /// One usage row per billed identity, already ordered for the panel.
     pub usage: &'a [UsageView],
+    /// The effective prompt template of every role.
+    pub prompts: &'a [PromptView],
+    /// The immutable role binding of each bound task, keyed by task id.
+    pub role_bindings: &'a BTreeMap<String, ResolvedRoleSettings>,
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -372,6 +475,8 @@ impl StateInput<'_> {
             policies,
             input_modes,
             usage,
+            prompts,
+            role_bindings,
             now_ms,
         } = *self;
         let repos = config
@@ -430,6 +535,11 @@ impl StateInput<'_> {
                         .get(id)
                         .cloned()
                         .ok_or_else(|| anyhow!("task \"{id}\" has no input mode"))?,
+                    binding: role_bindings.get(id).map(|role| RoleBindingView {
+                        harness: role.settings.harness,
+                        model: role.settings.model.clone(),
+                        effort: role.settings.effort.clone(),
+                    }),
                     queued_messages: 0,
                 })
             })
@@ -488,6 +598,18 @@ impl StateInput<'_> {
                 .then_with(|| left.repo.cmp(&right.repo))
                 .then_with(|| left.number.cmp(&right.number))
         });
+        let prs: Vec<PrSummary> = config
+            .repos
+            .keys()
+            .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
+            .flat_map(|(repo, items)| {
+                items.prs.values().filter(|pr| pr.open).map(|pr| PrSummary {
+                    repo: repo.clone(),
+                    number: pr.number,
+                    title: pr.title.clone(),
+                })
+            })
+            .collect();
         let links: Vec<LinkView> = links
             .iter()
             .filter(|(repo, _)| config.repos.contains_key(*repo))
@@ -539,10 +661,11 @@ impl StateInput<'_> {
             decisions: decisions.open().to_vec(),
             decision_items,
             tickets,
+            prs,
             links,
             trains,
             paused,
-            settings: SettingsView::from_config(config, settings_revision)?,
+            settings: SettingsView::from_config(config, settings_revision, prompts)?,
             usage: usage.to_vec(),
         })
     }
@@ -684,6 +807,17 @@ impl TicketGroup {
             TicketGroup::Untouched
         }
     }
+}
+
+/// One compact open pull request row for readable pipeline names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrSummary {
+    /// The repository alias.
+    pub repo: String,
+    /// The pull request number.
+    pub number: u64,
+    /// The current pull request title.
+    pub title: String,
 }
 
 /// The editable title and description of one issue.
@@ -863,7 +997,9 @@ pub struct TicketResult {
     pub request: String,
     /// The repository alias.
     pub repo: String,
-    /// The issue number.
+    /// The issue number. A result for a ticket creation carries `0`, the
+    /// existing sentinel for a ticket with no number yet, until GitHub
+    /// answers; a success then carries the created number.
     pub number: u64,
     /// The result state.
     pub kind: TicketResultKind,
@@ -936,6 +1072,17 @@ pub enum TicketAction {
         /// The six-digit hexadecimal color.
         color: String,
     },
+    /// Create one ticket from the direct form content.
+    Create {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The new ticket title.
+        title: String,
+        /// The new ticket description.
+        body: String,
+    },
     /// Start or resume the Claude conversation for one issue.
     Chat {
         /// The unique request identity.
@@ -991,6 +1138,21 @@ pub struct LaneView {
     pub slots: usize,
 }
 
+/// The bound role of one task, as the session header shows it.
+///
+/// The daemon resolves these values once before the first run, and the
+/// task keeps them for every retry. They name what the task runs with,
+/// not what the config currently promises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleBindingView {
+    /// The harness the task runs with.
+    pub harness: Harness,
+    /// The model the task runs with.
+    pub model: String,
+    /// The variant of the model, when the harness takes one.
+    pub effort: Option<String>,
+}
+
 /// One task in the state view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
@@ -1014,6 +1176,12 @@ pub struct TaskView {
     pub input: InputMode,
     /// How many chat messages wait to run for this task.
     pub queued_messages: usize,
+    /// The role the task bound before its first run, when one is.
+    ///
+    /// A queued task holds no binding yet. The field stays absent on the
+    /// wire when empty, so an older daemon push still parses.
+    #[serde(default)]
+    pub binding: Option<RoleBindingView>,
 }
 
 /// One release train in the state view.
@@ -1063,6 +1231,10 @@ pub enum SettingsOperation {
     Save,
     /// A reload request.
     Reload,
+    /// A prompt save request.
+    SavePrompt,
+    /// A prompt reset request.
+    ResetPrompt,
 }
 
 /// The typed outcome of one settings operation.
@@ -1236,6 +1408,26 @@ pub enum Action {
     ReloadSettings {
         /// The request identity from the UI.
         request: String,
+    },
+    /// Write the prompt file of one role against an exact prompt revision.
+    SavePrompt {
+        /// The request identity from the UI.
+        request: String,
+        /// The role whose prompt changes.
+        role: ExecutionRole,
+        /// The prompt revision that the edit started from.
+        base_revision: String,
+        /// The complete new template text.
+        text: String,
+    },
+    /// Remove the prompt file of one role, so the built-in template applies.
+    ResetPrompt {
+        /// The request identity from the UI.
+        request: String,
+        /// The role whose prompt returns to the built-in.
+        role: ExecutionRole,
+        /// The prompt revision that the request started from.
+        base_revision: String,
     },
     /// Force an early poll of one repository, or of all when None.
     Reconcile {
@@ -1758,6 +1950,41 @@ impl Iterator for Pushes {
 mod tests {
     use super::*;
 
+    const LEGACY_WIRE_PROTOCOL_REVISION: u32 = 2;
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyExecutionRole {
+        Refine,
+        Implement,
+        Review,
+        Release,
+        TicketCreate,
+        TicketChat,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyGlobalRoleSettingsView {
+        role: LegacyExecutionRole,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacySettingsView {
+        global: Vec<LegacyGlobalRoleSettingsView>,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyStateView {
+        protocol_revision: u32,
+        settings: LegacySettingsView,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyPush {
+        State(LegacyStateView),
+    }
+
     /// A temporary directory that removes itself on drop.
     struct TempDir(PathBuf);
 
@@ -1812,6 +2039,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -1940,7 +2168,14 @@ mod tests {
         );
         let config = Config::parse(&text).unwrap();
 
-        let view = SettingsView::from_config(&config, "content-revision").unwrap();
+        let prompts = vec![PromptView {
+            role: crate::config::ExecutionRole::Refine,
+            source: PromptSource::File,
+            text: "refine {number}\n".to_string(),
+            revision: "prompt-rev".to_string(),
+        }];
+        let view = SettingsView::from_config(&config, "content-revision", &prompts).unwrap();
+        assert_eq!(view.prompts, prompts);
 
         assert_eq!(view.revision, "content-revision");
         assert_eq!(view.global.len(), 6);
@@ -1981,11 +2216,97 @@ mod tests {
             policies: &BTreeMap::new(),
             input_modes: &BTreeMap::new(),
             usage: &[],
+            prompts: &prompts,
+            role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
         .unwrap();
         assert_eq!(state.settings, view);
+    }
+
+    #[test]
+    fn prompt_actions_and_views_round_trip_and_an_old_view_defaults_to_no_prompts() {
+        const {
+            assert!(
+                WIRE_PROTOCOL_REVISION >= 4,
+                "the prompt variants need wire revision 4"
+            )
+        };
+        let save = Action::SavePrompt {
+            request: "prompt-1".to_string(),
+            role: crate::config::ExecutionRole::Implement,
+            base_revision: "rev-old".to_string(),
+            text: "implement {number}\n".to_string(),
+        };
+        let reset = Action::ResetPrompt {
+            request: "prompt-2".to_string(),
+            role: crate::config::ExecutionRole::TicketChat,
+            base_revision: "rev-old".to_string(),
+        };
+        for action in [save, reset] {
+            let text = serde_json::to_string(&action).unwrap();
+            assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
+        }
+        let push = Push::SettingsResult(SettingsResult {
+            request: "prompt-1".to_string(),
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Invalid,
+            revision: "rev-current".to_string(),
+            message: Some("the prompt uses the unknown placeholder {x}".to_string()),
+        });
+        let text = serde_json::to_string(&push).unwrap();
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+
+        let json = r#"{"revision":"r","global":[],"repositories":[]}"#;
+        let view: SettingsView = serde_json::from_str(json).unwrap();
+        assert!(view.prompts.is_empty());
+    }
+
+    /// The settings view writes the theory roles into their own wire field
+    /// and the prompts into a third. One round trip must return every role
+    /// in role order and every prompt, so neither field eats the other.
+    #[test]
+    fn the_settings_view_round_trips_the_theory_roles_beside_the_prompts() {
+        let text = format!(
+            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
+             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+        let prompts = crate::prompts::ROLES
+            .into_iter()
+            .map(|role| PromptView {
+                role,
+                source: PromptSource::File,
+                text: format!("prompt of {role}\n"),
+                revision: format!("rev-{role}"),
+            })
+            .collect::<Vec<_>>();
+        let view = SettingsView::from_config(&config, "content-revision", &prompts).unwrap();
+        assert_eq!(view.global.len(), 8);
+        assert_eq!(view.prompts, prompts);
+
+        let wire = serde_json::to_string(&view).unwrap();
+        let parsed: SettingsView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed, view, "wire: {wire}");
+        assert_eq!(
+            parsed
+                .global
+                .iter()
+                .map(|value| value.role)
+                .collect::<Vec<_>>(),
+            crate::config::ExecutionRole::ALL.to_vec(),
+            "the theory roles come back in role order"
+        );
+        assert!(
+            !parsed.prompts.iter().any(|prompt| matches!(
+                prompt.role,
+                crate::config::ExecutionRole::TheoryAudit
+                    | crate::config::ExecutionRole::TheoryChat
+            )),
+            "a theory role carries no prompt"
+        );
     }
 
     #[test]
@@ -2104,6 +2425,42 @@ mod tests {
     }
 
     #[test]
+    fn a_revision_two_client_decodes_the_initial_state_before_rejecting_revision_three() {
+        let text = format!(
+            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
+             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+        let mut view = sample_view(1);
+        view.settings = SettingsView::from_config(&config, "revision", &[]).unwrap();
+        let push = Push::State(view);
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+        let legacy = serde_json::from_str::<LegacyPush>(&text)
+            .expect("revision 2 must decode the state before it checks the revision");
+        let LegacyPush::State(legacy) = legacy;
+        assert_ne!(legacy.protocol_revision, LEGACY_WIRE_PROTOCOL_REVISION);
+        assert_eq!(
+            legacy
+                .settings
+                .global
+                .into_iter()
+                .map(|entry| entry.role)
+                .collect::<Vec<_>>(),
+            vec![
+                LegacyExecutionRole::Refine,
+                LegacyExecutionRole::Implement,
+                LegacyExecutionRole::Review,
+                LegacyExecutionRole::Release,
+                LegacyExecutionRole::TicketCreate,
+                LegacyExecutionRole::TicketChat,
+            ]
+        );
+    }
+
+    #[test]
     fn a_client_rejects_a_state_from_an_older_wire_protocol() {
         let mut old = serde_json::to_value(Push::State(sample_view(1))).unwrap();
         old.as_object_mut().unwrap().remove("protocol_revision");
@@ -2207,6 +2564,25 @@ mod tests {
     }
 
     #[test]
+    fn ticket_create_action_round_trips_through_one_json_line() {
+        const {
+            assert!(
+                WIRE_PROTOCOL_REVISION >= 3,
+                "the create variant needs wire revision 3"
+            )
+        };
+        let action = Action::Ticket(TicketAction::Create {
+            request: "create-7".to_string(),
+            repo: "borsuk".to_string(),
+            title: "Add a direct creation form".to_string(),
+            body: "The Tickets view needs one typed field.".to_string(),
+        });
+        let text = serde_json::to_string(&action).unwrap();
+        assert!(!text.contains('\n'), "a wire line must not hold a newline");
+        assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
+    }
+
+    #[test]
     fn a_train_batch_survives_json_and_is_required() {
         let train = TrainView {
             repo: "borsuk".to_string(),
@@ -2272,6 +2648,7 @@ mod tests {
             log_path: PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
             input: InputMode::NextTurn,
             queued_messages: 2,
+            binding: None,
         });
         let text = serde_json::to_string(&Push::State(view.clone())).unwrap();
         assert!(
@@ -2281,6 +2658,123 @@ mod tests {
         assert!(text.contains("\"queued_messages\":2"), "line: {text}");
         let push = serde_json::from_str::<Push>(&text).unwrap();
         assert_eq!(push, Push::State(view));
+    }
+
+    #[test]
+    fn a_task_view_round_trips_the_binding_and_parses_an_old_daemon_push() {
+        let task = TaskView {
+            id: "borsuk/implement-i142".to_string(),
+            repo: "borsuk".to_string(),
+            stage: Stage::Implement,
+            kind: ItemKind::Issue,
+            number: 142,
+            state: TaskState::Running,
+            attempt: 1,
+            log_path: PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
+            input: InputMode::NextTurn,
+            queued_messages: 0,
+            binding: Some(RoleBindingView {
+                harness: Harness::Opencode,
+                model: "zai-coding-plan/glm-5.3-flash".to_string(),
+                effort: Some("xhigh".to_string()),
+            }),
+        };
+
+        let text = serde_json::to_string(&task).unwrap();
+        assert_eq!(serde_json::from_str::<TaskView>(&text).unwrap(), task);
+
+        // An old daemon ships no binding field; the parse falls back to
+        // none and the header keeps today's line.
+        let mut old = serde_json::to_value(&task).unwrap();
+        old.as_object_mut().unwrap().remove("binding");
+        let parsed = serde_json::from_value::<TaskView>(old).unwrap();
+        let mut expected = task;
+        expected.binding = None;
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn the_view_build_ships_the_bound_role_of_each_bound_task() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let mut table = TaskTable::new();
+        let bound = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
+                1_000,
+            )
+            .unwrap()
+            .clone();
+        let queued = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                7,
+                PathBuf::from("/state/logs/borsuk__refine-i7.jsonl"),
+                1_000,
+            )
+            .unwrap()
+            .clone();
+        let binding = ResolvedRoleSettings {
+            role: ExecutionRole::Implement,
+            source: SettingsSource::Global,
+            settings: RoleSettings {
+                harness: Harness::Opencode,
+                program: "opencode".to_string(),
+                model: "zai-coding-plan/glm-5.3-flash".to_string(),
+                effort: Some("xhigh".to_string()),
+                extra_args: Vec::new(),
+                agent: None,
+                profile: None,
+                permission_mode: None,
+                permission_handler: None,
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: None,
+                sandbox: None,
+            },
+        };
+        let mut role_bindings = BTreeMap::new();
+        role_bindings.insert(bound.id.clone(), binding);
+        let mut input_modes = BTreeMap::new();
+        input_modes.insert(bound.id.clone(), InputMode::NextTurn);
+        input_modes.insert(queued.id.clone(), InputMode::Live);
+
+        let view = StateInput {
+            config: &config,
+            settings_revision: "test-revision",
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &Decisions::new(),
+            snapshot: &Snapshot::default(),
+            links: &BTreeMap::new(),
+            trains: &BTreeMap::new(),
+            policies: &BTreeMap::new(),
+            input_modes: &input_modes,
+            prompts: &[],
+            role_bindings: &role_bindings,
+            usage: &[],
+            now_ms: 0,
+        }
+        .build()
+        .unwrap();
+
+        let bound_view = view.tasks.iter().find(|task| task.id == bound.id).unwrap();
+        let shipped = bound_view.binding.as_ref().unwrap();
+        assert_eq!(shipped.harness, Harness::Opencode);
+        assert_eq!(shipped.model, "zai-coding-plan/glm-5.3-flash");
+        assert_eq!(shipped.effort.as_deref(), Some("xhigh"));
+        let queued_view = view.tasks.iter().find(|task| task.id == queued.id).unwrap();
+        assert_eq!(queued_view.binding, None);
     }
 
     #[test]
@@ -2317,6 +2811,8 @@ mod tests {
             policies: &policies,
             input_modes: &input_modes,
             usage: &[],
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -2487,6 +2983,7 @@ mod tests {
             log_path: PathBuf::from("/state/logs/borsuk__refine-i142.jsonl"),
             input: InputMode::NextTurn,
             queued_messages: 1,
+            binding: None,
         });
         server.publish(second.clone());
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(second.clone()));
@@ -2595,6 +3092,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             links: vec![LinkView {
                 repo: "borsuk".to_string(),
                 ticket: 142,
@@ -2611,6 +3109,99 @@ mod tests {
         let text = serde_json::to_string(&view).unwrap();
         let back: StateView = serde_json::from_str(&text).unwrap();
         assert_eq!(back, view);
+    }
+
+    /// One pull request for a pr summary test.
+    fn test_pr(number: u64, title: &str) -> crate::model::Pr {
+        crate::model::Pr {
+            number,
+            node_id: format!("pr-{number}"),
+            title: title.to_string(),
+            body: format!("body {number}"),
+            labels: Vec::new(),
+            open: true,
+            draft: false,
+            head_sha: format!("sha-{number}"),
+            head_ref: format!("branch-{number}"),
+        }
+    }
+
+    #[test]
+    fn the_view_lists_open_pull_requests_of_every_repository_and_round_trips() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let input_modes = BTreeMap::new();
+        let mut closed = test_pr(4, "Closed pull request");
+        closed.open = false;
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            crate::model::RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [(4, closed), (9, test_pr(9, "Open pull request"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        snapshot.repos.insert(
+            "qubitsok".to_string(),
+            crate::model::RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [(2, test_pr(2, "Second pull request"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            settings_revision: "test-revision",
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            snapshot: &snapshot,
+            links: &BTreeMap::new(),
+            trains: &trains,
+            policies: &policies,
+            input_modes: &input_modes,
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
+            usage: &[],
+            now_ms: 0,
+        }
+        .build()
+        .unwrap();
+
+        let rows: Vec<(&str, u64, &str)> = view
+            .prs
+            .iter()
+            .map(|pr| (pr.repo.as_str(), pr.number, pr.title.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("borsuk", 9, "Open pull request"),
+                ("qubitsok", 2, "Second pull request"),
+            ]
+        );
+
+        let push = Push::State(view.clone());
+        let text = serde_json::to_string(&push).unwrap();
+        assert!(text.contains("\"prs\":["), "line: {text}");
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_view_without_the_prs_field_parses_with_an_empty_list() {
+        let json = r#"{"repos":[],"stages":[],"lanes":[],"tasks":[],"decisions":[],"trains":[],"paused":{"global":false,"overrides":[]},"settings":{"revision":"","global":[],"repositories":[]}}"#;
+        let view: StateView = serde_json::from_str(json).unwrap();
+        assert!(view.prs.is_empty());
     }
 
     fn huge_view(label: usize) -> StateView {
@@ -2824,6 +3415,8 @@ mod tests {
             policies: &policies,
             input_modes: &input_modes,
             usage: &[],
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -2890,6 +3483,8 @@ mod tests {
             policies: &policies,
             input_modes: &input_modes,
             usage: &[],
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -2996,6 +3591,8 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             usage: &[],
@@ -3091,6 +3688,8 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             usage: &[],
@@ -3135,6 +3734,8 @@ mod tests {
             policies: &policies,
             input_modes: &BTreeMap::new(),
             usage: &[],
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -3230,6 +3831,8 @@ mod tests {
             policies: &policies,
             input_modes: &input_modes,
             usage: &[],
+            prompts: &[],
+            role_bindings: &BTreeMap::new(),
             now_ms: 120_000,
         }
         .build()
