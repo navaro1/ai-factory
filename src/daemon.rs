@@ -4800,6 +4800,9 @@ mod tests {
             let state = dir.join("state");
             let prompts = dir.join("prompts");
             let mut config = test_config(&dir);
+            // The probes call real programs through the scripted exec, so a
+            // rig keeps them off unless a usage test turns them on.
+            config.usage.enabled = false;
             tweak(&mut config);
             let exec = scripted(steps);
             let jobs = Arc::new(Mutex::new(Vec::new()));
@@ -6783,11 +6786,7 @@ mod tests {
 
     #[test]
     fn an_idle_loop_waits_for_a_message_and_stop_returns() {
-        // Usage probes add their own deadlines, so this idle test turns
-        // them off and keeps only the message-driven wake.
-        let mut rig = Rig::make_with(vec![], |config| {
-            config.usage.enabled = false;
-        });
+        let mut rig = Rig::make(vec![]);
         let (push_tx, push_rx) = mpsc::channel();
         rig.daemon
             .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
@@ -11057,12 +11056,16 @@ mod tests {
     // Usage probes
     // ------------------------------------------------------------------
 
-    /// The stub probe error every wave-1 probe returns.
-    const STUB_ERROR: &str = "not implemented";
+    /// A rig with the usage probes on.
+    fn usage_rig() -> Rig {
+        Rig::make_with(Vec::new(), |config| {
+            config.usage.enabled = true;
+        })
+    }
 
     #[test]
     fn a_due_identity_spawns_one_probe_and_an_in_flight_identity_spawns_none() {
-        let mut rig = Rig::make(Vec::new());
+        let mut rig = usage_rig();
         let usage_rx = rig.daemon.usage_rx.take().unwrap();
 
         rig.daemon.drive();
@@ -11071,7 +11074,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the first drive must spawn the claude probe");
         assert_eq!(identity, "claude");
-        assert_eq!(result.as_ref().unwrap_err(), STUB_ERROR);
+        assert!(
+            result.is_err(),
+            "the scripted rig gives the probe no credentials: {result:?}"
+        );
 
         // The probe thread ran, but the answer is not applied yet, so the
         // identity stays in flight and a second drive spawns nothing.
@@ -11084,7 +11090,7 @@ mod tests {
         rig.daemon.handle(Inbound::Usage { identity, result });
 
         let record = rig.daemon.usage_records.get("claude").unwrap();
-        assert_eq!(record.error.as_deref(), Some(STUB_ERROR));
+        assert!(record.error.is_some());
         assert!(!rig.daemon.usage_in_flight.contains("claude"));
 
         // The failure started the backoff, so the next drive waits.
@@ -11097,7 +11103,7 @@ mod tests {
 
     #[test]
     fn a_usage_result_applies_the_record_clears_in_flight_and_resets_the_wait() {
-        let mut rig = Rig::make(Vec::new());
+        let mut rig = usage_rig();
         let usage_rx = rig.daemon.usage_rx.take().unwrap();
         rig.daemon.drive();
         let _ = usage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -11139,7 +11145,7 @@ mod tests {
 
     #[test]
     fn a_failed_probe_doubles_the_wait_and_keeps_the_last_good_record() {
-        let mut rig = Rig::make(Vec::new());
+        let mut rig = usage_rig();
         let usage_rx = rig.daemon.usage_rx.take().unwrap();
         rig.daemon.drive();
         let _ = usage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -11194,6 +11200,7 @@ mod tests {
     #[test]
     fn turn_end_costs_accumulate_per_identity_and_survive_a_restart() {
         let mut rig = Rig::make_with(Vec::new(), |config| {
+            config.usage.enabled = true;
             set_role_harness(config, ExecutionRole::Review, Harness::Codex);
         });
         rig.daemon

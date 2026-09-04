@@ -959,13 +959,17 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
         Selection::Row(index) if index < all.len() => Some(index),
         _ => None,
     };
+    let usage_lines = usage_lines(state, now_ms);
+    let band_height = usage_band_height(&usage_lines, area.height);
+    let body = Layout::vertical([Constraint::Min(0), Constraint::Length(band_height)]).split(area);
+    let lane_area = body[0];
     let lanes = Layout::horizontal([
         Constraint::Ratio(1, 4),
         Constraint::Ratio(1, 4),
         Constraint::Ratio(1, 4),
         Constraint::Ratio(1, 4),
     ])
-    .split(area);
+    .split(lane_area);
     for (stage, lane) in Stage::ALL.into_iter().zip(lanes.iter().copied()) {
         let inner_width = lane.width.saturating_sub(2);
         let mut lines = if stage == Stage::Release {
@@ -988,6 +992,159 @@ pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
         ));
         let scroll = lane_scroll(&lines, lane.height);
         f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), lane);
+    }
+    if band_height > 0 {
+        draw_usage_band(f, usage_lines, body[1]);
+    }
+}
+
+/// The height of the usage band: at most one third of the body height.
+///
+/// An empty usage list gives height zero, so the band hides while the view
+/// carries no usage rows.
+fn usage_band_height(usage_lines: &[Line<'_>], body_height: u16) -> u16 {
+    if usage_lines.is_empty() || body_height < 3 {
+        return 0;
+    }
+    let needed = (usage_lines.len() as u16).saturating_add(2);
+    needed.min(body_height / 3).max(3).min(body_height)
+}
+
+/// Draw the bordered `USAGE` box with the usage rows and the overflow line.
+fn draw_usage_band(f: &mut Frame, lines: Vec<Line<'static>>, area: Rect) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let mut shown: Vec<Line<'static>> = lines.iter().take(visible).cloned().collect();
+    let hidden = lines.len().saturating_sub(visible);
+    if hidden > 0 {
+        shown.truncate(visible.saturating_sub(1));
+        shown.push(Line::from(Span::styled(
+            format!("+ {hidden} more"),
+            THEME.dim(),
+        )));
+    }
+    let block = Block::bordered().title(Span::styled(
+        "USAGE",
+        Style::default()
+            .fg(THEME.accent)
+            .add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(Paragraph::new(shown).block(block), area);
+}
+
+/// The usage rows of the band, one or more lines per billed identity.
+///
+/// The rows arrive in panel order: claude first, the OpenCode providers
+/// sorted, codex last. Plan windows print LEFT, direct API rows print
+/// SPEND, and every probe failure adds one dim reason line with the age of
+/// the last good data.
+fn usage_lines(state: &StateView, now_ms: u64) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for row in &state.usage {
+        let mut header = vec![
+            Span::raw(" "),
+            Span::styled(
+                row.identity.clone(),
+                Style::default().fg(THEME.repo).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        let mode_label = match (&row.mode, &row.plan) {
+            (crate::usage::UsageMode::Plan, Some(plan)) => format!("{plan} plan"),
+            (crate::usage::UsageMode::Plan, None) => "plan".to_string(),
+            (crate::usage::UsageMode::Api, _) => "api".to_string(),
+            (crate::usage::UsageMode::Unknown, _) => "unknown".to_string(),
+        };
+        header.push(Span::styled(" · ", THEME.dim()));
+        header.push(Span::raw(mode_label));
+        if row.factory_spend_usd > 0.0 {
+            header.push(Span::styled(" · factory ", THEME.dim()));
+            header.push(Span::raw(format_usd(row.factory_spend_usd)));
+        }
+        lines.push(Line::from(header));
+        if matches!(row.mode, crate::usage::UsageMode::Plan) {
+            for window in &row.windows {
+                lines.push(window_line(window, now_ms));
+            }
+        }
+        if let Some(org) = &row.org_spend {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("org ", THEME.dim()),
+                Span::raw(format_usd(org.amount_usd)),
+            ]));
+        }
+        if let Some(credits) = &row.credits {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{} ", credits.label), THEME.dim()),
+                Span::raw(format_usd(credits.remaining)),
+            ]));
+        }
+        if let Some(error) = &row.error {
+            let age = format_age(now_ms.saturating_sub(row.updated_ms));
+            lines.push(Line::from(Span::styled(
+                format!("  ! {error} · data {age} old"),
+                THEME.dim(),
+            )));
+        } else if row.windows.is_empty()
+            && row.org_spend.is_none()
+            && row.credits.is_none()
+            && matches!(row.mode, crate::usage::UsageMode::Unknown)
+        {
+            lines.push(Line::from(Span::styled("  no data yet", THEME.dim())));
+        }
+    }
+    lines
+}
+
+/// One quota window row: a bar, the LEFT share, and the reset moment.
+fn window_line(window: &crate::usage::UsageWindow, now_ms: u64) -> Line<'static> {
+    let left = (100.0 - window.used_percent).clamp(0.0, 100.0);
+    let left_rounded = left.round() as u64;
+    let blocked = left_rounded == 0;
+    let width = 10usize;
+    let filled = ((left / 100.0) * width as f64).round() as usize;
+    let filled = filled.clamp(0, width);
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+    let style = if blocked {
+        Style::default().fg(THEME.error)
+    } else if left <= 20.0 {
+        Style::default().fg(THEME.warn)
+    } else {
+        Style::default().fg(THEME.ok)
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(format!("{:<12}", window.label), THEME.dim()),
+        Span::styled(bar, style),
+        Span::styled(format!(" {left_rounded}% left"), style),
+    ];
+    if let Some(resets_at_ms) = window.resets_at_ms {
+        let label = if resets_at_ms <= now_ms {
+            "resets now".to_string()
+        } else {
+            format!("resets {}", format_countdown(resets_at_ms - now_ms))
+        };
+        spans.push(Span::styled(format!(" · {label}"), THEME.dim()));
+    }
+    Line::from(spans)
+}
+
+/// The spend as `$1.25`.
+fn format_usd(amount: f64) -> String {
+    format!("${amount:.2}")
+}
+
+/// The age as `just now`, `5m`, `2h`, or `3d`.
+fn format_age(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    if minutes < 1 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        format!("{minutes}m")
+    } else if minutes < 1_440 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{}d", minutes / 1_440)
     }
 }
 
@@ -1946,6 +2103,213 @@ mod tests {
             settings: crate::sock::SettingsView::default(),
             usage: Vec::new(),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The USAGE band
+    // ------------------------------------------------------------------
+
+    /// Render only the pipeline board into a frame of the exact size.
+    fn render_board(state: StateView, width: u16, height: u16, now_ms: u64) -> String {
+        let app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                    now_ms,
+                );
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    /// One plan row with two windows, one Api row with spend, one error row.
+    fn usage_rows() -> Vec<crate::usage::UsageView> {
+        use crate::usage::{UsageMode, UsageView, UsageWindow};
+        vec![
+            UsageView {
+                identity: "claude".to_string(),
+                harness: crate::config::Harness::Claude,
+                mode: UsageMode::Plan,
+                plan: Some("Max".to_string()),
+                models: vec!["claude-opus-5[1m]".to_string()],
+                windows: vec![
+                    UsageWindow {
+                        label: "5 hour".to_string(),
+                        used_percent: 30.0,
+                        resets_at_ms: Some(5_000_000_000),
+                    },
+                    UsageWindow {
+                        label: "weekly".to_string(),
+                        used_percent: 100.0,
+                        resets_at_ms: Some(5_100_000_000),
+                    },
+                ],
+                factory_spend_usd: 1.25,
+                updated_ms: NOW - 60_000,
+                ..UsageView::default()
+            },
+            UsageView {
+                identity: "zai-coding-plan".to_string(),
+                harness: crate::config::Harness::Opencode,
+                mode: UsageMode::Api,
+                factory_spend_usd: 0.5,
+                org_spend: Some(crate::usage::OrgSpend {
+                    label: "org this month".to_string(),
+                    amount_usd: 12.0,
+                }),
+                credits: Some(crate::usage::Credits {
+                    label: "credits".to_string(),
+                    remaining: 18.5,
+                }),
+                updated_ms: NOW,
+                ..UsageView::default()
+            },
+            UsageView {
+                identity: "codex".to_string(),
+                harness: crate::config::Harness::Codex,
+                mode: UsageMode::Plan,
+                updated_ms: NOW - 300_000,
+                error: Some("rate limited".to_string()),
+                ..UsageView::default()
+            },
+        ]
+    }
+
+    /// The fixed now of the usage tests.
+    const NOW: u64 = 5_000_000_000;
+
+    #[test]
+    fn the_usage_band_hides_while_the_view_carries_no_rows() {
+        let state = empty_view();
+        assert!(state.usage.is_empty());
+
+        let text = render_board(state, 80, 24, NOW);
+
+        assert!(!text.contains("USAGE"), "board:\n{text}");
+    }
+
+    #[test]
+    fn the_usage_band_shows_plan_api_blocked_and_error_rows() {
+        let mut state = empty_view();
+        state.usage = usage_rows();
+
+        let text = render_board(state, 120, 40, NOW);
+
+        assert!(text.contains("USAGE"), "board:\n{text}");
+        assert!(text.contains("claude"), "board:\n{text}");
+        assert!(text.contains("Max plan"), "board:\n{text}");
+        assert!(text.contains("70% left"), "board:\n{text}");
+        assert!(text.contains("resets "), "board:\n{text}");
+        assert!(text.contains("0% left"), "board:\n{text}");
+        assert!(text.contains("factory $1.25"), "board:\n{text}");
+        assert!(text.contains("zai-coding-plan"), "board:\n{text}");
+        assert!(text.contains("api"), "board:\n{text}");
+        assert!(text.contains("factory $0.50"), "board:\n{text}");
+        assert!(text.contains("org $12.00"), "board:\n{text}");
+        assert!(text.contains("credits $18.50"), "board:\n{text}");
+        assert!(text.contains("! rate limited"), "board:\n{text}");
+        assert!(text.contains("data 5m old"), "board:\n{text}");
+    }
+
+    #[test]
+    fn the_usage_band_caps_at_one_third_and_ends_with_plus_n_more() {
+        let mut state = empty_view();
+        // Six identities with three lines each overflow the one-third cap.
+        state.usage = (0..6)
+            .map(|index| {
+                let mut row = usage_rows()[0].clone();
+                row.identity = format!("provider-{index}");
+                row.windows = vec![crate::usage::UsageWindow {
+                    label: "5 hour".to_string(),
+                    used_percent: 30.0,
+                    resets_at_ms: None,
+                }];
+                row
+            })
+            .collect();
+        let content_lines = state.usage.len() * 2;
+
+        // The body is 24 rows, so the cap is 8: 6 visible content rows.
+        let text = render_board(state, 80, 24, NOW);
+        let visible = 8 - 2;
+        let hidden = content_lines - visible;
+
+        assert!(text.contains(&format!("+ {hidden} more")), "board:\n{text}");
+        assert!(!text.contains("provider-5\n"), "board:\n{text}");
+        // The band fills the bottom of the body and closes it with a border.
+        let border_row = text.lines().nth(23).unwrap();
+        assert!(
+            border_row.contains("╘")
+                || border_row.contains('╧')
+                || border_row.contains('└')
+                || border_row.contains('┴'),
+            "the last row must close the band:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_usage_band_keeps_lane_selection_and_scroll_unchanged() {
+        let plain = sample_view();
+        let mut with_usage = sample_view();
+        with_usage.usage = usage_rows();
+        let expected_rows = rows(&plain).len();
+        assert_eq!(rows(&with_usage).len(), expected_rows);
+
+        for delta in [1_isize, 1, -1, -1] {
+            let mut a = App {
+                state: Some(plain.clone()),
+                connected: true,
+                ..App::default()
+            };
+            let mut b = App {
+                state: Some(with_usage.clone()),
+                connected: true,
+                ..App::default()
+            };
+            move_selection(&mut a, delta);
+            move_selection(&mut b, delta);
+            assert_eq!(a.selection, b.selection);
+        }
+        let mut a = App {
+            state: Some(plain.clone()),
+            connected: true,
+            selection: Selection::Row(0),
+            ..App::default()
+        };
+        let mut b = App {
+            state: Some(with_usage.clone()),
+            connected: true,
+            selection: Selection::Row(0),
+            ..App::default()
+        };
+        move_horizontal(&mut a, 1);
+        move_horizontal(&mut b, 1);
+        assert_eq!(a.selection, b.selection);
+
+        // The rendered board keeps the selected marker with a band visible.
+        let mut app = App {
+            state: Some(with_usage),
+            connected: true,
+            selection: Selection::Row(2),
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("│▸ queued · i142"), "board:\n{text}");
+        let _ = plain;
     }
 
     #[test]
