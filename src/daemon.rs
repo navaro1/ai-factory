@@ -23,7 +23,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -41,10 +40,7 @@ use crate::gh::GhClient;
 use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
-use crate::prompts::{
-    IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, RESTART_NOTICE, REVIEW_PROMPT,
-    TICKET_CHAT_PROMPT, TICKET_PROMPT,
-};
+use crate::prompts::{self, RESTART_NOTICE};
 #[cfg(test)]
 use crate::runner::Runner;
 use crate::runner::{
@@ -52,8 +48,9 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AskView, InputMode, PauseScope, Push, SettingsOperation, SettingsResult,
-    SettingsResultStatus, StateInput, StateView, TicketAction, TicketDetails, TicketProposal,
+    Action, AskView, InputMode, PauseScope, PromptSource, PromptView, Push, SettingsOperation,
+    SettingsResult, SettingsResultStatus, StateInput, StateView, TicketAction, TicketDetails,
+    TicketProposal,
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
@@ -166,6 +163,10 @@ pub struct Daemon {
     state_path: PathBuf,
     /// The directory of operator-provided prompt templates.
     prompts_dir: PathBuf,
+    /// The effective prompt template of every role, as the Settings view
+    /// shows it. A dispatch, a prompt save, and a settings reload refresh it
+    /// from the prompt files.
+    prompts: Vec<PromptView>,
     /// The state directory; the parent of the worktrees and the logs.
     state_dir: PathBuf,
 
@@ -478,6 +479,7 @@ impl Daemon {
             runner_factory,
             worktrees: WorktreeManager::new(state_dir.clone()),
             state_path: state_path.clone(),
+            prompts: prompt_views(&prompts_dir),
             prompts_dir,
             state_dir,
             limits,
@@ -770,6 +772,7 @@ impl Daemon {
             trains: &self.trains,
             policies: &self.policies,
             input_modes: &input_modes,
+            prompts: &self.prompts,
             role_bindings: &self.role_bindings,
             now_ms: self.now_ms,
         };
@@ -2543,6 +2546,17 @@ impl Daemon {
                 edit,
             } => self.save_settings(request, base_revision, edit),
             Action::ReloadSettings { request } => self.reload_settings(request),
+            Action::SavePrompt {
+                request,
+                role,
+                base_revision,
+                text,
+            } => self.save_prompt(request, role, base_revision, text),
+            Action::ResetPrompt {
+                request,
+                role,
+                base_revision,
+            } => self.reset_prompt(request, role, base_revision),
             Action::Reconcile { repo } => self.reconcile(repo.as_deref()),
             Action::Stop => self.shutdown = true,
         }
@@ -2729,7 +2743,11 @@ impl Daemon {
     }
 
     /// Reload the factory file without changing it on disk.
+    ///
+    /// The reload also refreshes the prompt views, so an operator who edited
+    /// a prompt file with another program sees the new text in the UI.
     fn reload_settings(&mut self, request: String) {
+        self.refresh_prompts();
         let (text, revision) = match self.read_factory_file() {
             Ok(value) => value,
             Err(error) => {
@@ -2795,6 +2813,201 @@ impl Daemon {
         self.config = config;
         self.settings_revision = revision;
         self.changed = true;
+    }
+
+    /// Write the prompt file of one role and refresh the prompt views.
+    ///
+    /// The save is a compare-and-swap on the effective prompt: a request
+    /// whose base revision is not the current one is refused as stale, and
+    /// the result carries the current revision so the UI can retry with it.
+    /// A template with an unknown placeholder never reaches the disk; the
+    /// message names the placeholder. A running task keeps its prompt; the
+    /// next task of the role reads the new file at its start.
+    fn save_prompt(
+        &mut self,
+        request: String,
+        role: ExecutionRole,
+        base_revision: String,
+        text: String,
+    ) {
+        let Some(file_name) = prompts::file_name(role) else {
+            self.refuse_promptless_role(request, SettingsOperation::SavePrompt, role);
+            return;
+        };
+        let Some(current_revision) = self.check_prompt_revision(
+            &request,
+            SettingsOperation::SavePrompt,
+            file_name,
+            role,
+            &base_revision,
+        ) else {
+            return;
+        };
+        if let Err(error) = prompts::check(role, &text) {
+            self.refresh_prompts();
+            self.push_settings_result(
+                request,
+                SettingsOperation::SavePrompt,
+                SettingsResultStatus::Invalid,
+                current_revision,
+                Some(format!("the prompt is invalid: {error:#}")),
+            );
+            return;
+        }
+        if let Err(error) = prompts::save(&self.prompts_dir, role, &text) {
+            self.refresh_prompts();
+            self.push_settings_result(
+                request,
+                SettingsOperation::SavePrompt,
+                SettingsResultStatus::Failed,
+                current_revision,
+                Some(format!("cannot save the prompt: {error:#}")),
+            );
+            return;
+        }
+        self.refresh_prompts();
+        // The revision comes from the refreshed view, so the result and the
+        // view never name two different texts.
+        let revision = self.prompt_revision(role);
+        self.push_settings_result(
+            request,
+            SettingsOperation::SavePrompt,
+            SettingsResultStatus::Saved,
+            revision,
+            Some(format!(
+                "prompt saved to {file_name}; the next {role} task uses it"
+            )),
+        );
+    }
+
+    /// Remove the prompt file of one role, so the built-in template applies
+    /// to the next task of the role.
+    fn reset_prompt(&mut self, request: String, role: ExecutionRole, base_revision: String) {
+        let (Some(file_name), Some(builtin)) = (prompts::file_name(role), prompts::builtin(role))
+        else {
+            self.refuse_promptless_role(request, SettingsOperation::ResetPrompt, role);
+            return;
+        };
+        let Some(current_revision) = self.check_prompt_revision(
+            &request,
+            SettingsOperation::ResetPrompt,
+            file_name,
+            role,
+            &base_revision,
+        ) else {
+            return;
+        };
+        if let Err(error) = prompts::reset(&self.prompts_dir, role) {
+            self.push_settings_result(
+                request,
+                SettingsOperation::ResetPrompt,
+                SettingsResultStatus::Failed,
+                current_revision,
+                Some(format!("cannot remove the prompt file: {error:#}")),
+            );
+            return;
+        }
+        self.refresh_prompts();
+        debug_assert_eq!(self.prompt_revision(role), config::file_revision(builtin));
+        self.push_settings_result(
+            request,
+            SettingsOperation::ResetPrompt,
+            SettingsResultStatus::Saved,
+            self.prompt_revision(role),
+            Some(format!(
+                "built-in prompt restored; the next {role} task uses it"
+            )),
+        );
+    }
+
+    /// Compare one prompt request against the effective prompt on disk.
+    ///
+    /// The current revision comes back when the request may proceed. A
+    /// stale or unreadable prompt pushes the result itself and yields
+    /// `None`. A stale request also refreshes the prompt views, so the UI
+    /// shows the text that won.
+    fn check_prompt_revision(
+        &mut self,
+        request: &str,
+        operation: SettingsOperation,
+        file_name: &str,
+        role: ExecutionRole,
+        base_revision: &str,
+    ) -> Option<String> {
+        let current = match prompts::load(&self.prompts_dir, role) {
+            Ok(template) => template,
+            // An unreadable file has no revision to compare. A reset is the
+            // only way out of that state, so it proceeds and removes the
+            // file. A save still refuses: nothing may overwrite a file the
+            // daemon cannot read.
+            Err(_) if operation == SettingsOperation::ResetPrompt => {
+                return Some(self.prompt_revision(role))
+            }
+            Err(error) => {
+                self.push_settings_result(
+                    request.to_string(),
+                    operation,
+                    SettingsResultStatus::Failed,
+                    self.prompt_revision(role),
+                    Some(format!("cannot read the prompt: {error:#}")),
+                );
+                return None;
+            }
+        };
+        let current_revision = config::file_revision(&current.text);
+        if base_revision != current_revision {
+            self.refresh_prompts();
+            self.push_settings_result(
+                request.to_string(),
+                operation,
+                SettingsResultStatus::Stale,
+                current_revision,
+                Some(format!(
+                    "{file_name} changed on disk after this edit started; \
+                     repeat the action to overwrite it"
+                )),
+            );
+            return None;
+        }
+        Some(current_revision)
+    }
+
+    /// Refuse one prompt request against a role with no template.
+    ///
+    /// Only a client that outran the daemon can send one: the Settings view
+    /// shows no prompt row for the theory roles.
+    fn refuse_promptless_role(
+        &self,
+        request: String,
+        operation: SettingsOperation,
+        role: ExecutionRole,
+    ) {
+        self.push_settings_result(
+            request,
+            operation,
+            SettingsResultStatus::Failed,
+            self.prompt_revision(role),
+            Some(format!("the {role} role has no prompt template")),
+        );
+    }
+
+    /// The revision the prompt views hold for one role.
+    fn prompt_revision(&self, role: ExecutionRole) -> String {
+        self.prompts
+            .iter()
+            .find(|view| view.role == role)
+            .map(|view| view.revision.clone())
+            .unwrap_or_default()
+    }
+
+    /// Read every prompt file again and mark the state changed when one
+    /// view differs.
+    fn refresh_prompts(&mut self) {
+        let fresh = prompt_views(&self.prompts_dir);
+        if fresh != self.prompts {
+            self.prompts = fresh;
+            self.changed = true;
+        }
     }
 
     /// Send one non-state settings result to each connected client.
@@ -3904,46 +4117,66 @@ impl Daemon {
 
     /// Render the prompt of one task.
     ///
-    /// The template comes from `prompts/<stage>.md` in the config directory,
-    /// or from the built-in default. Every placeholder must be known; an
-    /// unknown one is an error that names it, never a silent literal.
-    fn render_prompt(&self, task: &Task, repo_cfg: &RepoConfig, worktree: &Path) -> Result<String> {
-        if Self::is_ticket_creation(task) {
-            return fill_template(
-                TICKET_PROMPT,
-                &[
-                    ("repo", task.repo.clone()),
-                    ("owner_repo", repo_cfg.owner_repo.clone()),
-                    ("worktree", worktree.display().to_string()),
-                ],
+    /// The template comes from the prompt file of the task's role in the
+    /// config directory, read at this moment, or from the built-in default.
+    /// Every placeholder must be known; an unknown one is an error that
+    /// names it, never a silent literal.
+    fn render_prompt(
+        &mut self,
+        task: &Task,
+        repo_cfg: &RepoConfig,
+        worktree: &Path,
+    ) -> Result<String> {
+        let role = Self::execution_role(task);
+        let template = self.prompt_template(role)?;
+        // A crash between the write and the rename can leave a blank file.
+        // An agent with no instructions is worse than a failed dispatch.
+        if template.trim().is_empty() {
+            bail!(
+                "the {role} prompt file {} is empty",
+                prompts::file_name(role).unwrap_or_default()
             );
         }
+        let values = self.placeholder_values(task, repo_cfg, worktree)?;
+        prompts::fill_template(&template, &values)
+    }
+
+    /// The placeholder values of one task, in the order of
+    /// [`prompts::placeholders`] for its role.
+    fn placeholder_values(
+        &self,
+        task: &Task,
+        repo_cfg: &RepoConfig,
+        worktree: &Path,
+    ) -> Result<Vec<(&'static str, String)>> {
+        if Self::is_ticket_creation(task) {
+            return Ok(vec![
+                ("repo", task.repo.clone()),
+                ("owner_repo", repo_cfg.owner_repo.clone()),
+                ("worktree", worktree.display().to_string()),
+            ]);
+        }
         if Self::is_ticket_chat(task) {
-            let template = self.ticket_chat_prompt_template()?;
             let issue = self
                 .snapshot
                 .repos
                 .get(&task.repo)
                 .and_then(|snapshot| snapshot.issues.get(&task.number))
                 .ok_or_else(|| anyhow!("the issue is absent from the current snapshot"))?;
-            return fill_template(
-                &template,
-                &[
-                    ("repo", task.repo.clone()),
-                    ("owner_repo", repo_cfg.owner_repo.clone()),
-                    ("number", task.number.to_string()),
-                    ("title", issue.title.clone()),
-                    ("body", issue.body.clone()),
-                    ("labels", issue.labels.join(", ")),
-                    ("author", issue.author.clone()),
-                    ("assignees", issue.assignees.join(", ")),
-                    ("updated_at", issue.updated_at.clone()),
-                    ("github_url", issue.github_url.clone()),
-                    ("worktree", worktree.display().to_string()),
-                ],
-            );
+            return Ok(vec![
+                ("repo", task.repo.clone()),
+                ("owner_repo", repo_cfg.owner_repo.clone()),
+                ("number", task.number.to_string()),
+                ("title", issue.title.clone()),
+                ("body", issue.body.clone()),
+                ("labels", issue.labels.join(", ")),
+                ("author", issue.author.clone()),
+                ("assignees", issue.assignees.join(", ")),
+                ("updated_at", issue.updated_at.clone()),
+                ("github_url", issue.github_url.clone()),
+                ("worktree", worktree.display().to_string()),
+            ]);
         }
-        let template = self.prompt_template(task.stage)?;
         let (pr_list, pr_numbers, pr_count) = match self.release_batches.get(&task.id) {
             Some(prs) => {
                 let snapshot = self.snapshot.repos.get(&task.repo);
@@ -3994,43 +4227,35 @@ impl Daemon {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        fill_template(
-            &template,
-            &[
-                ("repo", task.repo.clone()),
-                ("owner_repo", repo_cfg.owner_repo.clone()),
-                ("number", task.number.to_string()),
-                ("title", title),
-                ("body", body),
-                ("worktree", worktree.display().to_string()),
-                ("tickets", tickets_text),
-                ("pr_list", pr_list),
-                ("pr_numbers", pr_numbers),
-                ("pr_count", pr_count),
-            ],
-        )
+        Ok(vec![
+            ("repo", task.repo.clone()),
+            ("owner_repo", repo_cfg.owner_repo.clone()),
+            ("number", task.number.to_string()),
+            ("title", title),
+            ("body", body),
+            ("worktree", worktree.display().to_string()),
+            ("tickets", tickets_text),
+            ("pr_list", pr_list),
+            ("pr_numbers", pr_numbers),
+            ("pr_count", pr_count),
+        ])
     }
 
-    /// Read the prompt template of one stage, or fall back to the built-in.
-    fn prompt_template(&self, stage: Stage) -> Result<String> {
-        let path = self.prompts_dir.join(format!("{}.md", stage.as_str()));
-        match fs::read_to_string(&path) {
-            Ok(text) => Ok(text),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(builtin_prompt(stage).to_string()),
-            Err(e) => Err(anyhow!("cannot read {}: {e}", path.display())),
-        }
-    }
-
-    /// Read the ticket chat prompt template or use the built-in text.
-    fn ticket_chat_prompt_template(&self) -> Result<String> {
-        let path = self.prompts_dir.join("ticket-chat.md");
-        match fs::read_to_string(&path) {
-            Ok(text) => Ok(text),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok(TICKET_CHAT_PROMPT.to_string())
+    /// Read the prompt template of one role at this moment.
+    ///
+    /// The prompt file wins; an absent file yields the built-in. The read
+    /// also refreshes the prompt view of the role, so a file another
+    /// program edited reaches the UI at the next task start.
+    fn prompt_template(&mut self, role: ExecutionRole) -> Result<String> {
+        let template = prompts::load(&self.prompts_dir, role)?;
+        let view = prompt_view(role, &template);
+        if let Some(slot) = self.prompts.iter_mut().find(|view| view.role == role) {
+            if *slot != view {
+                *slot = view;
+                self.changed = true;
             }
-            Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
         }
+        Ok(template.text)
     }
 
     /// Assemble the persisted view of the current state.
@@ -4191,60 +4416,40 @@ fn review_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
         .is_some_and(|pr| pr.open && !pr.draft)
 }
 
-/// Fill a prompt template.
-fn fill_template(template: &str, values: &[(&str, String)]) -> Result<String> {
-    for token in scan_placeholders(template) {
-        if !values.iter().any(|(name, _)| *name == token) {
-            bail!("the prompt template uses the unknown placeholder {{{token}}}");
-        }
-    }
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('}') else {
-            out.push_str(&rest[start..]);
-            rest = "";
-            break;
-        };
-        let token = &after[..end];
-        if let Some((_, value)) = values.iter().find(|(name, _)| *name == token) {
-            out.push_str(value);
-        } else {
-            out.push_str(&rest[start..start + end + 2]);
-        }
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
+/// The effective prompt view of every role that has a template, in role
+/// order. The theory roles carry no template, so they get no view.
+///
+/// An unreadable prompt file yields the built-in view and one line on
+/// standard error; the dispatch reports the same read error to the task.
+fn prompt_views(prompts_dir: &Path) -> Vec<PromptView> {
+    prompts::ROLES
+        .into_iter()
+        .filter_map(|role| {
+            let builtin = prompts::builtin(role)?;
+            let template = prompts::load(prompts_dir, role).unwrap_or_else(|error| {
+                eprintln!("cannot read the {role} prompt: {error:#}");
+                prompts::Template {
+                    text: builtin.to_string(),
+                    from_file: false,
+                }
+            });
+            Some(prompt_view(role, &template))
+        })
+        .collect()
 }
 
-/// List the `{placeholder}` tokens of a template, in first-seen order.
-///
-/// A token is placeholder-shaped when it holds only ASCII letters, digits,
-/// underscores, and hyphens. Other brace content stays untouched.
-fn scan_placeholders(template: &str) -> Vec<&str> {
-    let mut found: Vec<&str> = Vec::new();
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('}') else {
-            break;
-        };
-        let token = &after[..end];
-        if !token.is_empty()
-            && !token.contains('{')
-            && token
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            && !found.contains(&token)
-        {
-            found.push(token);
-        }
-        rest = &after[end + 1..];
+/// The socket view of one loaded template.
+fn prompt_view(role: ExecutionRole, template: &prompts::Template) -> PromptView {
+    PromptView {
+        role,
+        source: if template.from_file {
+            PromptSource::File
+        } else {
+            PromptSource::Builtin
+        },
+        text: template.text.clone(),
+        revision: config::file_revision(&template.text),
     }
-    found
 }
 
 /// Fold one inbound source into the loop's channel.
@@ -4282,22 +4487,15 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// The built-in prompt of one stage.
-fn builtin_prompt(stage: Stage) -> &'static str {
-    match stage {
-        Stage::Refine => REFINE_PROMPT,
-        Stage::Implement => IMPLEMENT_PROMPT,
-        Stage::Review => REVIEW_PROMPT,
-        Stage::Release => RELEASE_PROMPT,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ExecutionRole, Harness, RoleSettings, StageConfig};
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
+    use crate::prompts::{
+        scan_placeholders, IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT,
+    };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -11796,48 +11994,483 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Template helpers
+    // Prompt templates
     // ------------------------------------------------------------------
 
+    /// The placeholder values of every role match the placeholder set the
+    /// save-time check accepts, name for name and in order, so a prompt
+    /// that passes the check never fails at dispatch.
     #[test]
-    fn scan_placeholders_finds_placeholder_shaped_tokens() {
-        assert_eq!(scan_placeholders("{a} x {b_1} {a}"), vec!["a", "b_1"]);
-        assert!(scan_placeholders("{not a} {} {unclosed {oops}").is_empty());
+    fn the_placeholder_values_of_every_role_match_the_checked_set() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), vec![], |_| {});
+        let issue = issue(142, &["refined"]);
+        let mut repo_snapshot = RepoSnapshot::default();
+        repo_snapshot.issues.insert(142, issue);
+        rig.daemon
+            .snapshot
+            .repos
+            .insert("borsuk".to_string(), repo_snapshot);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        for role in prompts::ROLES {
+            let (stage, kind, number) = match role {
+                ExecutionRole::Refine => (Stage::Refine, ItemKind::Issue, 142),
+                ExecutionRole::Implement => (Stage::Implement, ItemKind::Issue, 142),
+                ExecutionRole::Review => (Stage::Review, ItemKind::Pr, 7),
+                ExecutionRole::Release => (Stage::Release, ItemKind::Pr, 0),
+                ExecutionRole::TicketCreate => (Stage::Refine, ItemKind::Issue, TICKET_NUMBER),
+                ExecutionRole::TicketChat => (Stage::Refine, ItemKind::Issue, 142),
+                ExecutionRole::TheoryAudit | ExecutionRole::TheoryChat => {
+                    panic!("a theory role has no prompt template")
+                }
+            };
+            let mut task = Task::new("borsuk", stage, kind, number, PathBuf::new(), T0);
+            task.purpose = match role {
+                ExecutionRole::TicketCreate => TaskPurpose::TicketCreate,
+                ExecutionRole::TicketChat => TaskPurpose::TicketChat,
+                _ => TaskPurpose::Pipeline,
+            };
+            assert_eq!(Daemon::execution_role(&task), role);
+            let values = rig
+                .daemon
+                .placeholder_values(&task, &repo_cfg, &dir)
+                .unwrap_or_else(|error| panic!("{role}: {error:#}"));
+            let names = values.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+            assert_eq!(
+                Some(names.as_slice()),
+                prompts::placeholders(role),
+                "{role}"
+            );
+        }
+    }
+
+    /// `execution_role` never yields a theory role today, so no dispatch
+    /// asks for a prompt that does not exist.
+    #[test]
+    fn no_dispatched_task_takes_a_theory_role() {
+        for stage in [
+            Stage::Refine,
+            Stage::Implement,
+            Stage::Review,
+            Stage::Release,
+        ] {
+            for purpose in [
+                TaskPurpose::Pipeline,
+                TaskPurpose::TicketCreate,
+                TaskPurpose::TicketChat,
+            ] {
+                let mut task = Task::new("borsuk", stage, ItemKind::Issue, 1, PathBuf::new(), T0);
+                task.purpose = purpose;
+                let role = Daemon::execution_role(&task);
+                assert!(
+                    prompts::file_name(role).is_some(),
+                    "{stage:?}/{purpose:?} dispatches {role}, which has no prompt"
+                );
+            }
+        }
     }
 
     #[test]
-    fn fill_template_rejects_an_unknown_placeholder_and_fills_known_ones() {
-        let error = fill_template("hi {name} {other}", &[("name", "x".to_string())]).unwrap_err();
-        assert!(error.to_string().contains("other"));
-        let filled = fill_template("hi {name}", &[("name", "x".to_string())]).unwrap();
-        assert_eq!(filled, "hi x");
+    fn a_prompt_save_writes_the_file_pushes_the_result_and_reaches_the_next_task() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let (state_tx, state_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| state_tx.send(view).unwrap()));
+        let builtin_revision = config::file_revision(IMPLEMENT_PROMPT);
+        let view = rig
+            .daemon
+            .prompts
+            .iter()
+            .find(|view| view.role == ExecutionRole::Implement)
+            .unwrap()
+            .clone();
+        assert_eq!(view.source, PromptSource::Builtin);
+        assert_eq!(view.revision, builtin_revision);
 
-        let error = fill_template("hi {not-known}", &[("name", "x".to_string())]).unwrap_err();
-        assert!(error.to_string().contains("not-known"));
+        rig.act(Action::SavePrompt {
+            request: "prompt-1".to_string(),
+            role: ExecutionRole::Implement,
+            base_revision: builtin_revision,
+            text: "implement #{number} of {repo}\n".to_string(),
+        });
 
-        let filled = fill_template(
-            "title={title}; body={body}",
-            &[
-                ("title", "keep {body} literal".to_string()),
-                ("body", "body text".to_string()),
-            ],
-        )
-        .unwrap();
-        assert_eq!(filled, "title=keep {body} literal; body=body text");
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the prompt save must push a settings result");
+        };
+        assert_eq!(result.request, "prompt-1");
+        assert_eq!(result.operation, SettingsOperation::SavePrompt);
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(
+            result.revision,
+            config::file_revision("implement #{number} of {repo}\n")
+        );
+        assert!(result.message.unwrap().contains("implement.md"));
+        assert_eq!(
+            fs::read_to_string(rig.prompts.join("implement.md")).unwrap(),
+            "implement #{number} of {repo}\n"
+        );
+        let view = rig
+            .daemon
+            .prompts
+            .iter()
+            .find(|view| view.role == ExecutionRole::Implement)
+            .unwrap();
+        assert_eq!(view.source, PromptSource::File);
+        assert_eq!(view.text, "implement #{number} of {repo}\n");
+        let pushed = std::iter::from_fn(|| state_rx.try_recv().ok())
+            .last()
+            .expect("a new prompt publishes the state");
+        assert_eq!(
+            pushed.settings.prompts[1].text,
+            "implement #{number} of {repo}\n"
+        );
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job(0).prompt, "implement #142 of borsuk\n");
     }
 
     #[test]
-    fn fill_template_fills_the_tickets_placeholder() {
-        let filled = fill_template(
-            "Tickets this PR closes: {tickets}",
-            &[("tickets", "#4, #9".to_string())],
-        )
-        .unwrap();
-        assert_eq!(filled, "Tickets this PR closes: #4, #9");
+    fn a_stale_prompt_save_is_refused_and_names_the_current_revision() {
+        let mut rig = Rig::make(vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("refine.md"), "edited outside {number}\n").unwrap();
 
-        let error =
-            fill_template("hi {tickets} {nope}", &[("tickets", "none".to_string())]).unwrap_err();
-        assert!(error.to_string().contains("nope"));
+        rig.act(Action::SavePrompt {
+            request: "prompt-stale".to_string(),
+            role: ExecutionRole::Refine,
+            base_revision: config::file_revision(REFINE_PROMPT),
+            text: "operator text {number}\n".to_string(),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the stale save must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Stale);
+        assert_eq!(
+            result.revision,
+            config::file_revision("edited outside {number}\n")
+        );
+        assert!(result.message.unwrap().contains("refine.md"));
+        assert_eq!(
+            fs::read_to_string(rig.prompts.join("refine.md")).unwrap(),
+            "edited outside {number}\n",
+            "a stale save leaves the file alone"
+        );
+        let view = rig
+            .daemon
+            .prompts
+            .iter()
+            .find(|view| view.role == ExecutionRole::Refine)
+            .unwrap();
+        assert_eq!(view.source, PromptSource::File);
+        assert_eq!(
+            view.text, "edited outside {number}\n",
+            "a stale save refreshes the view with the text that won"
+        );
+
+        rig.act(Action::SavePrompt {
+            request: "prompt-retry".to_string(),
+            role: ExecutionRole::Refine,
+            base_revision: result.revision,
+            text: "operator text {number}\n".to_string(),
+        });
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the retry must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(
+            fs::read_to_string(rig.prompts.join("refine.md")).unwrap(),
+            "operator text {number}\n"
+        );
+    }
+
+    #[test]
+    fn an_unknown_placeholder_blocks_the_prompt_save_before_the_disk() {
+        let mut rig = Rig::make(vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SavePrompt {
+            request: "prompt-bad".to_string(),
+            role: ExecutionRole::Release,
+            base_revision: config::file_revision(RELEASE_PROMPT),
+            text: "release {frobnicate}\n".to_string(),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the invalid save must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Invalid);
+        assert_eq!(result.revision, config::file_revision(RELEASE_PROMPT));
+        let message = result.message.unwrap();
+        assert!(message.contains("{frobnicate}"), "{message}");
+        assert!(message.contains("{pr_list}"), "{message}");
+        assert!(!rig.prompts.join("release.md").exists());
+    }
+
+    /// A theory role has no prompt template. A client that outran the
+    /// daemon and sent a prompt action against one gets a named refusal,
+    /// and no file appears.
+    #[test]
+    fn a_prompt_action_against_a_theory_role_is_refused_by_name() {
+        let mut rig = Rig::make(vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        for (index, action) in [
+            Action::SavePrompt {
+                request: "theory-save".to_string(),
+                role: ExecutionRole::TheoryAudit,
+                base_revision: String::new(),
+                text: "audit the model\n".to_string(),
+            },
+            Action::ResetPrompt {
+                request: "theory-reset".to_string(),
+                role: ExecutionRole::TheoryChat,
+                base_revision: String::new(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rig.act(action);
+            let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+                panic!("the refusal must push a settings result");
+            };
+            assert_eq!(result.status, SettingsResultStatus::Failed);
+            let role = if index == 0 {
+                "theory.audit"
+            } else {
+                "theory.chat"
+            };
+            assert_eq!(
+                result.message.unwrap(),
+                format!("the {role} role has no prompt template")
+            );
+        }
+        assert!(!rig.prompts.exists(), "no prompt file was written");
+        assert!(rig
+            .daemon
+            .prompts
+            .iter()
+            .all(|view| prompts::file_name(view.role).is_some()));
+    }
+
+    /// A prompt file the daemon cannot read blocks a save, because nothing
+    /// may overwrite a text the daemon never saw. A reset still works: it
+    /// is the only way out of that state.
+    #[test]
+    fn a_reset_recovers_an_unreadable_prompt_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut rig = Rig::make(vec![]);
+        fs::create_dir_all(&rig.prompts).unwrap();
+        let path = rig.prompts.join("release.md");
+        fs::write(&path, "release {pr_list}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&path).is_ok() {
+            // The root user reads every file, so the state under test
+            // cannot exist in this run.
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SavePrompt {
+            request: "unreadable-save".to_string(),
+            role: ExecutionRole::Release,
+            base_revision: config::file_revision(RELEASE_PROMPT),
+            text: "release {pr_list}\n".to_string(),
+        });
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the save must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Failed);
+        assert!(result.message.unwrap().contains("cannot read the prompt"));
+
+        rig.act(Action::ResetPrompt {
+            request: "unreadable-reset".to_string(),
+            role: ExecutionRole::Release,
+            base_revision: config::file_revision(RELEASE_PROMPT),
+        });
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the reset must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert!(!rig.prompts.join("release.md").exists());
+    }
+
+    /// A blank prompt file never starts an agent. A crash between the
+    /// write and the rename can leave one behind.
+    #[test]
+    fn an_empty_prompt_file_fails_the_dispatch_by_name() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("implement.md"), " \n\t").unwrap();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job_count(), 0, "an empty prompt blocks the dispatch");
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.attempt, 2, "the failed dispatch requeues the task");
+        assert_eq!(task.state, TaskState::Queued);
+        let log = fs::read_to_string(&task.log_path).unwrap();
+        assert!(
+            log.contains("implement.md is empty"),
+            "the dispatch must name the empty file: {log}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_reset_removes_the_file_and_the_next_task_reads_the_builtin() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("implement.md"), "custom {number}\n").unwrap();
+        rig.daemon.refresh_prompts();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::ResetPrompt {
+            request: "prompt-reset".to_string(),
+            role: ExecutionRole::Implement,
+            base_revision: config::file_revision("custom {number}\n"),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the reset must push a settings result");
+        };
+        assert_eq!(result.operation, SettingsOperation::ResetPrompt);
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(result.revision, config::file_revision(IMPLEMENT_PROMPT));
+        assert!(!rig.prompts.join("implement.md").exists());
+        let view = rig
+            .daemon
+            .prompts
+            .iter()
+            .find(|view| view.role == ExecutionRole::Implement)
+            .unwrap();
+        assert_eq!(view.source, PromptSource::Builtin);
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert!(rig
+            .job(0)
+            .prompt
+            .starts_with("You implement ticket #142 of borsuk"));
+    }
+
+    #[test]
+    fn the_state_view_carries_every_prompt_and_a_dispatch_refreshes_an_outside_edit() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| tx.send(view).unwrap()));
+        rig.drive();
+        let view = rx.try_recv().expect("the first drive publishes a view");
+        assert_eq!(
+            view.settings
+                .prompts
+                .iter()
+                .map(|prompt| prompt.role)
+                .collect::<Vec<_>>(),
+            prompts::ROLES.to_vec(),
+            "the view carries one prompt per role that has a template"
+        );
+        assert!(view
+            .settings
+            .prompts
+            .iter()
+            .all(|prompt| prompt.source == PromptSource::Builtin));
+        assert_eq!(
+            view.settings.prompts[1].text, IMPLEMENT_PROMPT,
+            "the view shows the built-in text of the implement role"
+        );
+
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("implement.md"), "outside {number}\n").unwrap();
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.job(0).prompt, "outside 142\n");
+        let view = std::iter::from_fn(|| rx.try_recv().ok())
+            .last()
+            .expect("the dispatch publishes a view");
+        let prompt = &view.settings.prompts[1];
+        assert_eq!(prompt.source, PromptSource::File);
+        assert_eq!(prompt.text, "outside {number}\n");
+    }
+
+    #[test]
+    fn a_settings_reload_refreshes_the_prompt_views() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        fs::write(&config_path, settings_config_text(&rig.repo, "m")).unwrap();
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("review.md"), "outside review {number}\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::ReloadSettings {
+            request: "reload-prompts".to_string(),
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the reload must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Reloaded);
+        let view = rig
+            .daemon
+            .prompts
+            .iter()
+            .find(|view| view.role == ExecutionRole::Review)
+            .unwrap();
+        assert_eq!(view.source, PromptSource::File);
+        assert_eq!(view.text, "outside review {number}\n");
     }
 
     // Path helpers that mirror the rig layout.

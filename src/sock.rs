@@ -51,7 +51,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 3;
+pub const WIRE_PROTOCOL_REVISION: u32 = 4;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -127,6 +127,35 @@ pub struct SettingsView {
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
+    /// The effective prompt template of every role that has one, in role
+    /// order. The theory roles carry no template, so they are absent.
+    pub prompts: Vec<PromptView>,
+}
+
+/// Where the effective prompt text of one role comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    /// The built-in template of the crate.
+    Builtin,
+    /// The prompt file of the role in the prompts directory.
+    File,
+}
+
+/// The effective prompt template of one role.
+///
+/// The daemon reads the file again at each task start, so the view shows
+/// the template the next task of the role gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptView {
+    /// The role identity.
+    pub role: ExecutionRole,
+    /// Where the text comes from.
+    pub source: PromptSource,
+    /// The effective template text.
+    pub text: String,
+    /// A stable digest of the effective text. A prompt save names it.
+    pub revision: String,
 }
 
 #[derive(Serialize)]
@@ -136,6 +165,7 @@ struct SettingsViewRef<'a> {
     repositories: &'a [RepositoryRoleSettingsView],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     theory_global: Vec<&'a GlobalRoleSettingsView>,
+    prompts: &'a [PromptView],
 }
 
 #[derive(Deserialize)]
@@ -145,6 +175,8 @@ struct SettingsViewWire {
     repositories: Vec<RepositoryRoleSettingsView>,
     #[serde(default)]
     theory_global: Vec<GlobalRoleSettingsView>,
+    #[serde(default)]
+    prompts: Vec<PromptView>,
 }
 
 impl Serialize for SettingsView {
@@ -161,6 +193,7 @@ impl Serialize for SettingsView {
             global,
             repositories: &self.repositories,
             theory_global,
+            prompts: &self.prompts,
         }
         .serialize(serializer)
     }
@@ -177,13 +210,15 @@ impl<'de> Deserialize<'de> for SettingsView {
             revision: wire.revision,
             global: wire.global,
             repositories: wire.repositories,
+            prompts: wire.prompts,
         })
     }
 }
 
 impl SettingsView {
-    /// Build the socket view from one validated configuration.
-    pub fn from_config(config: &Config, revision: &str) -> Result<Self> {
+    /// Build the socket view from one validated configuration and the
+    /// effective prompt templates.
+    pub fn from_config(config: &Config, revision: &str, prompts: &[PromptView]) -> Result<Self> {
         let global = ExecutionRole::ALL
             .into_iter()
             .filter_map(|role| {
@@ -217,6 +252,7 @@ impl SettingsView {
             revision: revision.to_string(),
             global,
             repositories,
+            prompts: prompts.to_vec(),
         })
     }
 }
@@ -409,6 +445,8 @@ pub struct StateInput<'a> {
     /// The input mode of each task, keyed by task id. The daemon decides
     /// every mode; this module only serializes it.
     pub input_modes: &'a BTreeMap<String, InputMode>,
+    /// The effective prompt template of every role.
+    pub prompts: &'a [PromptView],
     /// The immutable role binding of each bound task, keyed by task id.
     pub role_bindings: &'a BTreeMap<String, ResolvedRoleSettings>,
     /// The current time in milliseconds since the Unix epoch.
@@ -430,6 +468,7 @@ impl StateInput<'_> {
             trains,
             policies,
             input_modes,
+            prompts,
             role_bindings,
             now_ms,
         } = *self;
@@ -619,7 +658,7 @@ impl StateInput<'_> {
             links,
             trains,
             paused,
-            settings: SettingsView::from_config(config, settings_revision)?,
+            settings: SettingsView::from_config(config, settings_revision, prompts)?,
         })
     }
 }
@@ -1184,6 +1223,10 @@ pub enum SettingsOperation {
     Save,
     /// A reload request.
     Reload,
+    /// A prompt save request.
+    SavePrompt,
+    /// A prompt reset request.
+    ResetPrompt,
 }
 
 /// The typed outcome of one settings operation.
@@ -1357,6 +1400,26 @@ pub enum Action {
     ReloadSettings {
         /// The request identity from the UI.
         request: String,
+    },
+    /// Write the prompt file of one role against an exact prompt revision.
+    SavePrompt {
+        /// The request identity from the UI.
+        request: String,
+        /// The role whose prompt changes.
+        role: ExecutionRole,
+        /// The prompt revision that the edit started from.
+        base_revision: String,
+        /// The complete new template text.
+        text: String,
+    },
+    /// Remove the prompt file of one role, so the built-in template applies.
+    ResetPrompt {
+        /// The request identity from the UI.
+        request: String,
+        /// The role whose prompt returns to the built-in.
+        role: ExecutionRole,
+        /// The prompt revision that the request started from.
+        base_revision: String,
     },
     /// Force an early poll of one repository, or of all when None.
     Reconcile {
@@ -2096,7 +2159,14 @@ mod tests {
         );
         let config = Config::parse(&text).unwrap();
 
-        let view = SettingsView::from_config(&config, "content-revision").unwrap();
+        let prompts = vec![PromptView {
+            role: crate::config::ExecutionRole::Refine,
+            source: PromptSource::File,
+            text: "refine {number}\n".to_string(),
+            revision: "prompt-rev".to_string(),
+        }];
+        let view = SettingsView::from_config(&config, "content-revision", &prompts).unwrap();
+        assert_eq!(view.prompts, prompts);
 
         assert_eq!(view.revision, "content-revision");
         assert_eq!(view.global.len(), 6);
@@ -2136,12 +2206,97 @@ mod tests {
             trains: &BTreeMap::new(),
             policies: &BTreeMap::new(),
             input_modes: &BTreeMap::new(),
+            prompts: &prompts,
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
         .unwrap();
         assert_eq!(state.settings, view);
+    }
+
+    #[test]
+    fn prompt_actions_and_views_round_trip_and_an_old_view_defaults_to_no_prompts() {
+        const {
+            assert!(
+                WIRE_PROTOCOL_REVISION >= 4,
+                "the prompt variants need wire revision 4"
+            )
+        };
+        let save = Action::SavePrompt {
+            request: "prompt-1".to_string(),
+            role: crate::config::ExecutionRole::Implement,
+            base_revision: "rev-old".to_string(),
+            text: "implement {number}\n".to_string(),
+        };
+        let reset = Action::ResetPrompt {
+            request: "prompt-2".to_string(),
+            role: crate::config::ExecutionRole::TicketChat,
+            base_revision: "rev-old".to_string(),
+        };
+        for action in [save, reset] {
+            let text = serde_json::to_string(&action).unwrap();
+            assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
+        }
+        let push = Push::SettingsResult(SettingsResult {
+            request: "prompt-1".to_string(),
+            operation: SettingsOperation::SavePrompt,
+            status: SettingsResultStatus::Invalid,
+            revision: "rev-current".to_string(),
+            message: Some("the prompt uses the unknown placeholder {x}".to_string()),
+        });
+        let text = serde_json::to_string(&push).unwrap();
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+
+        let json = r#"{"revision":"r","global":[],"repositories":[]}"#;
+        let view: SettingsView = serde_json::from_str(json).unwrap();
+        assert!(view.prompts.is_empty());
+    }
+
+    /// The settings view writes the theory roles into their own wire field
+    /// and the prompts into a third. One round trip must return every role
+    /// in role order and every prompt, so neither field eats the other.
+    #[test]
+    fn the_settings_view_round_trips_the_theory_roles_beside_the_prompts() {
+        let text = format!(
+            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
+             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            config_text()
+        );
+        let config = Config::parse(&text).unwrap();
+        let prompts = crate::prompts::ROLES
+            .into_iter()
+            .map(|role| PromptView {
+                role,
+                source: PromptSource::File,
+                text: format!("prompt of {role}\n"),
+                revision: format!("rev-{role}"),
+            })
+            .collect::<Vec<_>>();
+        let view = SettingsView::from_config(&config, "content-revision", &prompts).unwrap();
+        assert_eq!(view.global.len(), 8);
+        assert_eq!(view.prompts, prompts);
+
+        let wire = serde_json::to_string(&view).unwrap();
+        let parsed: SettingsView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed, view, "wire: {wire}");
+        assert_eq!(
+            parsed
+                .global
+                .iter()
+                .map(|value| value.role)
+                .collect::<Vec<_>>(),
+            crate::config::ExecutionRole::ALL.to_vec(),
+            "the theory roles come back in role order"
+        );
+        assert!(
+            !parsed.prompts.iter().any(|prompt| matches!(
+                prompt.role,
+                crate::config::ExecutionRole::TheoryAudit
+                    | crate::config::ExecutionRole::TheoryChat
+            )),
+            "a theory role carries no prompt"
+        );
     }
 
     #[test]
@@ -2242,7 +2397,7 @@ mod tests {
         );
         let config = Config::parse(&text).unwrap();
         let mut view = sample_view(1);
-        view.settings = SettingsView::from_config(&config, "revision").unwrap();
+        view.settings = SettingsView::from_config(&config, "revision", &[]).unwrap();
         let push = Push::State(view);
         let text = serde_json::to_string(&push).unwrap();
 
@@ -2374,10 +2529,12 @@ mod tests {
 
     #[test]
     fn ticket_create_action_round_trips_through_one_json_line() {
-        assert_eq!(
-            WIRE_PROTOCOL_REVISION, 3,
-            "the create variant raised the revision"
-        );
+        const {
+            assert!(
+                WIRE_PROTOCOL_REVISION >= 3,
+                "the create variant needs wire revision 3"
+            )
+        };
         let action = Action::Ticket(TicketAction::Create {
             request: "create-7".to_string(),
             repo: "borsuk".to_string(),
@@ -2567,6 +2724,7 @@ mod tests {
             trains: &BTreeMap::new(),
             policies: &BTreeMap::new(),
             input_modes: &input_modes,
+            prompts: &[],
             role_bindings: &role_bindings,
             now_ms: 0,
         }
@@ -2615,6 +2773,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
@@ -2972,6 +3131,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
@@ -3214,6 +3374,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
         }
@@ -3280,6 +3441,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
         }
@@ -3387,6 +3549,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
@@ -3482,6 +3645,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
@@ -3525,6 +3689,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
@@ -3620,6 +3785,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            prompts: &[],
             role_bindings: &BTreeMap::new(),
             now_ms: 120_000,
         }

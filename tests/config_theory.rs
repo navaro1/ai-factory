@@ -200,7 +200,7 @@ fn a_theory_repo_value_must_be_owner_slash_name() {
 fn the_theory_roles_are_optional_global_tables() {
     let config =
         Config::parse(&format!("{BASE}{}", theory_tables())).expect("the theory tables must parse");
-    let view = SettingsView::from_config(&config, "revision").expect("the view must build");
+    let view = SettingsView::from_config(&config, "revision", &[]).expect("the view must build");
 
     assert_eq!(config.roles.len(), 8);
     assert_eq!(view.global.len(), 8);
@@ -239,6 +239,14 @@ fn the_theory_role_metadata_holds() {
     for role in ExecutionRole::ALL.iter().take(6) {
         assert!(role.overridable());
     }
+    // A theory role takes one prompt per task purpose, not one per role,
+    // so it carries no prompt file and the Settings view shows no prompt
+    // row for it.
+    for role in [ExecutionRole::TheoryAudit, ExecutionRole::TheoryChat] {
+        assert_eq!(aif::prompts::file_name(role), None);
+        assert!(!aif::prompts::ROLES.contains(&role));
+    }
+    assert_eq!(aif::prompts::ROLES.len(), 6);
 }
 
 #[test]

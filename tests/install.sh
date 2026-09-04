@@ -40,7 +40,7 @@ done
 config_dir="${test_home}/.config/aif"
 for file in factory.example.toml factory.toml prompts/refine.md \
     prompts/implement.md prompts/review.md prompts/release.md \
-    prompts/ticket-chat.md; do
+    prompts/ticket.md prompts/ticket-chat.md; do
     [[ -f "${config_dir}/${file}" ]] || {
         printf 'missing installed config file: %s\n' "${file}" >&2
         exit 1

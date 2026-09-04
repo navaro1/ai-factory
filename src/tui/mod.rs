@@ -486,6 +486,7 @@ impl App {
         if inbox_key(key) && (self.help || self.confirm.is_some() || !self.types_text()) {
             self.confirm = None;
             self.help = false;
+            self.settings.drop_confirmations();
             self.open_inbox_oldest();
             return true;
         }
@@ -650,29 +651,35 @@ impl App {
             }
             View::Settings => {
                 if !self.settings.typing() {
-                    match key.code {
+                    let mine = match key.code {
                         KeyCode::Char('1') => {
                             self.view = View::Pipeline;
-                            return true;
+                            true
                         }
                         KeyCode::Char('2') => {
                             self.enter_session();
-                            return true;
+                            true
                         }
                         KeyCode::Char('3') => {
                             self.view = View::Inbox;
-                            return true;
+                            true
                         }
                         KeyCode::Char('4') => {
                             self.view = View::Tickets;
-                            return true;
+                            true
                         }
-                        KeyCode::Char('5') => return true,
+                        KeyCode::Char('5') => true,
                         KeyCode::Char('?') => {
                             self.help = true;
-                            return true;
+                            true
                         }
-                        _ => {}
+                        _ => false,
+                    };
+                    if mine {
+                        // The form never saw this key, so it must still
+                        // drop a pending `d` or `Esc` confirmation.
+                        self.settings.drop_confirmations();
+                        return true;
                     }
                 }
                 if let Some(action) = self
@@ -1517,11 +1524,17 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, panel);
 }
 
+/// The number of key rows in the help overlay.
+///
+/// Two columns split the rows, so an odd count would drop the middle one.
+const HELP_ROWS: usize = 34;
+
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
-    let panel = centered(78, 18, area);
+    const { assert!(HELP_ROWS.is_multiple_of(2), "the help needs two columns") };
+    let panel = centered(78, HELP_ROWS as u16 / 2 + 2, area);
     f.render_widget(Clear, panel);
-    let rows: [(&str, &str); 32] = [
+    let rows: [(&str, &str); HELP_ROWS] = [
         ("1 2 3 4 5", "switch view"),
         ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
@@ -1554,11 +1567,13 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Enter", "edit settings value"),
         ("s r", "save / reload settings"),
         ("d", "remove repository override"),
+        ("d", "prompt row: restore the built-in"),
+        ("ctrl-s", "save the ticket or prompt editor"),
     ];
     let mut sorted = rows.to_vec();
     sorted.sort_by_key(|(key, text)| std::cmp::Reverse(key.len() + text.len()));
     let mut lines = Vec::new();
-    for row in 0..16 {
+    for row in 0..HELP_ROWS / 2 {
         let mut spans = Vec::new();
         for (column, index) in [row, sorted.len() - 1 - row].into_iter().enumerate() {
             let (key, text) = sorted[index];
@@ -2087,11 +2102,9 @@ mod tests {
         assert_eq!(app.selection, Selection::None);
     }
 
-    #[test]
-    fn a_model_discovery_message_fills_the_open_value_list() {
-        let mut surface = CountingSurface { draws: 0 };
-        let mut app = App::default();
-        let mut sink = FakeSink::default();
+    /// A pushed state whose settings hold one global row per role, plus
+    /// the given prompts.
+    fn settings_state(prompts: Vec<crate::sock::PromptView>) -> crate::sock::StateView {
         let mut state = crate::tui::pipeline::sample_view();
         state.settings = crate::sock::SettingsView {
             revision: "rev-one".to_string(),
@@ -2120,7 +2133,64 @@ mod tests {
                 })
                 .collect(),
             repositories: Vec::new(),
+            prompts,
         };
+        state
+    }
+
+    /// A `d` armed before a view switch must not delete a prompt file on
+    /// the first `d` after the operator comes back. The shell handles the
+    /// switch key itself, so it drops the confirmation.
+    #[test]
+    fn a_view_switch_drops_the_armed_prompt_reset() {
+        let state = settings_state(vec![crate::sock::PromptView {
+            role: crate::config::ExecutionRole::Refine,
+            source: crate::sock::PromptSource::File,
+            text: "refine {number}\n".to_string(),
+            revision: "prompt-rev".to_string(),
+        }]);
+        let mut app = App {
+            view: View::Settings,
+            state: Some(state),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        // BackTab wraps to the last field, which is the prompt row.
+        for code in [KeyCode::BackTab, KeyCode::Char('d')] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &mut sink);
+        }
+        assert!(sink.0.is_empty(), "the first d only arms the reset");
+
+        for character in ['1', '5', 'd'] {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut sink,
+            );
+        }
+        assert_eq!(app.view, View::Settings);
+        assert!(
+            sink.0.is_empty(),
+            "the view switch dropped the arming: {:?}",
+            sink.0
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert!(
+            matches!(sink.0.as_slice(), [Action::ResetPrompt { .. }]),
+            "two d presses in one visit send the reset: {:?}",
+            sink.0
+        );
+    }
+
+    #[test]
+    fn a_model_discovery_message_fills_the_open_value_list() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let state = settings_state(Vec::new());
 
         run_messages(
             &mut surface,
@@ -3925,6 +3995,8 @@ mod tests {
             "edit settings value",
             "save / reload settings",
             "remove repository override",
+            "prompt row: restore the built-in",
+            "save the ticket or prompt editor",
             "home / cancel settings edit",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
