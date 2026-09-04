@@ -5183,6 +5183,45 @@ mod tests {
     }
 
     #[test]
+    fn a_second_failed_ticket_chat_resume_clears_the_conversation_session() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, vec![], |_| {});
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
+        let key = ("borsuk".to_string(), 7);
+        let conversation = |rig: &Rig| rig.daemon.ticket_conversations[&key].session_id.clone();
+        let checkout = rig.repo.clone();
+        let marker = |rig: &Rig| {
+            rig.daemon
+                .worktrees
+                .read_task_session(&checkout, "borsuk/ticket-i7")
+                .unwrap()
+        };
+        assert_eq!(conversation(&rig).as_deref(), Some("session-ticket-7"));
+
+        // A failure on attempt 1 keeps every saved identity.
+        rig.event(exited("borsuk/ticket-i7", false, "boom"));
+        assert_eq!(rig.task("borsuk/ticket-i7").attempt, 2);
+        assert_eq!(conversation(&rig).as_deref(), Some("session-ticket-7"));
+        assert_eq!(marker(&rig).as_deref(), Some("session-ticket-7"));
+        assert_eq!(rig.job(1).resume.as_deref(), Some("session-ticket-7"));
+
+        // The requeue into the last attempt clears the task, the marker,
+        // and the conversation of the ticket chat.
+        rig.event(exited("borsuk/ticket-i7", false, "boom"));
+        assert_eq!(rig.task("borsuk/ticket-i7").attempt, 3);
+        assert_eq!(rig.task("borsuk/ticket-i7").session_id, None);
+        assert_eq!(conversation(&rig), None);
+        assert_eq!(marker(&rig), None);
+        assert_eq!(rig.job(2).resume, None, "the last attempt runs fresh");
+    }
+
+    #[test]
     fn a_queued_chat_message_keeps_the_saved_session_of_the_last_attempt() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 3);
