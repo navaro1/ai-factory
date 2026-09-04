@@ -756,9 +756,10 @@ impl Daemon {
 
     /// The moment the loop must wake next, as a duration from now.
     ///
-    /// The answer is the earliest of each interval train's fire moment and
-    /// each parked session's reaper expiry. `None` means the loop may block:
-    /// nothing can become due without a message.
+    /// The answer is the earliest of each interval train's fire moment, each
+    /// parked session's reaper expiry, and each identity's next usage probe.
+    /// `None` means the loop may block: nothing can become due without a
+    /// message.
     pub fn next_deadline(&self) -> Option<Duration> {
         let mut earliest: Option<u64> = None;
         for (repo, train) in &self.trains {
@@ -901,14 +902,24 @@ impl Daemon {
 
     /// Spawn one probe for every identity whose next moment is due.
     ///
-    /// At most one probe per identity runs at any time. A disabled
-    /// `[usage]` table spawns nothing, so the view stays empty and the
-    /// pipeline draws no band.
+    /// At most one probe per identity runs at any time. The pass first
+    /// drops the schedule of every retired identity. A disabled `[usage]`
+    /// table spawns nothing, so the view stays empty and the pipeline draws
+    /// no band.
     fn poll_usage(&mut self) {
         if !self.config.usage.enabled {
             return;
         }
-        for identity in usage::identities(&self.config) {
+        let identities = usage::identities(&self.config);
+        // A role edit retires an identity. Its past-due moment would keep
+        // the event loop awake with nothing to run, so the schedule maps
+        // follow the live identity set.
+        let live: BTreeSet<&str> = identities.iter().map(|one| one.id.as_str()).collect();
+        self.usage_next_probe_ms
+            .retain(|identity, _| live.contains(identity.as_str()));
+        self.usage_wait_minutes
+            .retain(|identity, _| live.contains(identity.as_str()));
+        for identity in identities {
             if self.usage_in_flight.contains(&identity.id) {
                 continue;
             }
@@ -945,6 +956,12 @@ impl Daemon {
             });
         if let Err(error) = spawned {
             self.usage_in_flight.remove(&identity.id);
+            // Without a new moment the identity stays due and every pass
+            // retries at once, so the failure takes the normal cadence.
+            self.usage_next_probe_ms.insert(
+                identity.id.clone(),
+                self.now_ms + self.config.usage.minutes * 60_000,
+            );
             eprintln!(
                 "aifd: cannot spawn the usage probe of {}: {error}",
                 identity.id
@@ -954,9 +971,11 @@ impl Daemon {
 
     /// Apply one finished probe.
     ///
-    /// A success stores the record and resets the wait. A failure keeps the
-    /// last good record, names the reason, and doubles the wait up to the
-    /// cap. Both paths clear the in-flight mark and schedule the next probe.
+    /// A success stores the record whole and resets the wait, so a reason
+    /// the probe itself reports, such as a pay-as-you-go key, reaches the
+    /// panel. A failure keeps the last good record, names the reason, and
+    /// doubles the wait up to the cap. Both paths clear the in-flight mark
+    /// and schedule the next probe.
     fn on_usage_result(&mut self, identity: &str, result: Result<UsageRecord, String>) {
         self.usage_in_flight.remove(identity);
         let current_wait = self
@@ -971,7 +990,6 @@ impl Daemon {
                     record.models = self.identity_models(identity);
                 }
                 record.updated_ms = self.now_ms;
-                record.error = None;
                 self.usage_records.insert(identity.to_string(), record);
                 self.config.usage.minutes
             }
@@ -5496,6 +5514,9 @@ mod tests {
             );
             let clock_t = t.clone();
             daemon.clock = Arc::new(move || *clock_t.lock().unwrap());
+            // The probes read their credential files under this home, so a
+            // test never reads the credentials of the operator.
+            daemon.set_usage_home(dir.join("usage-home"));
             Rig {
                 daemon,
                 exec,
@@ -13798,6 +13819,63 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_probe_keeps_the_reason_it_reports_itself() {
+        let mut rig = usage_rig();
+        let _usage_rx = rig.daemon.usage_rx.take().unwrap();
+
+        // The z.ai and zen probes answer Ok with a reason instead of a
+        // failure, because the factory spend of the identity stays valid.
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Ok(UsageRecord {
+                harness: Harness::Claude,
+                mode: usage::UsageMode::Api,
+                error: Some("pay as you go key: factory spend only".to_string()),
+                ..UsageRecord::default()
+            }),
+        });
+
+        let record = rig.daemon.usage_records.get("claude").unwrap();
+        assert_eq!(
+            record.error.as_deref(),
+            Some("pay as you go key: factory spend only")
+        );
+        assert_eq!(record.mode, usage::UsageMode::Api);
+        // The probe succeeded, so the wait stays at the configured cadence.
+        assert_eq!(
+            rig.daemon.usage_wait_minutes["claude"],
+            rig.daemon.config.usage.minutes
+        );
+        let views = rig.daemon.usage_views();
+        assert_eq!(
+            views[0].error.as_deref(),
+            Some("pay as you go key: factory spend only")
+        );
+    }
+
+    #[test]
+    fn a_later_good_probe_drops_the_error_of_the_failed_one() {
+        let mut rig = usage_rig();
+        let _usage_rx = rig.daemon.usage_rx.take().unwrap();
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Err("rate limited".to_string()),
+        });
+        assert!(rig.daemon.usage_records["claude"].error.is_some());
+
+        rig.daemon.handle(Inbound::Usage {
+            identity: "claude".to_string(),
+            result: Ok(UsageRecord {
+                harness: Harness::Claude,
+                mode: usage::UsageMode::Plan,
+                ..UsageRecord::default()
+            }),
+        });
+
+        assert_eq!(rig.daemon.usage_records["claude"].error, None);
+    }
+
+    #[test]
     fn a_failed_probe_doubles_the_wait_and_keeps_the_last_good_record() {
         let mut rig = usage_rig();
         let usage_rx = rig.daemon.usage_rx.take().unwrap();
@@ -13903,6 +13981,34 @@ mod tests {
         let reloaded = DaemonState::load(&rig.daemon.state_path);
         assert_eq!(reloaded.runtime.spend["claude"].total_usd, 0.75);
         assert_eq!(reloaded.runtime.spend["codex"].total_usd, 0.25);
+    }
+
+    #[test]
+    fn a_retired_identity_loses_its_moment_and_never_pins_the_loop_awake() {
+        let mut rig = usage_rig();
+        let _usage_rx = rig.daemon.usage_rx.take().unwrap();
+        // A role edit can retire an identity. The daemon keeps its past-due
+        // moment, which would make every deadline zero and spin the loop.
+        rig.daemon
+            .usage_next_probe_ms
+            .insert("codex".to_string(), T0 - 60_000);
+        rig.daemon
+            .usage_wait_minutes
+            .insert("codex".to_string(), 20);
+        rig.daemon
+            .usage_next_probe_ms
+            .insert("claude".to_string(), T0 + 10 * 60_000);
+        rig.daemon.now_ms = T0;
+
+        rig.daemon.drive();
+
+        assert!(!rig.daemon.usage_next_probe_ms.contains_key("codex"));
+        assert!(!rig.daemon.usage_wait_minutes.contains_key("codex"));
+        assert_eq!(
+            rig.daemon.next_deadline(),
+            Some(Duration::from_millis(10 * 60_000)),
+            "only the live identity may set the wake moment"
+        );
     }
 
     #[test]
