@@ -156,12 +156,13 @@ Use only the typed permission fields for dangerous native modes. The Settings vi
 A task binds its resolved settings when it starts. Retries, parked sessions, and restarts keep that binding.
 Later configuration changes apply only to tasks without a binding.
 
-Each role reads its prompt from `prompts/<name>.md` beside `factory.toml`:
+Six roles read a prompt from `prompts/<name>.md` beside `factory.toml`:
 `refine.md`, `implement.md`, `review.md`, `release.md`, `ticket.md`, and
-`ticket-chat.md`. An absent file means the built-in prompt. The daemon reads
-the file each time a task of the role starts. A saved prompt applies to the
-next task start. A running task keeps its prompt. The Settings view edits
-each prompt; see the `prompt` field below.
+`ticket-chat.md`. The two theory roles carry no prompt template yet. An
+absent file means the built-in prompt. The daemon reads the file each time
+a task of the role starts. A saved prompt applies to the next task start. A
+running task keeps its prompt. The Settings view edits each prompt; see the
+`prompt` field below.
 
 Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` for migration steps.
 
@@ -449,10 +450,11 @@ Repository topology changes require a daemon restart.
 
 #### The prompt of a role
 
-The last field of every role in the global scope is `prompt`. The row shows
-the source of the prompt, `built-in` or `prompts/<name>.md`, and its line
-count. Prompts have no repository scope. `Enter` opens the prompt editor
-over the whole view.
+The last field of a role in the global scope is `prompt`. The row shows the
+source of the prompt, `built-in` or `prompts/<name>.md`, and its line count.
+Prompts have no repository scope. The two theory roles carry no prompt
+template, so they show no `prompt` row. `Enter` opens the prompt editor over
+the whole view.
 
 | Key | Action |
 |---|---|

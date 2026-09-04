@@ -3912,6 +3912,55 @@ mod tests {
         assert!(text(&settings, &state, 100, 30).contains("already the built-in"));
     }
 
+    /// The editor keeps a template byte for byte through an open, a move,
+    /// and a save, and its cursor math counts characters, not bytes.
+    #[test]
+    fn the_editor_keeps_multibyte_text_byte_for_byte() {
+        let mut state = state();
+        let text_with_accents = "napraw zażółć #{number}\nkoniec\n";
+        for view in &mut state.settings.prompts {
+            view.text = text_with_accents.to_string();
+        }
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        settings.handle_key(&state, key(KeyCode::End));
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 23)));
+        settings.handle_key(&state, key(KeyCode::Left));
+        settings.handle_key(&state, key(KeyCode::Backspace));
+        assert_eq!(
+            settings.prompt_editor_text().as_deref(),
+            Some("napraw zażółć #{numbe}\nkoniec\n")
+        );
+        settings.handle_key(&state, key(KeyCode::Home));
+        for character in "łąka ".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        assert_eq!(settings.prompt_editor_cursor(), Some((0, 5)));
+
+        let mut settings = open_prompt(ExecutionRole::Implement, &state);
+        let Some(Action::SavePrompt { text: sent, .. }) = settings.handle_key(&state, ctrl('s'))
+        else {
+            panic!("ctrl-s on an unchanged prompt must still send it");
+        };
+        assert_eq!(sent, text_with_accents, "the round trip changes no byte");
+    }
+
+    /// A one-cell pane draws the editor without a panic, and so does a pane
+    /// narrower than the cursor column.
+    #[test]
+    fn the_prompt_editor_draws_in_a_tiny_pane() {
+        let mut state = state();
+        for view in &mut state.settings.prompts {
+            view.text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbb\ncc\ndd\n".to_string();
+        }
+        let mut settings = open_prompt(ExecutionRole::Refine, &state);
+        settings.handle_key(&state, key(KeyCode::End));
+        settings.handle_key(&state, key(KeyCode::PageDown));
+        settings.handle_key(&state, key(KeyCode::Up));
+        for (width, height) in [(1, 1), (2, 3), (4, 2), (20, 5), (100, 30)] {
+            text(&settings, &state, width, height);
+        }
+    }
+
     #[test]
     fn the_prompt_editor_draws_the_text_the_source_and_the_keys() {
         let state = state();
