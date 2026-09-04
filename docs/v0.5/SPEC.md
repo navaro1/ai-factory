@@ -902,7 +902,7 @@ pub enum Response { Allow, Deny { message: String },
 - A one-shot answer routes by the row kind. `Permission` + `Allow` records
   `AllowedPermission { permission, patterns }` for the task and requeues it from
   attempt 1; the next dispatch builds the job with the rule, and the rules clear
-  when the task completes or is cancelled. `Permission` + `Deny` closes the row
+  when the task completes, is cancelled, or is retired. `Permission` + `Deny` closes the row
   and leaves the task state alone. `Question` + `Text` queues the text in
   `pending_chats`, reopens the terminal task, and lets the pending-chats resume
   carry it to the recorded session. The text obeys the same `input_mode` policy

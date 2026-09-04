@@ -984,6 +984,9 @@ impl Daemon {
         self.paused.tasks.remove(id);
         self.interrupted.remove(id);
         self.restored_ids.remove(id);
+        // A rule that outlives its task names an unknown task in the state
+        // file, and the next load discards the complete state.
+        self.allowed_permissions.remove(id);
         self.decisions.drop_for_task(id);
         self.changed = true;
     }
@@ -6514,6 +6517,54 @@ mod tests {
         assert!(
             logged_lines(&rig.task("borsuk/implement-i142").log_path).is_empty(),
             "a refused answer writes no user line"
+        );
+    }
+
+    /// A retired task takes its permission rules with it. A rule that
+    /// outlives its task names an unknown task in `state.json`, and
+    /// `a_runtime_with_an_unknown_allowed_permission_task_discards_the_complete_state`
+    /// shows that the next load then discards the complete state.
+    #[test]
+    fn a_retire_drops_the_permission_rules_of_the_task() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, MAX_ATTEMPTS as usize);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(opencode_ask(
+            1,
+            "external_directory",
+            &["/home/navaro/.cargo/registry/src/*"],
+        ));
+
+        // The task still runs, so the answer arms the rule and requeues
+        // nothing. Every attempt then fails and the task ends failed.
+        rig.act(Action::Answer {
+            decision_id: ask_row_id(1),
+            response: Response::Allow,
+        });
+        assert!(rig
+            .daemon
+            .allowed_permissions
+            .contains_key("borsuk/implement-i142"));
+        for _ in 0..MAX_ATTEMPTS {
+            rig.event(exited(
+                "borsuk/implement-i142",
+                false,
+                "opencode exited with code 1",
+            ));
+        }
+        assert!(matches!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Failed(_)
+        ));
+
+        // The issue leaves GitHub, so the poll retires the failed task.
+        rig.poll(vec![], vec![]);
+
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/implement-i142"));
+        assert!(
+            rig.daemon.allowed_permissions.is_empty(),
+            "the retire drops the permission rules"
         );
     }
 
