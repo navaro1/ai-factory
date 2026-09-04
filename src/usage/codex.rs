@@ -452,6 +452,37 @@ exec sleep 30
         script(dir, "codex", &body)
     }
 
+    /// Probe the codex identity, retrying the transient `Text file busy`
+    /// race.
+    ///
+    /// The test writes its fake app server and executes it at once. On this
+    /// kernel, that exec can lose against the write-count release of the
+    /// just-closed file and fail with `Text file busy` for a few
+    /// microseconds. Production never executes a file it just wrote, so the
+    /// retry lives in this helper and not in the probe.
+    fn probe_with_retry(
+        program: &Path,
+        auth_path: &Path,
+        timeout: Duration,
+    ) -> Result<UsageRecord> {
+        for _ in 0..100 {
+            let result = probe_codex_with_timeout(
+                &ScriptExec::new(),
+                program.to_str().unwrap(),
+                auth_path,
+                NOW_MS,
+                timeout,
+            );
+            match result {
+                Err(error) if error.to_string().contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        panic!("the fake app server did not start after 100 attempts");
+    }
+
     /// An auth value with a non-empty `tokens` object.
     fn plan_auth() -> Value {
         json!({"tokens": {"id_token": "head.tail", "access_token": "secret"}})
@@ -507,14 +538,7 @@ exec sleep 30
         let program = happy_app_server(&dir);
         let auth_path = write_auth_file(&dir, &plan_auth());
 
-        let record = probe_codex_with_timeout(
-            &ScriptExec::new(),
-            program.to_str().unwrap(),
-            &auth_path,
-            NOW_MS,
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let record = probe_with_retry(&program, &auth_path, Duration::from_secs(2)).unwrap();
 
         assert_eq!(record.harness, Harness::Codex);
         assert_eq!(record.mode, UsageMode::Plan);
@@ -545,16 +569,12 @@ exec sleep 30
         let auth_path = write_auth_file(&dir, &plan_auth());
 
         let started = Instant::now();
-        let error = probe_codex_with_timeout(
-            &ScriptExec::new(),
-            program.to_str().unwrap(),
-            &auth_path,
-            NOW_MS,
-            Duration::from_millis(100),
-        )
-        .unwrap_err();
+        let error = probe_with_retry(&program, &auth_path, Duration::from_millis(100)).unwrap_err();
 
-        assert!(error.to_string().contains("did not answer in time"));
+        assert!(
+            error.to_string().contains("did not answer in time"),
+            "error was: {error:#}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

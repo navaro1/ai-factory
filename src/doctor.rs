@@ -159,12 +159,6 @@ pub struct DoctorEnv<'a> {
     pub exec: &'a dyn Exec,
 }
 
-/// The test entry of [`usage_curl_check`], which stays private.
-#[cfg(test)]
-pub fn usage_curl_check_for_tests(exec: &dyn Exec, config: &Config) -> Option<Check> {
-    usage_curl_check(exec, config)
-}
-
 /// Run every read-only check and return them in report order.
 ///
 /// The report never changes anything. A failed config does not stop the
@@ -1949,7 +1943,7 @@ mod tests {
             CmdOut::ok("curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0\n"),
         );
 
-        let check = usage_curl_check_for_tests(&exec, &config).unwrap();
+        let check = usage_curl_check(&exec, &config).unwrap();
 
         assert_eq!(check.label, "usage curl");
         assert_eq!(check.status, Status::Pass);
@@ -1961,7 +1955,7 @@ mod tests {
         let config = Config::parse(&config_text(&[], "")).unwrap();
         let exec = ScriptExec::new();
 
-        let check = usage_curl_check_for_tests(&exec, &config).unwrap();
+        let check = usage_curl_check(&exec, &config).unwrap();
 
         assert_eq!(check.status, Status::Warn);
         assert!(
@@ -1977,7 +1971,7 @@ mod tests {
         let config = Config::parse(&text).unwrap();
         let exec = ScriptExec::new();
 
-        assert!(usage_curl_check_for_tests(&exec, &config).is_none());
+        assert!(usage_curl_check(&exec, &config).is_none());
         assert!(
             !exec.calls().iter().any(|call| call.program == "curl"),
             "a disabled usage table must not run curl"
