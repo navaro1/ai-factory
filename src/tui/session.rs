@@ -1440,6 +1440,34 @@ mod tests {
     }
 
     #[test]
+    fn the_header_takes_the_role_of_the_task_the_next_show_brings() {
+        let dir = TempDir::new("swap");
+        let mut view = SessionView::new();
+        view.show(&bound_task(&dir.path().join("first.jsonl"), Some("xhigh")));
+        let screen = draw_screen(&view, 120, 10);
+        assert!(
+            screen.contains("opencode · zai-coding-plan/glm-5.3-flash · xhigh"),
+            "header: {screen}"
+        );
+
+        // Every state push and every tab switch calls `show` again. The
+        // header takes the new task's role and drops the old one.
+        let mut other = sample_task(&dir.path().join("second.jsonl"));
+        other.id = "borsuk/refine-i140".to_string();
+        other.binding = Some(crate::sock::RoleBindingView {
+            harness: crate::config::Harness::Claude,
+            model: "opus-5".to_string(),
+            effort: None,
+        });
+        view.show(&other);
+
+        let screen = draw_screen(&view, 120, 10);
+        assert!(screen.contains("claude · opus-5"), "header: {screen}");
+        assert!(!screen.contains("zai-coding-plan"), "header: {screen}");
+        assert!(!screen.contains("xhigh"), "header: {screen}");
+    }
+
+    #[test]
     fn the_draw_marks_an_older_hidden_history() {
         let dir = TempDir::new("hidden");
         let log = dir.path().join("task.jsonl");
@@ -1578,11 +1606,7 @@ mod tests {
 
     /// Render the view at 80 by 12 and return the visible text.
     fn drawn_screen(view: &SessionView) -> String {
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let area = Rect::new(0, 0, 80, 12);
-        terminal.draw(|frame| view.draw(frame, area, &[])).unwrap();
-        terminal.backend().to_string()
+        draw_screen(view, 80, 12)
     }
 
     /// Render the view and return the style of the input bar top border.

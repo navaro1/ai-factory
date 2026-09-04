@@ -266,7 +266,8 @@ parked task, and the task stays resumable.
 The session view follows the log of one task. You see the agent output and
 you converse with the agent. Press `enter` on a ticket in the pipeline to
 open its session. The header line names the harness, the model, and the
-variant of the role that the task bound for its runs.
+variant of the role that the task bound for its runs. A task that never
+started holds no binding, so its header names no role.
 
 The input bar states what your message does. The daemon decides this per
 task, and the bar never promises what the daemon refuses:
