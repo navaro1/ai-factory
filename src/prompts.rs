@@ -19,6 +19,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -461,7 +462,7 @@ pub fn save(prompts_dir: &Path, role: ExecutionRole, text: &str) -> Result<()> {
         .with_context(|| format!("cannot create {}", prompts_dir.display()))?;
     let destination = prompts_dir.join(name);
     let temporary = prompts_dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let written = fs::write(&temporary, text)
+    let written = write_all_synced(&temporary, text)
         .with_context(|| format!("cannot write {}", temporary.display()))
         .and_then(|()| {
             fs::rename(&temporary, &destination).with_context(|| {
@@ -476,6 +477,17 @@ pub fn save(prompts_dir: &Path, role: ExecutionRole, text: &str) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     written
+}
+
+/// Write one file and flush it to the storage device.
+///
+/// The flush matters because a rename follows: without it a crash can
+/// leave the renamed destination empty, and an empty prompt would start an
+/// agent with no instructions.
+fn write_all_synced(path: &Path, text: &str) -> io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 /// Remove the prompt file of one role, so the built-in template applies.
@@ -504,21 +516,13 @@ pub fn fill_template(template: &str, values: &[(&str, String)]) -> Result<String
     }
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
-    while let Some(start) = rest.find('{') {
+    while let Some((start, end, token)) = next_span(rest) {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('}') else {
-            out.push_str(&rest[start..]);
-            rest = "";
-            break;
-        };
-        let token = &after[..end];
-        if let Some((_, value)) = values.iter().find(|(name, _)| *name == token) {
-            out.push_str(value);
-        } else {
-            out.push_str(&rest[start..start + end + 2]);
+        match values.iter().find(|(name, _)| *name == token) {
+            Some((_, value)) => out.push_str(value),
+            None => out.push_str(&rest[start..end]),
         }
-        rest = &after[end + 1..];
+        rest = &rest[end..];
     }
     out.push_str(rest);
     Ok(out)
@@ -528,27 +532,47 @@ pub fn fill_template(template: &str, values: &[(&str, String)]) -> Result<String
 ///
 /// A token is placeholder-shaped when it holds only ASCII letters, digits,
 /// underscores, and hyphens. Other brace content stays untouched.
+///
+/// This walk and the one in [`fill_template`] share [`next_span`], so a
+/// template that passes [`check`] always fills.
 pub fn scan_placeholders(template: &str) -> Vec<&str> {
     let mut found: Vec<&str> = Vec::new();
     let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('}') else {
-            break;
-        };
-        let token = &after[..end];
-        if !token.is_empty()
-            && !token.contains('{')
-            && token
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            && !found.contains(&token)
-        {
+    while let Some((_, end, token)) = next_span(rest) {
+        if placeholder_shaped(token) && !found.contains(&token) {
             found.push(token);
         }
-        rest = &after[end + 1..];
+        rest = &rest[end..];
     }
     found
+}
+
+/// The next `{...}` span of `text`: the start byte, the byte after the
+/// closing brace, and the text between the braces.
+///
+/// A `{` inside a span means the true opener is the later one, so
+/// `{ and {number}` holds the span `{number}`. One stray brace therefore
+/// never hides the placeholder behind it. Every index sits on an ASCII
+/// brace, so every slice keeps a character boundary.
+fn next_span(text: &str) -> Option<(usize, usize, &str)> {
+    let mut from = 0;
+    loop {
+        let open = from + text[from..].find('{')?;
+        let after = &text[open + 1..];
+        let close = after.find('}')?;
+        match after[..close].rfind('{') {
+            Some(inner) => from = open + 1 + inner,
+            None => return Some((open, open + close + 2, &after[..close])),
+        }
+    }
+}
+
+/// True when a span between braces may name a placeholder.
+fn placeholder_shaped(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 #[cfg(test)]
@@ -594,6 +618,18 @@ mod tests {
                 assert!(
                     allowed.contains(&token),
                     "the built-in {role} prompt uses {{{token}}} outside its placeholder set"
+                );
+            }
+            // Every literal `{word}` of the text must reach the scan. A
+            // stray brace that hid one would leave it unfilled at dispatch.
+            for literal in text.split('{').skip(1).filter_map(|rest| {
+                rest.find('}')
+                    .map(|end| &rest[..end])
+                    .filter(|token| placeholder_shaped(token))
+            }) {
+                assert!(
+                    scan_placeholders(text).contains(&literal),
+                    "the built-in {role} prompt hides {{{literal}}} from the scan"
                 );
             }
         }
@@ -696,7 +732,68 @@ mod tests {
     #[test]
     fn scan_placeholders_finds_placeholder_shaped_tokens() {
         assert_eq!(scan_placeholders("{a} x {b_1} {a}"), vec!["a", "b_1"]);
-        assert!(scan_placeholders("{not a} {} {unclosed {oops}").is_empty());
+        assert!(scan_placeholders("{not a} {} {unclosed").is_empty());
+        assert_eq!(scan_placeholders(r#"{"question":"x"} {a}"#), vec!["a"]);
+    }
+
+    /// One stray `{` must not hide the placeholder behind it. The scan and
+    /// the fill share one span rule, so a template that passes the check
+    /// always fills: every placeholder-shaped token the fill would leave
+    /// literal is a token the scan reports.
+    #[test]
+    fn a_stray_brace_never_hides_the_placeholder_behind_it() {
+        for template in [
+            "Use { as a brace. Ticket {number}.",
+            "Ticket {number}. See { and {frobnicate}.",
+            "{ {number} }",
+            "{unclosed {oops}",
+        ] {
+            let scanned = scan_placeholders(template);
+            let filled = fill_template(
+                template,
+                &scanned
+                    .iter()
+                    .map(|name| (*name, format!("<{name}>")))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert!(
+                scan_placeholders(&filled).is_empty(),
+                "{template:?} left a placeholder unfilled in {filled:?}"
+            );
+        }
+
+        assert_eq!(
+            scan_placeholders("Use { as a brace. Ticket {number}."),
+            vec!["number"]
+        );
+        let error = check(ExecutionRole::Implement, "See { and {frobnicate}.").unwrap_err();
+        assert!(error.to_string().contains("{frobnicate}"), "{error:#}");
+        assert_eq!(
+            fill_template(
+                "Use { as a brace. #{number}",
+                &[("number", "142".to_string())]
+            )
+            .unwrap(),
+            "Use { as a brace. #142"
+        );
+    }
+
+    /// The parsers index by byte but cut only on ASCII braces, so a
+    /// multi-byte template neither panics nor loses a character.
+    #[test]
+    fn the_parsers_keep_multibyte_text_whole() {
+        let template = "zażółć {number} — gęślą jaźń {title}\n";
+        assert_eq!(scan_placeholders(template), vec!["number", "title"]);
+        assert_eq!(
+            fill_template(
+                template,
+                &[("number", "142".to_string()), ("title", "łódź".to_string()),],
+            )
+            .unwrap(),
+            "zażółć 142 — gęślą jaźń łódź\n"
+        );
+        assert!(scan_placeholders("żółw {ą} ok").is_empty());
     }
 
     #[test]
