@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
-    Config, ExecutionRole, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
+    Config, ExecutionRole, Harness, ReleasePolicy, ResolvedRoleSettings, RoleOverride,
+    RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
 use crate::links::Links;
@@ -346,6 +347,8 @@ pub struct StateInput<'a> {
     /// The input mode of each task, keyed by task id. The daemon decides
     /// every mode; this module only serializes it.
     pub input_modes: &'a BTreeMap<String, InputMode>,
+    /// The immutable role binding of each bound task, keyed by task id.
+    pub role_bindings: &'a BTreeMap<String, ResolvedRoleSettings>,
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -365,6 +368,7 @@ impl StateInput<'_> {
             trains,
             policies,
             input_modes,
+            role_bindings,
             now_ms,
         } = *self;
         let repos = config
@@ -423,6 +427,11 @@ impl StateInput<'_> {
                         .get(id)
                         .cloned()
                         .ok_or_else(|| anyhow!("task \"{id}\" has no input mode"))?,
+                    binding: role_bindings.get(id).map(|role| RoleBindingView {
+                        harness: role.settings.harness,
+                        model: role.settings.model.clone(),
+                        effort: role.settings.effort.clone(),
+                    }),
                     queued_messages: 0,
                 })
             })
@@ -983,6 +992,21 @@ pub struct LaneView {
     pub slots: usize,
 }
 
+/// The bound role of one task, as the session header shows it.
+///
+/// The daemon resolves these values once before the first run, and the
+/// task keeps them for every retry. They name what the task runs with,
+/// not what the config currently promises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleBindingView {
+    /// The harness the task runs with.
+    pub harness: Harness,
+    /// The model the task runs with.
+    pub model: String,
+    /// The variant of the model, when the harness takes one.
+    pub effort: Option<String>,
+}
+
 /// One task in the state view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
@@ -1006,6 +1030,12 @@ pub struct TaskView {
     pub input: InputMode,
     /// How many chat messages wait to run for this task.
     pub queued_messages: usize,
+    /// The role the task bound before its first run, when one is.
+    ///
+    /// A queued task holds no binding yet. The field stays absent on the
+    /// wire when empty, so an older daemon push still parses.
+    #[serde(default)]
+    pub binding: Option<RoleBindingView>,
 }
 
 /// One release train in the state view.
@@ -1971,6 +2001,7 @@ mod tests {
             trains: &BTreeMap::new(),
             policies: &BTreeMap::new(),
             input_modes: &BTreeMap::new(),
+            role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -2236,6 +2267,7 @@ mod tests {
             log_path: PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
             input: InputMode::NextTurn,
             queued_messages: 2,
+            binding: None,
         });
         let text = serde_json::to_string(&Push::State(view.clone())).unwrap();
         assert!(
@@ -2245,6 +2277,121 @@ mod tests {
         assert!(text.contains("\"queued_messages\":2"), "line: {text}");
         let push = serde_json::from_str::<Push>(&text).unwrap();
         assert_eq!(push, Push::State(view));
+    }
+
+    #[test]
+    fn a_task_view_round_trips_the_binding_and_parses_an_old_daemon_push() {
+        let task = TaskView {
+            id: "borsuk/implement-i142".to_string(),
+            repo: "borsuk".to_string(),
+            stage: Stage::Implement,
+            kind: ItemKind::Issue,
+            number: 142,
+            state: TaskState::Running,
+            attempt: 1,
+            log_path: PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
+            input: InputMode::NextTurn,
+            queued_messages: 0,
+            binding: Some(RoleBindingView {
+                harness: Harness::Opencode,
+                model: "zai-coding-plan/glm-5.3-flash".to_string(),
+                effort: Some("xhigh".to_string()),
+            }),
+        };
+
+        let text = serde_json::to_string(&task).unwrap();
+        assert_eq!(serde_json::from_str::<TaskView>(&text).unwrap(), task);
+
+        // An old daemon ships no binding field; the parse falls back to
+        // none and the header keeps today's line.
+        let mut old = serde_json::to_value(&task).unwrap();
+        old.as_object_mut().unwrap().remove("binding");
+        let parsed = serde_json::from_value::<TaskView>(old).unwrap();
+        let mut expected = task;
+        expected.binding = None;
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn the_view_build_ships_the_bound_role_of_each_bound_task() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let mut table = TaskTable::new();
+        let bound = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                PathBuf::from("/state/logs/borsuk__implement-i142.jsonl"),
+                1_000,
+            )
+            .unwrap()
+            .clone();
+        let queued = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                7,
+                PathBuf::from("/state/logs/borsuk__refine-i7.jsonl"),
+                1_000,
+            )
+            .unwrap()
+            .clone();
+        let binding = ResolvedRoleSettings {
+            role: ExecutionRole::Implement,
+            source: SettingsSource::Global,
+            settings: RoleSettings {
+                harness: Harness::Opencode,
+                program: "opencode".to_string(),
+                model: "zai-coding-plan/glm-5.3-flash".to_string(),
+                effort: Some("xhigh".to_string()),
+                extra_args: Vec::new(),
+                agent: None,
+                profile: None,
+                permission_mode: None,
+                permission_handler: None,
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: None,
+                sandbox: None,
+            },
+        };
+        let mut role_bindings = BTreeMap::new();
+        role_bindings.insert(bound.id.clone(), binding);
+        let mut input_modes = BTreeMap::new();
+        input_modes.insert(bound.id.clone(), InputMode::NextTurn);
+        input_modes.insert(queued.id.clone(), InputMode::Live);
+
+        let view = StateInput {
+            config: &config,
+            settings_revision: "test-revision",
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &Decisions::new(),
+            snapshot: &Snapshot::default(),
+            links: &BTreeMap::new(),
+            trains: &BTreeMap::new(),
+            policies: &BTreeMap::new(),
+            input_modes: &input_modes,
+            role_bindings: &role_bindings,
+            now_ms: 0,
+        }
+        .build()
+        .unwrap();
+
+        let bound_view = view.tasks.iter().find(|task| task.id == bound.id).unwrap();
+        let shipped = bound_view.binding.as_ref().unwrap();
+        assert_eq!(shipped.harness, Harness::Opencode);
+        assert_eq!(shipped.model, "zai-coding-plan/glm-5.3-flash");
+        assert_eq!(shipped.effort.as_deref(), Some("xhigh"));
+        let queued_view = view.tasks.iter().find(|task| task.id == queued.id).unwrap();
+        assert_eq!(queued_view.binding, None);
     }
 
     #[test]
@@ -2280,6 +2427,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -2450,6 +2598,7 @@ mod tests {
             log_path: PathBuf::from("/state/logs/borsuk__refine-i142.jsonl"),
             input: InputMode::NextTurn,
             queued_messages: 1,
+            binding: None,
         });
         server.publish(second.clone());
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(second.clone()));
@@ -2785,6 +2934,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -2850,6 +3000,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            role_bindings: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -2956,6 +3107,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             now_ms: 3_000,
@@ -3050,6 +3202,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            role_bindings: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             now_ms: 3_000,
@@ -3092,6 +3245,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &BTreeMap::new(),
+            role_bindings: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -3186,6 +3340,7 @@ mod tests {
             trains: &trains,
             policies: &policies,
             input_modes: &input_modes,
+            role_bindings: &BTreeMap::new(),
             now_ms: 120_000,
         }
         .build()
