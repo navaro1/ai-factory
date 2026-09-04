@@ -1331,9 +1331,17 @@ fn input_summary(input: &serde_json::Value) -> String {
 }
 
 /// The primary message of one question decision.
+///
+/// A one-shot harness records the ask as a pattern list, never as an
+/// option list, because the harness auto-rejects the ask and keeps the
+/// question text on its own log. That row names the log instead of
+/// blaming the payload.
 fn question_message(questions: &serde_json::Value) -> String {
     let parsed = parse_questions(questions);
     let Some(first) = parsed.first() else {
+        if questions.get("patterns").is_some() {
+            return "The agent asked a question. Read the task log for its text.".to_string();
+        }
         return "The agent sent a question with unreadable options.".to_string();
     };
     if parsed.len() == 1 {
@@ -2613,6 +2621,42 @@ mod tests {
         assert_eq!(
             feed_message(&decision),
             "Allow external_directory for /home/navaro/.cargo/registry/src/*?"
+        );
+    }
+
+    /// A one-shot question row carries a pattern list, never an option
+    /// list. The feed points at the task log instead of blaming the
+    /// payload, and the row still offers the text input.
+    #[test]
+    fn a_one_shot_question_row_points_at_the_task_log() {
+        let worker = worker();
+        let decision = Decision::question(
+            &worker,
+            "rej-2",
+            serde_json::json!({"patterns": []}),
+            OPENED,
+        );
+
+        assert_eq!(
+            feed_message(&decision),
+            "The agent asked a question. Read the task log for its text."
+        );
+        assert_eq!(
+            feed_actions(&decision),
+            "[1-9] pick · [s] submit · [i] write · [enter] details"
+        );
+    }
+
+    /// A malformed claude payload keeps the old message: nothing points at
+    /// a pattern list there, so the row still blames the options.
+    #[test]
+    fn a_malformed_question_payload_still_names_the_unreadable_options() {
+        let worker = worker();
+        let decision = Decision::question(&worker, "q-1", serde_json::json!({"nope": 1}), OPENED);
+
+        assert_eq!(
+            feed_message(&decision),
+            "The agent sent a question with unreadable options."
         );
     }
 

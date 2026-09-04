@@ -912,6 +912,11 @@ pub enum Response { Allow, Deny { message: String },
   the whole prompt. An accepted text writes one user line into the task log,
   like every other queue-path message. `Question` + `Answers` is refused and
   re-pushes the row, because a one-shot row carries no option list.
+- The inbox names a one-shot row by its payload. A `Permission` row reads
+  `Allow external_directory for /home/navaro/.cargo/registry/src/*?` from the
+  `patterns` array. A `Question` row carries a pattern list and no options, so it
+  points at the task log instead of blaming the payload, and the operator answers
+  it with the text input.
 - Sources are wired by the daemon in chunk 15; this chunk owns the type, the
   queue, the id rules, and the validation.
 - The `NeedsHuman` source reads the `needs-human` label. Opening it must not
