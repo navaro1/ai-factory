@@ -53,6 +53,7 @@ grep -Fq 'start all agents for that wave in one tool turn' \
     "${config_dir}/prompts/implement.md"
 grep -Fq 'Push once, at the end of the run' \
     "${config_dir}/prompts/review.md"
+grep -Fq 'Run without the operator.' "${config_dir}/prompts/release.md"
 
 for file in factory.example.toml factory.toml; do
     grep -q '/home/you/Workplace/borsuk' "${config_dir}/${file}" || {

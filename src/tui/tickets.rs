@@ -124,6 +124,27 @@ impl Tickets {
         self.focus
     }
 
+    /// Open the focus view of one issue and request its details.
+    ///
+    /// The call mirrors the `enter` key of the list. The nested state of
+    /// the same issue survives; a different issue starts with a clean
+    /// state.
+    pub fn open(&mut self, repo: &str, number: u64) -> Option<Action> {
+        let key = (repo.to_string(), number);
+        if self.focus_key.as_ref() != Some(&key) {
+            self.clear_issue_state();
+        }
+        self.focus = true;
+        self.focus_key = Some(key);
+        self.details = None;
+        self.result = None;
+        Some(Action::Ticket(TicketAction::Details {
+            request: request_code(),
+            repo: repo.to_string(),
+            number,
+        }))
+    }
+
     /// True while this view owns text input.
     pub fn typing(&self) -> bool {
         self.searching
@@ -1421,6 +1442,42 @@ mod tests {
         assert_eq!(repo, "borsuk");
         assert_eq!(number, 7);
         assert!(tickets.focus_open());
+    }
+
+    #[test]
+    fn open_focuses_one_issue_and_requests_its_details() {
+        let mut tickets = Tickets::default();
+
+        let action = tickets.open("borsuk", 142);
+
+        let Some(Action::Ticket(TicketAction::Details {
+            request,
+            repo,
+            number,
+        })) = action
+        else {
+            panic!("open must request ticket details");
+        };
+        assert!(!request.is_empty());
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 142);
+        assert!(tickets.focus_open());
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 142)));
+
+        // The same issue keeps its nested state; another issue clears it.
+        let state = state();
+        tickets.open("borsuk", 7);
+        tickets.observe_details(details());
+        tickets.handle_key(&state, key(KeyCode::Char('e')));
+        assert!(tickets.editor.as_ref().is_some_and(|editor| editor.open));
+        assert!(tickets.open("borsuk", 7).is_some());
+        assert!(
+            tickets.editor.as_ref().is_some_and(|editor| editor.open),
+            "the same issue keeps its editor"
+        );
+        assert!(tickets.open("borsuk", 142).is_some());
+        assert!(tickets.editor.is_none(), "another issue clears the state");
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 142)));
     }
 
     #[test]

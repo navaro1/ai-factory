@@ -206,3 +206,134 @@ fn aifd_run_with_a_missing_config_fails_and_names_the_file() {
         stderr(&output)
     );
 }
+
+/// A git checkout with an `origin` remote, for the daemon start.
+fn git_checkout(dir: &Path) -> PathBuf {
+    let repo = dir.join("borsuk");
+    for arguments in [
+        vec!["init", "-q", repo.to_str().unwrap()],
+        vec![
+            "-C",
+            repo.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:acme/borsuk.git",
+        ],
+    ] {
+        let outcome = Command::new("git")
+            .args(&arguments)
+            .output()
+            .expect("git must run");
+        assert!(
+            outcome.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+    }
+    repo
+}
+
+/// Wait until the path exists, or panic after the timeout.
+fn wait_for(path: &Path, timeout: std::time::Duration, what: &str) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("timeout while waiting for {what}: {}", path.display());
+}
+
+#[test]
+fn a_sigterm_stops_the_daemon_cleanly_and_saves_the_paused_runtime() {
+    let dir = temp_dir("sigterm");
+    let config_home = dir.join("config");
+    let state_home = dir.join("state");
+    let runtime_dir = dir.join("runtime");
+    let bin_dir = dir.join("bin");
+    for path in [&config_home, &state_home, &runtime_dir, &bin_dir] {
+        fs::create_dir_all(path).expect("the test directories must be creatable");
+    }
+    let stderr_log = dir.join("aifd.stderr");
+    let repo = git_checkout(&dir);
+
+    // A stub `gh` first on PATH keeps the poll offline.
+    let gh = bin_dir.join("gh");
+    fs::write(&gh, "#!/bin/sh\nexit 0\n").expect("the gh stub must be writable");
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))
+        .expect("the gh stub must be executable");
+
+    let config_dir = config_home.join("aif");
+    fs::create_dir_all(&config_dir).expect("the config directory must be creatable");
+    let config_path = config_dir.join("factory.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "schema_version = 1\n\
+             \n[stage.refine]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 2\n\
+             \n[stage.implement]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
+             \n[stage.review]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 2\n\
+             \n[stage.release]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
+             \n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
+             \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n\
+             permission_mode = \"manual\"\npermission_handler = \"inbox\"\n\
+             tools = [\"Read\", \"Glob\", \"Grep\"]\n\
+             \n[repo.borsuk]\npath = \"{}\"\n",
+            repo.display()
+        ),
+    )
+    .expect("the config must be writable");
+
+    let socket = runtime_dir.join("aif").join("daemon.sock");
+    let state_path = state_home.join("aif").join("state.json");
+    let stderr_file = fs::File::create(&stderr_log).expect("the stderr log must be creatable");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aifd"))
+        .args(["run", "--config", config_path.to_str().unwrap(), "--paused"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()
+        .expect("the daemon must start");
+
+    wait_for(
+        &socket,
+        std::time::Duration::from_secs(30),
+        "the daemon socket",
+    );
+    let stop = Command::new("kill")
+        .args(["-TERM", child.id().to_string().as_str()])
+        .status()
+        .expect("kill must run");
+    assert!(stop.success(), "the SIGTERM delivery must succeed");
+
+    let status = child.wait().expect("the daemon must be waitable");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the daemon must exit with code 0; see {}",
+        stderr_log.display()
+    );
+    assert!(
+        !socket.exists(),
+        "the socket file must be gone after the exit"
+    );
+    let state = fs::read_to_string(&state_path).expect("the forced state write must exist");
+    assert!(
+        state.contains("\"runtime\":{\"paused\":{\"global\":true"),
+        "the state file must hold the runtime pause marks: {state}"
+    );
+
+    fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+}

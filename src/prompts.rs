@@ -9,12 +9,28 @@
 //! "PR". A `gh` command inside backticks keeps the GitHub word, because
 //! the CLI speaks its own nouns.
 
+/// The notice that precedes the rendered prompt of a task the daemon
+/// interrupted with a stop.
+///
+/// The daemon prepends it only to a run that resumes the saved session of
+/// such a task. The agent reads the worktree to find its place instead of
+/// repeating finished work.
+pub const RESTART_NOTICE: &str = "Note: the AI Factory daemon stopped and restarted \
+while this task ran. This run continues your saved session. Read the worktree \
+state first to find where you stopped, then continue the remaining work. Do not \
+repeat work that is already done.";
+
 /// The built-in prompt of a refine run.
 ///
 /// It runs in the repository checkout and never creates a worktree.
 pub const REFINE_PROMPT: &str = r#"You refine ticket #{number} of {repo}
 ({owner_repo}). You work in {worktree}, the repository checkout. Never create
 a git worktree; stay in this checkout.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 Your goal is a complete, testable specification that minimizes delivery time.
 Do not implement the change.
@@ -49,7 +65,12 @@ Edit the ticket body with `gh`. Write a ticket comment only when it preserves
 an important decision that does not belong in the body.
 
 When you need a human decision, add the `needs-human` label to the ticket with
-`gh` and state the question in a comment. Stop after the label is on.
+`gh` and state the question in a comment. Stop after the label is on. When the
+decision is a choice between named answers, end the comment with one strict
+block in this form. Keep the JSON on one line:
+<aif-ask-v1>
+{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
+</aif-ask-v1>
 
 When the specification is complete, run
 `gh issue edit {number} --remove-label to-refine --add-label refined`.
@@ -65,6 +86,11 @@ Ticket #{number}: {title}
 pub const IMPLEMENT_PROMPT: &str = r#"You implement ticket #{number} of {repo}
 ({owner_repo}). You work in {worktree}, your own git worktree. Never create
 another git worktree; work only in this one.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 Your goal is a complete change that meets every acceptance criterion with the
 shortest safe delivery time. Follow the repository instructions and keep the
@@ -103,7 +129,12 @@ Open a draft PR with `gh pr create --draft` when the work is done. Put
 
 If the specification is incomplete, or you need a human decision, add the
 `needs-human` label to ticket #{number} with `gh`, write the question into a
-comment on it, and stop. Do not guess.
+comment on it, and stop. Do not guess. When the decision is a choice between
+named answers, end the comment with one strict block in this form. Keep the JSON
+on one line:
+<aif-ask-v1>
+{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
+</aif-ask-v1>
 
 Report one line at the end: what you did, and the PR number.
 
@@ -116,6 +147,11 @@ Ticket #{number}: {title}
 pub const REVIEW_PROMPT: &str = r#"You review PR #{number} of {repo}
 ({owner_repo}). You work in {worktree}, your own git worktree. Never create
 another git worktree; work only in this one.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 PR #{number}: {title}
 
@@ -162,7 +198,12 @@ When the PR needs no repair, post the record and run `gh pr ready {number}`.
 Take the human path when the PR comes from a fork, when a finding needs a human
 decision, when the repair leaves the scope of the linked tickets, or when the
 push fails. On that path, add the `needs-human` label to the PR with `gh`, write
-the question into a comment, leave the draft, and stop. Do not guess.
+the question into a comment, leave the draft, and stop. Do not guess. When the
+decision is a choice between named answers, end the comment with one strict
+block in this form. Keep the JSON on one line:
+<aif-ask-v1>
+{"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
+</aif-ask-v1>
 
 Report one line at the end: the review verdict, and the number of commits you
 pushed.
@@ -172,6 +213,11 @@ pushed.
 pub const RELEASE_PROMPT: &str = r#"You release the stacked PRs of {repo}
 ({owner_repo}). You work in {worktree}, the release worktree. Never create
 another git worktree; work only in this one.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 The batch holds {pr_count} PR(s), in merge order:
 
@@ -309,6 +355,16 @@ mod tests {
     }
 
     #[test]
+    fn the_choice_prompts_show_a_block_that_the_ask_parser_accepts() {
+        for prompt in [REFINE_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT] {
+            let ask = crate::ask::parse_ask_block(prompt)
+                .expect("the choice prompt must contain one valid ask block");
+            assert_eq!(ask.question, "Which workload mode ships first?");
+            assert_eq!(ask.options.len(), 2);
+        }
+    }
+
+    #[test]
     fn the_refine_prompt_defines_a_parallel_execution_plan() {
         let prompt = REFINE_PROMPT
             .split_whitespace()
@@ -365,6 +421,38 @@ mod tests {
             "add the `needs-human` label to the PR",
         ] {
             assert!(prompt.contains(required), "missing: {required}");
+        }
+    }
+
+    #[test]
+    fn the_stage_prompts_run_without_the_operator() {
+        let paragraph = "Run without the operator. No person reads your text during \
+the run. Do not ask for approval of a plan, a design, or a change. Do not \
+stop to report a plan, and do not end a turn with a question. Decide with \
+the facts you have and act. Stop early only through the escape this prompt \
+names.";
+        for (prompt, opening_end) in [
+            (REFINE_PROMPT, "stay in this checkout."),
+            (IMPLEMENT_PROMPT, "work only in this one."),
+            (REVIEW_PROMPT, "work only in this one."),
+            (RELEASE_PROMPT, "work only in this one."),
+        ] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            let position = normalized
+                .find(paragraph)
+                .expect("the stage prompt holds the autonomy paragraph");
+            let before = normalized[..position].trim_end();
+            assert!(
+                before.ends_with(opening_end),
+                "the autonomy paragraph does not follow the opening paragraph: {before}"
+            );
+        }
+        for prompt in [TICKET_PROMPT, TICKET_CHAT_PROMPT] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !normalized.contains(paragraph),
+                "a ticket prompt must not hold the autonomy paragraph"
+            );
         }
     }
 }
