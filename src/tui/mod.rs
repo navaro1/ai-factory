@@ -356,6 +356,7 @@ impl App {
     fn mark_disconnected(&mut self, reason: String) {
         self.connected = false;
         self.disconnect = Some(reason);
+        self.tickets.delivery_failed(None);
         self.settings.delivery_failed(None);
     }
 
@@ -638,7 +639,10 @@ impl App {
                     .as_ref()
                     .and_then(|state| self.tickets.handle_key(state, key))
                 {
-                    emit(self, sink, action, "sent ticket request".to_string());
+                    let copy = action.clone();
+                    if !emit(self, sink, action, "sent ticket request".to_string()) {
+                        self.tickets.delivery_failed(Some(&copy));
+                    }
                 }
                 if key.code == KeyCode::Esc && !nested {
                     self.view = View::Pipeline;
@@ -1513,7 +1517,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("h l", "switch session, chat unfocused"),
         ("y n i t c s w 1-9", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ e L c a m", "search and ticket keys"),
+        ("/ n e L c a m", "search and ticket keys"),
         ("h l", "repo / ticket / settings scope"),
         ("j k", "settings role"),
         ("Tab", "select settings field"),
@@ -2191,6 +2195,7 @@ mod tests {
             "PageUp PageDown",
             "PageDown",
             "End",
+            "/ n e L c a m",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
@@ -2295,6 +2300,94 @@ mod tests {
         assert!(!app.help, "the letters went into the reason input");
         let text = render_to_string(&mut app);
         assert!(text.contains("reason: q?"), "screen: {text}");
+    }
+
+    #[test]
+    fn the_new_ticket_form_types_a_digit_instead_of_switching_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let ctrl_s = Msg::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('4'),
+                key('n'),
+                key('1'),
+                ctrl_s,
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets, "1 must not switch the view");
+        assert!(app.tickets.typing(), "the form kept the keyboard");
+        let [crate::sock::Action::Ticket(crate::sock::TicketAction::Create { repo, title, .. })] =
+            sink.0.as_slice()
+        else {
+            panic!("ctrl-s must send the typed title: {:?}", sink.0);
+        };
+        assert_eq!(repo, "borsuk", "the form targets the first repository");
+        assert_eq!(title, "1", "the digit went into the title");
+    }
+
+    #[test]
+    fn a_failed_ticket_send_keeps_the_draft_and_allows_a_retry() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut FailSink,
+        );
+        app.handle_key(ctrl_s, &mut FailSink);
+
+        let mut sink = FakeSink::default();
+        app.handle_key(ctrl_s, &mut sink);
+
+        let [Action::Ticket(crate::sock::TicketAction::Create { title, .. })] = sink.0.as_slice()
+        else {
+            panic!("the retry must send the retained ticket draft");
+        };
+        assert_eq!(title, "x");
+    }
+
+    #[test]
+    fn a_disconnect_unlocks_a_pending_ticket_send() {
+        let mut app = App {
+            view: View::Tickets,
+            state: Some(crate::tui::pipeline::sample_view()),
+            ..App::default()
+        };
+        let mut sink = FakeSink::default();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        app.handle_key(ctrl_s, &mut sink);
+
+        app.mark_disconnected("lost".to_string());
+        app.handle_key(ctrl_s, &mut sink);
+
+        assert_eq!(sink.0.len(), 2, "the disconnect must allow one retry");
     }
 
     #[test]
@@ -3166,7 +3259,7 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         for entry in [
-            "/ e L c a m",
+            "/ n e L c a m",
             "search and ticket keys",
             "repo / ticket / settings scope",
         ] {

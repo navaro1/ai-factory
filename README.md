@@ -347,6 +347,7 @@ issues inside the active tab.
 |---|---|---|
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
+| List | `n` | Create a ticket in the active repository tab. |
 | List | `enter` | Open the selected issue. |
 | Issue | `j` / `k` or Down / Up | Scroll the issue pane by one line. |
 | Issue | `h` / `l` or Left / Right | Open the previous or the next issue of the tab. |
