@@ -18,7 +18,7 @@ refine ──▶ implement ──▶ review ──▶ release
 |---|---|---|
 | refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
-| review | OpenCode, GPT-5.6 | The agent reviews the change and marks the pull request ready. |
+| review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
@@ -64,12 +64,12 @@ do not exist:
 |---|---|
 | `factory.toml` | Your configuration, copied from the example. |
 | `factory.example.toml` | A portable reference copy of the example. |
-| `prompts/*.md` | The four stage prompts and the ticket chat prompt. |
+| `prompts/*.md` | The six role prompts: the four stages, ticket creation, and ticket chat. |
 
 The installer never overwrites a file that exists. The installer keeps an
 installed prompt file. After an upgrade, copy the new prompt files from
-`docs/v0.6/prompts/` by hand. Edit `~/.config/aif/factory.toml` and set the
-path of every repository.
+`docs/v0.6/prompts/` by hand, or edit each prompt in the Settings view.
+Edit `~/.config/aif/factory.toml` and set the path of every repository.
 
 ## Configure
 
@@ -86,6 +86,7 @@ limit = 3
 [stage.implement]
 harness = "opencode"
 model = "zai-coding-plan/glm-5.3-flash"
+auto_approve = true
 limit = 3
 
 [stage.review]
@@ -93,6 +94,7 @@ harness = "opencode"
 model = "openai/gpt-5.6-sol"
 effort = "xhigh"
 extra_args = []
+auto_approve = true
 limit = 7
 
 [stage.release]
@@ -135,6 +137,12 @@ effort = "max"
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
 OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
 
+Set `auto_approve = true` on every unattended opencode role. Without it,
+opencode auto-rejects every permission request. Tools that read outside the
+project directory then fail, and the task loses its evidence. The run can
+still end `ok`. `aif doctor` reports a `permissions` warning for each opencode
+role that lacks the approval.
+
 A repository role table can override individual fields. A harness change requires a complete role block.
 The Settings view marks inherited repository values with `~`.
 
@@ -147,6 +155,14 @@ Use only the typed permission fields for dangerous native modes. The Settings vi
 
 A task binds its resolved settings when it starts. Retries, parked sessions, and restarts keep that binding.
 Later configuration changes apply only to tasks without a binding.
+
+Six roles read a prompt from `prompts/<name>.md` beside `factory.toml`:
+`refine.md`, `implement.md`, `review.md`, `release.md`, `ticket.md`, and
+`ticket-chat.md`. The two theory roles carry no prompt template yet. An
+absent file means the built-in prompt. The daemon reads the file each time
+a task of the role starts. A saved prompt applies to the next task start. A
+running task keeps its prompt. The Settings view edits each prompt; see the
+`prompt` field below.
 
 Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` for migration steps.
 
@@ -217,6 +233,14 @@ The release lane puts the next, active, or retry batch inside a border.
 The waiting pull requests start below the border.
 The oldest request is at the top, and the newest request is at the bottom.
 
+One piece of work holds one row. A finished task loses its row as soon as a
+later lane shows the same work: a done refine yields to its implement, a done
+implement yields to the review of its pull request, and a done review yields
+to the release train that holds that pull request. A failed task keeps its row
+until a later lane picks the work up, so you can always retry it. The daemon
+drops the tasks of an issue or a pull request that left GitHub, so a merge
+leaves no row behind.
+
 | Key | Action |
 |---|---|
 | `j` / `k` or Up / Down | Move the selection inside a lane. |
@@ -249,7 +273,9 @@ parked task, and the task stays resumable.
 
 The session view follows the log of one task. You see the agent output and
 you converse with the agent. Press `enter` on a ticket in the pipeline to
-open its session.
+open its session. The header line names the harness, the model, and the
+variant of the role that the task bound for its runs. A task that never
+started holds no binding, so its header names no role.
 
 The input bar states what your message does. The daemon decides this per
 task, and the bar never promises what the daemon refuses:
@@ -347,9 +373,13 @@ issues inside the active tab.
 |---|---|---|
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
+| List | `n` | Create a ticket in the active repository tab. |
 | List | `enter` | Open the selected issue. |
+| Issue | `j` / `k` or Down / Up | Scroll the issue pane by one line. |
+| Issue | `h` / `l` or Left / Right | Open the previous or the next issue of the tab. |
 | Issue | `e` | Edit the title and description. |
-| Issue | `l` | Open the repository label picker. |
+| Issue | `L` | Open the repository label picker. |
+| Issue | `m` | Add the label `to-refine`. A prompt asks first. |
 | Issue | `c` | Start or resume the configured ticket chat. |
 | Issue | `a` | Apply the latest shown agent proposal. |
 | Editor | `ctrl-s` | Save the content edit. |
@@ -360,6 +390,10 @@ issues inside the active tab.
 | Nested view | `esc` | Return one level. |
 
 The issue focus shows all issue details and the GitHub reference.
+A dim hint line under the pane names these keys.
+The issue move follows the order and the search filter of the list.
+It stops at the first issue and at the last issue of the tab.
+It never changes the repository tab.
 Wide terminals put the details and chat beside each other.
 Narrow terminals put the chat below the details.
 
@@ -369,17 +403,17 @@ AIF applies a shown proposal only after key `a`.
 
 ### Settings, view 5
 
-The Settings view edits all six execution roles. It supports global and repository scopes.
+The Settings view edits every execution role. It supports global and repository scopes. The two theory roles take no repository override.
 
 | Key | Action |
 |---|---|
 | `h` / `l` | Select the global or repository scope. |
 | `j` / `k` | Select a role, or a row inside an open list. |
 | `Tab` | Select a field. |
-| `Enter` | Open the value list of the field, or apply the marked row. |
-| `d` | Remove the selected repository override. |
+| `Enter` | Open the value list of the field, or apply the marked row. On `prompt`, open the prompt editor. |
+| `d` | Remove the selected repository override. On `prompt`, restore the built-in prompt after a second `d`. |
 | `s` | Save the draft. |
-| `r` | Reload the file. |
+| `r` | Reload the file and the prompt files. |
 | `Esc` | Close a list, cancel an edit, or confirm draft removal. |
 
 `Enter` opens a value list on these fields: `harness`, `program`, `model`,
@@ -414,6 +448,33 @@ Narrow terminals stack the role list above the form.
 The daemon rejects a stale save if the file changed after the draft loaded.
 Repository topology changes require a daemon restart.
 
+#### The prompt of a role
+
+The last field of a role in the global scope is `prompt`. The row shows the
+source of the prompt, `built-in` or `prompts/<name>.md`, and its line count.
+Prompts have no repository scope. The two theory roles carry no prompt
+template, so they show no `prompt` row. `Enter` opens the prompt editor over
+the whole view.
+
+| Key | Action |
+|---|---|
+| typed text | Insert at the cursor. `Enter` starts a new line. |
+| Arrows, `Home`, `End` | Move the cursor. |
+| `PageUp` / `PageDown` | Move the cursor 20 lines. |
+| `Backspace` / `Delete` | Remove the character before or under the cursor. |
+| `ctrl-s` | Save the prompt file through the daemon. |
+| `Esc` | Close the editor. A changed prompt asks for a second `Esc`. |
+
+The daemon checks the prompt before it writes the file. A placeholder that
+the role cannot fill blocks the save, and the message names it and lists
+the known placeholders. The daemon also refuses a save when the prompt file
+changed on disk after the editor opened. The message says so, and a second
+`ctrl-s` overwrites the file. A saved prompt applies to the next task of the
+role. A running task keeps its prompt.
+
+`d` on the `prompt` row asks for a second `d`, then removes the prompt file.
+The role returns to the built-in prompt.
+
 ## How state survives
 
 - GitHub carries the flow. The labels and the pull request states are the
@@ -438,8 +499,12 @@ Repository topology changes require a daemon restart.
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
-- An interrupted turn restarts from the stage prompt plus the restart
-  notice. The agent reads the worktree to find its place.
+- A re-queued task resumes its saved agent session. Only the first prompt
+  after a daemon restart carries the restart notice; a retry after a
+  failure carries none.
+- A session that the harness can no longer resume wastes the earlier
+  attempts. Only the last attempt starts a fresh session. A task that holds
+  a queued chat message keeps its session, because the message names it.
 - A `SIGKILL` or a power loss keeps the snapshot of the last drive, not of
   the last event.
 - Anyone who can set the trigger labels on a repository can start work
@@ -448,7 +513,14 @@ Repository topology changes require a daemon restart.
   tool again next time.
 - An implement or review turn that already runs can not change course. A
   message waits for the next turn.
+- An opencode role without `auto_approve = true` auto-rejects every
+  permission request in an unattended run. Its tools fail. `aif doctor`
+  reports each such role.
 - A release gate row refreshes at the poll after you stack a pull request.
+- A review push on a draft pull request can restart that review at the next
+  poll.
+- A review of a pull request from a fork takes the `needs-human` path before a
+  repair.
 
 ## Development
 

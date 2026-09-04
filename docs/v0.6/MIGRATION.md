@@ -88,8 +88,16 @@ subagents with separate file ownership.
 The installer writes the version 0.6 prompts only when a prompt file is absent.
 An existing prompt file still overrides the built-in prompt.
 
+The installer now writes `prompts/ticket.md` too. The ticket-creation prompt
+takes a file override for the first time. Version 0.5 read no file for it.
+
 Compare each existing prompt with `docs/v0.6/prompts/`. Replace the existing
 copy when you want the new execution contract.
+
+The Settings view edits each prompt in place. Select a role, press `Tab` to
+the `prompt` field, and press `Enter`. `ctrl-s` saves the file. `d` on the
+row restores the built-in prompt. A saved prompt applies to the next task of
+the role.
 
 ## Extra arguments
 
