@@ -950,4 +950,23 @@ mod tests {
         assert_eq!(line_text(&wide[0]), "▌ 界");
         assert_eq!(line_text(&wide[1]), "  界");
     }
+
+    #[test]
+    fn a_dispatch_failure_line_reaches_the_transcript() {
+        let line = "aif: dispatch failed: cannot prepare the worktree: git reset failed: \
+                    fatal: ambiguous argument 'FETCH_HEAD'";
+
+        let entries = parse(line);
+
+        assert_eq!(entries.len(), 1);
+        let Entry::Raw { text } = &entries[0] else {
+            panic!("a line that is not JSON must stay raw: {:?}", entries[0]);
+        };
+        assert_eq!(text, line);
+        let rendered: String = render(&entries[0], 200)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(rendered.contains("dispatch failed"), "rendered: {rendered}");
+    }
 }

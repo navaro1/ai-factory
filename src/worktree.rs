@@ -310,14 +310,7 @@ impl WorktreeManager {
         if !path.exists() {
             return Ok(());
         }
-        let Some(name) = path.file_name() else {
-            bail!("cannot name the stale sibling of {}", path.display());
-        };
-        let stale = path.with_file_name(format!(
-            "{}.stale-{}",
-            name.to_string_lossy(),
-            unix_millis()
-        ));
+        let stale = stale_sibling(path, unix_millis())?;
         fs::rename(path, &stale).with_context(|| {
             format!(
                 "cannot move the stale directory {} to {}",
@@ -556,6 +549,26 @@ fn git(exec: &dyn Exec, dir: &Path, args: &[&str]) -> Result<CmdOut> {
     let mut argv: Vec<&str> = vec!["-C", dir_text.as_str()];
     argv.extend_from_slice(args);
     exec.run("git", &argv, None).context("git could not run")
+}
+
+/// The free sibling path that receives a stale worktree directory.
+///
+/// The name is `<name>.stale-<stamp>`. A second recovery of the same path
+/// inside one millisecond finds that name taken, so the function appends
+/// `-1`, `-2`, and so on until the path is free. A rename onto a taken
+/// path would fail on a non-empty directory, or merge two stale trees.
+fn stale_sibling(path: &Path, stamp: u64) -> Result<PathBuf> {
+    let Some(name) = path.file_name() else {
+        bail!("cannot name the stale sibling of {}", path.display());
+    };
+    let name = name.to_string_lossy();
+    let mut candidate = path.with_file_name(format!("{name}.stale-{stamp}"));
+    let mut extra = 0u32;
+    while candidate.exists() {
+        extra += 1;
+        candidate = path.with_file_name(format!("{name}.stale-{stamp}-{extra}"));
+    }
+    Ok(candidate)
 }
 
 /// The current time in milliseconds since the Unix epoch.
@@ -1331,6 +1344,25 @@ mod tests {
         fs::remove_dir_all(&root).expect("the temp dir must be removable");
     }
 
+    #[test]
+    fn stale_sibling_skips_a_name_that_exists() {
+        let root = temp_root("stale-sibling");
+        let path = root.join("issue-7");
+        fs::create_dir_all(&path).expect("the worktree dir must be creatable");
+        fs::create_dir_all(root.join("issue-7.stale-42")).expect("the taken dir must be creatable");
+        fs::create_dir_all(root.join("issue-7.stale-42-1"))
+            .expect("the second taken dir must be creatable");
+
+        let free = stale_sibling(&path, 42).unwrap();
+
+        assert_eq!(free, root.join("issue-7.stale-42-2"));
+        assert_eq!(
+            stale_sibling(&root.join("issue-8"), 42).unwrap(),
+            root.join("issue-8.stale-42"),
+            "a free name takes no counter"
+        );
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
     #[test]
     fn ensure_train_resets_an_existing_worktree_through_the_documented_commands() {
         let root = temp_root("argv-train");
