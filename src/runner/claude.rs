@@ -1916,10 +1916,21 @@ done
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
 
         // The ask reaches the caller as a human question, yolo or not.
-        let (request_id, tool, _input, _suggestions, needs_human) = wait_for_ask(&rx);
+        let (request_id, tool, input, _suggestions, needs_human) = wait_for_ask(&rx);
         assert_eq!(request_id, "req-ask");
         assert_eq!(tool, "AskUserQuestion");
         assert!(needs_human);
+        // The input is the whole tool input, so the question list stays
+        // under `questions`. The inbox reads the payload in that shape.
+        let questions = input
+            .get("questions")
+            .and_then(Value::as_array)
+            .expect("the ask input carries the question list under `questions`");
+        assert_eq!(questions.len(), 1);
+        assert_eq!(
+            questions[0].get("header").and_then(Value::as_str),
+            Some("Database")
+        );
         // The runner wrote no answer of its own: the child is still waiting.
         assert!(
             responses_in_log(&dir, "req-ask").is_empty(),

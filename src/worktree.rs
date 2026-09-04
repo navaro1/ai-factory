@@ -63,6 +63,10 @@ impl WorktreeKind {
 /// the manager is the single source of the directory names.
 pub const WORKTREE_KINDS: [WorktreeKind; 2] = [WorktreeKind::Issue, WorktreeKind::Pr];
 
+/// The directory name of the train worktree. The manager owns this name,
+/// so every caller that prints it reads this const.
+pub const TRAIN_DIR: &str = "train";
+
 /// Creates, reuses, and removes one git worktree per issue, plus the train
 /// worktree of a repository.
 ///
@@ -107,7 +111,7 @@ impl WorktreeManager {
         self.state_dir
             .join("worktrees")
             .join(&repo.alias)
-            .join("train")
+            .join(TRAIN_DIR)
     }
 
     /// The issue branch name: `aif/<alias>/issue-<n>`.
@@ -680,6 +684,7 @@ mod tests {
             owner_repo: "owner/demo".to_string(),
             lanes: BTreeMap::new(),
             release: ReleasePolicy::Manual,
+            theory: crate::config::TheoryConfig::default(),
             role_overrides: BTreeMap::new(),
         }
     }

@@ -21,6 +21,7 @@
 //! process restarted.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,7 +59,7 @@ use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
-use crate::worktree::WorktreeManager;
+use crate::worktree::{WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// The label that asks a human to decide something on GitHub.
 pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
@@ -110,6 +111,38 @@ struct TicketTurnText {
     last: String,
     /// True when an earlier event contained proposal marker text.
     earlier_marker: bool,
+}
+
+/// The working directory identity of one task.
+///
+/// `Shared` is the repository checkout. The refine stage, the ticket
+/// session, and the ticket chat all work there, and none of them owns it.
+/// `Exclusive` is a private git worktree. One task at a time may run in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Workspace {
+    Shared,
+    Exclusive(WorktreeKey),
+}
+
+/// The key of one exclusive worktree of one repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeKey {
+    Issue(u64),
+    Pr(u64),
+    Train,
+}
+
+impl fmt::Display for WorktreeKey {
+    /// The directory name of the worktree, as the manager writes it on
+    /// disk. The names come from the worktree module, so the refusal text
+    /// and the directory cannot drift apart.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorktreeKey::Issue(number) => write!(f, "{}{number}", WorktreeKind::Issue.prefix()),
+            WorktreeKey::Pr(number) => write!(f, "{}{number}", WorktreeKind::Pr.prefix()),
+            WorktreeKey::Train => f.write_str(TRAIN_DIR),
+        }
+    }
 }
 
 /// The daemon: every module assembled into one event loop.
@@ -798,6 +831,7 @@ impl Daemon {
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
         }
+        self.retire_absent_items(repo, &fresh);
         self.complete_parked_refines(repo, &fresh);
         if !unchanged {
             self.reconcile_unready(repo, &fresh);
@@ -820,7 +854,9 @@ impl Daemon {
     /// snapshot, so a task whose issue or pull request closed while the
     /// daemon was down only meets its end here. Release tasks stay out:
     /// the train, not one pull request, is their unit. Ticket sessions
-    /// carry item number 0 and stay out for the same reason.
+    /// carry item number 0 and stay out for the same reason. The cancel
+    /// stops the live session; [`Daemon::retire_absent_items`] then drops
+    /// the task in the same poll.
     fn cancel_absent_restored(&mut self, repo: &str, fresh: &RepoSnapshot) {
         let ids: Vec<String> = self
             .table
@@ -861,13 +897,15 @@ impl Daemon {
     /// Retire work whose item closed, went back to draft, or vanished.
     ///
     /// GitHub is the source of truth: a gone or draft pull request leaves the
-    /// train, and a gone or closed item cancels its active tasks.
+    /// train, and a gone or closed item cancels its active tasks and drops
+    /// its terminal tasks, so the board keeps no stale row.
     fn reconcile_removed(&mut self, repo: &str, old: &RepoSnapshot, fresh: &RepoSnapshot) {
         for number in old.issues.keys() {
             let gone = fresh.issues.get(number).is_none_or(|issue| !issue.open);
             if gone {
                 self.gates.forget(repo, ItemKind::Issue, *number);
                 self.cancel_item_tasks(repo, ItemKind::Issue, *number);
+                self.retire_item_tasks(repo, ItemKind::Issue, *number);
             }
         }
         for number in old.prs.keys() {
@@ -881,6 +919,7 @@ impl Daemon {
             if gone {
                 self.gates.forget(repo, ItemKind::Pr, *number);
                 self.cancel_item_tasks(repo, ItemKind::Pr, *number);
+                self.retire_item_tasks(repo, ItemKind::Pr, *number);
             }
         }
     }
@@ -900,6 +939,105 @@ impl Daemon {
             .collect();
         for id in ids {
             self.cancel_task(&id, false);
+        }
+    }
+
+    /// Drop one task and every per-task record it owns.
+    ///
+    /// The daemon removes the tasks of an item that left GitHub instead of
+    /// keeping them for ever. A missing id is a no-operation.
+    fn retire_task(&mut self, id: &str) {
+        if self.table.remove(id).is_none() {
+            return;
+        }
+        self.role_bindings.remove(id);
+        self.review_tickets.remove(id);
+        self.release_batches.remove(id);
+        self.pending_chats.remove(id);
+        self.ticket_turn_text.remove(id);
+        self.paused.tasks.remove(id);
+        self.interrupted.remove(id);
+        self.restored_ids.remove(id);
+        self.decisions.drop_for_task(id);
+        self.changed = true;
+    }
+
+    /// True when a release train still needs this task.
+    ///
+    /// A train in flight needs its task, so [`Daemon::reconcile_trains`]
+    /// can close the train. A failed train needs its task too: the train
+    /// saved the exact batch to retry, and [`Daemon::retry_task`] reads
+    /// that batch through the task id. The release merges one pull request
+    /// at a time, so a failed batch often leaves GitHub in part. Without
+    /// this guard the retire drops the task the moment the lowest pull
+    /// request of the batch merges, and a `Manual` train can never retry.
+    /// The board applies the same rule: it draws the task inside the retry
+    /// border while the batch is not empty.
+    fn train_needs_task(&self, task: &Task) -> bool {
+        self.trains.values().any(|train| {
+            train.in_flight.as_deref() == Some(task.id.as_str())
+                || (train.repo == task.repo
+                    && task.stage == Stage::Release
+                    && !train.batch().is_empty())
+        })
+    }
+
+    /// Drop every pipeline task of one item that left GitHub.
+    ///
+    /// A ticket chat and a ticket-creation session serve the Tickets view,
+    /// so their purpose keeps them. A release task that its train still
+    /// needs stays too, by [`Daemon::train_needs_task`].
+    fn retire_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
+        let ids: Vec<String> = self
+            .table
+            .by_id
+            .values()
+            .filter(|task| task.repo == repo && task.kind == kind && task.number == number)
+            .filter(|task| task.purpose == TaskPurpose::Pipeline)
+            .filter(|task| !self.train_needs_task(task))
+            .map(|task| task.id.clone())
+            .collect();
+        for id in ids {
+            self.retire_task(&id);
+        }
+    }
+
+    /// Drop every terminal pipeline task whose item is no longer open.
+    ///
+    /// [`Daemon::reconcile_removed`] compares two snapshots, so it sees only
+    /// the poll that watches an item leave. The daemon saves no snapshot, so
+    /// a restart forgets every earlier item. A pull request merged while the
+    /// daemon was down therefore never meets that path, and its done task
+    /// keeps a stale board row for ever. This sweep needs no earlier
+    /// snapshot: it reads the fresh one alone, so it also clears the rows a
+    /// restart carried over. It runs on every poll and repeats without
+    /// effect.
+    ///
+    /// The sweep drops no active task. A live session ends through
+    /// [`Daemon::cancel_absent_restored`] or [`Daemon::cancel_item_tasks`],
+    /// which run first and make the task terminal. The purpose keeps a
+    /// ticket chat and a ticket-creation session, and
+    /// [`Daemon::train_needs_task`] keeps the release task that a train
+    /// still needs.
+    fn retire_absent_items(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let ids: Vec<String> = self
+            .table
+            .by_id
+            .values()
+            .filter(|task| task.repo == repo && task.state.is_terminal())
+            .filter(|task| task.purpose == TaskPurpose::Pipeline)
+            .filter(|task| !self.train_needs_task(task))
+            .filter(|task| match task.kind {
+                ItemKind::Issue => fresh
+                    .issues
+                    .get(&task.number)
+                    .is_none_or(|issue| !issue.open),
+                ItemKind::Pr => fresh.prs.get(&task.number).is_none_or(|pr| !pr.open),
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        for id in ids {
+            self.retire_task(&id);
         }
     }
 
@@ -1294,10 +1432,10 @@ impl Daemon {
     /// and waits for the exit; the exit reopens the task when messages
     /// remain. A task in `Queued` or `AwaitingUser` gets one run: the first
     /// message is the prompt, and the session id continues the old
-    /// conversation. The scheduler decides whether the run may start, so
-    /// stage limits, lane reservations, and pauses all apply to a follow-up
-    /// turn. A full live-process limit stops one yielding parked session
-    /// first, and the limit check retries once.
+    /// conversation. The pipeline order and the scheduler decide whether the
+    /// run may start, so prior stages, stage limits, lane reservations, and
+    /// pauses all apply to a follow-up turn. A full live-process limit stops
+    /// one yielding parked session first, and the limit check retries once.
     fn resume_pending_chats(&mut self) {
         let ids: Vec<String> = self.pending_chats.keys().cloned().collect();
         for id in ids {
@@ -1320,6 +1458,9 @@ impl Daemon {
             if task.state.is_terminal() {
                 self.pending_chats.remove(&id);
                 eprintln!("the pending chat for {id}: the task is {}", task.state);
+                continue;
+            }
+            if self.prior_stage_active(&task) {
                 continue;
             }
             if !matches!(
@@ -1567,18 +1708,17 @@ impl Daemon {
             self.fail_run(&task, &reason);
             return Err(anyhow!(reason));
         };
-        let cwd = match task.stage {
-            Stage::Refine => Ok(repo_cfg.path.clone()),
-            Stage::Implement => self
-                .worktrees
-                .ensure_issue(&*self.exec, &repo_cfg, task.number),
-            Stage::Review => match self.review_item(&task) {
-                (ItemKind::Issue, number) => {
-                    self.worktrees.ensure_issue(&*self.exec, &repo_cfg, number)
-                }
-                (ItemKind::Pr, number) => self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number),
-            },
-            Stage::Release => self.worktrees.ensure_train(&*self.exec, &repo_cfg),
+        let cwd = match self.workspace(&task) {
+            Workspace::Shared => Ok(repo_cfg.path.clone()),
+            Workspace::Exclusive(WorktreeKey::Issue(number)) => {
+                self.worktrees.ensure_issue(&*self.exec, &repo_cfg, number)
+            }
+            Workspace::Exclusive(WorktreeKey::Pr(number)) => {
+                self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number)
+            }
+            Workspace::Exclusive(WorktreeKey::Train) => {
+                self.worktrees.ensure_train(&*self.exec, &repo_cfg)
+            }
         };
         let cwd = match cwd {
             Ok(cwd) => cwd,
@@ -2252,10 +2392,13 @@ impl Daemon {
                     }
                 }
                 if let Some((repo, issue, _confirmed_ms)) = effects.confirmed {
-                    if let Some(items) = self.snapshot.repos.get_mut(&repo) {
-                        items.issues.insert(issue.number, issue);
-                        self.changed = true;
-                    }
+                    self.snapshot
+                        .repos
+                        .entry(repo.clone())
+                        .or_default()
+                        .issues
+                        .insert(issue.number, issue);
+                    self.changed = true;
                     if let Some(fresh) = self.snapshot.repos.get(&repo).cloned() {
                         self.complete_parked_refines(&repo, &fresh);
                         self.reconcile_unready(&repo, &fresh);
@@ -2617,8 +2760,9 @@ impl Daemon {
     /// task, and `resume_pending_chats` starts a run whose prompt is the
     /// message and whose session continues the old one. A failed live send
     /// also keeps the message for a resumed turn. The call refuses any
-    /// message while another task of the same worktree item is active. It
-    /// also refuses a task with no session id and no session marker.
+    /// message while another task that owns the same exclusive worktree is
+    /// active. It also refuses a task with no session id and no session
+    /// marker.
     /// The result is true when the daemon delivered or queued the message.
     fn chat(&mut self, id: &str, text: &str) -> bool {
         let Some(task) = self.table.by_id.get(id).cloned() else {
@@ -2716,14 +2860,24 @@ impl Daemon {
         }
     }
 
-    /// The item whose workspace the task runs in.
+    /// The working directory identity of one task.
     ///
-    /// The comparison of two tasks uses this item, so two agents never
-    /// share one worktree.
-    fn worktree_item(&self, task: &Task) -> (ItemKind, u64) {
+    /// The refine stage, the ticket session, and the ticket chat share the
+    /// repository checkout, so a `Shared` task owns no worktree. Every other
+    /// stage runs in one private git worktree and owns it. The guard and the
+    /// directory readers both read this helper, so they cannot disagree.
+    fn workspace(&self, task: &Task) -> Workspace {
         match task.stage {
-            Stage::Review => self.review_item(task),
-            _ => (task.kind, task.number),
+            Stage::Refine => Workspace::Shared,
+            Stage::Implement => Workspace::Exclusive(WorktreeKey::Issue(task.number)),
+            Stage::Review => {
+                let (kind, number) = self.review_item(task);
+                match kind {
+                    ItemKind::Issue => Workspace::Exclusive(WorktreeKey::Issue(number)),
+                    ItemKind::Pr => Workspace::Exclusive(WorktreeKey::Pr(number)),
+                }
+            }
+            Stage::Release => Workspace::Exclusive(WorktreeKey::Train),
         }
     }
 
@@ -2731,9 +2885,13 @@ impl Daemon {
     ///
     /// A running or awaiting task owns its worktree process; a queued task
     /// does not. The dispatch loop skips a task whose worktree is held, so
-    /// two agents never share one worktree.
+    /// two agents never share one worktree. A `Shared` task holds nothing
+    /// and nothing holds it.
     fn worktree_holder(&self, task: &Task) -> Option<String> {
-        let item = self.worktree_item(task);
+        let workspace = self.workspace(task);
+        if !matches!(workspace, Workspace::Exclusive(_)) {
+            return None;
+        }
         self.table
             .by_id
             .values()
@@ -2741,7 +2899,7 @@ impl Daemon {
                 other.id != task.id
                     && other.repo == task.repo
                     && matches!(other.state, TaskState::Running | TaskState::AwaitingUser)
-                    && self.worktree_item(other) == item
+                    && self.workspace(other) == workspace
             })
             .map(|other| other.id.clone())
     }
@@ -2749,9 +2907,13 @@ impl Daemon {
     /// The active task that blocks a follow-up to `task`, if one exists.
     ///
     /// Two agents must never run in one worktree. A follow-up waits while
-    /// another task of the same repository and worktree item is active.
+    /// another task of the same repository and exclusive worktree is active.
+    /// A `Shared` task never blocks and is never blocked.
     fn sibling_blocker(&self, task: &Task) -> Option<String> {
-        let item = self.worktree_item(task);
+        let workspace = self.workspace(task);
+        if !matches!(workspace, Workspace::Exclusive(_)) {
+            return None;
+        }
         self.table
             .by_id
             .values()
@@ -2759,17 +2921,24 @@ impl Daemon {
                 other.id != task.id
                     && other.repo == task.repo
                     && !other.state.is_terminal()
-                    && self.worktree_item(other) == item
+                    && self.workspace(other) == workspace
             })
             .map(|other| other.id.clone())
     }
 
     /// The clear refusal for a follow-up whose sibling is not terminal.
+    ///
+    /// The refusal names the blocker, its state, and the worktree, so the
+    /// operator can check the claim.
     fn sibling_refusal(&self, task: &Task) -> Option<String> {
+        let Workspace::Exclusive(key) = self.workspace(task) else {
+            return None;
+        };
         self.sibling_blocker(task).map(|blocker| {
+            let state = &self.table.by_id[&blocker].state;
             format!(
-                "the chat message for \"{}\" cannot start. Task \"{blocker}\" uses the same \
-                 worktree item. Wait until that task is terminal.",
+                "the chat message for \"{}\" cannot start. Task \"{blocker}\" ({state}) uses \
+                 the worktree \"{key}\". Wait until that task is terminal.",
                 task.id
             )
         })
@@ -3532,14 +3701,13 @@ impl Daemon {
     fn task_cwd(&self, id: &str) -> Option<PathBuf> {
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
-        Some(match task.stage {
-            Stage::Refine => repo.path.clone(),
-            Stage::Implement => self.worktrees.issue_path(repo, task.number),
-            Stage::Review => match self.review_item(task) {
-                (ItemKind::Issue, number) => self.worktrees.issue_path(repo, number),
-                (ItemKind::Pr, number) => self.worktrees.pr_path(repo, number),
-            },
-            Stage::Release => self.worktrees.train_path(repo),
+        Some(match self.workspace(task) {
+            Workspace::Shared => repo.path.clone(),
+            Workspace::Exclusive(WorktreeKey::Issue(number)) => {
+                self.worktrees.issue_path(repo, number)
+            }
+            Workspace::Exclusive(WorktreeKey::Pr(number)) => self.worktrees.pr_path(repo, number),
+            Workspace::Exclusive(WorktreeKey::Train) => self.worktrees.train_path(repo),
         })
     }
 
@@ -4427,6 +4595,7 @@ mod tests {
                 owner_repo: "acme/borsuk".to_string(),
                 lanes: BTreeMap::new(),
                 release: ReleasePolicy::Manual,
+                theory: crate::config::TheoryConfig::default(),
                 role_overrides: BTreeMap::new(),
             },
         );
@@ -6357,7 +6526,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_task_of_a_closed_issue_is_cancelled_at_the_first_poll() {
+    fn a_restored_task_of_a_closed_issue_is_retired_at_the_first_poll() {
         let dir = temp_root();
         let worktree = issue_wt(&dir, 142);
         {
@@ -6377,12 +6546,53 @@ mod tests {
         );
         second.poll(vec![], vec![]);
 
-        assert_eq!(
-            second.task("borsuk/implement-i142").state,
-            TaskState::Failed("cancelled".to_string()),
-            "the first poll cancels the restored task of the closed issue"
+        assert!(
+            !second
+                .daemon
+                .table
+                .by_id
+                .contains_key("borsuk/implement-i142"),
+            "the first poll cancels and then retires the restored task of the closed issue"
+        );
+        assert!(
+            !second.daemon.interrupted.contains("borsuk/implement-i142"),
+            "the retire drops the restart mark, so a later task of the same \
+             id never reads the restart notice"
+        );
+        assert!(
+            !second.daemon.restored_ids.contains("borsuk/implement-i142"),
+            "the retire drops the restore mark"
         );
         assert_eq!(second.job_count(), 0);
+    }
+
+    #[test]
+    fn a_restored_done_review_of_a_merged_pr_is_retired_at_the_first_poll() {
+        let dir = temp_root();
+        {
+            let steps =
+                fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
+            first.poll(vec![], vec![pr(5, true, &[])]);
+            first.poll(vec![], vec![pr(5, false, &[])]);
+            first.event(turn_finished("borsuk/review-p5", true, "approved"));
+            assert_eq!(first.task("borsuk/review-p5").state, TaskState::Done);
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |_| {});
+        second.drive();
+        assert!(
+            second.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the restore carries the done review task over"
+        );
+
+        second.poll(vec![], vec![]);
+
+        assert!(
+            !second.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the first poll retires the done review of the merged pull request, \
+             although no earlier snapshot names it"
+        );
     }
 
     #[test]
@@ -8039,7 +8249,7 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_handoff_retries_after_the_sibling_task_stops() {
+    fn the_handoff_runs_while_a_refine_task_of_the_ticket_is_active() {
         let steps = vec![gh_step(
             &[
                 "api",
@@ -8062,6 +8272,8 @@ mod tests {
         rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
         rig.event(turn_ended("borsuk/ticket-i7"));
         let session = rig.session(0);
+        // The refine task and the ticket chat share the repository checkout,
+        // so the active refine never blocks the conversation handoff.
         let blocker = rig
             .daemon
             .table
@@ -8088,16 +8300,11 @@ mod tests {
             label: "to-refine".to_string(),
             on: true,
         }));
-        assert!(session.sends.lock().unwrap().is_empty());
-        assert!(!rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
-
-        rig.daemon
-            .table
-            .transition(&blocker, TaskState::Done, T0 + 1)
-            .unwrap();
-        rig.set_now(T0 + 1);
-        rig.poll(vec![issue(7, &["to-refine"])], vec![]);
-        assert_eq!(session.sends.lock().unwrap().len(), 1);
+        assert_eq!(
+            session.sends.lock().unwrap().len(),
+            1,
+            "the active refine never blocks the handoff"
+        );
         assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
     }
 
@@ -9023,7 +9230,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_an_issue_cancels_its_running_tasks() {
+    fn a_dropped_issue_stops_its_session_and_retires_its_tasks() {
         let dir = temp_root();
         let steps = fresh_issue_steps(
             &rig_repo(&dir),
@@ -9034,16 +9241,234 @@ mod tests {
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         assert_eq!(rig.job_count(), 1);
+        let session = rig.session(0);
 
         rig.poll(vec![], vec![]);
+
         assert!(
-            rig.session(0).stopped.load(Ordering::SeqCst),
+            session.stopped.load(Ordering::SeqCst),
             "the vanished issue stops the live session"
         );
-        assert_eq!(
-            rig.task("borsuk/implement-i142").state,
-            TaskState::Failed("cancelled".to_string())
+        assert!(
+            !rig.daemon
+                .table
+                .by_id
+                .values()
+                .any(|task| task.repo == "borsuk"
+                    && task.kind == ItemKind::Issue
+                    && task.number == 142),
+            "the dropped issue leaves no task in the table"
         );
+    }
+
+    #[test]
+    fn a_dropped_pr_retires_its_done_review_task() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        rig.event(turn_finished("borsuk/review-p5", true, "approved"));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the dropped pull request leaves no review task in the table"
+        );
+    }
+
+    #[test]
+    fn a_dropped_issue_ends_its_open_ticket_conversation() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        assert!(rig
+            .daemon
+            .ticket_conversations
+            .contains_key(&("borsuk".to_string(), 7)));
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            rig.daemon.ticket_conversations.is_empty(),
+            "the dropped issue ends the conversation"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/ticket-i7"),
+            "the conversation reconciler removes the chat task"
+        );
+    }
+
+    #[test]
+    fn a_dropped_pr_keeps_the_in_flight_release_and_closes_the_train() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        rig.event(turn_finished("borsuk/review-p5", true, "approved"));
+        rig.event(started("borsuk/release", "session-release"));
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release")
+        );
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the in-flight release task survives the retire"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the dropped review retires"
+        );
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight, None,
+            "reconcile_trains closes the train after the release task ends"
+        );
+    }
+
+    #[test]
+    fn a_failed_release_keeps_its_task_after_one_batch_pr_merges() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = train_wt(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let steps: Vec<Step> = fresh_train_steps(&repo, &worktree, &gitdir)
+            .into_iter()
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[]), pr(3, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2, 3],
+        });
+        for detail in ["first", "second", "third"] {
+            rig.event(exited("borsuk/release", false, detail));
+        }
+        assert_eq!(rig.daemon.trains["borsuk"].batch(), &[2, 3]);
+        assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
+
+        // The failed batch merged pr 2 before it stopped, so pr 2 leaves
+        // GitHub while the saved retry batch still holds pr 3.
+        rig.poll(vec![], vec![pr(3, false, &[])]);
+
+        assert_eq!(
+            rig.daemon.trains["borsuk"].batch(),
+            &[3],
+            "the merged pull request leaves the retry batch"
+        );
+        assert!(
+            rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the release task outlives the pull request that names it, \
+             because the train still holds a batch to retry"
+        );
+
+        rig.act(Action::Answer {
+            decision_id: "stuck:borsuk/release:3".to_string(),
+            response: Response::Retry,
+        });
+
+        assert_eq!(rig.job_count(), 4, "the retry starts a fresh run");
+        assert!(rig.job(3).prompt.contains("#3"));
+        assert!(!rig.job(3).prompt.contains("#2"));
+    }
+
+    #[test]
+    fn a_finished_release_retires_after_its_batch_merges() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = train_wt(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let steps = fresh_train_steps(&repo, &worktree, &gitdir);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        rig.event(turn_finished("borsuk/release", true, "released"));
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Done);
+        assert!(rig.daemon.trains["borsuk"].batch().is_empty());
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "an idle train keeps no release task"
+        );
+    }
+
+    #[test]
+    fn a_retire_drops_the_binding_the_pause_and_the_decisions() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "session-impl"));
+        assert!(rig
+            .daemon
+            .role_bindings
+            .contains_key("borsuk/implement-i142"));
+        rig.event(RunEvent::Ask {
+            task: "borsuk/implement-i142".to_string(),
+            request_id: "q-1".to_string(),
+            tool: "AskUserQuestion".to_string(),
+            input: json!([{"question": "which database?"}]),
+            suggestions: serde_json::Value::Null,
+            needs_human: true,
+        });
+        assert!(rig.decision("perm:borsuk/implement-i142:q-1").is_some());
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/implement-i142".to_string(),
+            },
+            paused: true,
+        });
+        assert!(rig
+            .daemon
+            .paused
+            .tasks
+            .contains_key("borsuk/implement-i142"));
+
+        rig.poll(vec![], vec![]);
+
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/implement-i142"));
+        assert!(!rig
+            .daemon
+            .role_bindings
+            .contains_key("borsuk/implement-i142"));
+        assert!(!rig
+            .daemon
+            .paused
+            .tasks
+            .contains_key("borsuk/implement-i142"));
+        assert!(rig.decision("perm:borsuk/implement-i142:q-1").is_none());
     }
 
     #[test]
@@ -9846,62 +10271,70 @@ mod tests {
     #[test]
     fn a_follow_up_refuses_while_another_task_of_the_item_is_active() {
         let dir = temp_root();
-        let mut rig = opencode_rig(&dir, 0);
-        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
-        rig.event(turn_ended("borsuk/refine-i142"));
-        rig.poll(vec![issue(142, &["refined"])], vec![]);
-        assert_eq!(rig.job_count(), 2, "the implement gate opened");
+        let mut rig = opencode_rig(&dir, 1);
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+        assert_eq!(rig.job_count(), 1, "the implement runs first");
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert_eq!(
+            rig.job_count(),
+            2,
+            "the review gate opened after the implement"
+        );
+        rig.event(started("borsuk/review-p7", "sid-7"));
 
-        let task = rig.task("borsuk/refine-i142");
+        let task = rig.task("borsuk/implement-i142");
         assert_eq!(
             rig.daemon.sibling_refusal(&task).as_deref(),
             Some(
-                "the chat message for \"borsuk/refine-i142\" cannot start. Task \
-                 \"borsuk/implement-i142\" uses the same worktree item. Wait until that task is \
-                 terminal."
+                "the chat message for \"borsuk/implement-i142\" cannot start. Task \
+                 \"borsuk/review-p7\" (running) uses the worktree \"issue-142\". Wait until \
+                 that task is terminal."
             )
         );
         rig.daemon
-            .chat("borsuk/refine-i142", "adjust the specification");
+            .chat("borsuk/implement-i142", "adjust the implementation");
 
         assert!(
             rig.daemon.pending_chats.is_empty(),
             "the sibling guard refuses the follow-up"
         );
-        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
         assert_eq!(rig.job_count(), 2);
     }
 
     #[test]
     fn a_sibling_closure_blocks_a_live_claude_send() {
-        let mut rig = Rig::make(vec![]);
-        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
-        rig.event(started("borsuk/refine-i142", "sid-142"));
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+        rig.event(started("borsuk/implement-i142", "sid-142"));
         let session = rig.session(0);
-        let log = rig
-            .daemon
-            .log_path("borsuk", Stage::Implement, ItemKind::Issue, 142);
-        rig.daemon
-            .table
-            .upsert_queued(
-                "borsuk",
-                Stage::Implement,
-                ItemKind::Issue,
-                142,
-                log,
-                rig.daemon.now_ms,
-            )
-            .unwrap();
+        // The review of the linked ticket queues behind the implement, and
+        // both tasks map to the ticket worktree.
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Queued);
 
-        let task = rig.task("borsuk/refine-i142");
+        let task = rig.task("borsuk/implement-i142");
         assert!(matches!(
             rig.daemon.input_mode(&task),
             InputMode::Closed { .. }
         ));
 
         rig.daemon
-            .chat("borsuk/refine-i142", "do not steer this task");
+            .chat("borsuk/implement-i142", "do not steer this task");
 
         assert!(
             session.sends.lock().unwrap().is_empty(),
@@ -10152,28 +10585,338 @@ mod tests {
     fn a_follow_up_still_refuses_after_an_abort_of_the_sibling() {
         let dir = temp_root();
         let mut rig = opencode_rig(&dir, 1);
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 2, "the review gate opened");
+        rig.event(started("borsuk/review-p7", "sid-7"));
+        // A message that the live review could not take waits as a queued
+        // chat, so the abort requeues the review instead of closing it.
+        rig.session(1).fail_send.store(true, Ordering::SeqCst);
+        rig.daemon
+            .chat("borsuk/review-p7", "check the failing test");
+        assert!(rig.daemon.pending_chats.contains_key("borsuk/review-p7"));
+        rig.act(Action::Abort {
+            task: "borsuk/review-p7".to_string(),
+        });
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Queued);
+
+        let task = rig.task("borsuk/implement-i142");
+        assert!(rig.daemon.sibling_refusal(&task).is_some());
+        rig.daemon
+            .chat("borsuk/implement-i142", "adjust the implementation");
+
+        assert!(
+            !rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the sibling guard refuses the follow-up after the abort"
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_follow_up_to_the_implement_waits_while_the_refine_is_active() {
+        for refine_state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::AwaitingUser,
+        ] {
+            let dir = temp_root();
+            let mut rig = opencode_rig(&dir, 0);
+            rig.poll(vec![issue(142, &["refined"])], vec![]);
+            rig.event(started("borsuk/implement-i142", "ses-142"));
+            rig.event(exited("borsuk/implement-i142", true, "code 0"));
+            assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+            // A refine task of the same ticket that is not terminal. The
+            // refine works in the shared checkout, so it owns no worktree.
+            let log = rig
+                .daemon
+                .log_path("borsuk", Stage::Refine, ItemKind::Issue, 142);
+            rig.daemon
+                .table
+                .upsert_queued(
+                    "borsuk",
+                    Stage::Refine,
+                    ItemKind::Issue,
+                    142,
+                    log,
+                    rig.daemon.now_ms,
+                )
+                .unwrap();
+            if refine_state != TaskState::Queued {
+                rig.daemon
+                    .table
+                    .transition("borsuk/refine-i142", TaskState::Running, rig.daemon.now_ms)
+                    .unwrap();
+            }
+            if refine_state == TaskState::AwaitingUser {
+                rig.daemon
+                    .table
+                    .transition(
+                        "borsuk/refine-i142",
+                        TaskState::AwaitingUser,
+                        rig.daemon.now_ms,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(rig.task("borsuk/refine-i142").state, refine_state);
+
+            let task = rig.task("borsuk/implement-i142");
+            assert!(!matches!(
+                rig.daemon.input_mode(&task),
+                InputMode::Closed { .. }
+            ));
+            rig.act(Action::Chat {
+                task: "borsuk/implement-i142".to_string(),
+                text: "start from the specification".to_string(),
+            });
+
+            let implement_runs = (0..rig.job_count())
+                .filter(|&index| rig.job(index).task == "borsuk/implement-i142")
+                .count();
+            assert_eq!(
+                implement_runs, 1,
+                "the implement follow-up waits for the refine state {refine_state:?}"
+            );
+            assert_eq!(
+                rig.daemon
+                    .pending_chats
+                    .get("borsuk/implement-i142")
+                    .map(Vec::as_slice),
+                Some(&["start from the specification".to_string()][..]),
+                "the refine state {refine_state:?} must not block the implement chat"
+            );
+            // The chat reopened the task, so the bar now names the cause of
+            // the wait. The operator never faces a silent stall.
+            let queued = rig.task("borsuk/implement-i142");
+            assert_eq!(queued.state, TaskState::Queued);
+            assert_eq!(
+                rig.daemon.input_mode(&queued),
+                InputMode::Closed {
+                    reason: "This task waits for \"borsuk/refine-i142\" to finish.".to_string()
+                },
+                "the bar names the prior stage for the refine state {refine_state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follow_up_to_the_refine_starts_while_the_implement_runs() {
+        let dir = temp_root();
+        let checkout = rig_repo(&dir);
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
+        });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
-        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        // The one-shot refine reports its result and completes.
+        rig.event(exited("borsuk/refine-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         assert_eq!(rig.job_count(), 2, "the implement gate opened");
         rig.event(started("borsuk/implement-i142", "ses-142"));
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
-        rig.act(Action::Abort {
-            task: "borsuk/implement-i142".to_string(),
-        });
-        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
 
         let task = rig.task("borsuk/refine-i142");
-        assert!(rig.daemon.sibling_refusal(&task).is_some());
-        rig.daemon
-            .chat("borsuk/refine-i142", "adjust the specification");
+        assert!(!matches!(
+            rig.daemon.input_mode(&task),
+            InputMode::Closed { .. }
+        ));
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "clarify the second requirement".to_string(),
+        });
 
+        // The shared checkout carries no guard, and no prior stage holds a
+        // refine, so the follow-up turn runs while the implement runs.
+        assert_eq!(rig.job_count(), 3, "the refine follow-up started");
+        let followup = rig.job(2);
+        assert_eq!(followup.task, "borsuk/refine-i142");
+        assert_eq!(followup.cwd, checkout, "the refine keeps the checkout");
+        assert_eq!(followup.prompt, "clarify the second requirement");
+        assert!(rig.daemon.pending_chats.is_empty());
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_follow_up_to_the_implement_queues_while_the_ticket_chat_is_active() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        // An active conversation about the same ticket works in the shared
+        // checkout, so it owns no worktree.
+        let log = rig
+            .daemon
+            .log_path("borsuk", Stage::Refine, ItemKind::Issue, 142);
+        rig.daemon
+            .table
+            .upsert_ticket_chat("borsuk", 142, log, rig.daemon.now_ms)
+            .unwrap();
+
+        let task = rig.task("borsuk/implement-i142");
         assert!(
-            !rig.daemon.pending_chats.contains_key("borsuk/refine-i142"),
-            "the sibling guard refuses the follow-up after the abort"
+            rig.daemon.sibling_refusal(&task).is_none(),
+            "the ticket chat never blocks the implement"
         );
+        rig.act(Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "extend the change".to_string(),
+        });
+
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(&["extend the change".to_string()][..])
+        );
+        // The worktree guard takes the message. The pipeline order still
+        // holds the turn: the ticket chat carries the refine stage of the
+        // same ticket, so it is a prior stage of the implement.
+        let implement_runs = (0..rig.job_count())
+            .filter(|&index| rig.job(index).task == "borsuk/implement-i142")
+            .count();
+        assert_eq!(implement_runs, 1, "the pipeline order holds the turn");
+        let queued = rig.task("borsuk/implement-i142");
+        assert_eq!(
+            rig.daemon.input_mode(&queued),
+            InputMode::Closed {
+                reason: "This task waits for \"borsuk/ticket-i142\" to finish.".to_string()
+            },
+            "the bar names the ticket chat as the cause"
+        );
+    }
+
+    #[test]
+    fn workspace_and_task_cwd_agree_for_every_stage() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), vec![], |_| {});
+        let log = PathBuf::from("log");
+        let now = rig.daemon.now_ms;
+        rig.daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                log.clone(),
+                now,
+            )
+            .unwrap();
+        rig.daemon
+            .table
+            .upsert_queued(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                log.clone(),
+                now,
+            )
+            .unwrap();
+        rig.daemon
+            .table
+            .upsert_queued("borsuk", Stage::Review, ItemKind::Pr, 7, log.clone(), now)
+            .unwrap();
+        rig.daemon
+            .table
+            .upsert_queued("borsuk", Stage::Review, ItemKind::Pr, 8, log.clone(), now)
+            .unwrap();
+        rig.daemon
+            .table
+            .upsert_with_id(
+                crate::tasks::ScopedTask {
+                    id: "borsuk/release",
+                    repo: "borsuk",
+                    stage: Stage::Release,
+                    kind: ItemKind::Pr,
+                    number: 7,
+                },
+                log.clone(),
+                now,
+            )
+            .unwrap();
+        rig.daemon
+            .table
+            .upsert_ticket_chat("borsuk", 142, log, now)
+            .unwrap();
+        rig.daemon
+            .review_tickets
+            .insert("borsuk/review-p7".to_string(), BTreeSet::from([142]));
+
+        // The stage walk keeps this test complete when the pipeline grows.
+        let stage_cases = Stage::ALL.map(|stage| match stage {
+            Stage::Refine => ("borsuk/refine-i142", Workspace::Shared),
+            Stage::Implement => (
+                "borsuk/implement-i142",
+                Workspace::Exclusive(WorktreeKey::Issue(142)),
+            ),
+            Stage::Review => (
+                "borsuk/review-p7",
+                Workspace::Exclusive(WorktreeKey::Issue(142)),
+            ),
+            Stage::Release => ("borsuk/release", Workspace::Exclusive(WorktreeKey::Train)),
+        });
+        let extra_cases = [
+            ("borsuk/ticket-i142", Workspace::Shared),
+            ("borsuk/review-p8", Workspace::Exclusive(WorktreeKey::Pr(8))),
+        ];
+        let checkout = rig_repo(&dir);
+        for (id, expected) in stage_cases.into_iter().chain(extra_cases) {
+            let task = rig.task(id);
+            assert_eq!(rig.daemon.workspace(&task), expected, "workspace of {id}");
+            let expected_cwd = match &expected {
+                Workspace::Shared => checkout.clone(),
+                Workspace::Exclusive(key) => dir
+                    .join("state")
+                    .join("worktrees")
+                    .join("borsuk")
+                    .join(key.to_string()),
+            };
+            assert_eq!(
+                rig.daemon.task_cwd(id).unwrap(),
+                expected_cwd,
+                "task_cwd of {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_implement_waits_while_the_refine_of_its_ticket_is_not_done() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 0);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        // The label change queues the implement. The shared checkout carries
+        // no worktree guard, so only the pipeline order holds it.
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        rig.drive();
+        assert_eq!(rig.job_count(), 1, "the implement waits for the refine");
+
+        rig.event(turn_ended("borsuk/refine-i142"));
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/implement-i142");
+        assert_eq!(
+            rig.job(1).cwd,
+            issue_wt(&dir, 142),
+            "the implement still runs in the issue worktree"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -10288,21 +11031,24 @@ mod tests {
     #[test]
     fn the_input_mode_closes_a_task_that_a_sibling_blocks() {
         let dir = temp_root();
-        let mut rig = opencode_rig(&dir, 0);
-        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
-        rig.event(started("borsuk/refine-i142", "sid-142"));
-        rig.event(turn_ended("borsuk/refine-i142"));
-        rig.poll(vec![issue(142, &["refined"])], vec![]);
-        assert_eq!(rig.job_count(), 2, "the implement gate opened");
+        let mut rig = opencode_rig(&dir, 1);
+        let mut pull = pr(7, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = "Closes #142".to_string();
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 2, "the review gate opened");
+        rig.event(started("borsuk/review-p7", "sid-7"));
 
-        let task = rig.task("borsuk/refine-i142");
+        let task = rig.task("borsuk/implement-i142");
         assert_eq!(
             rig.daemon.input_mode(&task),
             InputMode::Closed {
-                reason: "the chat message for \"borsuk/refine-i142\" cannot start. Task \
-                     \"borsuk/implement-i142\" uses the same worktree item. Wait until that \
-                     task is terminal."
+                reason: "the chat message for \"borsuk/implement-i142\" cannot start. Task \
+                     \"borsuk/review-p7\" (running) uses the worktree \"issue-142\". Wait \
+                     until that task is terminal."
                     .to_string()
             }
         );
@@ -10634,6 +11380,57 @@ mod tests {
         // A quiet second drive publishes nothing.
         rig.drive();
         assert!(rx.try_recv().is_err(), "an unchanged drive must not push");
+    }
+
+    #[test]
+    fn a_ticket_created_before_the_first_poll_reaches_the_next_state() {
+        let created = json!({
+            "number": 12,
+            "node_id": "node-12",
+            "title": "Direct title",
+            "body": "Direct body",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-03T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk/issues/12"
+        });
+        let (mut rig, rx) = pushed_rig(vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Direct title",
+                "-f",
+                "body=Direct body",
+            ],
+            CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+        )]);
+        rig.drive();
+        let initial = rx.try_recv().expect("the first drive must publish");
+        assert!(initial.tickets.is_empty());
+
+        rig.act(Action::Ticket(TicketAction::Create {
+            request: "create-12".to_string(),
+            repo: "borsuk".to_string(),
+            title: "Direct title".to_string(),
+            body: "Direct body".to_string(),
+        }));
+
+        assert_eq!(
+            rig.daemon.snapshot.repos["borsuk"].issues[&12].title,
+            "Direct title"
+        );
+        let view = rx
+            .try_recv()
+            .expect("ticket creation must publish a fresh state");
+        assert_eq!(view.tickets.len(), 1);
+        assert_eq!(view.tickets[0].repo, "borsuk");
+        assert_eq!(view.tickets[0].number, 12);
     }
 
     #[test]

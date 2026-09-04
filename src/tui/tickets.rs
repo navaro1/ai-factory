@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use crate::sock::{
@@ -69,6 +70,35 @@ struct NewLabelForm {
     error: Option<String>,
 }
 
+/// The active field of the new-ticket form.
+#[derive(Debug, Clone, Copy, Default)]
+enum NewTicketField {
+    /// The title field.
+    #[default]
+    Title,
+    /// The description field.
+    Body,
+}
+
+/// One direct new-ticket draft.
+#[derive(Debug, Clone, Default)]
+struct NewTicketForm {
+    /// The repository that receives the ticket.
+    repo: String,
+    /// The pending title.
+    title: String,
+    /// The pending description.
+    body: String,
+    /// The field that receives text.
+    field: NewTicketField,
+    /// The current validation or daemon error.
+    error: Option<String>,
+    /// The request identity of the create in flight.
+    request: Option<String>,
+    /// True while one create waits for its result.
+    pending: bool,
+}
+
 /// The Tickets view state.
 #[derive(Debug, Default)]
 pub struct Tickets {
@@ -94,6 +124,8 @@ pub struct Tickets {
     label_selected: usize,
     /// The open new-label form.
     new_label_form: Option<NewLabelForm>,
+    /// The open new-ticket form.
+    new_ticket: Option<NewTicketForm>,
     /// The last mutation result.
     result: Option<TicketResult>,
     /// The retained direct edit draft.
@@ -116,6 +148,10 @@ pub struct Tickets {
     mentions: MentionStatuses,
     /// The last time the focus sent a mention-status refresh.
     status_polled_at: Option<Instant>,
+    /// The scroll offset of the focused ticket pane.
+    body_scroll: Cell<u16>,
+    /// The highest offset that the focused ticket pane accepts.
+    body_scroll_max: Cell<u16>,
 }
 
 impl Tickets {
@@ -124,11 +160,36 @@ impl Tickets {
         self.focus
     }
 
+    /// True while the plain ticket focus holds the keyboard.
+    ///
+    /// The editor, the conflict comparison, the label picker, and the chat
+    /// keep their own keys in their nested views.
+    pub fn focus_plain(&self) -> bool {
+        self.focus
+            && !self.searching
+            && !self.label_picker_open
+            && !self.conflict_open
+            && !self.chat_active
+            && !self.editor.as_ref().is_some_and(|editor| editor.open)
+    }
+
+    /// The issue identity of the open focus.
+    pub fn focus_key(&self) -> Option<(String, u64)> {
+        self.focus_key.clone()
+    }
+
+    /// True when the focused issue carries the label.
+    pub fn focus_has_label(&self, label: &str) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| details.issue.labels.iter().any(|current| current == label))
+    }
+
     /// Open the focus view of one issue and request its details.
     ///
     /// The call mirrors the `enter` key of the list. The nested state of
     /// the same issue survives; a different issue starts with a clean
-    /// state.
+    /// state. Every call starts the ticket pane at the top.
     pub fn open(&mut self, repo: &str, number: u64) -> Option<Action> {
         let key = (repo.to_string(), number);
         if self.focus_key.as_ref() != Some(&key) {
@@ -138,6 +199,7 @@ impl Tickets {
         self.focus_key = Some(key);
         self.details = None;
         self.result = None;
+        self.body_scroll.set(0);
         Some(Action::Ticket(TicketAction::Details {
             request: request_code(),
             repo: repo.to_string(),
@@ -150,7 +212,72 @@ impl Tickets {
         self.searching
             || self.editor.as_ref().is_some_and(|editor| editor.open)
             || self.new_label_form.is_some()
+            || self.new_ticket.is_some()
             || self.chat_active
+    }
+
+    /// The bottom-row hints of the tickets state.
+    ///
+    /// The open nested view decides the hint; a state that takes typed
+    /// text shows no `? help`. Both forms create with ctrl-s. The plain
+    /// focus swaps one slot to keep the row inside the cap: a waiting
+    /// proposal offers `a`, and a focus without one offers the `m` key
+    /// that the shell binds to the to-refine label.
+    pub fn footer_hints(&self) -> String {
+        if self.focus {
+            if self.chat_active {
+                return "esc back to issue".to_string();
+            }
+            if self.conflict_open {
+                return "g keep remote · p reapply · esc back".to_string();
+            }
+            if self.editor.as_ref().is_some_and(|editor| editor.open) {
+                return "ctrl-s save · tab field · esc close".to_string();
+            }
+            if self.label_picker_open {
+                if self.new_label_form.is_some() {
+                    return "ctrl-s create · tab field · esc cancel".to_string();
+                }
+                return "space apply · n new label · esc close".to_string();
+            }
+            if self.has_proposal() {
+                return "e edit · a apply · L labels · c chat · esc back · ? help".to_string();
+            }
+            return "e edit · L labels · c chat · m refine · esc back · ? help".to_string();
+        }
+        if self.new_ticket.is_some() {
+            return "ctrl-s create · tab field · esc cancel".to_string();
+        }
+        if self.searching {
+            return "type filter · enter apply · esc clear".to_string();
+        }
+        "h l tabs · / search · n new · enter open · ? help".to_string()
+    }
+
+    /// True when the open focus shows a proposal that `a` applies.
+    fn has_proposal(&self) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| details.proposal.is_some())
+    }
+
+    /// Unlock a ticket creation after a failed send or socket disconnect.
+    pub fn delivery_failed(&mut self, action: Option<&Action>) {
+        let Some(form) = self.new_ticket.as_mut() else {
+            return;
+        };
+        let matches = match action {
+            Some(Action::Ticket(TicketAction::Create { request, .. })) => {
+                form.pending && form.request.as_deref() == Some(request.as_str())
+            }
+            Some(_) => false,
+            None => form.pending,
+        };
+        if matches {
+            form.request = None;
+            form.pending = false;
+            form.error = Some("The ticket request was not delivered.".to_string());
+        }
     }
 
     /// True when the open focus has a ticket transcript to poll.
@@ -275,6 +402,26 @@ impl Tickets {
 
     /// Apply one ticket mutation response.
     pub fn observe_result(&mut self, result: TicketResult) {
+        if self.new_ticket.is_some() {
+            let form_request = self
+                .new_ticket
+                .as_ref()
+                .and_then(|form| form.request.as_deref());
+            if form_request == Some(result.request.as_str()) {
+                match result.kind {
+                    TicketResultKind::Success => self.new_ticket = None,
+                    TicketResultKind::Failure => {
+                        if let Some(form) = self.new_ticket.as_mut() {
+                            form.request = None;
+                            form.pending = false;
+                            form.error = Some(result.message.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
         let current = self
             .focus_key
             .as_ref()
@@ -439,7 +586,11 @@ impl Tickets {
                         }
                     }
                 }
-                KeyCode::Char('l') => {
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_body(1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_body(-1),
+                KeyCode::Char('h') | KeyCode::Left => return self.step_focus(state, -1),
+                KeyCode::Char('l') | KeyCode::Right => return self.step_focus(state, 1),
+                KeyCode::Char('L') => {
                     let (repo, _) = self.focus_key.clone()?;
                     self.label_picker_open = true;
                     self.label_selected = 0;
@@ -500,6 +651,9 @@ impl Tickets {
             }
             return None;
         }
+        if self.new_ticket.is_some() {
+            return self.handle_new_ticket_key(key);
+        }
         if self.searching {
             match key.code {
                 KeyCode::Esc => {
@@ -522,6 +676,17 @@ impl Tickets {
         }
         match key.code {
             KeyCode::Char('/') => self.searching = true,
+            KeyCode::Char('n') => {
+                let repo = self
+                    .tab(state)
+                    .or_else(|| state.repos.first().map(|repo| repo.alias.clone()));
+                if let Some(repo) = repo {
+                    self.new_ticket = Some(NewTicketForm {
+                        repo,
+                        ..NewTicketForm::default()
+                    });
+                }
+            }
             KeyCode::Char('h') | KeyCode::Left => self.switch_tab(state, -1),
             KeyCode::Char('l') | KeyCode::Right => self.switch_tab(state, 1),
             KeyCode::Char('j') | KeyCode::Down => {
@@ -535,23 +700,44 @@ impl Tickets {
             }
             KeyCode::Enter => {
                 let selected = self.filtered(state).get(self.selected).copied().cloned()?;
-                let key = (selected.repo.clone(), selected.number);
-                if self.focus_key.as_ref() != Some(&key) {
-                    self.clear_issue_state();
-                }
-                self.focus = true;
-                self.focus_key = Some(key);
-                self.details = None;
-                self.result = None;
-                return Some(Action::Ticket(TicketAction::Details {
-                    request: request_code(),
-                    repo: selected.repo,
-                    number: selected.number,
-                }));
+                return self.open(&selected.repo, selected.number);
             }
             _ => {}
         }
         None
+    }
+
+    /// Scroll the focused ticket pane and clamp at both ends.
+    fn scroll_body(&self, step: i32) {
+        let current = i32::from(self.body_scroll.get());
+        let maximum = i32::from(self.body_scroll_max.get());
+        let next = (current + step).clamp(0, maximum);
+        self.body_scroll.set(next as u16);
+    }
+
+    /// Open the previous or the next ticket of the active tab.
+    ///
+    /// The move follows the filtered list and stops at both ends. It never
+    /// changes the repository tab.
+    fn step_focus(&mut self, state: &StateView, step: isize) -> Option<Action> {
+        let list = self.filtered(state);
+        let current = self
+            .focus_key
+            .as_ref()
+            .and_then(|(repo, number)| {
+                list.iter()
+                    .position(|ticket| ticket.repo == *repo && ticket.number == *number)
+            })
+            .unwrap_or(self.selected);
+        let next = current as isize + step;
+        if next < 0 {
+            return None;
+        }
+        let ticket = list.get(next as usize).copied()?;
+        let repo = ticket.repo.clone();
+        let number = ticket.number;
+        self.selected = next as usize;
+        self.open(&repo, number)
     }
 
     /// Clear all nested data that belongs to the previous focused issue.
@@ -572,6 +758,8 @@ impl Tickets {
         self.proposal_lines.clear();
         self.mentions.clear();
         self.status_polled_at = None;
+        self.body_scroll.set(0);
+        self.body_scroll_max.set(0);
     }
 
     /// Apply one key inside the direct editor.
@@ -766,6 +954,70 @@ impl Tickets {
         None
     }
 
+    /// Apply one key inside the new-ticket form.
+    fn handle_new_ticket_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            let form = self.new_ticket.as_mut()?;
+            if form.pending {
+                return None;
+            }
+            let title = form.title.trim().to_string();
+            if title.is_empty() {
+                form.error = Some("The ticket title must not be empty.".to_string());
+                return None;
+            }
+            let request = request_code();
+            let repo = form.repo.clone();
+            let body = form.body.clone();
+            form.request = Some(request.clone());
+            form.pending = true;
+            form.error = None;
+            return Some(Action::Ticket(TicketAction::Create {
+                request,
+                repo,
+                title,
+                body,
+            }));
+        }
+
+        let form = self.new_ticket.as_mut()?;
+        match key.code {
+            KeyCode::Esc => self.new_ticket = None,
+            KeyCode::Tab => {
+                form.field = match form.field {
+                    NewTicketField::Title => NewTicketField::Body,
+                    NewTicketField::Body => NewTicketField::Title,
+                };
+                form.error = None;
+            }
+            KeyCode::Backspace => {
+                match form.field {
+                    NewTicketField::Title => {
+                        form.title.pop();
+                    }
+                    NewTicketField::Body => {
+                        form.body.pop();
+                    }
+                }
+                form.error = None;
+            }
+            KeyCode::Enter if matches!(form.field, NewTicketField::Body) => form.body.push('\n'),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match form.field {
+                    NewTicketField::Title => form.title.push(character),
+                    NewTicketField::Body => form.body.push(character),
+                }
+                form.error = None;
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Add the created label to the visible catalog and close its form.
     fn finish_new_label(&mut self) {
         let Some(form) = self.new_label_form.take() else {
@@ -794,6 +1046,8 @@ impl Tickets {
     pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         if self.focus {
             self.draw_focus(frame, area, state);
+        } else if self.new_ticket.is_some() {
+            self.draw_new_ticket(frame, area);
         } else {
             self.draw_list(frame, area, state);
         }
@@ -984,11 +1238,23 @@ impl Tickets {
                 THEME.dim(),
             ))],
         };
+        let focus_rows =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(panes[0]);
+        let content_area = focus_rows[0];
+        let paragraph = Paragraph::new(details)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title(" ticket // esc back "));
+        let line_count = paragraph.line_count(content_area.width.saturating_sub(2));
+        let maximum = line_count
+            .saturating_sub(usize::from(content_area.height))
+            .min(usize::from(u16::MAX)) as u16;
+        self.body_scroll_max.set(maximum);
+        let scroll = self.body_scroll.get().min(maximum);
+        self.body_scroll.set(scroll);
+        frame.render_widget(paragraph.scroll((scroll, 0)), content_area);
         frame.render_widget(
-            Paragraph::new(details)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(Block::bordered().title(" ticket // esc back ")),
-            panes[0],
+            Paragraph::new("j k scroll · h l ticket · L labels · m to-refine").style(THEME.dim()),
+            focus_rows[1],
         );
         let (chat_title, chat_ready) = ticket_chat_identity(state, repo);
         let chat_block = Block::bordered().title(format!(" {chat_title} "));
@@ -1203,6 +1469,57 @@ impl Tickets {
             rows[2],
         );
     }
+
+    /// Draw the new-ticket creation form.
+    fn draw_new_ticket(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(form) = self.new_ticket.as_ref() else {
+            return;
+        };
+        let rows = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let title_style = if matches!(form.field, NewTicketField::Title) {
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(THEME.text)
+        };
+        let body_style = if matches!(form.field, NewTicketField::Body) {
+            Style::default().fg(THEME.accent)
+        } else {
+            Style::default().fg(THEME.text)
+        };
+        frame.render_widget(
+            Paragraph::new(form.title.clone())
+                .style(title_style)
+                .block(Block::bordered().title(format!(" new ticket // {} ", form.repo))),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(form.body.clone())
+                .style(body_style)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title(" description ")),
+            rows[1],
+        );
+        let status = form
+            .error
+            .as_deref()
+            .unwrap_or("tab field · enter newline · ctrl-s create · esc cancel");
+        let color = if form.error.is_some() {
+            THEME.error
+        } else {
+            THEME.dim
+        };
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(color)),
+            rows[2],
+        );
+    }
 }
 
 /// Convert a repository label color to one terminal true color.
@@ -1217,7 +1534,7 @@ fn repo_label_color(color: &str) -> Color {
 }
 
 /// Create one globally unique ticket request code.
-fn request_code() -> String {
+pub(super) fn request_code() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -1322,6 +1639,7 @@ mod tests {
                     group: TicketGroup::ToRefine,
                 },
             ],
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -1415,6 +1733,50 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| tickets.draw(frame, frame.area(), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A state whose active tab holds the tickets `borsuk#7` and `borsuk#8`.
+    fn two_ticket_state() -> StateView {
+        let mut state = state();
+        state.tickets.insert(
+            1,
+            TicketSummary {
+                repo: "borsuk".to_string(),
+                number: 8,
+                title: "Second borsuk issue".to_string(),
+                labels: Vec::new(),
+                updated_at: "2026-08-31T12:00:00Z".to_string(),
+                group: TicketGroup::Untouched,
+            },
+        );
+        state
+    }
+
+    /// Details whose body spans more lines than one short pane shows.
+    fn long_body_details() -> TicketDetails {
+        let mut detail = details();
+        detail.issue.body = (0..60)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        detail
+    }
+
+    /// Render the view at an explicit size and return the screen rows.
+    fn render_focus(tickets: &Tickets, state: &StateView, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| tickets.draw(frame, frame.area(), state))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1713,6 +2075,209 @@ mod tests {
     }
 
     #[test]
+    fn j_and_k_scroll_the_focused_ticket_body() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        assert!(
+            tickets.body_scroll_max.get() > 0,
+            "the long body must set a bound"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('j')));
+        assert_eq!(tickets.body_scroll.get(), 1);
+        tickets.handle_key(&state, key(KeyCode::Down));
+        assert_eq!(tickets.body_scroll.get(), 2);
+        tickets.handle_key(&state, key(KeyCode::Char('k')));
+        assert_eq!(tickets.body_scroll.get(), 1);
+        tickets.handle_key(&state, key(KeyCode::Up));
+        assert_eq!(tickets.body_scroll.get(), 0);
+        tickets.handle_key(&state, key(KeyCode::Char('k')));
+        assert_eq!(tickets.body_scroll.get(), 0, "k stops at 0");
+
+        for _ in 0..tickets.body_scroll_max.get() + 5 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            tickets.body_scroll.get(),
+            tickets.body_scroll_max.get(),
+            "j stops at the last rendered line"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_body_sets_the_scroll_bound() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        let mut detail = details();
+        detail.issue.body = "word ".repeat(200);
+        tickets.observe_details(detail);
+
+        render_focus(&tickets, &state, 104, 20);
+
+        assert!(
+            tickets.body_scroll_max.get() > 0,
+            "one wrapped paragraph line must still scroll"
+        );
+    }
+
+    #[test]
+    fn h_and_l_open_the_next_and_previous_ticket_of_the_repo() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 7)));
+
+        let next = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = next else {
+            panic!("l must open the next ticket of the tab");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 8);
+        assert_eq!(tickets.focus_key, Some(("borsuk".to_string(), 8)));
+        assert_eq!(tickets.selected, 1);
+        assert!(
+            tickets.details.is_none(),
+            "the move clears the previous issue"
+        );
+
+        let at_end = tickets.handle_key(&state, key(KeyCode::Right));
+        assert!(
+            at_end.is_none(),
+            "the last ticket of the tab stops the move"
+        );
+
+        let previous = tickets.handle_key(&state, key(KeyCode::Left));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = previous else {
+            panic!("h must open the previous ticket of the tab");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 7);
+
+        let at_start = tickets.handle_key(&state, key(KeyCode::Char('h')));
+        assert!(
+            at_start.is_none(),
+            "the first ticket of the tab stops the move"
+        );
+        assert_eq!(
+            tickets.tab(&state).as_deref(),
+            Some("borsuk"),
+            "the move never changes the tab"
+        );
+
+        // The search text still controls the move.
+        let mut searching = Tickets {
+            query: "#8".to_string(),
+            focus: true,
+            focus_key: Some(("borsuk".to_string(), 8)),
+            ..Tickets::default()
+        };
+        assert!(searching
+            .handle_key(&state, key(KeyCode::Char('l')))
+            .is_none());
+        assert!(searching
+            .handle_key(&state, key(KeyCode::Char('h')))
+            .is_none());
+    }
+
+    #[test]
+    fn a_focus_move_resets_the_scroll() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(tickets.body_scroll.get(), 0, "enter resets the offset");
+
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        let moved = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert!(matches!(
+            moved,
+            Some(Action::Ticket(TicketAction::Details { .. }))
+        ));
+        assert_eq!(tickets.body_scroll.get(), 0, "l resets the offset");
+        assert_eq!(tickets.body_scroll_max.get(), 0);
+    }
+
+    #[test]
+    fn open_resets_the_focus_scroll() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        // The inbox reopens the very same ticket.
+        tickets.open("borsuk", 7);
+        assert_eq!(
+            tickets.body_scroll.get(),
+            0,
+            "the inbox path starts the pane at the top"
+        );
+
+        tickets.observe_details(long_body_details());
+        render_focus(&tickets, &state, 104, 20);
+        for _ in 0..3 {
+            tickets.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert!(tickets.body_scroll.get() > 0);
+
+        // The inbox opens another ticket.
+        tickets.open("borsuk", 142);
+        assert_eq!(tickets.body_scroll.get(), 0);
+        assert_eq!(tickets.body_scroll_max.get(), 0);
+    }
+
+    #[test]
+    fn a_focus_move_keeps_the_list_selection() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(tickets.selected, 1);
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(!tickets.focus_open());
+
+        let action = tickets.handle_key(&state, key(KeyCode::Enter));
+        let Some(Action::Ticket(TicketAction::Details { repo, number, .. })) = action else {
+            panic!("enter must reopen the ticket last read");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(number, 8);
+    }
+
+    #[test]
+    fn the_focus_hint_line_names_the_new_keys() {
+        let screen = draw_focus(104);
+        let text = screen.join("\n");
+        assert!(
+            text.contains("j k scroll · h l ticket · L labels · m to-refine"),
+            "screen:\n{text}"
+        );
+    }
+
+    #[test]
     fn body_render_renders_markdown_once_per_update() {
         let mut tickets = Tickets::default();
         tickets.handle_key(&state(), key(KeyCode::Enter));
@@ -1912,12 +2477,27 @@ mod tests {
 
     #[test]
     fn label_picker_space_sends_one_immediate_toggle() {
-        let state = state();
+        let state = two_ticket_state();
         let mut tickets = Tickets::default();
         tickets.handle_key(&state, key(KeyCode::Enter));
         tickets.observe_details(details());
 
-        let catalog_action = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        let move_action = tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert!(
+            matches!(
+                move_action,
+                Some(Action::Ticket(TicketAction::Details { number: 8, .. }))
+            ),
+            "l must move between tickets instead of the label picker"
+        );
+        let back = tickets.handle_key(&state, key(KeyCode::Char('h')));
+        assert!(matches!(
+            back,
+            Some(Action::Ticket(TicketAction::Details { number: 7, .. }))
+        ));
+        tickets.observe_details(details());
+
+        let catalog_action = tickets.handle_key(&state, key(KeyCode::Char('L')));
         assert!(matches!(
             catalog_action,
             Some(Action::Ticket(TicketAction::Labels { ref repo, .. })) if repo == "borsuk"
@@ -2042,7 +2622,7 @@ mod tests {
         let mut tickets = Tickets::default();
         tickets.handle_key(&state, key(KeyCode::Enter));
         tickets.observe_details(details());
-        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        tickets.handle_key(&state, key(KeyCode::Char('L')));
         tickets.observe_labels(TicketLabels {
             request: "labels-1".to_string(),
             repo: "borsuk".to_string(),
@@ -2211,5 +2791,377 @@ mod tests {
         assert!(tickets.result.is_none());
         assert!(tickets.conflict.is_none());
         assert!(!tickets.conflict_open);
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_nested_view() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        assert_eq!(
+            tickets.footer_hints(),
+            "h l tabs · / search · n new · enter open · ? help"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('/')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "type filter · enter apply · esc clear"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+
+        // The new-ticket form takes text, so it names no help key.
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert!(tickets.typing());
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s create · tab field · esc cancel"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(tickets.new_ticket.is_none());
+
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        assert!(tickets.focus_open());
+        assert_eq!(
+            tickets.footer_hints(),
+            "e edit · L labels · c chat · m refine · esc back · ? help"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('e')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s save · tab field · esc close"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+
+        // The capital L opens the picker; the plain l steps the focus.
+        tickets.handle_key(&state, key(KeyCode::Char('L')));
+        assert!(tickets.label_picker_open);
+        assert_eq!(
+            tickets.footer_hints(),
+            "space apply · n new label · esc close"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s create · tab field · esc cancel"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(!tickets.label_picker_open);
+
+        // A waiting proposal takes the slot of the to-refine key.
+        let mut with_proposal = details();
+        with_proposal.proposal = Some(crate::sock::TicketProposal {
+            id: "proposal-7".to_string(),
+            title: "Improve the ticket list".to_string(),
+            body: "A shorter plan.".to_string(),
+            original_title: "Improve the ticket list".to_string(),
+            original_body: "Show every issue without leaving the terminal.".to_string(),
+        });
+        tickets.observe_details(with_proposal);
+        assert_eq!(
+            tickets.footer_hints(),
+            "e edit · a apply · L labels · c chat · esc back · ? help"
+        );
+
+        let conflict = Tickets {
+            focus: true,
+            conflict_open: true,
+            ..Tickets::default()
+        };
+        assert_eq!(
+            conflict.footer_hints(),
+            "g keep remote · p reapply · esc back"
+        );
+
+        let chat = Tickets {
+            focus: true,
+            chat_active: true,
+            ..Tickets::default()
+        };
+        assert_eq!(chat.footer_hints(), "esc back to issue");
+    }
+
+    #[test]
+    fn every_ticket_hint_stays_within_the_bottom_row_cap() {
+        for hint in [
+            "h l tabs · / search · n new · enter open · ? help",
+            "type filter · enter apply · esc clear",
+            "ctrl-s create · tab field · esc cancel",
+            "e edit · L labels · c chat · m refine · esc back · ? help",
+            "e edit · a apply · L labels · c chat · esc back · ? help",
+            "ctrl-s save · tab field · esc close",
+            "space apply · n new label · esc close",
+            "g keep remote · p reapply · esc back",
+            "esc back to issue",
+        ] {
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
+        }
+    }
+
+    fn type_string(tickets: &mut Tickets, state: &StateView, text: &str) {
+        for character in text.chars() {
+            tickets.handle_key(state, key(KeyCode::Char(character)));
+        }
+    }
+
+    fn send_key(tickets: &mut Tickets, state: &StateView) -> Option<Action> {
+        tickets.handle_key(
+            state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+    }
+
+    #[test]
+    fn n_opens_the_new_ticket_form_for_the_active_tab() {
+        let state = state();
+        let mut tickets = Tickets::default();
+
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+
+        let form = tickets.new_ticket.as_ref().expect("n must open the form");
+        assert_eq!(form.repo, "borsuk");
+        assert!(tickets.typing(), "the form must own the keyboard");
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(tickets.new_ticket.is_none(), "esc drops the draft");
+
+        let mut switched = Tickets::default();
+        switched.handle_key(&state, key(KeyCode::Char('l')));
+        switched.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(switched.new_ticket.as_ref().unwrap().repo, "qubitsok");
+    }
+
+    #[test]
+    fn n_falls_back_to_the_first_repo_and_ignores_an_empty_state() {
+        let mut state = state();
+        state.tickets.clear();
+        state.repos = vec![crate::sock::RepoView {
+            alias: "ryba".to_string(),
+            owner_repo: String::new(),
+        }];
+
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(
+            tickets.new_ticket.as_ref().unwrap().repo,
+            "ryba",
+            "no tab falls back to the first repository"
+        );
+
+        let empty = StateView {
+            tickets: Vec::new(),
+            repos: Vec::new(),
+            ..state
+        };
+        let mut idle = Tickets::default();
+        idle.handle_key(&empty, key(KeyCode::Char('n')));
+        assert!(
+            idle.new_ticket.is_none(),
+            "an empty state must not open the form"
+        );
+    }
+
+    #[test]
+    fn n_stays_free_in_the_focus_and_types_inside_the_search() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert!(tickets.new_ticket.is_none(), "the focus keeps n free");
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Char('/')));
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert!(
+            tickets.new_ticket.is_none(),
+            "the search input must not open the form"
+        );
+        assert_eq!(tickets.query, "n", "the letter went into the search");
+    }
+
+    #[test]
+    fn ctrl_s_sends_one_create_for_the_form_repository() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "  Direct title ");
+        tickets.handle_key(&state, key(KeyCode::Tab));
+        type_string(&mut tickets, &state, "Body");
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.handle_key(&state, key(KeyCode::Char('x')));
+
+        let action = send_key(&mut tickets, &state);
+        let Some(Action::Ticket(TicketAction::Create {
+            request,
+            repo,
+            title,
+            body,
+        })) = action
+        else {
+            panic!("ctrl-s must send one create action");
+        };
+        assert!(!request.is_empty(), "the request code must be fresh");
+        assert_eq!(repo, "borsuk");
+        assert_eq!(title, "Direct title");
+        assert_eq!(body, "Body\nx");
+
+        let form = tickets.new_ticket.as_ref().unwrap();
+        assert_eq!(form.request.as_deref(), Some(request.as_str()));
+        assert!(form.pending, "the form must mark one create in flight");
+
+        let second = send_key(&mut tickets, &state);
+        assert!(second.is_none(), "a pending create must not resend");
+    }
+
+    #[test]
+    fn ctrl_s_with_an_empty_title_shows_the_error_and_sends_nothing() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "   ");
+
+        let action = send_key(&mut tickets, &state);
+
+        assert!(action.is_none());
+        let form = tickets.new_ticket.as_ref().unwrap();
+        assert_eq!(
+            form.error.as_deref(),
+            Some("The ticket title must not be empty.")
+        );
+        assert!(!form.pending);
+    }
+
+    #[test]
+    fn a_failure_keeps_the_draft_and_shows_the_daemon_message() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "Direct title");
+        let sent = send_key(&mut tickets, &state);
+        let Some(Action::Ticket(TicketAction::Create { request, .. })) = sent else {
+            panic!("ctrl-s must send one create action");
+        };
+
+        tickets.observe_result(TicketResult {
+            request,
+            repo: "borsuk".to_string(),
+            number: 0,
+            kind: TicketResultKind::Failure,
+            message: "GitHub rejected the ticket creation: 422".to_string(),
+            issue: None,
+            conflict: None,
+        });
+
+        let form = tickets.new_ticket.as_ref().unwrap();
+        assert_eq!(form.title, "Direct title");
+        assert_eq!(
+            form.error.as_deref(),
+            Some("GitHub rejected the ticket creation: 422")
+        );
+        assert!(!form.pending);
+    }
+
+    #[test]
+    fn a_success_closes_the_form() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "Direct title");
+        let sent = send_key(&mut tickets, &state);
+        let Some(Action::Ticket(TicketAction::Create { request, .. })) = sent else {
+            panic!("ctrl-s must send one create action");
+        };
+
+        tickets.observe_result(TicketResult {
+            request,
+            repo: "borsuk".to_string(),
+            number: 12,
+            kind: TicketResultKind::Success,
+            message: "GitHub created ticket #12.".to_string(),
+            issue: None,
+            conflict: None,
+        });
+
+        assert!(tickets.new_ticket.is_none(), "the success closed the form");
+    }
+
+    #[test]
+    fn a_foreign_request_cannot_change_the_form() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        type_string(&mut tickets, &state, "Direct title");
+        let sent = send_key(&mut tickets, &state);
+        assert!(matches!(
+            sent,
+            Some(Action::Ticket(TicketAction::Create { .. }))
+        ));
+
+        tickets.observe_result(TicketResult {
+            request: "another-request".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: TicketResultKind::Success,
+            message: "GitHub confirmed the label update.".to_string(),
+            issue: None,
+            conflict: None,
+        });
+        tickets.observe_result(TicketResult {
+            request: "third-request".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+            kind: TicketResultKind::Failure,
+            message: "GitHub rejected the label update.".to_string(),
+            issue: None,
+            conflict: None,
+        });
+
+        let form = tickets.new_ticket.as_ref().expect("the form stays open");
+        assert!(form.pending, "the create stays in flight");
+        assert!(form.error.is_none(), "no foreign failure reached the form");
+        assert_eq!(form.title, "Direct title");
+    }
+
+    #[test]
+    fn the_new_ticket_form_draws_both_fields_and_the_status_line() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        let screen_of = |tickets: &Tickets| {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| tickets.draw(frame, frame.area(), &state))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .map(|(x, y)| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let screen = screen_of(&tickets);
+        assert!(screen.contains("new ticket // borsuk"), "screen: {screen}");
+        assert!(screen.contains("description"), "screen: {screen}");
+        assert!(screen.contains("ctrl-s create"), "screen: {screen}");
+
+        send_key(&mut tickets, &state);
+        let screen = screen_of(&tickets);
+        assert!(
+            screen.contains("The ticket title must not be empty."),
+            "screen: {screen}"
+        );
+
+        type_string(&mut tickets, &state, "Direct title");
+        let screen = screen_of(&tickets);
+        assert!(screen.contains("Direct title"), "screen: {screen}");
+        assert!(
+            !screen.contains("must not be empty"),
+            "typing cleared the error: {screen}"
+        );
     }
 }

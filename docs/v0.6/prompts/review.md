@@ -13,18 +13,51 @@ PR #{number}: {title}
 
 Tickets this PR closes: {tickets}
 
-Read the diff of the PR with `gh pr diff {number}`. Review it for
-correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`. If it is correct, approve it and then run
-`gh pr ready {number}`. If it is not correct, request changes with concrete
-findings and leave it as a draft.
+You are the last agent on this change. You repair every finding yourself. You
+never hand a finding back to the author. The PR must leave your run ready for
+review, or labelled `needs-human`.
 
-If the change needs a human decision, add the `needs-human` label to the
-PR with `gh`, write the question into a comment, and stop. Do not
-guess. When the decision is a choice between named answers, end the comment
-with one strict block in this form. Keep the JSON on one line:
+Read the diff of the PR with `gh pr diff {number}`. Review it for
+correctness, tests, and fit with the codebase. Read the repository
+instructions and the linked tickets.
+
+Before your first edit, check whether the PR comes from a fork:
+`gh pr view {number} --json isCrossRepository --jq .isCrossRepository`.
+When the command prints `true`, take the human path. Never push a fork repair
+to `origin`.
+
+Before your first edit, prove that this worktree holds the PR head. Compare
+`gh pr view {number} --json headRefOid --jq .headRefOid` with
+`git rev-parse HEAD`. When the two differ, run
+`git fetch origin pull/{number}/head` and then `git reset --hard FETCH_HEAD`.
+
+Fix every finding in this worktree. Add the missing tests. Keep the scope of
+the linked tickets. Run the full validation of the repository and make it
+pass. Commit the repairs in small, complete commits.
+
+Push once, at the end of the run. A push on a draft PR can restart your own
+review, so never push a partial fix. Push the commits and open the release
+gate in one command line:
+
+`git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}`
+
+Never pass `--force`. Never merge the PR.
+
+Record the outcome with `gh pr comment {number}`. Name the findings, the
+repairs, and the validation result. GitHub refuses a formal review of your own
+PR, so this comment is the record.
+
+When the PR needs no repair, post the record and run `gh pr ready {number}`.
+
+Take the human path when the PR comes from a fork, when a finding needs a human
+decision, when the repair leaves the scope of the linked tickets, or when the
+push fails. On that path, add the `needs-human` label to the PR with `gh`, write
+the question into a comment, leave the draft, and stop. Do not guess. When the
+decision is a choice between named answers, end the comment with one strict
+block in this form. Keep the JSON on one line:
 <aif-ask-v1>
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Report one line at the end: the review verdict.
+Report one line at the end: the review verdict, and the number of commits you
+pushed.

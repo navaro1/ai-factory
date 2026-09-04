@@ -493,6 +493,29 @@ impl SessionView {
         !self.input_enabled()
     }
 
+    /// The bottom-row hints of the session state.
+    ///
+    /// A bar that holds the focus shows only the release keys, because
+    /// the shell gives `h` and `l` to the bar and sends `esc` to the
+    /// focus. A bar that cannot take text keeps the `? help` key. A
+    /// released focus names the session and pipeline keys, and a view
+    /// with no task falls back to the shell view keys.
+    pub fn footer_hints(&self) -> String {
+        if self.task.is_none() {
+            return "1 2 3 4 5 views · ? help".to_string();
+        }
+        if self.chat_focus {
+            if self.input_enabled() {
+                return "esc tab release focus".to_string();
+            }
+            return "esc tab release focus · ? help".to_string();
+        }
+        if self.input_enabled() {
+            return "i enter focus · h l session · esc pipeline · ? help".to_string();
+        }
+        "h l session · esc pipeline · ? help".to_string()
+    }
+
     /// Handle one key press. Returns the action to send to the daemon.
     ///
     /// `page` is the visible transcript height in rows; the shell passes
@@ -892,6 +915,61 @@ mod tests {
     /// One letter key press.
     fn letter(letter: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_chat_focus_and_task_state() {
+        let dir = TempDir::new("footer-hints");
+        let task = sample_task(dir.path());
+
+        // No shown task: the shell keeps its view keys.
+        let view = SessionView::new();
+        assert_eq!(view.footer_hints(), "1 2 3 4 5 views · ? help");
+
+        // A focused bar that can take text shows only the release keys.
+        let mut view = SessionView::new();
+        view.show(&task);
+        assert!(view.chat_focus());
+        assert_eq!(view.footer_hints(), "esc tab release focus");
+
+        // A released focus offers the focus, session, and pipeline keys.
+        view.set_chat_focus(false);
+        assert_eq!(
+            view.footer_hints(),
+            "i enter focus · h l session · esc pipeline · ? help"
+        );
+
+        // A closed bar that holds the focus still owns esc and tab. The
+        // shell keeps the help key, because the bar takes no text.
+        let closed = task_with_mode(
+            dir.path(),
+            InputMode::Closed {
+                reason: "the session is parked".to_string(),
+            },
+            0,
+        );
+        let mut view = SessionView::new();
+        view.show(&closed);
+        assert!(view.chat_focus());
+        assert_eq!(
+            view.footer_hints(),
+            "esc tab release focus · ? help",
+            "a focused closed bar releases the focus first"
+        );
+
+        // A released focus names no focus key, because the bar is closed.
+        view.set_chat_focus(false);
+        assert_eq!(view.footer_hints(), "h l session · esc pipeline · ? help");
+
+        for hint in [
+            "1 2 3 4 5 views · ? help",
+            "esc tab release focus",
+            "esc tab release focus · ? help",
+            "i enter focus · h l session · esc pipeline · ? help",
+            "h l session · esc pipeline · ? help",
+        ] {
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
+        }
     }
 
     #[test]
@@ -1488,7 +1566,12 @@ mod tests {
         assert_eq!(asks[0].options, vec!["a".to_string(), "b".to_string()]);
         assert!(asks[1].options.is_empty());
 
-        // A wrapped object and a wrong shape both yield nothing.
+        // The recorded tool input wraps the same list under `questions`.
+        let wrapped = ask_questions(&serde_json::json!({"questions": value}));
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].options, vec!["a".to_string(), "b".to_string()]);
+
+        // A wrong shape yields nothing.
         assert!(ask_questions(&serde_json::json!(null)).is_empty());
         assert!(ask_questions(&serde_json::json!("no")).is_empty());
     }
