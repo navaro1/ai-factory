@@ -56,6 +56,9 @@ pub enum ProcEvent {
     /// exact raw bytes, including lines that are not valid JSON, reached the
     /// log file first.
     Line(String),
+    /// One complete stderr line, newline stripped and decoded lossily. The
+    /// exact raw bytes reached the log file first, with a `stderr ` prefix.
+    StderrLine(String),
     /// The child exited. Sent exactly once, whatever stopped the child.
     Exit {
         /// The exit code, or `None` when a signal killed the child.
@@ -150,7 +153,8 @@ fn decode_line(bytes: &[u8]) -> String {
 /// The parent directory of `spec.log` is created if needed and the log is
 /// opened for append. The child starts with piped stdin, stdout, and stderr.
 /// Every raw stdout line reaches the log byte for byte; stderr lines are
-/// appended to the same log with a `stderr ` prefix and produce no events.
+/// appended to the same log with a `stderr ` prefix and travel on as
+/// [`ProcEvent::StderrLine`] events.
 /// SIGTERM runs `kill -TERM <pid>` through [`RealExec`].
 pub fn spawn(spec: RunSpec, tx: Sender<ProcEvent>) -> anyhow::Result<ProcHandle> {
     spawn_with_exec(spec, tx, Arc::new(RealExec))
@@ -243,8 +247,8 @@ fn spawn_with_exec(
         })
     };
 
-    // The stderr reader appends to the same log with a prefix and sends no
-    // events.
+    // The stderr reader appends to the same log with a prefix and reports
+    // each line, so a harness can read what the child prints there.
     let stderr_reader = {
         let sink = Arc::clone(&sink);
         let tx = tx.clone();
@@ -252,11 +256,17 @@ fn spawn_with_exec(
         thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             let mut buf = Vec::new();
+            let mut events_on = true;
             loop {
                 buf.clear();
                 match reader.read_until(b'\n', &mut buf) {
                     Ok(0) => break,
-                    Ok(_) => sink.write_bytes(b"stderr ", &buf, true, &task, &tx),
+                    Ok(_) => {
+                        sink.write_bytes(b"stderr ", &buf, true, &task, &tx);
+                        if events_on && tx.send(ProcEvent::StderrLine(decode_line(&buf))).is_err() {
+                            events_on = false;
+                        }
+                    }
                     Err(error) => {
                         let _ = tx.send(ProcEvent::Error(format!(
                             "task {task}: stderr read failed: {error}"
@@ -788,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn stderr_lines_reach_the_log_with_a_prefix_and_no_events() {
+    fn stderr_lines_reach_the_log_with_a_prefix_and_travel_as_events() {
         let dir = temp_dir("stderr-prefix");
         let program = script(
             &dir,
@@ -797,9 +807,11 @@ mod tests {
         );
         let (tx, rx) = channel();
         let handle = spawn(spec(&dir, "t/noisy", &program, &[]), tx).unwrap();
-        let events = collect_until_exit(&rx);
+        let mut events = collect_until_exit(&rx);
         drop(handle);
+        events.extend(collect_until_disconnect(&rx));
 
+        // The stdout lines stay plain `Line` events.
         let lines: Vec<&String> = events
             .iter()
             .filter_map(|event| match event {
@@ -809,6 +821,17 @@ mod tests {
             .collect();
         assert_eq!(lines, vec![&"out1".to_string(), &"out2".to_string()]);
 
+        // Each stderr line also arrives as an event, newline stripped.
+        let stderr_lines: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProcEvent::StderrLine(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stderr_lines, vec![&"err1".to_string(), &"err2".to_string()]);
+
+        // The log keeps the exact `stderr ` prefix contract.
         let logged = fs::read_to_string(dir.join("log.jsonl")).unwrap();
         let mut logged_lines: Vec<&str> = logged.lines().collect();
         logged_lines.sort_unstable();
