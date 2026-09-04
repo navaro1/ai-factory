@@ -2455,6 +2455,7 @@ mod tests {
             decisions,
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -4155,6 +4156,7 @@ mod tests {
             decisions,
             decision_items: items,
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: vec![TrainView {
                 repo: "borsuk".to_string(),
                 queue,

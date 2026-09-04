@@ -1122,12 +1122,16 @@ fn release_lane_lines(
                     pr: *pr,
                 };
                 let badge = release_pr_badge(state, &repo.alias, *pr);
+                let label = match release_pr_title(state, &repo.alias, *pr) {
+                    Some(title) => format!("#{pr} · {title}{badge}"),
+                    None => format!("#{pr}{badge}"),
+                };
                 push_custom_row_line(
                     all,
                     selected,
                     &row,
                     vec![Span::styled(
-                        box_line(&format!("#{pr}{badge}"), box_width),
+                        box_line(&label, box_width),
                         Style::default().fg(THEME.text),
                     )],
                     &mut lines,
@@ -1179,17 +1183,19 @@ fn release_lane_lines(
             } else {
                 "ready"
             };
-            push_custom_row_line(
-                all,
-                selected,
-                &row,
-                vec![
-                    Span::styled(format!("#{pr}"), Style::default().fg(THEME.text)),
-                    Span::styled(format!(" {status}"), THEME.dim()),
-                    Span::styled(release_pr_badge(state, &repo.alias, *pr), THEME.dim()),
-                ],
-                &mut lines,
-            );
+            let mut spans = vec![
+                Span::styled(format!("#{pr}"), Style::default().fg(THEME.text)),
+                Span::styled(format!(" {status}"), THEME.dim()),
+            ];
+            if let Some(title) = release_pr_title(state, &repo.alias, *pr) {
+                spans.push(Span::raw(" · "));
+                spans.push(Span::styled(title, THEME.dim()));
+            }
+            spans.push(Span::styled(
+                release_pr_badge(state, &repo.alias, *pr),
+                THEME.dim(),
+            ));
+            push_custom_row_line(all, selected, &row, spans, &mut lines);
         }
 
         let batch_task = release_batch_task_id(train);
@@ -1463,18 +1469,26 @@ fn truncate(text: &str) -> String {
     }
 }
 
-/// The title of the task's ticket, when the state view knows one.
+/// The title of the task's issue or pull request, when the state view
+/// knows one.
 ///
 /// The row shows the number itself, so the suffix carries the title only.
-/// The tickets list holds open issues only, so a pull request task finds
-/// nothing and its row keeps the bare item label.
-fn ticket_title(state: &StateView, task: &TaskView) -> Option<String> {
-    let number = task.number;
-    state
-        .tickets
-        .iter()
-        .find(|ticket| ticket.repo == task.repo && ticket.number == number)
-        .map(|ticket| truncate(&ticket.title))
+/// The tickets list holds open issues only, and the prs list holds open
+/// pull requests only, so a task without a snapshot entry finds nothing
+/// and its row keeps the bare item label.
+fn item_title(state: &StateView, task: &TaskView) -> Option<String> {
+    match task.kind {
+        ItemKind::Issue => state
+            .tickets
+            .iter()
+            .find(|ticket| ticket.repo == task.repo && ticket.number == task.number)
+            .map(|ticket| truncate(&ticket.title)),
+        ItemKind::Pr => state
+            .prs
+            .iter()
+            .find(|pr| pr.repo == task.repo && pr.number == task.number)
+            .map(|pr| truncate(&pr.title)),
+    }
 }
 
 /// The linked numbers as `#7 #9`, at most three, then `+n`.
@@ -1593,12 +1607,23 @@ fn release_pr_badge(state: &StateView, repo: &str, pr: u64) -> String {
     }
 }
 
+/// The title of one release PR row, cut to the row budget, when the
+/// state view knows the open pull request.
+fn release_pr_title(state: &StateView, repo: &str, pr: u64) -> Option<String> {
+    state
+        .prs
+        .iter()
+        .find(|item| item.repo == repo && item.number == pr)
+        .map(|item| truncate(&item.title))
+}
+
 /// The spans of one ticket row: state, attempt, queued messages, and item.
 ///
-/// The state leads the row. A matching open issue then names the ticket as
-/// `#784 · title`; any other task keeps the bare item label `i784` or `p7`,
-/// because the tickets list holds open issues only and the prefix then
-/// separates issues from PRs.
+/// The state leads the row. A matching open issue or open pull request
+/// then names the item as `#784 · title`; any other task keeps the bare
+/// item label `i784` or `p7`, because the tickets and prs lists hold
+/// open snapshot entries only and the prefix then separates issues from
+/// PRs.
 ///
 /// A queued task that a pause blocks shows the pause instead of the queue
 /// state, because it cannot start. A task in any other state keeps its true
@@ -1624,7 +1649,7 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
         spans.push(Span::styled(format!(" a{}", task.attempt), THEME.dim()));
     }
     spans.push(Span::raw(" · "));
-    match ticket_title(state, task) {
+    match item_title(state, task) {
         Some(title) => {
             spans.push(Span::styled(
                 format!("#{}", task.number),
@@ -1662,7 +1687,7 @@ fn task_label(state: &StateView, task: &TaskView) -> String {
     if task.attempt > 1 {
         label.push_str(&format!(" a{}", task.attempt));
     }
-    match ticket_title(state, task) {
+    match item_title(state, task) {
         Some(title) => label.push_str(&format!(" · #{} · {title}", task.number)),
         None => label.push_str(&format!(" · {}{}", task.kind.as_str(), task.number)),
     }
@@ -1908,6 +1933,7 @@ pub(crate) fn sample_view() -> StateView {
         decisions: Vec::new(),
         decision_items: Vec::new(),
         tickets: Vec::new(),
+        prs: Vec::new(),
         trains: vec![
             TrainView {
                 repo: "borsuk".to_string(),
@@ -2005,6 +2031,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -2951,11 +2978,123 @@ mod tests {
         assert!(!text.contains("running · p7 ·"));
     }
 
+    #[test]
+    fn a_pr_row_names_an_open_pull_request_and_keeps_its_badge() {
+        let mut state = sample_view();
+        state.prs = vec![pr("borsuk", 7, "Ship the board")];
+        state.links = vec![link("borsuk", 142, 7), link("borsuk", 150, 7)];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(
+            text.contains("running · #7 · Ship the board · ← #142 #150"),
+            "board:\n{text}"
+        );
+        assert!(!text.contains("p7"), "board:\n{text}");
+    }
+
+    #[test]
+    fn a_pr_task_without_a_snapshot_entry_keeps_the_bare_label() {
+        let mut state = sample_view();
+        // Only pull request 9 is open in the snapshot, so the p7 row and
+        // the release task p5 stay bare.
+        state.prs = vec![pr("borsuk", 9, "Open pull request")];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        assert!(text.contains("running · p7"), "board:\n{text}");
+        assert!(!text.contains("running · #7"), "board:\n{text}");
+        assert!(text.contains("running · p5"), "board:\n{text}");
+        assert!(
+            text.contains("needs input · #9 · Open pull request"),
+            "board:\n{text}"
+        );
+    }
+
+    #[test]
+    fn release_rows_show_the_pull_request_titles() {
+        let mut state = sample_view();
+        state.prs = vec![
+            pr("borsuk", 5, "Land the batch box"),
+            pr("borsuk", 7, "Queue the next release"),
+            pr("borsuk", 9, "Wait for the train"),
+        ];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        let text = render_to_size(&mut app, 200, 24);
+
+        // The batch box row carries the title inside the border.
+        assert!(text.contains("│#5 · Land the batch box"), "board:\n{text}");
+        // The release task row inside the box names the pull request too.
+        assert!(
+            text.contains("running · #5 · Land the batch box"),
+            "board:\n{text}"
+        );
+        // The waiting rows keep their status words and gain the title.
+        assert!(
+            text.contains("#7 next · Queue the next release"),
+            "board:\n{text}"
+        );
+        assert!(
+            text.contains("#9 new · Wait for the train"),
+            "board:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_release_row_cuts_the_title_to_the_row_budget_and_the_box_width() {
+        let mut state = sample_view();
+        state.prs = vec![pr("borsuk", 5, &"a".repeat(60))];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+
+        // At 80 columns the batch box holds 14 characters inside, so the
+        // row shows `#5 · ` plus the first nine budgeted title letters.
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains(&format!("│#5 · {}│", "a".repeat(9))),
+            "board:\n{text}"
+        );
+
+        // On a wide lane the title budget itself cuts the row at 32.
+        let text = render_to_size(&mut app, 200, 24);
+        assert!(
+            text.contains(&format!("│#5 · {}", "a".repeat(32))),
+            "board:\n{text}"
+        );
+        assert!(!text.contains(&"a".repeat(33)), "board:\n{text}");
+    }
+
     fn link(repo: &str, ticket: u64, pr: u64) -> crate::sock::LinkView {
         crate::sock::LinkView {
             repo: repo.to_string(),
             ticket,
             pr,
+        }
+    }
+
+    fn pr(repo: &str, number: u64, title: &str) -> crate::sock::PrSummary {
+        crate::sock::PrSummary {
+            repo: repo.to_string(),
+            number,
+            title: title.to_string(),
         }
     }
 

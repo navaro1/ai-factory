@@ -103,6 +103,9 @@ pub struct StateView {
     /// Compact open issue rows for the Tickets view.
     #[serde(default)]
     pub tickets: Vec<TicketSummary>,
+    /// Compact open pull request rows for readable pipeline names.
+    #[serde(default)]
+    pub prs: Vec<PrSummary>,
     /// The ticket-PR links of every configured repository.
     #[serde(default)]
     pub links: Vec<LinkView>,
@@ -540,6 +543,18 @@ impl StateInput<'_> {
                 .then_with(|| left.repo.cmp(&right.repo))
                 .then_with(|| left.number.cmp(&right.number))
         });
+        let prs: Vec<PrSummary> = config
+            .repos
+            .keys()
+            .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
+            .flat_map(|(repo, items)| {
+                items.prs.values().filter(|pr| pr.open).map(|pr| PrSummary {
+                    repo: repo.clone(),
+                    number: pr.number,
+                    title: pr.title.clone(),
+                })
+            })
+            .collect();
         let links: Vec<LinkView> = links
             .iter()
             .filter(|(repo, _)| config.repos.contains_key(*repo))
@@ -591,6 +606,7 @@ impl StateInput<'_> {
             decisions: decisions.open().to_vec(),
             decision_items,
             tickets,
+            prs,
             links,
             trains,
             paused,
@@ -735,6 +751,17 @@ impl TicketGroup {
             TicketGroup::Untouched
         }
     }
+}
+
+/// One compact open pull request row for readable pipeline names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrSummary {
+    /// The repository alias.
+    pub repo: String,
+    /// The pull request number.
+    pub number: u64,
+    /// The current pull request title.
+    pub title: String,
 }
 
 /// The editable title and description of one issue.
@@ -1911,6 +1938,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
@@ -2718,6 +2746,7 @@ mod tests {
             decisions: Vec::new(),
             decision_items: Vec::new(),
             tickets: Vec::new(),
+            prs: Vec::new(),
             links: vec![LinkView {
                 repo: "borsuk".to_string(),
                 ticket: 142,
@@ -2733,6 +2762,96 @@ mod tests {
         let text = serde_json::to_string(&view).unwrap();
         let back: StateView = serde_json::from_str(&text).unwrap();
         assert_eq!(back, view);
+    }
+
+    /// One pull request for a pr summary test.
+    fn test_pr(number: u64, title: &str) -> crate::model::Pr {
+        crate::model::Pr {
+            number,
+            node_id: format!("pr-{number}"),
+            title: title.to_string(),
+            body: format!("body {number}"),
+            labels: Vec::new(),
+            open: true,
+            draft: false,
+            head_sha: format!("sha-{number}"),
+            head_ref: format!("branch-{number}"),
+        }
+    }
+
+    #[test]
+    fn the_view_lists_open_pull_requests_of_every_repository_and_round_trips() {
+        let config = Config::parse(&config_text()).unwrap();
+        let limits = Limits::from_config(&config);
+        let paused = Paused::default();
+        let table = TaskTable::new();
+        let decisions = Decisions::new();
+        let trains = BTreeMap::new();
+        let policies = BTreeMap::new();
+        let input_modes = BTreeMap::new();
+        let mut closed = test_pr(4, "Closed pull request");
+        closed.open = false;
+        let mut snapshot = Snapshot::default();
+        snapshot.repos.insert(
+            "borsuk".to_string(),
+            crate::model::RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [(4, closed), (9, test_pr(9, "Open pull request"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        snapshot.repos.insert(
+            "qubitsok".to_string(),
+            crate::model::RepoSnapshot {
+                issues: BTreeMap::new(),
+                prs: [(2, test_pr(2, "Second pull request"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        let view = StateInput {
+            config: &config,
+            settings_revision: "test-revision",
+            limits: &limits,
+            paused: &paused,
+            table: &table,
+            decisions: &decisions,
+            snapshot: &snapshot,
+            links: &BTreeMap::new(),
+            trains: &trains,
+            policies: &policies,
+            input_modes: &input_modes,
+            now_ms: 0,
+        }
+        .build()
+        .unwrap();
+
+        let rows: Vec<(&str, u64, &str)> = view
+            .prs
+            .iter()
+            .map(|pr| (pr.repo.as_str(), pr.number, pr.title.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("borsuk", 9, "Open pull request"),
+                ("qubitsok", 2, "Second pull request"),
+            ]
+        );
+
+        let push = Push::State(view.clone());
+        let text = serde_json::to_string(&push).unwrap();
+        assert!(text.contains("\"prs\":["), "line: {text}");
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_view_without_the_prs_field_parses_with_an_empty_list() {
+        let json = r#"{"repos":[],"stages":[],"lanes":[],"tasks":[],"decisions":[],"trains":[],"paused":{"global":false,"overrides":[]},"settings":{"revision":"","global":[],"repositories":[]}}"#;
+        let view: StateView = serde_json::from_str(json).unwrap();
+        assert!(view.prs.is_empty());
     }
 
     fn huge_view(label: usize) -> StateView {
