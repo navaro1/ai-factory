@@ -9,12 +9,28 @@
 //! "PR". A `gh` command inside backticks keeps the GitHub word, because
 //! the CLI speaks its own nouns.
 
+/// The notice that precedes the rendered prompt of a task the daemon
+/// interrupted with a stop.
+///
+/// The daemon prepends it only to a run that resumes the saved session of
+/// such a task. The agent reads the worktree to find its place instead of
+/// repeating finished work.
+pub const RESTART_NOTICE: &str = "Note: the AI Factory daemon stopped and restarted \
+while this task ran. This run continues your saved session. Read the worktree \
+state first to find where you stopped, then continue the remaining work. Do not \
+repeat work that is already done.";
+
 /// The built-in prompt of a refine run.
 ///
 /// It runs in the repository checkout and never creates a worktree.
 pub const REFINE_PROMPT: &str = r#"You refine ticket #{number} of {repo}
 ({owner_repo}). You work in {worktree}, the repository checkout. Never create
 a git worktree; stay in this checkout.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 Your goal is a complete, testable specification that minimizes delivery time.
 Do not implement the change.
@@ -70,6 +86,11 @@ Ticket #{number}: {title}
 pub const IMPLEMENT_PROMPT: &str = r#"You implement ticket #{number} of {repo}
 ({owner_repo}). You work in {worktree}, your own git worktree. Never create
 another git worktree; work only in this one.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 Your goal is a complete change that meets every acceptance criterion with the
 shortest safe delivery time. Follow the repository instructions and keep the
@@ -127,6 +148,11 @@ pub const REVIEW_PROMPT: &str = r#"You review PR #{number} of {repo}
 ({owner_repo}). You work in {worktree}, your own git worktree. Never create
 another git worktree; work only in this one.
 
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
+
 PR #{number}: {title}
 
 {body}
@@ -154,6 +180,11 @@ Report one line at the end: the review verdict.
 pub const RELEASE_PROMPT: &str = r#"You release the stacked PRs of {repo}
 ({owner_repo}). You work in {worktree}, the release worktree. Never create
 another git worktree; work only in this one.
+
+Run without the operator. No person reads your text during the run. Do not
+ask for approval of a plan, a design, or a change. Do not stop to report a
+plan, and do not end a turn with a question. Decide with the facts you have
+and act. Stop early only through the escape this prompt names.
 
 The batch holds {pr_count} PR(s), in merge order:
 
@@ -334,6 +365,38 @@ mod tests {
             "The coordinator owns shared files, integration, git operations, and GitHub operations",
         ] {
             assert!(prompt.contains(required), "missing: {required}");
+        }
+    }
+
+    #[test]
+    fn the_stage_prompts_run_without_the_operator() {
+        let paragraph = "Run without the operator. No person reads your text during \
+the run. Do not ask for approval of a plan, a design, or a change. Do not \
+stop to report a plan, and do not end a turn with a question. Decide with \
+the facts you have and act. Stop early only through the escape this prompt \
+names.";
+        for (prompt, opening_end) in [
+            (REFINE_PROMPT, "stay in this checkout."),
+            (IMPLEMENT_PROMPT, "work only in this one."),
+            (REVIEW_PROMPT, "work only in this one."),
+            (RELEASE_PROMPT, "work only in this one."),
+        ] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            let position = normalized
+                .find(paragraph)
+                .expect("the stage prompt holds the autonomy paragraph");
+            let before = normalized[..position].trim_end();
+            assert!(
+                before.ends_with(opening_end),
+                "the autonomy paragraph does not follow the opening paragraph: {before}"
+            );
+        }
+        for prompt in [TICKET_PROMPT, TICKET_CHAT_PROMPT] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                !normalized.contains(paragraph),
+                "a ticket prompt must not hold the autonomy paragraph"
+            );
         }
     }
 }

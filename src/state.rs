@@ -6,7 +6,7 @@
 //! daemon writes the file through a temporary file and a rename. A missing or
 //! corrupt file is not an error. The loader logs once and uses the defaults.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -14,8 +14,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ReleasePolicy, ResolvedRoleSettings};
+use crate::decisions::{Decision, DecisionKind};
 use crate::model::Stage;
 use crate::sock::TicketProposal;
+use crate::tasks::{Task, MAX_ATTEMPTS};
 
 /// One issue conversation that survives a daemon restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +48,64 @@ struct LaneEntry {
     slots: usize,
 }
 
+/// One persisted lane pause mark.
+///
+/// A JSON map cannot key on a pair, so the `(stage, repo)` lane marks are
+/// entries, as [`LaneEntry`] already shows for the lane reservations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanePauseEntry {
+    /// The stage the pause mark applies to.
+    pub stage: Stage,
+    /// The repository alias of the pause mark.
+    pub repo: String,
+    /// The pause state of the lane.
+    pub paused: bool,
+}
+
+/// The pause marks of one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PausedState {
+    /// The whole factory takes no new work.
+    #[serde(default)]
+    pub global: bool,
+    /// Explicit states for stages, by stage name.
+    #[serde(default)]
+    pub stages: BTreeMap<Stage, bool>,
+    /// Explicit states for repository lanes.
+    #[serde(default)]
+    pub lanes: Vec<LanePauseEntry>,
+    /// Explicit states for tasks, by stable task id.
+    #[serde(default)]
+    pub tasks: BTreeMap<String, bool>,
+}
+
+/// The runtime work state of one snapshot.
+///
+/// The object holds what the task table and the session bookkeeping hold,
+/// so a restarted daemon resumes its work instead of losing it. Every field
+/// defaults to empty, so an older file loads without an error.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeState {
+    /// The pause marks the operator set.
+    #[serde(default)]
+    pub paused: PausedState,
+    /// Every task, in insertion order.
+    #[serde(default)]
+    pub tasks: Vec<Task>,
+    /// The chat messages that wait for their turn, by task id.
+    #[serde(default)]
+    pub pending_chats: BTreeMap<String, Vec<String>>,
+    /// The ticket set of each review task, pinned at admit time.
+    #[serde(default)]
+    pub review_tickets: BTreeMap<String, BTreeSet<u64>>,
+    /// The pull request batch of each release task.
+    #[serde(default)]
+    pub release_batches: BTreeMap<String, Vec<u64>>,
+    /// The stuck rows of the tasks that gave up.
+    #[serde(default)]
+    pub stuck: Vec<Decision>,
+}
+
 /// The on-disk shape of `state.json`.
 ///
 /// Every field defaults to empty, so a file written by an older daemon and a
@@ -71,6 +131,9 @@ struct StateFile {
     /// Immutable role bindings, by stable task identity.
     #[serde(default)]
     role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    /// The runtime work state of the last drive.
+    #[serde(default)]
+    runtime: RuntimeState,
 }
 
 /// The state the daemon persists across restarts.
@@ -91,6 +154,9 @@ pub struct DaemonState {
     pub ticket_conversations: Vec<TicketConversationState>,
     /// Immutable role bindings, by stable task identity.
     pub role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    /// The runtime work state: pause marks, tasks, queued chats, review
+    /// ticket sets, release batches, and stuck rows.
+    pub runtime: RuntimeState,
 }
 
 impl DaemonState {
@@ -138,6 +204,7 @@ impl DaemonState {
                     last_fire_ms: file.last_fire_ms,
                     ticket_conversations: file.ticket_conversations,
                     role_bindings: file.role_bindings,
+                    runtime: file.runtime,
                 }
             }
             Err(e) => {
@@ -171,6 +238,7 @@ impl DaemonState {
             last_fire_ms: self.last_fire_ms.clone(),
             ticket_conversations: self.ticket_conversations.clone(),
             role_bindings: self.role_bindings.clone(),
+            runtime: self.runtime.clone(),
         };
         serde_json::to_string(&file).context("cannot serialize the daemon state")
     }
@@ -218,6 +286,34 @@ fn invalid_state(file: &StateFile) -> Option<String> {
             return Some(error.to_string());
         }
     }
+    let runtime = &file.runtime;
+    let mut task_ids = BTreeSet::new();
+    for task in &runtime.tasks {
+        if !task_ids.insert(task.id.as_str()) {
+            return Some(format!("two tasks carry the id {}", task.id));
+        }
+        if task.attempt == 0 || task.attempt > MAX_ATTEMPTS {
+            return Some(format!(
+                "the task {} carries the attempt {}, outside 1 to {MAX_ATTEMPTS}",
+                task.id, task.attempt
+            ));
+        }
+    }
+    for id in runtime.pending_chats.keys() {
+        if !task_ids.contains(id.as_str()) {
+            return Some(format!("a pending chat names the unknown task {id}"));
+        }
+    }
+    for row in &runtime.stuck {
+        if let DecisionKind::Stuck { task, .. } = &row.kind {
+            if !task_ids.contains(task.as_str()) {
+                return Some(format!(
+                    "the stuck row {} names the unknown task {task}",
+                    row.id
+                ));
+            }
+        }
+    }
     None
 }
 
@@ -227,6 +323,8 @@ mod tests {
     use crate::config::{
         ExecutionRole, Harness, ResolvedRoleSettings, RoleSettings, SettingsSource,
     };
+    use crate::model::ItemKind;
+    use std::path::PathBuf;
 
     /// A unique directory for one test's files.
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -237,6 +335,214 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// One queued task for the runtime round trips.
+    fn task(id: &str, repo: &str, number: u64, attempt: u32) -> Task {
+        let mut task = Task::new(
+            repo,
+            crate::model::Stage::Implement,
+            ItemKind::Issue,
+            number,
+            PathBuf::from(format!("logs/{id}.jsonl")),
+            1_000,
+        );
+        task.id = id.to_string();
+        task.attempt = attempt;
+        task
+    }
+
+    #[test]
+    fn the_runtime_object_defaults_to_empty() {
+        let runtime = RuntimeState::default();
+        assert!(!runtime.paused.global);
+        assert!(runtime.paused.stages.is_empty());
+        assert!(runtime.paused.lanes.is_empty());
+        assert!(runtime.paused.tasks.is_empty());
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.pending_chats.is_empty());
+        assert!(runtime.review_tickets.is_empty());
+        assert!(runtime.release_batches.is_empty());
+        assert!(runtime.stuck.is_empty());
+        assert_eq!(
+            DaemonState::default().runtime,
+            RuntimeState::default(),
+            "a daemon state without runtime data carries an empty runtime object"
+        );
+    }
+
+    #[test]
+    fn a_v0_6_state_file_loads_with_an_empty_runtime() {
+        let dir = temp_dir("v0-6-file");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"stage_limits":{"refine":3},"lanes":[],"policies":{},"last_fire_ms":{}}"#,
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert_eq!(loaded.stage_limits.get(&Stage::Refine), Some(&3));
+        assert_eq!(loaded.runtime, RuntimeState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_state_file_with_a_runtime_section_and_unknown_fields_loads() {
+        let dir = temp_dir("runtime-section");
+        let path = dir.join("state.json");
+        // An older daemon reads the same file and ignores the `runtime`
+        // field, because serde drops unknown fields. This file also carries
+        // an unknown top-level field in the other direction.
+        fs::write(
+            &path,
+            r#"{"stage_limits":{},"lanes":[],"policies":{},"last_fire_ms":{},
+                "future_field":{"x":1},
+                "runtime":{"paused":{"global":true},"tasks":[],"pending_chats":{},
+                "review_tickets":{},"release_batches":{},"stuck":[]}}"#,
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert!(loaded.runtime.paused.global);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_runtime_pause_marks_round_trip_with_lane_entries() {
+        let dir = temp_dir("pause-marks");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        state.runtime.paused.global = false;
+        state.runtime.paused.stages.insert(Stage::Implement, true);
+        state.runtime.paused.lanes.push(LanePauseEntry {
+            stage: Stage::Review,
+            repo: "borsuk".to_string(),
+            paused: true,
+        });
+        state
+            .runtime
+            .paused
+            .tasks
+            .insert("borsuk/refine-i7".to_string(), false);
+
+        state.save(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#""lanes":[{"stage":"review","repo":"borsuk","paused":true}]"#),
+            "the lane pause marks are entries, not a map: {text}"
+        );
+        let loaded = DaemonState::load(&path);
+        assert_eq!(loaded.runtime.paused, state.runtime.paused);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_runtime_tasks_keep_the_insertion_order() {
+        let dir = temp_dir("task-order");
+        let path = dir.join("state.json");
+        let first = task("borsuk/refine-i1", "borsuk", 1, 1);
+        let second = task("borsuk/implement-i2", "borsuk", 2, 2);
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![first, second.clone()];
+
+        state.save(&path).unwrap();
+
+        let loaded = DaemonState::load(&path);
+        assert_eq!(
+            loaded
+                .runtime
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["borsuk/refine-i1", "borsuk/implement-i2"]
+        );
+        assert_eq!(loaded.runtime.tasks[1], second);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_runtime_stuck_rows_round_trip() {
+        let dir = temp_dir("stuck-rows");
+        let path = dir.join("state.json");
+        let failed = task("borsuk/implement-i9", "borsuk", 9, MAX_ATTEMPTS);
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![failed.clone()];
+        state.runtime.stuck = vec![Decision::stuck(&failed, "boom", 2_000)];
+
+        state.save(&path).unwrap();
+
+        let loaded = DaemonState::load(&path);
+        assert_eq!(loaded.runtime.stuck, state.runtime.stuck);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_runtime_with_two_tasks_of_one_id_discards_the_complete_state() {
+        let dir = temp_dir("duplicate-task");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![
+            task("borsuk/implement-i1", "borsuk", 1, 1),
+            task("borsuk/implement-i1", "borsuk", 1, 2),
+        ];
+        state.stage_limits.insert(Stage::Review, 9);
+
+        state.save(&path).unwrap();
+
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_runtime_with_an_out_of_range_attempt_discards_the_complete_state() {
+        for attempt in [0_u32, MAX_ATTEMPTS + 1] {
+            let dir = temp_dir("bad-attempt");
+            let path = dir.join("state.json");
+            let mut state = DaemonState::default();
+            state.runtime.tasks = vec![task("borsuk/refine-i3", "borsuk", 3, attempt)];
+
+            state.save(&path).unwrap();
+
+            assert_eq!(DaemonState::load(&path), DaemonState::default());
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_runtime_with_an_unknown_pending_chat_discards_the_complete_state() {
+        let dir = temp_dir("unknown-chat");
+        let path = dir.join("state.json");
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![task("borsuk/refine-i3", "borsuk", 3, 1)];
+        state
+            .runtime
+            .pending_chats
+            .insert("borsuk/refine-i4".to_string(), vec!["hello".to_string()]);
+
+        state.save(&path).unwrap();
+
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_runtime_with_an_unknown_stuck_task_discards_the_complete_state() {
+        let dir = temp_dir("unknown-stuck");
+        let path = dir.join("state.json");
+        let failed = task("borsuk/implement-i9", "borsuk", 9, MAX_ATTEMPTS);
+        let mut state = DaemonState::default();
+        state.runtime.tasks = vec![task("borsuk/refine-i3", "borsuk", 3, 1)];
+        state.runtime.stuck = vec![Decision::stuck(&failed, "boom", 2_000)];
+
+        state.save(&path).unwrap();
+
+        assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -259,6 +565,25 @@ mod tests {
                 proposal: None,
             }],
             role_bindings: BTreeMap::new(),
+            runtime: RuntimeState {
+                paused: PausedState {
+                    global: false,
+                    stages: BTreeMap::from([(Stage::Release, true)]),
+                    lanes: Vec::new(),
+                    tasks: BTreeMap::new(),
+                },
+                tasks: vec![task("borsuk/implement-i42", "borsuk", 42, 2)],
+                pending_chats: BTreeMap::from([(
+                    "borsuk/implement-i42".to_string(),
+                    vec!["continue".to_string()],
+                )]),
+                review_tickets: BTreeMap::from([(
+                    "borsuk/review-p5".to_string(),
+                    BTreeSet::from([42]),
+                )]),
+                release_batches: BTreeMap::from([("borsuk/release".to_string(), vec![5])]),
+                stuck: Vec::new(),
+            },
         };
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);

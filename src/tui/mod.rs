@@ -15,12 +15,14 @@
 //! `handle_key` for the inbox.
 //!
 //! A view that holds the keyboard for text input keeps a typed `q` away
-//! from the quit handler. The session view holds it while its chat bar is
-//! focused and open; `esc` or `tab` releases the focus, `h` and `l` then
-//! switch the live sessions, and `i` or `enter` takes the focus back.
-//! A session bar that cannot take text, and every other view, leaves the
-//! `1` through `5` view keys and `?` to the shell. The `!` inbox key and
-//! the ctrl-q and ctrl-c quit chords work from every view.
+//! from the quit handler and takes a typed `!` as a character. The session
+//! view holds the keyboard while its chat bar is focused and open; `esc`
+//! or `tab` releases the focus, `h` and `l` then switch the live sessions,
+//! and `i` or `enter` takes the focus back. A session bar that cannot take
+//! text, and every other view, leaves the `1` through `5` view keys and
+//! `?` to the shell. Every state without an open text input opens the
+//! inbox on `!`, and the ctrl-q and ctrl-c quit chords work from every
+//! view.
 
 pub mod inbox;
 pub mod markdown;
@@ -50,7 +52,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::catalog;
 use crate::decisions::DecisionKind;
+use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
 use crate::tasks::TaskState;
@@ -110,6 +114,8 @@ enum Msg {
     Ask(crate::sock::AskView),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
+    /// The parsed `opencode models` probe result of this shell start.
+    HarnessModels(Result<Vec<String>, String>),
     /// The socket reader reached the daemon.
     Connected,
     /// The daemon went away, with the reason for the banner.
@@ -358,6 +364,19 @@ impl App {
         }
     }
 
+    /// True when a typed character lands in an open text input now.
+    ///
+    /// The session bar takes text only while it is focused and open. A
+    /// closed bar and a bar with no task swallow the letters, so the
+    /// shell keeps the `!` inbox key there. Every other view takes text
+    /// while its own input is open.
+    fn types_text(&self) -> bool {
+        if matches!(self.view, View::Session) && !self.session.input_enabled() {
+            return false;
+        }
+        self.text_focus()
+    }
+
     /// Enter the session view and give the chat bar the focus.
     fn enter_session(&mut self) {
         self.view = View::Session;
@@ -433,13 +452,16 @@ impl App {
 
     /// Apply one key press. Returns false when the app wants to quit.
     ///
-    /// The quit chords and the inbox key work in every state. A view that
-    /// holds text input keeps a typed `q` away from the quit handler.
+    /// The quit chords work in every state. An open text input takes the
+    /// typed `q` and `!` as characters; every other state quits on `q`
+    /// and opens the inbox on `!`.
     fn handle_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
         if quit_chord(key) {
             return false;
         }
-        if inbox_key(key) {
+        // An overlay covers the text input below it, so the global key
+        // still works while the overlay is open.
+        if inbox_key(key) && (self.help || self.confirm.is_some() || !self.types_text()) {
             self.confirm = None;
             self.help = false;
             self.open_inbox_oldest();
@@ -945,6 +967,7 @@ pub fn run(socket: &Path) -> Result<()> {
         terminal: Terminal::new(backend).context("cannot create the terminal")?,
     };
     let (tx, rx) = channel();
+    spawn_model_probe(tx.clone());
     spawn_key_thread(tx.clone());
     spawn_socket_thread(tx, socket.to_path_buf());
     let mut app = App::default();
@@ -953,6 +976,19 @@ pub fn run(socket: &Path) -> Result<()> {
         client: None,
     };
     run_loop(&mut surface, &mut app, &rx, &mut link)
+}
+
+/// Run `opencode models` once in the background.
+///
+/// The thread sends one message with the parsed model list or the failure
+/// reason. The shell never blocks on this thread; a late result still
+/// refreshes an open model value list.
+fn spawn_model_probe(tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let result =
+            catalog::fetch_opencode_models(&RealExec).map_err(|error| format!("{error:#}"));
+        let _ = tx.send(Msg::HarnessModels(result));
+    });
 }
 
 /// Read crossterm events until the channel dies.
@@ -1149,6 +1185,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::SettingsResult(result) => {
             app.settings.observe_result(result);
+            Ok(true)
+        }
+        Msg::HarnessModels(result) => {
+            app.settings.observe_models(result);
             Ok(true)
         }
         Msg::Connected => {
@@ -1933,6 +1973,69 @@ mod tests {
     }
 
     #[test]
+    fn a_model_discovery_message_fills_the_open_value_list() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.settings = crate::sock::SettingsView {
+            revision: "rev-one".to_string(),
+            global: crate::config::ExecutionRole::ALL
+                .into_iter()
+                .map(|role| crate::sock::GlobalRoleSettingsView {
+                    role,
+                    settings: crate::config::RoleSettings {
+                        harness: crate::config::Harness::Opencode,
+                        program: "opencode".to_string(),
+                        model: "model-one".to_string(),
+                        effort: None,
+                        extra_args: Vec::new(),
+                        agent: None,
+                        profile: None,
+                        permission_mode: None,
+                        permission_handler: None,
+                        tools: Vec::new(),
+                        disallowed_tools: Vec::new(),
+                        strict_mcp: None,
+                        auto_approve: Some(false),
+                        approval_policy: None,
+                        sandbox: None,
+                    },
+                    limit: None,
+                })
+                .collect(),
+            repositories: Vec::new(),
+        };
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('5'),
+                key('j'),
+                key_code(KeyCode::Tab),
+                key_code(KeyCode::Tab),
+                key_code(KeyCode::Enter),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("discovering models..."), "{screen}");
+
+        handle_message(
+            &mut app,
+            Msg::HarnessModels(Ok(vec!["zai-coding-plan/glm-5.3-flash".to_string()])),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("zai-coding-plan/glm-5.3-flash"), "{screen}");
+    }
+
+    #[test]
     fn banner_text_covers_every_state() {
         let mut app = App::default();
         assert_eq!(banner_text(&app), " connecting to the daemon ");
@@ -2159,10 +2262,11 @@ mod tests {
         app.show_session_task();
         app.view = View::Session;
 
+        // esc releases the chat focus, so the shell takes the ! key.
         run_messages(
             &mut surface,
             &mut app,
-            vec![key('!')].into_iter(),
+            vec![key_code(KeyCode::Esc), key('!')].into_iter(),
             &mut sink,
         )
         .unwrap();
@@ -2172,6 +2276,151 @@ mod tests {
             app.inbox.selected_id(),
             Some("perm:borsuk/implement-i140:req-2")
         );
+    }
+
+    #[test]
+    fn a_focused_open_bar_types_bang_and_a_released_bar_leaves_it_to_the_shell() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Session,
+            "the focused open bar keeps the session view"
+        );
+        assert_eq!(app.session.input_text(), "!", "the bar took the ! as text");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Inbox,
+            "the released focus leaves ! to the shell"
+        );
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+    }
+
+    #[test]
+    fn bang_opens_the_inbox_when_the_session_bar_cannot_type() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        // A closed input disables the focused bar, so ! stays global.
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].input = crate::sock::InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "! left the closed session");
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+
+        // A session with no shown task disables the focused bar too.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = None;
+        app.session.clear();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "! left the taskless session");
+    }
+
+    #[test]
+    fn bang_types_into_the_inbox_reason_and_the_tickets_search() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('3'), key('n'), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "the reason input keeps the view");
+        assert!(app.inbox.typing(), "the reason input stays open");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("reason: !"), "screen: {text}");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('4'), key('/'), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Tickets, "the search keeps the view");
+        let text = render_to_string(&mut app);
+        assert!(text.contains(" /!▌"), "screen: {text}");
     }
 
     #[test]

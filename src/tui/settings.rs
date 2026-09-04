@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
+use crate::catalog::{self, ListField};
 use crate::config::{
     validate_extra_args, ExecutionRole, Harness, RoleOverride, RoleSettings, SettingsEdit,
     SettingsSource, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES,
@@ -64,16 +65,26 @@ impl Field {
         matches!(self, Self::ExtraArgs | Self::Tools | Self::DisallowedTools)
     }
 
-    fn is_choice(self) -> bool {
-        matches!(
-            self,
-            Self::Harness
-                | Self::StrictMcp
-                | Self::AutoApprove
-                | Self::PermissionMode
-                | Self::ApprovalPolicy
-                | Self::Sandbox
-        )
+    fn is_toggle(self) -> bool {
+        matches!(self, Self::StrictMcp | Self::AutoApprove)
+    }
+
+    /// The catalog field of one value list field. `None` for the fields
+    /// that use another editor.
+    fn list_field(self) -> Option<ListField> {
+        match self {
+            Self::Harness => Some(ListField::Harness),
+            Self::Program => Some(ListField::Program),
+            Self::Model => Some(ListField::Model),
+            Self::Effort => Some(ListField::Effort),
+            Self::Agent => Some(ListField::Agent),
+            Self::Profile => Some(ListField::Profile),
+            Self::PermissionMode => Some(ListField::PermissionMode),
+            Self::PermissionHandler => Some(ListField::PermissionHandler),
+            Self::ApprovalPolicy => Some(ListField::ApprovalPolicy),
+            Self::Sandbox => Some(ListField::Sandbox),
+            _ => None,
+        }
     }
 }
 
@@ -130,6 +141,147 @@ struct ListEditor {
     row_editor: Option<String>,
 }
 
+/// The state of the one `opencode models` probe per shell start.
+#[derive(Debug, Clone, Default)]
+enum ModelDiscovery {
+    /// The probe thread has not reported yet.
+    #[default]
+    Pending,
+    /// The probe parsed this model list.
+    Ready(Vec<String>),
+    /// The probe failed with this reason.
+    Failed(String),
+}
+
+/// One row of a value list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListRow {
+    /// Clear the optional field.
+    Empty,
+    /// Apply this value.
+    Value(String),
+    /// A dim, non-selectable status line.
+    Note(String),
+    /// Open the text box with the current value.
+    Custom,
+}
+
+impl ListRow {
+    /// True when `Enter` may apply the row.
+    fn selectable(&self) -> bool {
+        !matches!(self, Self::Note(_))
+    }
+
+    /// The value the row applies. `None` for rows without a write.
+    fn applied_value(&self) -> Option<String> {
+        match self {
+            Self::Empty => Some(String::new()),
+            Self::Value(value) => Some(value.clone()),
+            Self::Custom | Self::Note(_) => None,
+        }
+    }
+}
+
+/// The value list overlay of one field.
+#[derive(Debug, Clone)]
+struct ValueList {
+    field: Field,
+    list_field: ListField,
+    /// The typed filter. A row matches when it contains the text.
+    filter: String,
+    /// The marked row index into `rows`.
+    cursor: usize,
+    /// The current value of the field. The cursor returns to it.
+    current: String,
+    /// The visible rows, rebuilt after every filter change.
+    rows: Vec<ListRow>,
+    /// The fixed and state candidates of the field.
+    base: Vec<String>,
+    /// The probe state of the OpenCode model list, for `model`.
+    models: Option<ModelDiscovery>,
+}
+
+impl ValueList {
+    /// True when the list carries the OpenCode model discovery state.
+    fn discovers_models(&self) -> bool {
+        self.list_field == ListField::Model && self.models.is_some()
+    }
+
+    /// The joined candidate values of the list.
+    fn values(&self) -> Vec<String> {
+        let mut sources = vec![self.base.clone()];
+        if let Some(ModelDiscovery::Ready(models)) = &self.models {
+            sources.push(models.clone());
+        }
+        catalog::join_candidates(sources)
+    }
+
+    /// Rebuild the visible rows from the filter and restore the cursor.
+    fn rebuild(&mut self) {
+        let mut rows = Vec::new();
+        if catalog::optional(self.list_field) {
+            rows.push(ListRow::Empty);
+        }
+        let needle = self.filter.to_lowercase();
+        for value in self.values() {
+            if needle.is_empty() || value.to_lowercase().contains(&needle) {
+                rows.push(ListRow::Value(value));
+            }
+        }
+        match &self.models {
+            Some(ModelDiscovery::Pending) => {
+                rows.push(ListRow::Note("discovering models...".to_string()));
+            }
+            Some(ModelDiscovery::Failed(reason)) => rows.push(ListRow::Note(reason.clone())),
+            Some(ModelDiscovery::Ready(_)) | None => {}
+        }
+        if catalog::open(self.list_field) {
+            rows.push(ListRow::Custom);
+        }
+        self.rows = rows;
+        self.restore_cursor();
+    }
+
+    /// Put the cursor back on the current value, or on the first row
+    /// `Enter` may apply.
+    fn restore_cursor(&mut self) {
+        let on_current = self
+            .rows
+            .iter()
+            .position(|row| row.applied_value().as_deref() == Some(self.current_value()));
+        self.cursor = on_current
+            .or_else(|| self.rows.iter().position(ListRow::selectable))
+            .unwrap_or(0);
+    }
+
+    /// The value the cursor returns to after a filter change.
+    fn current_value(&self) -> &str {
+        self.current.as_str()
+    }
+
+    /// Move the cursor one row. The step clamps at the ends and skips the
+    /// status rows.
+    fn step(&mut self, delta: isize) {
+        let mut next = self.cursor as isize + delta;
+        while next >= 0 && next < self.rows.len() as isize {
+            self.cursor = next as usize;
+            if self.rows[next as usize].selectable() {
+                return;
+            }
+            next += delta;
+        }
+    }
+
+    /// Replace the discovery state and refresh an open model list.
+    fn observe_models(&mut self, models: &ModelDiscovery) {
+        if !self.discovers_models() {
+            return;
+        }
+        self.models = Some(models.clone());
+        self.rebuild();
+    }
+}
+
 /// The Settings view state.
 #[derive(Debug, Default)]
 pub struct Settings {
@@ -139,6 +291,11 @@ pub struct Settings {
     draft: Option<Draft>,
     text_editor: Option<TextEditor>,
     list_editor: Option<ListEditor>,
+    value_list: Option<ValueList>,
+    /// The state of the one `opencode models` probe per shell start.
+    models: ModelDiscovery,
+    /// The notice line that a harness change leaves under the form.
+    notice: Option<String>,
     errors: BTreeMap<Field, String>,
     pending_request: Option<String>,
     status: Option<(SettingsResultStatus, String)>,
@@ -148,7 +305,20 @@ pub struct Settings {
 impl Settings {
     /// True while the settings view owns typed characters.
     pub fn typing(&self) -> bool {
-        self.text_editor.is_some() || self.list_editor.is_some()
+        self.text_editor.is_some() || self.list_editor.is_some() || self.value_list.is_some()
+    }
+
+    /// Store the result of the `opencode models` probe and refresh an
+    /// open model list.
+    pub fn observe_models(&mut self, result: Result<Vec<String>, String>) {
+        self.models = match result {
+            Ok(models) => ModelDiscovery::Ready(models),
+            Err(reason) => ModelDiscovery::Failed(reason),
+        };
+        if let Some(list) = self.value_list.as_mut() {
+            let models = self.models.clone();
+            list.observe_models(&models);
+        }
     }
 
     /// Unlock a settings request after a failed send or socket disconnect.
@@ -195,6 +365,7 @@ impl Settings {
             self.draft = None;
             self.errors.clear();
             self.discard_confirm = false;
+            self.notice = None;
         } else if result.status == SettingsResultStatus::Invalid {
             let field = field_from_error(&message).unwrap_or_else(|| self.selected_field_for(None));
             self.errors.insert(field, message.clone());
@@ -213,6 +384,10 @@ impl Settings {
         }
         if self.list_editor.is_some() {
             self.handle_list_key(state, key);
+            return None;
+        }
+        if self.value_list.is_some() {
+            self.handle_value_list_key(state, key);
             return None;
         }
         self.clamp(state);
@@ -270,6 +445,7 @@ impl Settings {
                     self.draft = None;
                     self.errors.clear();
                     self.discard_confirm = false;
+                    self.notice = None;
                 } else {
                     self.discard_confirm = true;
                     self.status = Some((
@@ -285,8 +461,8 @@ impl Settings {
 
     fn enter_field(&mut self, state: &StateView) {
         let field = self.selected_field_for(Some(state));
-        if field.is_choice() {
-            self.cycle_choice(state, field);
+        if let Some(list_field) = field.list_field() {
+            self.open_value_list(state, field, list_field);
             return;
         }
         if field.is_list() {
@@ -299,11 +475,214 @@ impl Settings {
             });
             return;
         }
+        if field.is_toggle() {
+            self.toggle_choice(state, field);
+            return;
+        }
         let original = self.field_value(state, field);
         self.text_editor = Some(TextEditor {
             field,
             buffer: original,
         });
+    }
+
+    /// Open the value list of one field.
+    ///
+    /// The rows start on the current value. A filter narrows the rows, and
+    /// `Enter` applies the marked row.
+    fn open_value_list(&mut self, state: &StateView, field: Field, list_field: ListField) {
+        let Some(settings) = self.current_settings_ref(state) else {
+            return;
+        };
+        let harness = settings.harness;
+        let current = self.field_value(state, field);
+        let current_candidate = (!current.trim().is_empty())
+            .then(|| current.clone())
+            .into_iter()
+            .collect();
+        let base = catalog::join_candidates([
+            self.candidates(state, harness, list_field),
+            current_candidate,
+        ]);
+        let models = match (list_field, harness) {
+            (ListField::Model, Harness::Opencode) => Some(self.models.clone()),
+            _ => None,
+        };
+        let mut list = ValueList {
+            field,
+            list_field,
+            filter: String::new(),
+            cursor: 0,
+            current,
+            rows: Vec::new(),
+            base,
+            models,
+        };
+        list.rebuild();
+        self.value_list = Some(list);
+    }
+
+    /// The sorted, deduplicated candidate values of one field.
+    ///
+    /// The join takes the fixed table of the harness and every value that
+    /// the pushed settings state holds for the same field and harness.
+    fn candidates(
+        &self,
+        state: &StateView,
+        harness: Harness,
+        list_field: ListField,
+    ) -> Vec<String> {
+        let fixed = catalog::fixed_values(harness, list_field);
+        let state_values = self
+            .same_harness_settings(state, harness)
+            .filter_map(|settings| scalar_value(settings, list_field))
+            .collect();
+        catalog::join_candidates([fixed, state_values])
+    }
+
+    /// Every pushed settings value that uses `harness`, from all global
+    /// roles and all repository roles.
+    fn same_harness_settings<'a>(
+        &'a self,
+        state: &'a StateView,
+        harness: Harness,
+    ) -> impl Iterator<Item = &'a RoleSettings> {
+        state
+            .settings
+            .global
+            .iter()
+            .map(|value| &value.settings)
+            .chain(
+                state
+                    .settings
+                    .repositories
+                    .iter()
+                    .map(|value| &value.settings),
+            )
+            .filter(move |settings| settings.harness == harness)
+    }
+
+    /// Apply one key while a value list is open.
+    fn handle_value_list_key(&mut self, state: &StateView, key: KeyEvent) {
+        let Some(editor) = self.value_list.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.value_list = None,
+            KeyCode::Char('j') | KeyCode::Down => editor.step(1),
+            KeyCode::Char('k') | KeyCode::Up => editor.step(-1),
+            KeyCode::Enter => {
+                let row = editor.rows.get(editor.cursor).cloned();
+                self.apply_value_row(state, row);
+            }
+            KeyCode::Backspace => {
+                editor.filter.pop();
+                editor.rebuild();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.filter.push(character);
+                editor.rebuild();
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply one marked value list row.
+    fn apply_value_row(&mut self, state: &StateView, row: Option<ListRow>) {
+        let Some(editor) = self.value_list.as_ref() else {
+            return;
+        };
+        match row {
+            Some(ListRow::Custom) => {
+                let field = editor.field;
+                let buffer = self.field_value(state, field);
+                self.value_list = None;
+                self.text_editor = Some(TextEditor { field, buffer });
+            }
+            Some(ListRow::Value(value)) => {
+                let field = editor.field;
+                self.value_list = None;
+                if field == Field::Harness {
+                    if let Some(harness) = catalog::harness_value(&value) {
+                        self.apply_harness(state, harness);
+                    }
+                } else {
+                    self.set_text(state, field, value);
+                }
+            }
+            Some(ListRow::Empty) => {
+                let field = editor.field;
+                self.value_list = None;
+                self.set_text(state, field, String::new());
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply one harness choice to the complete form.
+    ///
+    /// The change sets the program, picks a default model, clears every
+    /// harness-specific field, and leaves one notice line under the form.
+    /// The model comes from the same global role, else from the first row
+    /// of the fixed harness table, else from the sorted candidates.
+    fn apply_harness(&mut self, state: &StateView, next: Harness) {
+        if self
+            .current_settings_ref(state)
+            .is_some_and(|settings| settings.harness == next)
+        {
+            return;
+        }
+        let role = self.selected_role_for();
+        let global_model = state
+            .settings
+            .global
+            .iter()
+            .find(|value| value.role == role && value.settings.harness == next)
+            .map(|value| value.settings.model.clone())
+            .filter(|model| !model.is_empty());
+        let mut model_candidates = self.candidates(state, next, ListField::Model);
+        if next == Harness::Opencode {
+            if let ModelDiscovery::Ready(models) = &self.models {
+                model_candidates = catalog::join_candidates([model_candidates, models.clone()]);
+            }
+        }
+        let model = global_model
+            .or_else(|| {
+                catalog::fixed_values(next, ListField::Model)
+                    .into_iter()
+                    .next()
+            })
+            .or_else(|| model_candidates.into_iter().next())
+            .unwrap_or_default();
+        self.ensure_draft(state);
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        let previous = draft.settings().clone();
+        let settings = draft.settings_mut();
+        settings.harness = next;
+        settings.program = next.program().to_string();
+        settings.model = model.clone();
+        clear_harness_fields(settings);
+        if next == Harness::Opencode {
+            settings.auto_approve = Some(false);
+        }
+        if let DraftValue::Repository {
+            settings,
+            override_settings,
+        } = &mut draft.value
+        {
+            **override_settings = complete_override(settings);
+        }
+        draft.changed.insert(Field::Harness);
+        self.errors.clear();
+        self.discard_confirm = false;
+        self.field = 0;
+        self.notice = Some(harness_notice(&previous, next, &model));
     }
 
     fn handle_text_key(&mut self, state: &StateView, key: KeyEvent) {
@@ -473,69 +852,22 @@ impl Settings {
         true
     }
 
-    fn cycle_choice(&mut self, state: &StateView, field: Field) {
+    fn toggle_choice(&mut self, state: &StateView, field: Field) {
         self.ensure_draft(state);
         let Some(draft) = self.draft.as_mut() else {
             return;
         };
+        let settings = draft.settings_mut();
         match field {
-            Field::Harness => {
-                let next = match draft.settings().harness {
-                    Harness::Claude => Harness::Opencode,
-                    Harness::Opencode => Harness::Codex,
-                    Harness::Codex => Harness::Claude,
-                };
-                let settings = draft.settings_mut();
-                settings.harness = next;
-                settings.program = next.program().to_string();
-                clear_harness_fields(settings);
-                match next {
-                    Harness::Claude => {}
-                    Harness::Opencode => settings.auto_approve = Some(false),
-                    Harness::Codex => {}
-                }
-                if let DraftValue::Repository {
-                    settings,
-                    override_settings,
-                } = &mut draft.value
-                {
-                    **override_settings = complete_override(settings);
-                }
-                self.field = 0;
-            }
             Field::StrictMcp => {
-                let settings = draft.settings_mut();
                 settings.strict_mcp = Some(!settings.strict_mcp.unwrap_or(false));
-                sync_override(draft, field);
             }
             Field::AutoApprove => {
-                let settings = draft.settings_mut();
                 settings.auto_approve = Some(!settings.auto_approve.unwrap_or(false));
-                sync_override(draft, field);
             }
-            Field::PermissionMode => {
-                let settings = draft.settings_mut();
-                settings.permission_mode = Some(next_choice(
-                    settings.permission_mode.as_deref(),
-                    CLAUDE_PERMISSION_MODES,
-                ));
-                sync_override(draft, field);
-            }
-            Field::ApprovalPolicy => {
-                let settings = draft.settings_mut();
-                settings.approval_policy = Some(next_choice(
-                    settings.approval_policy.as_deref(),
-                    CODEX_APPROVAL_POLICIES,
-                ));
-                sync_override(draft, field);
-            }
-            Field::Sandbox => {
-                let settings = draft.settings_mut();
-                settings.sandbox = Some(next_choice(settings.sandbox.as_deref(), CODEX_SANDBOXES));
-                sync_override(draft, field);
-            }
-            _ => {}
+            _ => return,
         }
+        sync_override(draft, field);
         draft.changed.insert(field);
         self.errors.remove(&field);
         self.discard_confirm = false;
@@ -892,6 +1224,12 @@ impl Settings {
                 Style::default().fg(THEME.warn).add_modifier(Modifier::BOLD),
             )));
         }
+        if let Some(notice) = &self.notice {
+            lines.push(Line::from(Span::styled(
+                notice.clone(),
+                Style::default().fg(THEME.ok),
+            )));
+        }
         if let Some((status, message)) = &self.status {
             let color = match status {
                 SettingsResultStatus::Saved | SettingsResultStatus::Reloaded => THEME.ok,
@@ -930,6 +1268,56 @@ impl Settings {
                 Line::from(editor.buffer.clone()),
                 Line::from(Span::styled("Enter apply   Esc cancel", THEME.dim())),
             ];
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::bordered().title(format!(" {} ", editor.field.label()))),
+                panel,
+            );
+        } else if let Some(editor) = &self.value_list {
+            let row_count = u16::try_from(editor.rows.len()).unwrap_or(u16::MAX);
+            let height = row_count.saturating_add(5).clamp(7, 18);
+            let panel = centered(64, height, area);
+            frame.render_widget(Clear, panel);
+            let mut lines = Vec::new();
+            if !editor.filter.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(" filter: {}", editor.filter),
+                    THEME.dim(),
+                )));
+            }
+            let filter_rows = u16::from(!editor.filter.is_empty());
+            let row_capacity = usize::from(panel.height.saturating_sub(3 + filter_rows).max(1));
+            let start = editor
+                .cursor
+                .saturating_sub(row_capacity.saturating_sub(1))
+                .min(editor.rows.len().saturating_sub(row_capacity));
+            for (index, row) in editor
+                .rows
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(row_capacity)
+            {
+                let marker = if index == editor.cursor { ">" } else { " " };
+                let line = match row {
+                    ListRow::Empty => {
+                        Line::from(Span::styled(format!("{marker} (none)"), THEME.dim()))
+                    }
+                    ListRow::Value(value) => Line::from(format!("{marker} {value}")),
+                    ListRow::Note(reason) => {
+                        Line::from(Span::styled(format!("{marker} {reason}"), THEME.dim()))
+                    }
+                    ListRow::Custom => Line::from(Span::styled(
+                        format!("{marker} custom value..."),
+                        Style::default().fg(THEME.accent),
+                    )),
+                };
+                lines.push(line);
+            }
+            lines.push(Line::from(Span::styled(
+                "j/k move  type to filter  Enter apply  Esc cancel",
+                THEME.dim(),
+            )));
             frame.render_widget(
                 Paragraph::new(lines)
                     .block(Block::bordered().title(format!(" {} ", editor.field.label()))),
@@ -1119,6 +1507,42 @@ impl Settings {
     fn dirty(&self) -> bool {
         self.draft.is_some()
     }
+
+    #[cfg(test)]
+    fn value_list_field(&self) -> Option<Field> {
+        self.value_list.as_ref().map(|list| list.field)
+    }
+
+    #[cfg(test)]
+    fn value_list_rows(&self) -> Vec<String> {
+        self.value_list
+            .as_ref()
+            .map(|list| list.rows.iter().map(row_text).collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn value_list_selected(&self) -> Option<String> {
+        let list = self.value_list.as_ref()?;
+        list.rows.get(list.cursor).map(row_text)
+    }
+
+    #[cfg(test)]
+    fn text_editor_buffer(&self) -> Option<String> {
+        self.text_editor
+            .as_ref()
+            .map(|editor| editor.buffer.clone())
+    }
+}
+
+#[cfg(test)]
+fn row_text(row: &ListRow) -> String {
+    match row {
+        ListRow::Empty => "(none)".to_string(),
+        ListRow::Value(value) => value.clone(),
+        ListRow::Note(reason) => reason.clone(),
+        ListRow::Custom => "custom value...".to_string(),
+    }
 }
 
 fn optional(value: String) -> Option<String> {
@@ -1141,6 +1565,7 @@ fn role_label(role: ExecutionRole) -> &'static str {
 }
 
 fn clear_harness_fields(settings: &mut RoleSettings) {
+    settings.effort = None;
     settings.agent = None;
     settings.profile = None;
     settings.permission_mode = None;
@@ -1326,11 +1751,56 @@ fn validate_draft(draft: &Draft) -> BTreeMap<Field, String> {
     errors
 }
 
-fn next_choice(current: Option<&str>, choices: &[&str]) -> String {
-    let index = current
-        .and_then(|value| choices.iter().position(|choice| *choice == value))
-        .map_or(0, |index| (index + 1) % choices.len());
-    choices[index].to_string()
+/// One field value that the pushed settings state holds, when present.
+fn scalar_value(settings: &RoleSettings, list_field: ListField) -> Option<String> {
+    let value = match list_field {
+        ListField::Harness => Some(settings.harness.program().to_string()),
+        ListField::Program => Some(settings.program.clone()),
+        ListField::Model => Some(settings.model.clone()),
+        ListField::Effort => settings.effort.clone(),
+        ListField::Agent => settings.agent.clone(),
+        ListField::Profile => settings.profile.clone(),
+        ListField::PermissionMode => settings.permission_mode.clone(),
+        ListField::PermissionHandler => settings.permission_handler.clone(),
+        ListField::ApprovalPolicy => settings.approval_policy.clone(),
+        ListField::Sandbox => settings.sandbox.clone(),
+    };
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// The notice line that one harness change leaves under the form.
+///
+/// The line names the new harness and every field that the change reset.
+fn harness_notice(previous: &RoleSettings, next: Harness, model: &str) -> String {
+    let mut parts = vec![format!("switched to {}", next.program())];
+    let cleared = [
+        ("effort", previous.effort.is_some()),
+        ("agent", previous.agent.is_some()),
+        ("profile", previous.profile.is_some()),
+        ("permission mode", previous.permission_mode.is_some()),
+        ("permission handler", previous.permission_handler.is_some()),
+        ("tools", !previous.tools.is_empty()),
+        ("denied tools", !previous.disallowed_tools.is_empty()),
+        ("strict MCP", previous.strict_mcp.is_some()),
+        ("approval policy", previous.approval_policy.is_some()),
+        ("sandbox", previous.sandbox.is_some()),
+        ("auto approve", previous.auto_approve.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, cleared)| *cleared)
+    .map(|(label, _)| label)
+    .collect::<Vec<_>>();
+    if !cleared.is_empty() {
+        parts.push(format!("cleared {}", cleared.join(", ")));
+    }
+    if previous.model != model {
+        if model.is_empty() {
+            parts.push("cleared model".to_string());
+        } else {
+            parts.push(format!("model {model}"));
+        }
+    }
+    parts.join("; ")
 }
 
 fn source_for_field(sources: &RoleFieldSources, field: Field) -> &SettingsSource {
@@ -1552,18 +2022,26 @@ mod tests {
     }
 
     #[test]
-    fn enter_edits_text_and_cycles_typed_values() {
+    fn enter_opens_the_value_list_and_the_text_box() {
         let state = state();
         let mut settings = Settings::default();
         assert_eq!(settings.selected_field(), Field::Harness);
         settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings.typing());
+        assert_eq!(settings.value_list_field(), Some(Field::Harness));
         assert_eq!(
             settings.current_settings(&state).unwrap().harness,
-            Harness::Opencode
+            Harness::Claude
         );
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(!settings.typing());
         settings.handle_key(&state, key(KeyCode::Tab));
         settings.handle_key(&state, key(KeyCode::Enter));
         assert!(settings.typing());
+        assert_eq!(settings.value_list_field(), Some(Field::Program));
+        settings.handle_key(&state, key(KeyCode::Char('x')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings.typing(), "the custom row opens the text box");
         settings.handle_key(&state, key(KeyCode::Char('x')));
         settings.handle_key(&state, key(KeyCode::Enter));
         assert!(settings
@@ -1574,10 +2052,46 @@ mod tests {
     }
 
     #[test]
+    fn enter_opens_the_value_list_on_the_ten_choice_fields() {
+        let state = state();
+        let cases = [
+            (ExecutionRole::Refine, Field::Harness),
+            (ExecutionRole::Refine, Field::Program),
+            (ExecutionRole::Refine, Field::Model),
+            (ExecutionRole::Refine, Field::Effort),
+            (ExecutionRole::Refine, Field::Agent),
+            (ExecutionRole::Refine, Field::PermissionMode),
+            (ExecutionRole::Refine, Field::PermissionHandler),
+            (ExecutionRole::Implement, Field::Harness),
+            (ExecutionRole::Implement, Field::Model),
+            (ExecutionRole::Implement, Field::Effort),
+            (ExecutionRole::Implement, Field::Agent),
+            (ExecutionRole::Review, Field::Profile),
+            (ExecutionRole::Review, Field::ApprovalPolicy),
+            (ExecutionRole::Review, Field::Sandbox),
+        ];
+        let mut settings = Settings::default();
+        for (role, field) in cases {
+            settings.set_role(role);
+            settings.set_field(field);
+            settings.handle_key(&state, key(KeyCode::Enter));
+            assert_eq!(settings.value_list_field(), Some(field), "{field:?}");
+            assert!(settings.typing(), "{field:?} must hold the keyboard");
+            settings.handle_key(&state, key(KeyCode::Esc));
+            assert!(!settings.typing(), "{field:?} must close on esc");
+        }
+    }
+
+    #[test]
     fn closed_native_values_use_value_selection() {
         let state = state();
         let mut settings = Settings::default();
         settings.set_field(Field::PermissionMode);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        for character in "dont".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        settings.handle_key(&state, key(KeyCode::Char('j')));
         settings.handle_key(&state, key(KeyCode::Enter));
         assert!(!settings.typing());
         assert_eq!(
@@ -1592,6 +2106,11 @@ mod tests {
         settings.set_role(ExecutionRole::Review);
         settings.set_field(Field::ApprovalPolicy);
         settings.handle_key(&state, key(KeyCode::Enter));
+        for character in "nev".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
         assert_eq!(
             settings
                 .current_settings(&state)
@@ -1602,6 +2121,11 @@ mod tests {
         );
         settings.set_field(Field::Sandbox);
         settings.handle_key(&state, key(KeyCode::Enter));
+        for character in "dang".chars() {
+            settings.handle_key(&state, key(KeyCode::Char(character)));
+        }
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
         assert_eq!(
             settings
                 .current_settings(&state)
@@ -1610,6 +2134,393 @@ mod tests {
                 .as_deref(),
             Some("danger-full-access")
         );
+    }
+
+    #[test]
+    fn the_value_list_moves_filters_and_applies_with_the_documented_keys() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Model);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.value_list_selected(),
+            Some("model-one".to_string()),
+            "the cursor starts on the current value"
+        );
+        settings.handle_key(&state, key(KeyCode::Char('s')));
+        settings.handle_key(&state, key(KeyCode::Char('o')));
+        settings.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(
+            settings.value_list_rows(),
+            ["sonnet", "custom value..."],
+            "a printable character extends the filter"
+        );
+        for _ in 0..3 {
+            settings.handle_key(&state, key(KeyCode::Backspace));
+        }
+        assert_eq!(
+            settings.value_list_rows(),
+            ["fable", "model-one", "opus", "sonnet", "custom value..."],
+            "backspace shortens the filter"
+        );
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        assert_eq!(settings.value_list_selected(), Some("opus".to_string()));
+        settings.handle_key(&state, key(KeyCode::Down));
+        assert_eq!(settings.value_list_selected(), Some("sonnet".to_string()));
+        settings.handle_key(&state, key(KeyCode::Char('k')));
+        settings.handle_key(&state, key(KeyCode::Up));
+        settings.handle_key(&state, key(KeyCode::Char('k')));
+        assert_eq!(settings.value_list_selected(), Some("fable".to_string()));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(settings.current_settings(&state).unwrap().model, "fable");
+        assert!(!settings.typing());
+
+        settings.set_field(Field::Effort);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('z')));
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(!settings.typing());
+        assert_eq!(
+            settings.current_settings(&state).unwrap().effort,
+            Some("high".to_string()),
+            "esc cancels and changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_candidate_set_joins_the_fixed_and_state_values() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Model);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.value_list_rows(),
+            ["fable", "model-one", "opus", "sonnet", "custom value..."]
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+        settings.set_field(Field::Effort);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.value_list_rows(),
+            [
+                "(none)",
+                "high",
+                "low",
+                "max",
+                "medium",
+                "xhigh",
+                "custom value..."
+            ]
+        );
+        settings.handle_key(&state, key(KeyCode::Esc));
+        settings.set_field(Field::Harness);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(settings.value_list_rows(), ["claude", "codex", "opencode"]);
+    }
+
+    #[test]
+    fn the_program_list_includes_pushed_custom_values_and_selects_the_current_value() {
+        let mut state = state();
+        state.settings.global[0].settings.program = "/opt/custom-claude".to_string();
+        state.settings.global[3].settings.program = "claude-nightly".to_string();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Program);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let rows = settings.value_list_rows();
+        assert!(rows.contains(&"/opt/custom-claude".to_string()));
+        assert!(rows.contains(&"claude-nightly".to_string()));
+        assert_eq!(
+            settings.value_list_selected(),
+            Some("/opt/custom-claude".to_string())
+        );
+    }
+
+    #[test]
+    fn the_model_list_shows_the_discovery_state() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_role(ExecutionRole::Implement);
+        settings.set_field(Field::Model);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.value_list_rows(),
+            ["model-one", "discovering models...", "custom value..."]
+        );
+        settings.observe_models(Ok(vec![
+            "zai-coding-plan/glm-5.3".to_string(),
+            "zai-coding-plan/glm-5.3-flash".to_string(),
+        ]));
+        assert_eq!(
+            settings.value_list_rows(),
+            [
+                "model-one",
+                "zai-coding-plan/glm-5.3",
+                "zai-coding-plan/glm-5.3-flash",
+                "custom value..."
+            ]
+        );
+
+        settings.handle_key(&state, key(KeyCode::Esc));
+        settings.observe_models(Err("opencode models exited with status 1".to_string()));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.value_list_rows(),
+            [
+                "model-one",
+                "opencode models exited with status 1",
+                "custom value..."
+            ]
+        );
+        settings.handle_key(&state, key(KeyCode::Down));
+        assert_eq!(
+            settings.value_list_selected(),
+            Some("custom value...".to_string()),
+            "the cursor skips the dim failure row"
+        );
+        let output = text(&settings, &state, 100, 28);
+        assert!(output.contains("opencode models exited with status 1"));
+        settings.handle_key(&state, key(KeyCode::Esc));
+    }
+
+    #[test]
+    fn a_long_model_list_keeps_the_marked_row_visible() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_role(ExecutionRole::Implement);
+        settings.observe_models(Ok((0..30)
+            .map(|index| format!("model-{index:02}"))
+            .collect()));
+        settings.set_field(Field::Model);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let output = text(&settings, &state, 100, 28);
+        assert!(output.contains("> model-one"), "{output}");
+
+        settings.handle_key(&state, key(KeyCode::Down));
+        let output = text(&settings, &state, 100, 28);
+        assert!(output.contains("> custom value..."), "{output}");
+    }
+
+    #[test]
+    fn optional_fields_start_with_a_none_row() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Effort);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.value_list_rows().first(),
+            Some(&"(none)".to_string())
+        );
+        settings.handle_key(&state, key(KeyCode::Char('k')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(settings.current_settings(&state).unwrap().effort, None);
+
+        settings.set_field(Field::PermissionMode);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let rows = settings.value_list_rows();
+        assert_eq!(rows.first(), Some(&"(none)".to_string()));
+        assert_eq!(rows.last(), Some(&"plan".to_string()));
+    }
+
+    #[test]
+    fn open_fields_end_with_a_custom_row_that_opens_the_text_box() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Model);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let rows = settings.value_list_rows();
+        assert_eq!(rows.last(), Some(&"custom value...".to_string()));
+        for _ in 0..(rows.len() - 2) {
+            settings.handle_key(&state, key(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            settings.value_list_selected(),
+            Some("custom value...".to_string())
+        );
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings.typing());
+        assert_eq!(settings.text_editor_buffer(), Some("model-one".to_string()));
+        settings.handle_key(&state, key(KeyCode::Esc));
+
+        settings.set_field(Field::Harness);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(settings.value_list_rows(), ["claude", "codex", "opencode"]);
+    }
+
+    #[test]
+    fn a_reopened_list_selects_the_current_custom_draft_value() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "provider/custom-draft");
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(settings
+            .value_list_rows()
+            .contains(&"provider/custom-draft".to_string()));
+        assert_eq!(
+            settings.value_list_selected(),
+            Some("provider/custom-draft".to_string())
+        );
+    }
+
+    #[test]
+    fn a_value_choice_writes_through_the_text_path_and_marks_the_repository() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_field(Field::Model);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(settings.current_settings(&state).unwrap().model, "opus");
+        assert!(matches!(
+            settings.field_source(&state, Field::Model),
+            Some(SettingsSource::Repository { .. })
+        ));
+        let output = text(&settings, &state, 100, 28);
+        assert!(output.contains("+ model"), "{output}");
+    }
+
+    #[test]
+    fn a_harness_change_sets_the_program_picks_a_model_and_clears_the_rest() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).expect("the draft exists");
+        assert_eq!(current.harness, Harness::Opencode);
+        assert_eq!(current.program, "opencode");
+        assert_eq!(current.model, "model-one");
+        assert_eq!(current.effort, None);
+        assert_eq!(current.agent, None);
+        assert_eq!(current.profile, None);
+        assert_eq!(current.permission_mode, None);
+        assert_eq!(current.permission_handler, None);
+        assert_eq!(current.tools, Vec::<String>::new());
+        assert_eq!(current.disallowed_tools, Vec::<String>::new());
+        assert_eq!(current.strict_mcp, None);
+        assert_eq!(current.approval_policy, None);
+        assert_eq!(current.sandbox, None);
+        assert_eq!(current.auto_approve, Some(false));
+        assert_eq!(settings.selected_field(), Field::Harness);
+    }
+
+    #[test]
+    fn applying_the_current_harness_changes_nothing() {
+        let state = state();
+        let mut settings = Settings::default();
+        let before = settings.current_settings(&state).unwrap().clone();
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(settings.current_settings(&state), Some(&before));
+        assert!(!settings.dirty());
+        assert!(!text(&settings, &state, 100, 28).contains("switched to"));
+    }
+
+    #[test]
+    fn an_opencode_harness_change_uses_the_first_discovered_model() {
+        let mut state = state();
+        for value in &mut state.settings.global {
+            value.settings = role(Harness::Claude);
+        }
+        for value in &mut state.settings.repositories {
+            value.settings = role(Harness::Claude);
+        }
+        let mut settings = Settings::default();
+        settings.observe_models(Ok(vec![
+            "provider/z-model".to_string(),
+            "provider/a-model".to_string(),
+        ]));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Down));
+        settings.handle_key(&state, key(KeyCode::Down));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).unwrap();
+        assert_eq!(current.harness, Harness::Opencode);
+        assert_eq!(current.model, "provider/a-model");
+    }
+
+    #[test]
+    fn a_codex_harness_change_takes_the_first_fixed_model() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).expect("the draft exists");
+        assert_eq!(current.harness, Harness::Codex);
+        assert_eq!(current.model, "gpt-5.6-sol");
+        let output = text(&settings, &state, 140, 30);
+        assert!(output.contains("model gpt-5.6-sol"), "{output}");
+    }
+
+    #[test]
+    fn a_harness_change_takes_the_model_of_the_same_global_role() {
+        let mut state = state();
+        state.settings.global[0].settings.harness = Harness::Codex;
+        state.settings.global[0].settings.program = "codex".to_string();
+        state.settings.global[0].settings.model = "codex-primary".to_string();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).expect("the draft exists");
+        assert_eq!(current.harness, Harness::Codex);
+        assert_eq!(current.model, "codex-primary");
+    }
+
+    #[test]
+    fn the_harness_change_notice_names_the_resets_and_disappears() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let output = text(&settings, &state, 140, 30);
+        assert!(output.contains("switched to opencode"), "{output}");
+        assert!(output.contains("cleared effort"), "{output}");
+        assert!(output.contains("agent"), "{output}");
+        assert!(output.contains("permission mode"), "{output}");
+        assert!(output.contains("tools"), "{output}");
+
+        let save = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("save action");
+        let Action::SaveSettings { request, .. } = save else {
+            panic!("wrong save action");
+        };
+        settings.observe_result(SettingsResult {
+            request,
+            operation: SettingsOperation::Save,
+            status: SettingsResultStatus::Saved,
+            revision: "rev-two".to_string(),
+            message: None,
+        });
+        assert!(!text(&settings, &state, 140, 30).contains("switched to opencode"));
+
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert!(text(&settings, &state, 140, 30).contains("switched to opencode"));
+        settings.handle_key(&state, key(KeyCode::Esc));
+        settings.handle_key(&state, key(KeyCode::Esc));
+        assert!(!text(&settings, &state, 140, 30).contains("switched to opencode"));
+    }
+
+    #[test]
+    fn the_harness_notice_names_a_cleared_false_auto_approve_value() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_role(ExecutionRole::Implement);
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Up));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let output = text(&settings, &state, 140, 30);
+        assert!(output.contains("auto approve"), "{output}");
     }
 
     #[test]
@@ -2078,6 +2989,9 @@ mod tests {
         let mut settings = Settings::default();
         settings.handle_key(&state, key(KeyCode::Char('l')));
         settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Enter));
         let Action::SaveSettings {
             edit:
                 crate::config::SettingsEdit::Repository {
@@ -2108,6 +3022,9 @@ mod tests {
         let state = state();
         let mut settings = Settings::default();
         settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
+        settings.handle_key(&state, key(KeyCode::Char('j')));
         settings.handle_key(&state, key(KeyCode::Enter));
         for field in settings.visible_fields(&state) {
             assert!(matches!(

@@ -587,6 +587,11 @@ pub fn start_detached(
             "--collect",
             "--unit",
             "aif-daemon",
+            // The daemon stops its own agent children in the right order, so
+            // systemd sends SIGTERM to the daemon only (`mixed`) and waits
+            // before any SIGKILL. A survivor still dies after the timeout.
+            "--property=KillMode=mixed",
+            "--property=TimeoutStopSec=45",
             "--",
             program_text.as_str(),
             "run",
@@ -2272,6 +2277,27 @@ mod tests {
     }
 
     #[test]
+    fn item_worktrees_skips_a_stale_sibling_directory() {
+        let dir = temp_dir("stale-item");
+        let worktrees = dir.join("worktrees");
+        fs::create_dir_all(worktrees.join("pr-7")).expect("the pr worktree must be creatable");
+        fs::create_dir_all(worktrees.join("pr-7.stale-1"))
+            .expect("the stale sibling must be creatable");
+
+        let found = item_worktrees(&worktrees).expect("the listing must succeed");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "the stale sibling must not parse as an item: {found:?}"
+        );
+        assert_eq!(found[0].0, WorktreeKind::Pr);
+        assert_eq!(found[0].1, 7);
+        assert_eq!(found[0].2, worktrees.join("pr-7"));
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
     fn a_scheduler_lane_warning_is_reported() {
         let dir = temp_dir("lane-warn");
         let config_path = dir.join("factory.toml");
@@ -2799,6 +2825,8 @@ mod tests {
                 "--collect",
                 "--unit",
                 "aif-daemon",
+                "--property=KillMode=mixed",
+                "--property=TimeoutStopSec=45",
                 "--",
                 "/opt/aif/bin/aifd",
                 "run"
@@ -3165,6 +3193,8 @@ mod tests {
                 "--collect",
                 "--unit",
                 "aif-daemon",
+                "--property=KillMode=mixed",
+                "--property=TimeoutStopSec=45",
                 "--",
                 "/opt/aif/bin/aifd",
                 "run",

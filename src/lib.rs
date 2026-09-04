@@ -5,6 +5,7 @@
 //! Later chunks fill them in.
 
 pub mod ask;
+pub mod catalog;
 pub mod config;
 pub mod daemon;
 pub mod decisions;
