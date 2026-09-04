@@ -141,7 +141,8 @@ Set `auto_approve = true` on every unattended opencode role. Without it,
 opencode auto-rejects every permission request. Tools that read outside the
 project directory then fail, and the task loses its evidence. The run can
 still end `ok`. `aif doctor` reports a `permissions` warning for each opencode
-role that lacks the approval.
+role that lacks the approval. A rejected request also opens an inbox row, so
+you can grant the permission for the next run of that task.
 
 A repository role table can override individual fields. A harness change requires a complete role block.
 The Settings view marks inherited repository values with `~`.
@@ -515,7 +516,13 @@ The role returns to the built-in prompt.
   message waits for the next turn.
 - An opencode role without `auto_approve = true` auto-rejects every
   permission request in an unattended run. Its tools fail. `aif doctor`
-  reports each such role.
+  reports each such role. Each rejected request opens an inbox row. Press
+  `y` to grant the permission and rerun the task from attempt 1; press `n`
+  to close the row. The grant lasts until the task finishes or you cancel
+  it.
+- An auto-rejected `question` request opens a question row. The question
+  text stays in the task log; press `i` to answer it in text. The answer
+  continues the recorded session of the task.
 - A release gate row refreshes at the poll after you stack a pull request.
 - A review push on a draft pull request can restart that review at the next
   poll.
