@@ -478,6 +478,25 @@ impl SessionView {
         !self.input_enabled()
     }
 
+    /// The bottom-row hints of the session state.
+    ///
+    /// A bar that holds the focus and can take text shows only the focus
+    /// release keys; the input bar itself shows the send hints. A shown
+    /// task names the session and pipeline keys, and a view with no task
+    /// falls back to the shell view keys.
+    pub fn footer_hints(&self) -> String {
+        if self.chat_focus && self.input_enabled() {
+            return "esc tab release focus".to_string();
+        }
+        if self.task.is_some() {
+            if self.input_enabled() {
+                return "i enter focus · h l session · esc pipeline · ? help".to_string();
+            }
+            return "h l session · esc pipeline · ? help".to_string();
+        }
+        "1 2 3 4 5 views · ? help".to_string()
+    }
+
     /// Handle one key press. Returns the action to send to the daemon.
     ///
     /// `page` is the visible transcript height in rows; the shell passes
@@ -853,6 +872,47 @@ mod tests {
     /// One letter key press.
     fn letter(letter: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_chat_focus_and_task_state() {
+        let dir = TempDir::new("footer-hints");
+        let task = sample_task(dir.path());
+
+        // No shown task: the shell keeps its view keys.
+        let view = SessionView::new();
+        assert_eq!(view.footer_hints(), "1 2 3 4 5 views · ? help");
+
+        // A focused bar that can take text shows only the release keys.
+        let mut view = SessionView::new();
+        view.show(&task);
+        assert!(view.chat_focus());
+        assert_eq!(view.footer_hints(), "esc tab release focus");
+
+        // A released focus offers the focus, session, and pipeline keys.
+        view.set_chat_focus(false);
+        assert_eq!(
+            view.footer_hints(),
+            "i enter focus · h l session · esc pipeline · ? help"
+        );
+
+        // A closed bar names no focus keys, whatever the focus says.
+        let closed = task_with_mode(
+            dir.path(),
+            InputMode::Closed {
+                reason: "the session is parked".to_string(),
+            },
+            0,
+        );
+        let mut view = SessionView::new();
+        view.show(&closed);
+        assert_eq!(
+            view.footer_hints(),
+            "h l session · esc pipeline · ? help",
+            "a focused closed bar still cannot take text"
+        );
+        view.set_chat_focus(false);
+        assert_eq!(view.footer_hints(), "h l session · esc pipeline · ? help");
     }
 
     #[test]

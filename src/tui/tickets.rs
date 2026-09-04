@@ -132,6 +132,35 @@ impl Tickets {
             || self.chat_active
     }
 
+    /// The bottom-row hints of the tickets state.
+    ///
+    /// The open nested view decides the hint; a state that takes typed
+    /// text shows no `? help`. The new-label form creates with ctrl-s.
+    pub fn footer_hints(&self) -> String {
+        if self.focus {
+            if self.chat_active {
+                return "esc back to issue".to_string();
+            }
+            if self.conflict_open {
+                return "g keep remote · p reapply · esc back".to_string();
+            }
+            if self.editor.as_ref().is_some_and(|editor| editor.open) {
+                return "ctrl-s save · tab field · esc close".to_string();
+            }
+            if self.label_picker_open {
+                if self.new_label_form.is_some() {
+                    return "ctrl-s create · esc cancel".to_string();
+                }
+                return "space apply · n new label · esc close".to_string();
+            }
+            return "e edit · l labels · c chat · a apply · esc back · ? help".to_string();
+        }
+        if self.searching {
+            return "type filter · enter apply · esc clear".to_string();
+        }
+        "h l tabs · / search · enter open · ? help".to_string()
+    }
+
     /// True when the open focus has a ticket transcript to poll.
     pub fn needs_poll(&self) -> bool {
         self.focus && self.chat.task_id().is_some()
@@ -2153,5 +2182,74 @@ mod tests {
         assert!(tickets.result.is_none());
         assert!(tickets.conflict.is_none());
         assert!(!tickets.conflict_open);
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_nested_view() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        assert_eq!(
+            tickets.footer_hints(),
+            "h l tabs · / search · enter open · ? help"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('/')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "type filter · enter apply · esc clear"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        assert!(tickets.focus_open());
+        assert_eq!(
+            tickets.footer_hints(),
+            "e edit · l labels · c chat · a apply · esc back · ? help"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('e')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s save · tab field · esc close"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "space apply · n new label · esc close"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(tickets.footer_hints(), "ctrl-s create · esc cancel");
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(!tickets.label_picker_open);
+
+        let conflict = Tickets {
+            focus: true,
+            conflict_open: true,
+            ..Tickets::default()
+        };
+        assert_eq!(
+            conflict.footer_hints(),
+            "g keep remote · p reapply · esc back"
+        );
+
+        let chat = Tickets {
+            focus: true,
+            chat_active: true,
+            ..Tickets::default()
+        };
+        assert_eq!(chat.footer_hints(), "esc back to issue");
+
+        for hint in [
+            tickets.footer_hints(),
+            conflict.footer_hints(),
+            chat.footer_hints(),
+        ] {
+            assert!(hint.chars().count() <= 64, "hint {hint}");
+        }
     }
 }
