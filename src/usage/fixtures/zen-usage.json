@@ -1,0 +1,11 @@
+{
+  "rolling": {
+    "usedPercent": 42.5,
+    "resetAtMs": 1788307200000
+  },
+  "weekly": null,
+  "monthly": {
+    "percent": 0.3,
+    "resetAt": 1788220800
+  }
+}
