@@ -3,16 +3,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use aif::config::{self, Config};
 use aif::daemon::Daemon;
 use aif::poll;
-use aif::sock;
+use aif::sock::{self, Action};
 
 /// Command line for `aifd`.
 #[derive(Parser)]
@@ -93,6 +96,23 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
         .context("cannot load the factory config")?;
     let (server, action_rx) = sock::Server::bind(socket_path)?;
     eprintln!("aifd: listening on {}", socket_path.display());
+    // One exit path serves every caller: the signal thread turns the first
+    // SIGTERM, SIGINT, or SIGHUP into the same Action::Stop that
+    // `aif stop` sends over the socket. The socket channel and the signal
+    // channel merge into the one receiver the daemon takes.
+    let (merged_tx, merged_rx) = mpsc::channel::<Action>();
+    install_signal_thread(merged_tx.clone())?;
+    let socket_tx = merged_tx;
+    std::thread::Builder::new()
+        .name("aif-socket".to_string())
+        .spawn(move || {
+            for action in action_rx {
+                if socket_tx.send(action).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("cannot spawn the socket forwarder")?;
     if paused {
         eprintln!("aifd: the factory starts paused; nothing dispatches until the operator resumes");
     }
@@ -105,7 +125,7 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
         prompts_dir(Some(&config_path)),
         poll_rx,
         pollers.wake,
-        action_rx,
+        merged_rx,
         paused,
     )
     .context("cannot initialize the factory daemon")?;
@@ -124,6 +144,44 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
     let result = daemon.run();
     drop(server);
     result
+}
+
+/// Install the one signal thread of the daemon.
+///
+/// The first `SIGTERM`, `SIGINT`, or `SIGHUP` sends [`Action::Stop`] into
+/// the daemon's action channel and names the signal on standard error. A
+/// later signal writes one line that says the daemon already stops and
+/// changes nothing. The thread runs until the process exits.
+fn install_signal_thread(stop_tx: mpsc::Sender<Action>) -> anyhow::Result<()> {
+    let signals = Signals::new([SIGTERM, SIGINT, SIGHUP])
+        .context("cannot register the daemon signal handlers")?;
+    std::thread::Builder::new()
+        .name("aif-signal".to_string())
+        .spawn(move || {
+            let mut signals = signals;
+            let announced = Arc::new(AtomicBool::new(false));
+            for signal in signals.forever() {
+                let name = signal_name(signal);
+                if !announced.swap(true, Ordering::SeqCst) {
+                    eprintln!("aifd: received {name}; the daemon stops its agent sessions");
+                    let _ = stop_tx.send(Action::Stop);
+                } else {
+                    eprintln!("aifd: received {name}; the daemon already stops");
+                }
+            }
+        })
+        .context("cannot spawn the signal thread")?;
+    Ok(())
+}
+
+/// The readable name of one registered signal number.
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        SIGTERM => "SIGTERM",
+        SIGINT => "SIGINT",
+        SIGHUP => "SIGHUP",
+        _ => "a signal",
+    }
 }
 
 /// Select prompt files beside a custom config file.

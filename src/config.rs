@@ -1370,8 +1370,13 @@ fn write_role_settings(table: &mut toml_edit::Table, settings: &RoleSettings) {
         "permission_handler",
         settings.permission_handler.as_deref(),
     );
-    set_strings(table, "tools", Some(&settings.tools));
-    set_strings(table, "disallowed_tools", Some(&settings.disallowed_tools));
+    let claude = settings.harness == Harness::Claude;
+    set_strings(table, "tools", claude.then_some(settings.tools.as_slice()));
+    set_strings(
+        table,
+        "disallowed_tools",
+        claude.then_some(settings.disallowed_tools.as_slice()),
+    );
     set_bool(table, "strict_mcp", settings.strict_mcp);
     set_bool(table, "auto_approve", settings.auto_approve);
     set_string(
@@ -1575,6 +1580,43 @@ mod lifecycle_tests {
             Some("high")
         );
         assert_eq!(parsed.stage(Stage::Review).limit, 8);
+    }
+
+    #[test]
+    fn a_global_harness_change_drops_the_empty_claude_tool_lists() {
+        let text = config_text().replace(
+            "[stage.refine]\nharness = \"claude\"",
+            "[stage.refine]\nharness = \"claude\"\ntools = []\ndisallowed_tools = []",
+        );
+        let config = Config::parse(&text).unwrap();
+        let mut settings = config.roles[&ExecutionRole::Refine].clone();
+        settings.harness = Harness::Opencode;
+        settings.program = "opencode".to_string();
+        settings.model = "openai/gpt-5.6-luna".to_string();
+        settings.permission_mode = None;
+        settings.permission_handler = None;
+        settings.tools.clear();
+        settings.disallowed_tools.clear();
+        settings.strict_mcp = None;
+        settings.auto_approve = Some(false);
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(5),
+            },
+        )
+        .unwrap();
+
+        let refine = edited.split("[stage.implement]").next().unwrap();
+        assert!(!refine.contains("tools"), "{refine}");
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(
+            parsed.roles[&ExecutionRole::Refine].harness,
+            Harness::Opencode
+        );
     }
 
     #[test]
