@@ -367,6 +367,8 @@ Repository topology changes require a daemon restart.
 - A release gate row refreshes at the poll after you stack a pull request.
 - A review push on a draft pull request can restart that review at the next
   poll.
+- A review of a pull request from a fork takes the `needs-human` path before a
+  repair.
 
 ## Development
 

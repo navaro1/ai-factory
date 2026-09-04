@@ -131,6 +131,11 @@ Read the diff of the PR with `gh pr diff {number}`. Review it for
 correctness, tests, and fit with the codebase. Read the repository
 instructions and the linked tickets.
 
+Before your first edit, check whether the PR comes from a fork:
+`gh pr view {number} --json isCrossRepository --jq .isCrossRepository`.
+When the command prints `true`, take the human path. Never push a fork repair
+to `origin`.
+
 Before your first edit, prove that this worktree holds the PR head. Compare
 `gh pr view {number} --json headRefOid --jq .headRefOid` with
 `git rev-parse HEAD`. When the two differ, run
@@ -154,10 +159,10 @@ PR, so this comment is the record.
 
 When the PR needs no repair, post the record and run `gh pr ready {number}`.
 
-Take the human path when a finding needs a human decision, when the repair
-leaves the scope of the linked tickets, or when the push fails. On that path,
-add the `needs-human` label to the PR with `gh`, write the question into a
-comment, leave the draft, and stop. Do not guess.
+Take the human path when the PR comes from a fork, when a finding needs a human
+decision, when the repair leaves the scope of the linked tickets, or when the
+push fails. On that path, add the `needs-human` label to the PR with `gh`, write
+the question into a comment, leave the draft, and stop. Do not guess.
 
 Report one line at the end: the review verdict, and the number of commits you
 pushed.
@@ -349,6 +354,9 @@ mod tests {
         for required in [
             "You repair every finding yourself",
             "ready for review, or labelled `needs-human`",
+            "gh pr view {number} --json isCrossRepository --jq .isCrossRepository",
+            "Never push a fork repair to `origin`",
+            "Take the human path when the PR comes from a fork",
             "prove that this worktree holds the PR head",
             "Push once, at the end of the run",
             "git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}",
