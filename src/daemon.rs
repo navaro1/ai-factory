@@ -177,7 +177,8 @@ pub struct Daemon {
     /// One live session per running or parked task.
     sessions: BTreeMap<String, Box<dyn Session>>,
     /// Tasks whose old process is stopping and still owes an exit event.
-    stopping_sessions: BTreeSet<String>,
+    /// The stage keeps each process inside its live-process limit.
+    stopping_sessions: BTreeMap<String, Stage>,
     /// Chat messages that wait for a stopped process or a live-process slot.
     pending_chats: BTreeMap<String, Vec<String>>,
     /// The time of the last event of each task, for the idle reaper.
@@ -464,7 +465,7 @@ impl Daemon {
             ticket_conversations,
             ticket_turn_text: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            stopping_sessions: BTreeSet::new(),
+            stopping_sessions: BTreeMap::new(),
             pending_chats,
             last_event_ms: BTreeMap::new(),
             interrupted,
@@ -581,7 +582,7 @@ impl Daemon {
         }
         let unreported: Vec<String> = self
             .stopping_sessions
-            .iter()
+            .keys()
             .chain(self.sessions.keys())
             .cloned()
             .collect();
@@ -1214,10 +1215,12 @@ impl Daemon {
         }
     }
 
-    /// Stop the processes of parked sessions that passed the idle limit.
+    /// Stop the processes of parked sessions that the factory cannot use.
     ///
-    /// The task stays `AwaitingUser` and a chat message resumes it later, but
-    /// its live-process slot is free at once.
+    /// A parked session stops when it passed the idle limit, or when a
+    /// pause blocks its task. The task stays `AwaitingUser` and a chat
+    /// message resumes it later. Its live-process slot becomes free after
+    /// the process reports `Exit`. A `Running` task keeps its process.
     fn reap_idle_sessions(&mut self) {
         let mut reaped: Vec<String> = Vec::new();
         for task in self.table.active() {
@@ -1232,17 +1235,55 @@ impl Daemon {
                 .get(&task.id)
                 .copied()
                 .unwrap_or(self.now_ms);
-            if self.now_ms >= last.saturating_add(self.idle_reap_ms) {
+            let idle = self.now_ms >= last.saturating_add(self.idle_reap_ms);
+            let paused = self.paused.blocks_task(task.stage, &task.repo, &task.id);
+            if idle || paused {
                 reaped.push(task.id.clone());
             }
         }
         for id in reaped {
             if self.sessions.contains_key(&id) {
-                eprintln!("task {id}: the parked session passed the idle limit; stopping it");
+                eprintln!("task {id}: the parked session is idle or paused; stopping it");
                 self.stop_session(&id, "cannot stop the parked session");
                 self.changed = true;
             }
         }
+    }
+
+    /// Stop one parked session to free a live-process slot of `stage`.
+    ///
+    /// The call selects the `AwaitingUser` tasks of `stage` that hold a
+    /// live session, that hold no queued chat message, and that are not
+    /// `waiting`. It stops the one with the oldest `last_event_ms` and
+    /// reports true. The stopped task keeps `AwaitingUser` and a later
+    /// chat message resumes it from its session id, exactly as after an
+    /// idle reap.
+    fn free_live_slot(&mut self, stage: Stage, waiting: &str) -> bool {
+        let candidate = self
+            .table
+            .by_id
+            .values()
+            .filter(|task| {
+                task.stage == stage
+                    && task.state == TaskState::AwaitingUser
+                    && task.id != waiting
+                    && self.sessions.contains_key(&task.id)
+                    && !self.pending_chats.contains_key(&task.id)
+            })
+            .min_by_key(|task| {
+                self.last_event_ms
+                    .get(&task.id)
+                    .copied()
+                    .unwrap_or(self.now_ms)
+            })
+            .map(|task| task.id.clone());
+        let Some(id) = candidate else {
+            return false;
+        };
+        eprintln!("task {id}: the stage needs the live slot; stopping its parked session");
+        self.stop_session(&id, "cannot stop the yielding parked session");
+        self.changed = true;
+        true
     }
 
     /// Start the follow-up turns of the tasks that hold chat messages.
@@ -1254,11 +1295,12 @@ impl Daemon {
     /// message is the prompt, and the session id continues the old
     /// conversation. The scheduler decides whether the run may start, so
     /// stage limits, lane reservations, and pauses all apply to a follow-up
-    /// turn.
+    /// turn. A full live-process limit stops one yielding parked session
+    /// first, and the limit check retries once.
     fn resume_pending_chats(&mut self) {
         let ids: Vec<String> = self.pending_chats.keys().cloned().collect();
         for id in ids {
-            if self.stopping_sessions.contains(&id) || self.sessions.contains_key(&id) {
+            if self.stopping_sessions.contains_key(&id) || self.sessions.contains_key(&id) {
                 continue;
             }
             let Some(task) = self.table.by_id.get(&id).cloned() else {
@@ -1279,6 +1321,19 @@ impl Daemon {
                 eprintln!("the pending chat for {id}: the task is {}", task.state);
                 continue;
             }
+            if !matches!(
+                sched::can_start(
+                    &self.limits,
+                    &self.paused,
+                    &self.table,
+                    task.stage,
+                    &task.repo,
+                    &task.id,
+                ),
+                Verdict::Yes
+            ) {
+                continue;
+            }
             let session_id = match self.followup_session_id(&task) {
                 Ok(session_id) => session_id,
                 Err(error) => {
@@ -1292,22 +1347,14 @@ impl Daemon {
                 continue;
             };
             // Scheduler capacity counts running tasks. The separate live
-            // process limit also counts parked live-input sessions.
+            // process limit also counts parked live-input sessions. A
+            // parked session that no queued message waits for yields its
+            // slot here, and the check retries once.
             if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
-                continue;
-            }
-            if !matches!(
-                sched::can_start(
-                    &self.limits,
-                    &self.paused,
-                    &self.table,
-                    task.stage,
-                    &task.repo,
-                    &task.id,
-                ),
-                Verdict::Yes
-            ) {
-                continue;
+                self.free_live_slot(task.stage, &task.id);
+                if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
+                    continue;
+                }
             }
             let Some(messages) = self.pending_chats.remove(&id) else {
                 continue;
@@ -1379,7 +1426,8 @@ impl Daemon {
     ///
     /// This mirrors [`sched::next_dispatch`] with one daemon-side exception:
     /// a stage whose live-process slots are full yields to the later tasks of
-    /// other stages until the reaper or an exit frees a slot. A task that
+    /// other stages until `dispatch_one` stops a yielding parked session,
+    /// the reaper stops one, or an exit frees a slot. A task that
     /// holds queued chat messages is not eligible either;
     /// `resume_pending_chats` owns it.
     fn next_eligible(
@@ -1394,7 +1442,7 @@ impl Daemon {
             if task.state != TaskState::Queued
                 || saturated.contains(&task.stage)
                 || failed.contains(&task.id)
-                || self.stopping_sessions.contains(&task.id)
+                || self.stopping_sessions.contains_key(&task.id)
                 || self.sessions.contains_key(&task.id)
                 || (self.pending_chats.contains_key(&task.id)
                     && !self.interrupted.contains(&task.id))
@@ -1488,9 +1536,10 @@ impl Daemon {
     ///
     /// `Ok(true)` means the task started, or that it holds queued chat
     /// messages and `resume_pending_chats` owns it. `Ok(false)` means the
-    /// stage's live processes are at their limit; the caller tries the next
-    /// stage. An error means the dispatch failed, the task is handled, and
-    /// the caller must stop this round.
+    /// stage's live processes are at their limit and no parked session
+    /// could yield a slot; the caller tries the next stage. An error means
+    /// the dispatch failed, the task is handled, and the caller must stop
+    /// this round.
     fn dispatch_one(&mut self, id: &str) -> Result<bool> {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return Ok(true);
@@ -1502,9 +1551,14 @@ impl Daemon {
         }
         // The second limit: live processes, not scheduler slots. A parked
         // chat holds a process between turns, and that process is the real
-        // memory cost the stage limit exists to bound.
+        // memory cost the stage limit exists to bound. A parked session
+        // that no queued message waits for yields its slot to this task,
+        // and the check retries once.
         if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
-            return Ok(false);
+            self.free_live_slot(task.stage, &task.id);
+            if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
+                return Ok(false);
+            }
         }
         let Some(repo_cfg) = self.config.repos.get(&task.repo).cloned() else {
             let reason = format!("repository {} left the config", task.repo);
@@ -1621,7 +1675,10 @@ impl Daemon {
     ///
     /// This is the one failure path for dispatch errors and run exits. A
     /// task that still has attempts left goes back to `Queued`; the last
-    /// failure opens a `Stuck` decision for the human.
+    /// failure opens a `Stuck` decision for the human. A live process
+    /// belongs to a task that can use it, so the daemon stops the session
+    /// of the failed task first. The task waits for the `Exit` event
+    /// before a retry, like every replaced session.
     fn fail_task(&mut self, id: &str, reason: &str) {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
@@ -1629,6 +1686,7 @@ impl Daemon {
         if task.state.is_terminal() {
             return;
         }
+        self.stop_session(id, "cannot stop the failed session");
         let final_attempt = task.attempt >= tasks::MAX_ATTEMPTS;
         if let Err(e) =
             self.table
@@ -1689,7 +1747,8 @@ impl Daemon {
     /// Map one runner event onto the task table, the decisions, and disk.
     fn on_run_event(&mut self, event: RunEvent) {
         let task_id = event_task(&event).to_string();
-        if self.stopping_sessions.contains(&task_id) && !matches!(event, RunEvent::Exit { .. }) {
+        if self.stopping_sessions.contains_key(&task_id) && !matches!(event, RunEvent::Exit { .. })
+        {
             return;
         }
         self.last_event_ms.insert(task_id.clone(), self.now_ms);
@@ -1842,7 +1901,7 @@ impl Daemon {
     /// task for its follow-up turn.
     fn on_exit_event(&mut self, id: &str, ok: bool, detail: &str) {
         self.last_event_ms.remove(id);
-        if self.stopping_sessions.remove(id) {
+        if self.stopping_sessions.remove(id).is_some() {
             return;
         }
         self.sessions.remove(id);
@@ -3350,9 +3409,13 @@ impl Daemon {
 
     /// The number of live sessions of one stage.
     ///
-    /// This counts each session until its process reports `Exit`.
+    /// This counts each session until its process reports `Exit`. The daemon
+    /// stops the session of a failed task and the parked session that
+    /// blocks, yields, or passed the idle limit, so the count stays a true
+    /// bound on the stage's live processes.
     fn live_sessions(&self, stage: Stage) -> usize {
-        self.sessions
+        let active = self
+            .sessions
             .keys()
             .filter(|id| {
                 self.table
@@ -3360,7 +3423,13 @@ impl Daemon {
                     .get(*id)
                     .is_some_and(|task| task.stage == stage)
             })
-            .count()
+            .count();
+        let stopping = self
+            .stopping_sessions
+            .values()
+            .filter(|stopping_stage| **stopping_stage == stage)
+            .count();
+        active + stopping
     }
 
     /// Stop one live session and wait for its exit before a replacement.
@@ -3368,7 +3437,9 @@ impl Daemon {
         let Some(mut session) = self.sessions.remove(id) else {
             return;
         };
-        self.stopping_sessions.insert(id.to_string());
+        if let Some(stage) = self.table.by_id.get(id).map(|task| task.stage) {
+            self.stopping_sessions.insert(id.to_string(), stage);
+        }
         if let Err(error) = session.stop() {
             eprintln!("task {id}: {context}: {error:#}");
         }
@@ -5200,7 +5271,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_end_parks_a_session_and_the_reaper_frees_the_slot() {
+    fn turn_end_parks_a_session_and_the_queued_task_starts_after_exit() {
         let mut rig = Rig::make_with(vec![], |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
@@ -5213,31 +5284,171 @@ mod tests {
             1,
             "the live limit holds the second task back"
         );
+
         rig.event(turn_ended("borsuk/refine-i142"));
+
         assert_eq!(
             rig.task("borsuk/refine-i142").state,
             TaskState::AwaitingUser
         );
-        assert!(!rig.session(0).stopped.load(Ordering::SeqCst));
-        assert_eq!(
-            rig.daemon.next_deadline(),
-            Some(Duration::from_millis(30 * 60_000)),
-            "the parked session sets the reaper deadline"
-        );
-
-        rig.set_now(T0 + 31 * 60_000);
-        rig.drive();
         assert!(
             rig.session(0).stopped.load(Ordering::SeqCst),
-            "the reaper stops the process"
+            "the parked session receives a stop request"
         );
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the old process holds the slot until its exit"
+        );
+        assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Queued);
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the yielding process exited",
+        ));
         assert_eq!(
             rig.task("borsuk/refine-i142").state,
             TaskState::AwaitingUser,
             "the task stays parked and resumable"
         );
-        assert_eq!(rig.job_count(), 2, "the freed slot admits the second task");
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).task, "borsuk/refine-i143");
+        assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Running);
         assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
+
+    #[test]
+    fn a_failed_turn_returns_the_live_slot() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+
+        rig.event(turn_finished(
+            "borsuk/implement-i142",
+            false,
+            "the turn failed",
+        ));
+
+        assert!(
+            rig.session(0).stopped.load(Ordering::SeqCst),
+            "the failed task loses its live process"
+        );
+        assert_eq!(
+            rig.daemon.live_sessions(Stage::Implement),
+            1,
+            "the stopping process still holds the live slot"
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+    }
+
+    #[test]
+    fn the_last_failed_attempt_returns_the_live_slot() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(reuse_issue_steps(
+                    &rig_repo(&dir),
+                    &worktree,
+                    &rig_gitdir(&dir),
+                ))
+                .chain(reuse_issue_steps(
+                    &rig_repo(&dir),
+                    &worktree,
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        for attempt in 0..tasks::MAX_ATTEMPTS {
+            let last = attempt + 1 == tasks::MAX_ATTEMPTS;
+            rig.event(turn_finished(
+                "borsuk/implement-i142",
+                false,
+                "the turn failed",
+            ));
+            assert!(
+                rig.session(attempt as usize).stopped.load(Ordering::SeqCst),
+                "attempt {} stops its live process",
+                attempt + 1
+            );
+            assert_eq!(rig.daemon.live_sessions(Stage::Implement), 1);
+            if last {
+                assert_eq!(
+                    rig.task("borsuk/implement-i142").state,
+                    TaskState::Failed("the turn failed".to_string())
+                );
+            } else {
+                assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+                rig.event(exited(
+                    "borsuk/implement-i142",
+                    false,
+                    "the stopped process exited",
+                ));
+                assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+            }
+        }
+        assert!(
+            rig.decision("stuck:borsuk/implement-i142:3").is_some(),
+            "the last failure opens a stuck row"
+        );
+        rig.event(exited(
+            "borsuk/implement-i142",
+            false,
+            "the final stopped process exited",
+        ));
+        assert_eq!(rig.daemon.live_sessions(Stage::Implement), 0);
+    }
+
+    #[test]
+    fn the_retried_task_starts_after_the_old_process_exits() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(reuse_issue_steps(
+                    &rig_repo(&dir),
+                    &worktree,
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        rig.event(turn_finished(
+            "borsuk/implement-i142",
+            false,
+            "the turn failed",
+        ));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        rig.drive();
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the exit of the stopped process holds the retry back"
+        );
+
+        rig.event(exited(
+            "borsuk/implement-i142",
+            false,
+            "the stopped process exited",
+        ));
+
+        assert_eq!(rig.job_count(), 2, "the exit frees the retry");
+        assert_eq!(rig.job(1).task, "borsuk/implement-i142");
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
     }
 
     #[test]
@@ -5353,15 +5564,27 @@ mod tests {
         let mut rig = Rig::make_with(vec![], |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
-        rig.poll(
-            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
-            vec![],
-        );
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         rig.event(turn_ended("borsuk/refine-i142"));
         rig.set_now(T0 + 31 * 60_000);
         rig.drive();
+        assert_eq!(rig.job_count(), 1);
+        assert!(rig.session(0).stopped.load(Ordering::SeqCst));
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the reaped process exited",
+        ));
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 0);
+
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
         assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Running);
 
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
@@ -5374,12 +5597,6 @@ mod tests {
             TaskState::AwaitingUser
         );
 
-        rig.event(exited(
-            "borsuk/refine-i142",
-            false,
-            "the reaped process exited",
-        ));
-        assert_eq!(rig.job_count(), 2, "the other task still holds the slot");
         rig.event(exited(
             "borsuk/refine-i143",
             false,
@@ -5394,7 +5611,73 @@ mod tests {
     }
 
     #[test]
-    fn a_reaped_chat_waits_while_a_parked_session_holds_the_live_process_slot() {
+    fn a_parked_session_yields_its_slot_to_a_chat_resume() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
+        });
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        // The park of 142 frees its slot, and the queued 143 takes it.
+        rig.event(turn_ended("borsuk/refine-i142"));
+        rig.event(exited(
+            "borsuk/refine-i142",
+            false,
+            "the yielding process exited",
+        ));
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser
+        );
+        assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Running);
+        rig.event(started("borsuk/refine-i143", "sid-143"));
+        rig.event(turn_ended("borsuk/refine-i143"));
+        assert_eq!(
+            rig.task("borsuk/refine-i143").state,
+            TaskState::AwaitingUser
+        );
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "resume after the parked session".to_string(),
+        });
+
+        assert!(
+            rig.session(1).stopped.load(Ordering::SeqCst),
+            "the parked session of 143 yields its slot to the chat resume"
+        );
+        assert_eq!(rig.job_count(), 2, "the stopping process holds its slot");
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser
+        );
+        assert_eq!(
+            rig.task("borsuk/refine-i143").state,
+            TaskState::AwaitingUser,
+            "the yielding task stays parked and resumable"
+        );
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+
+        rig.event(exited(
+            "borsuk/refine-i143",
+            false,
+            "the yielding process exited",
+        ));
+
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).task, "borsuk/refine-i142");
+        assert_eq!(rig.job(2).prompt, "resume after the parked session");
+        assert_eq!(rig.job(2).resume.as_deref(), Some("sid-142"));
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
+
+    #[test]
+    fn a_paused_chat_does_not_stop_an_unrelated_parked_session() {
         let mut rig = Rig::make_with(vec![], |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
@@ -5404,42 +5687,137 @@ mod tests {
         );
         rig.event(started("borsuk/refine-i142", "sid-142"));
         rig.event(turn_ended("borsuk/refine-i142"));
-
-        rig.set_now(T0 + 31 * 60_000);
-        rig.drive();
         rig.event(exited(
             "borsuk/refine-i142",
             false,
-            "the reaped process exited",
+            "the yielding process exited",
         ));
         rig.event(started("borsuk/refine-i143", "sid-143"));
         rig.event(turn_ended("borsuk/refine-i143"));
-        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
 
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/refine-i142".to_string(),
+            },
+            paused: true,
+        });
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
-            text: "resume after the parked session".to_string(),
+            text: "wait until the pause ends".to_string(),
         });
 
-        assert_eq!(rig.job_count(), 2, "the parked process keeps the slot");
+        assert!(
+            !rig.session(1).stopped.load(Ordering::SeqCst),
+            "the blocked chat cannot take another task's live slot"
+        );
+        assert_eq!(rig.job_count(), 2);
         assert_eq!(
             rig.daemon
                 .pending_chats
                 .get("borsuk/refine-i142")
                 .map(Vec::as_slice),
-            Some(&["resume after the parked session".to_string()][..])
+            Some(&["wait until the pause ends".to_string()][..])
         );
         assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
 
+    #[test]
+    fn a_parked_session_with_a_queued_chat_keeps_its_process() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
+        });
+        rig.poll(
+            vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
+            vec![],
+        );
+        assert_eq!(rig.job_count(), 1);
+        // The session refuses the message, so the chat queues for the
+        // resumed turn while the live session stays parked.
+        rig.session(0).fail_send.store(true, Ordering::SeqCst);
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: "queued for the parked turn".to_string(),
+        });
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+
+        rig.event(turn_ended("borsuk/refine-i142"));
+
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser
+        );
+        assert!(
+            !rig.session(0).stopped.load(Ordering::SeqCst),
+            "the queued chat message keeps the process alive"
+        );
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/refine-i142")
+                .map(Vec::as_slice),
+            Some(&["queued for the parked turn".to_string()][..])
+        );
+        assert_eq!(rig.job_count(), 1, "the queued task stays back");
+        assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Queued);
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
+    }
+
+    #[test]
+    fn a_pause_stops_the_parked_process_it_blocks() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser
+        );
+        assert!(!rig.session(0).stopped.load(Ordering::SeqCst));
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/refine-i142".to_string(),
+            },
+            paused: true,
+        });
+
+        assert!(
+            rig.session(0).stopped.load(Ordering::SeqCst),
+            "the pause stops the parked process it blocks"
+        );
+        assert_eq!(
+            rig.daemon.live_sessions(Stage::Refine),
+            1,
+            "the stopping process keeps the slot until its exit"
+        );
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser,
+            "the task stays parked and resumable"
+        );
         rig.event(exited(
-            "borsuk/refine-i143",
-            true,
-            "the parked process exited",
+            "borsuk/refine-i142",
+            false,
+            "the paused process exited",
         ));
+        assert_eq!(rig.daemon.live_sessions(Stage::Refine), 0);
+    }
 
-        assert_eq!(rig.job_count(), 3);
-        assert_eq!(rig.job(2).prompt, "resume after the parked session");
-        assert_eq!(rig.job(2).resume.as_deref(), Some("sid-142"));
+    #[test]
+    fn a_pause_keeps_a_running_process() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Global,
+            paused: true,
+        });
+
+        assert!(
+            !rig.session(0).stopped.load(Ordering::SeqCst),
+            "the running process stays alive under a pause"
+        );
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
         assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
     }
 
@@ -8515,25 +8893,48 @@ mod tests {
                 &worktree,
                 &rig_gitdir(&dir),
             ))
+            .chain(fresh_train_steps(
+                &rig_repo(&dir),
+                &train_wt(&dir),
+                &rig_gitdir(&dir),
+            ))
             .collect();
         let mut rig = Rig::make_in(dir, steps, |config| {
             config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
         });
         rig.poll(vec![], vec![pr(5, true, &[])]);
         rig.poll(vec![], vec![pr(5, false, &[])]);
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Queued);
+        assert_eq!(
+            rig.task("borsuk/release").attempt,
+            1,
+            "the running review holds the release back"
+        );
 
-        rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
-        rig.event(exited("borsuk/review-p5", false, "review failed"));
-        rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
-        rig.event(exited("borsuk/review-p5", false, "review failed"));
-        rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
-        rig.event(exited("borsuk/review-p5", false, "review failed"));
+        for attempt in 0..tasks::MAX_ATTEMPTS {
+            rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+            assert_eq!(
+                rig.task("borsuk/release").attempt,
+                1,
+                "the review attempt {} still holds the release back",
+                attempt + 1
+            );
+            if attempt + 1 < tasks::MAX_ATTEMPTS {
+                assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Queued);
+                rig.event(exited("borsuk/review-p5", false, "review failed"));
+                assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
+            }
+        }
 
-        assert_eq!(rig.job_count(), 3, "only review attempts can run");
+        assert_eq!(
+            rig.task("borsuk/review-p5").state,
+            TaskState::Failed("review failed".to_string())
+        );
+        assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());
         let release = rig.task("borsuk/release");
+        assert_eq!(rig.job_count(), 3, "only review attempts can run");
         assert_eq!(release.state, TaskState::Queued);
         assert_eq!(release.attempt, 1, "the release never reached dispatch");
-        assert!(rig.decision("stuck:borsuk/review-p5:3").is_some());
         assert_eq!(
             rig.daemon.input_mode(&release),
             InputMode::Closed {
