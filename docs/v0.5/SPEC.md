@@ -659,8 +659,9 @@ task log, and report exit, all without blocking the event loop.
   log's parent directory, opens the log for append, spawns the child with piped
   stdin, stdout, and stderr, and starts two reader threads. The stdout thread
   writes each raw line to the log and sends `ProcEvent::Line`. The stderr
-  thread appends to the same log with a `stderr ` prefix and does not send
-  events. A waiter thread sends `ProcEvent::Exit { code, ok }`.
+  thread appends to the same log with a `stderr ` prefix and sends
+  `ProcEvent::StderrLine` for each line, so a harness can read what the child
+  prints on stderr. A waiter thread sends `ProcEvent::Exit { code, ok }`.
 - `ProcHandle` exposes `write_line(&str)`, `close_stdin()`, `interrupt_hook`
   (a closure the runner can install to send its own protocol interrupt),
   `terminate()`, and `kill()`. `terminate()` sends SIGTERM without a `libc`
@@ -714,7 +715,9 @@ pub trait Session: Send {
   redefine it.
 - `Job { task: String, stage: Stage, repo: String, model: String,
   variant: Option<String>, prompt: String, cwd: PathBuf, log: PathBuf,
-  resume: Option<String>, yolo: bool }`.
+  resume: Option<String>, yolo: bool, allowed_tools: Option<Vec<String>>,
+  allowed_permissions: Vec<AllowedPermission> }` with one
+  `AllowedPermission { permission, patterns }` per rule.
 - `RunEvent { Started { task, session_id: Option<String> },
   Text { task, text }, Tool { task, name, summary },
   Ask { task, request_id, tool, input: serde_json::Value,
@@ -727,6 +730,18 @@ pub trait Session: Send {
   yields `Started` with the `sessionID` on the first line only; `text` yields
   `Text` from `part.text`; a tool part yields `Tool`; `step_finish` yields
   `TurnEnd`. Unknown types are logged and ignored, never fatal.
+- The opencode runner also reads the stderr lines, because opencode without
+  `--auto` cannot emit an ask on stdout: it prints
+  `permission requested: <name> (<patterns>); auto-rejecting` and rejects the
+  ask. The runner strips the ANSI escapes, matches that shape, and emits one
+  `RunEvent::Ask` per match: `tool` is the permission name, `input` is
+  `{"patterns": [...]}`, `needs_human` is true only for the `question`
+  permission, and `request_id` is `rej-<n>`, counted in stream order, so a
+  retry refreshes the same row.
+- The job's `allowed_permissions` reach the opencode child as the
+  `OPENCODE_PERMISSION` environment value,
+  `{"<permission>": {"<pattern>": "allow"}}`, the inline permissions config
+  that opencode merges over its own config, so the inline allow wins.
 - `Session::stop` for opencode kills the child; `send_user` and `answer` return
   the unsupported error.
 
@@ -876,6 +891,23 @@ pub enum Response { Allow, Deny { message: String },
   because they are the same underlying `can_use_tool` request from the claude
   control channel, told apart only by `requires_user_interaction`. One namespace
   is what stops a single request opening two rows.
+- The daemon keeps the ask rows of a one-shot harness over a failure: a task
+  whose runner has no `permission_responses` capability, such as opencode,
+  cannot answer a live ask, so its `Permission` and `Question` rows stay open
+  while the task retries or fails. A steerable claude task still loses its rows
+  on failure, and `Stuck` rows always drop. Success and cancel still close every
+  row of the task. The kept rows and the granted permission rules persist in
+  `state.json` (`runtime.asks` and `runtime.allowed_permissions`), each
+  validated against the known task ids like the other runtime maps.
+- A one-shot answer routes by the row kind. `Permission` + `Allow` records
+  `AllowedPermission { permission, patterns }` for the task and requeues it from
+  attempt 1; the next dispatch builds the job with the rule, and the rules clear
+  when the task completes or is cancelled. `Permission` + `Deny` closes the row
+  and leaves the task state alone. `Question` + `Text` queues the text in
+  `pending_chats`, reopens the terminal task, and lets the pending-chats resume
+  carry it to the recorded session; a run with no session marker re-pushes the
+  row and logs the reason. `Question` + `Answers` is refused and re-pushes the
+  row, because a one-shot row carries no option list.
 - Sources are wired by the daemon in chunk 15; this chunk owns the type, the
   queue, the id rules, and the validation.
 - The `NeedsHuman` source reads the `needs-human` label. Opening it must not
