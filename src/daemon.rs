@@ -1512,6 +1512,7 @@ impl Daemon {
         }
         let Some(repo_cfg) = self.config.repos.get(&task.repo).cloned() else {
             let reason = format!("repository {} left the config", task.repo);
+            self.log_dispatch_failure(&task, &reason);
             self.fail_run(&task, &reason);
             return Err(anyhow!(reason));
         };
@@ -1531,6 +1532,7 @@ impl Daemon {
             Ok(cwd) => cwd,
             Err(e) => {
                 let reason = format!("cannot prepare the worktree: {e:#}");
+                self.log_dispatch_failure(&task, &reason);
                 self.fail_run(&task, &reason);
                 return Err(e);
             }
@@ -1539,6 +1541,7 @@ impl Daemon {
             Ok(prompt) => prompt,
             Err(e) => {
                 let reason = format!("cannot render the prompt: {e:#}");
+                self.log_dispatch_failure(&task, &reason);
                 self.fail_run(&task, &reason);
                 return Err(e);
             }
@@ -1551,6 +1554,7 @@ impl Daemon {
                 Ok(resume) => resume,
                 Err(e) => {
                     let reason = format!("cannot read the session marker: {e:#}");
+                    self.log_dispatch_failure(&task, &reason);
                     self.fail_run(&task, &reason);
                     return Err(e);
                 }
@@ -1567,6 +1571,7 @@ impl Daemon {
         };
         if let Err(e) = self.launch_task(&task, prompt, resume) {
             let reason = format!("the runner could not start: {e:#}");
+            self.log_dispatch_failure(&task, &reason);
             self.fail_run(&task, &reason);
             return Err(e);
         }
@@ -1909,6 +1914,37 @@ impl Daemon {
         }
         self.fail_task(&task.id, reason);
         self.reopen_for_pending_chat(&task.id);
+    }
+
+    /// Append one dispatch-failure line to the log of the task.
+    ///
+    /// A dispatch failure happens before the runner starts, so no process
+    /// ever writes to the log, and the session view would show no output at
+    /// all. This line is the reason the operator sees there. A write failure
+    /// goes to standard error and never masks the dispatch failure.
+    fn log_dispatch_failure(&self, task: &Task, reason: &str) {
+        if let Some(parent) = task.log_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("cannot create the log directory {}: {e}", parent.display());
+                    return;
+                }
+            }
+        }
+        let line = format!("aif: dispatch failed: {reason}\n");
+        let opened = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&task.log_path);
+        match opened {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                if let Err(e) = file.write_all(line.as_bytes()) {
+                    eprintln!("cannot write to {}: {e}", task.log_path.display());
+                }
+            }
+            Err(e) => eprintln!("cannot open the task log {}: {e}", task.log_path.display()),
+        }
     }
 
     /// Write the `.aif/reviewed-sha` marker of a finished review.
@@ -3892,12 +3928,14 @@ mod tests {
         )
     }
 
-    /// The four git calls of a fresh issue worktree.
+    /// The five git calls of a fresh issue worktree: the create path first
+    /// prunes broken registrations, then cuts the branch from `HEAD`.
     fn fresh_issue_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
         let reference = format!("refs/heads/aif/borsuk/issue-{number}");
         let branch = format!("aif/borsuk/issue-{number}");
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
             git_step(
                 repo,
                 &["rev-parse", "--verify", "--quiet", reference.as_str()],
@@ -3924,15 +3962,17 @@ mod tests {
         ]
     }
 
-    /// The git calls of a first dispatch into a PR worktree: cut the branch
-    /// from `HEAD`, prepare the markers, then fetch the GitHub pull ref and
-    /// reset the branch hard to it.
+    /// The git calls of a first dispatch into a PR worktree: prune broken
+    /// registrations, cut the branch from `HEAD`, prepare the markers, then
+    /// fetch the GitHub pull ref in the worktree and reset the branch hard
+    /// to it.
     fn fresh_pr_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
         let reference = format!("refs/heads/aif/borsuk/pr-{number}");
         let branch = format!("aif/borsuk/pr-{number}");
         let pull_ref = format!("pull/{number}/head");
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
             git_step(
                 repo,
                 &["rev-parse", "--verify", "--quiet", reference.as_str()],
@@ -3957,7 +3997,7 @@ mod tests {
             ),
             common_dir_step(worktree, gitdir),
             git_step(
-                repo,
+                worktree,
                 &["fetch", "origin", pull_ref.as_str()],
                 CmdOut::ok(""),
             ),
@@ -3978,7 +4018,8 @@ mod tests {
         ]
     }
 
-    /// The four git calls of a fresh train worktree.
+    /// The five git calls of a fresh train worktree: the create path prunes
+    /// broken registrations before it checks the branch.
     fn fresh_train_steps(repo: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
@@ -3987,6 +4028,7 @@ mod tests {
                 &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
                 refused(),
             ),
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
             git_step(
                 repo,
                 &[
@@ -4653,6 +4695,36 @@ mod tests {
             .find(|row| matches!(row.kind, DecisionKind::Stuck { .. }))
             .expect("the third failure opens a stuck row");
         assert_eq!(stuck.id, "stuck:borsuk/implement-i142:3");
+    }
+
+    #[test]
+    fn a_dispatch_failure_appends_its_reason_to_the_task_log() {
+        let dir = temp_root();
+        let steps = vec![git_step(
+            &rig_repo(&dir),
+            &["worktree", "prune"],
+            CmdOut {
+                status: 128,
+                stdout: String::new(),
+                stderr: "fatal: not a git repository\n".to_string(),
+            },
+        )];
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert_eq!(rig.job_count(), 0, "the runner never started");
+        let task = rig.task("borsuk/implement-i142");
+        let log =
+            fs::read_to_string(&task.log_path).expect("the dispatch failure must write the log");
+        assert!(
+            log.contains("aif: dispatch failed: cannot prepare the worktree"),
+            "log: {log}"
+        );
+        assert!(
+            log.contains("git worktree prune failed: fatal: not a git repository"),
+            "the git error text must reach the log: {log}"
+        );
     }
 
     #[test]
