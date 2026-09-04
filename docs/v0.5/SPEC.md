@@ -905,9 +905,13 @@ pub enum Response { Allow, Deny { message: String },
   when the task completes or is cancelled. `Permission` + `Deny` closes the row
   and leaves the task state alone. `Question` + `Text` queues the text in
   `pending_chats`, reopens the terminal task, and lets the pending-chats resume
-  carry it to the recorded session; a run with no session marker re-pushes the
-  row and logs the reason. `Question` + `Answers` is refused and re-pushes the
-  row, because a one-shot row carries no option list.
+  carry it to the recorded session. The text obeys the same `input_mode` policy
+  as a chat message, so a run with no session marker, a task whose worktree a
+  sibling holds, and a queued task that never ran all re-push the row with the
+  reason; a queued task must refuse, because the resume uses the queued text as
+  the whole prompt. An accepted text writes one user line into the task log,
+  like every other queue-path message. `Question` + `Answers` is refused and
+  re-pushes the row, because a one-shot row carries no option list.
 - Sources are wired by the daemon in chunk 15; this chunk owns the type, the
   queue, the id rules, and the validation.
 - The `NeedsHuman` source reads the `needs-human` label. Opening it must not

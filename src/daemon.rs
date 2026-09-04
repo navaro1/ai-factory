@@ -3172,7 +3172,9 @@ impl Daemon {
     ///
     /// `chat` calls this exactly once per accepted message: on the live
     /// delivery success, on the live delivery failure, and on the queue
-    /// path. `resume_pending_chats` calls it never, because the queue path
+    /// path. `deliver_one_shot_chat` calls it once for the text answer of
+    /// a one-shot question row, which takes the same queue path.
+    /// `resume_pending_chats` calls it never, because the queue path
     /// already wrote the line. A refused message writes nothing.
     ///
     /// The daemon sends two messages of its own through `chat`: the ticket
@@ -3654,9 +3656,15 @@ impl Daemon {
     /// Queue one question answer as the follow-up chat of a one-shot task.
     ///
     /// The text waits in `pending_chats`, the terminal task reopens, and
-    /// `resume_pending_chats` resumes the recorded session with the text. A
-    /// run that left no session marker refuses the text, so the caller
-    /// re-pushes the row and the answer is not lost.
+    /// `resume_pending_chats` resumes the recorded session with the text.
+    ///
+    /// The answer obeys the chat policy, so the inbox opens no door the
+    /// chat bar keeps shut. [`Daemon::input_mode`] refuses a run that left
+    /// no session marker, a task whose worktree a sibling holds, and a
+    /// queued task that never ran: `resume_pending_chats` uses the queued
+    /// text as the whole prompt, so a queued task would start with the
+    /// answer in place of its stage prompt. A refusal names the reason,
+    /// the caller re-pushes the row, and the answer is not lost.
     fn deliver_one_shot_chat(&mut self, task: &str, text: &str) -> Result<()> {
         let task_value = self
             .table
@@ -3664,15 +3672,16 @@ impl Daemon {
             .get(task)
             .ok_or_else(|| anyhow!("no task holds this answer"))?
             .clone();
-        match self.followup_session_id(&task_value) {
-            Ok(Some(_)) => {}
-            Ok(None) => bail!("the run left no session marker to resume"),
-            Err(error) => return Err(anyhow!("cannot read the session marker: {error:#}")),
+        if let InputMode::Closed { reason } = self.input_mode(&task_value) {
+            bail!("{reason}");
         }
         self.pending_chats
             .entry(task.to_string())
             .or_default()
             .push(text.to_string());
+        // The queue path owns the log line. Without it the answer reaches
+        // the agent and leaves no record in the transcript.
+        self.log_chat_line(&task_value, text);
         self.reopen_for_pending_chat(task);
         Ok(())
     }
@@ -6344,7 +6353,8 @@ mod tests {
     }
 
     /// A text answer to a one-shot question resumes the recorded session
-    /// with the text through the pending-chats path.
+    /// with the text through the pending-chats path, and the queue path
+    /// writes the one user line that records the answer.
     #[test]
     fn a_text_answer_resumes_a_one_shot_task_with_a_session_marker() {
         let dir = temp_root();
@@ -6376,6 +6386,13 @@ mod tests {
             "the resume delivers the queued text"
         );
         assert!(rig.decision(&row_id).is_none());
+        assert_eq!(
+            logged_lines(&rig.task("borsuk/implement-i142").log_path),
+            vec![
+                r#"{"type":"user","message":{"role":"user","content":"use the vendored sources"}}"#
+            ],
+            "the answer leaves one durable record in the task log"
+        );
     }
 
     /// Without a session marker the row re-pushes and a log line names the
@@ -6449,6 +6466,55 @@ mod tests {
             "the refused answer re-pushes the row"
         );
         assert!(rig.daemon.pending_chats.is_empty());
+    }
+
+    /// A queued task takes no text answer. `resume_pending_chats` uses the
+    /// queued text as the whole prompt, so a queued task would start with
+    /// the answer in place of its stage prompt. The chat bar refuses the
+    /// same task, and the inbox must not open a door the chat bar shuts.
+    #[test]
+    fn a_text_answer_on_a_queued_one_shot_task_keeps_the_row_open() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, MAX_ATTEMPTS as usize);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(opencode_ask(2, "question", &[]));
+        let row_id = ask_row_id(2);
+        // The pause holds the requeued task, so the failure leaves it
+        // queued instead of running the next attempt at once.
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/implement-i142".to_string(),
+            },
+            paused: true,
+        });
+        rig.event(exited(
+            "borsuk/implement-i142",
+            false,
+            "opencode exited with code 1",
+        ));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+
+        rig.act(Action::Answer {
+            decision_id: row_id.clone(),
+            response: Response::Text {
+                text: "use the vendored sources".to_string(),
+            },
+        });
+
+        assert!(
+            rig.decision(&row_id).is_some(),
+            "the queued task re-pushes the row"
+        );
+        assert!(
+            rig.daemon.pending_chats.is_empty(),
+            "the daemon queues no text it must not deliver"
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert!(
+            logged_lines(&rig.task("borsuk/implement-i142").log_path).is_empty(),
+            "a refused answer writes no user line"
+        );
     }
 
     #[test]
