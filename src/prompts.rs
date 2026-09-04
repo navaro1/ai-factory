@@ -9,6 +9,17 @@
 //! "PR". A `gh` command inside backticks keeps the GitHub word, because
 //! the CLI speaks its own nouns.
 
+/// The notice that precedes the rendered prompt of a task the daemon
+/// interrupted with a stop.
+///
+/// The daemon prepends it only to a run that resumes the saved session of
+/// such a task. The agent reads the worktree to find its place instead of
+/// repeating finished work.
+pub const RESTART_NOTICE: &str = "Note: the AI Factory daemon stopped and restarted \
+while this task ran. This run continues your saved session. Read the worktree \
+state first to find where you stopped, then continue the remaining work. Do not \
+repeat work that is already done.";
+
 /// The built-in prompt of a refine run.
 ///
 /// It runs in the repository checkout and never creates a worktree.
@@ -138,17 +149,44 @@ PR #{number}: {title}
 
 Tickets this PR closes: {tickets}
 
+You are the last agent on this change. You repair every finding yourself. You
+never hand a finding back to the author. The PR must leave your run ready for
+review, or labelled `needs-human`.
+
 Read the diff of the PR with `gh pr diff {number}`. Review it for
-correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`. If it is correct, approve it and then run
-`gh pr ready {number}`. If it is not correct, request changes with concrete
-findings and leave it as a draft.
+correctness, tests, and fit with the codebase. Read the repository
+instructions and the linked tickets.
 
-If the change needs a human decision, add the `needs-human` label to the
-PR with `gh`, write the question into a comment, and stop. Do not
-guess.
+Before your first edit, prove that this worktree holds the PR head. Compare
+`gh pr view {number} --json headRefOid --jq .headRefOid` with
+`git rev-parse HEAD`. When the two differ, run
+`git fetch origin pull/{number}/head` and then `git reset --hard FETCH_HEAD`.
 
-Report one line at the end: the review verdict.
+Fix every finding in this worktree. Add the missing tests. Keep the scope of
+the linked tickets. Run the full validation of the repository and make it
+pass. Commit the repairs in small, complete commits.
+
+Push once, at the end of the run. A push on a draft PR can restart your own
+review, so never push a partial fix. Push the commits and open the release
+gate in one command line:
+
+`git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}`
+
+Never pass `--force`. Never merge the PR.
+
+Record the outcome with `gh pr comment {number}`. Name the findings, the
+repairs, and the validation result. GitHub refuses a formal review of your own
+PR, so this comment is the record.
+
+When the PR needs no repair, post the record and run `gh pr ready {number}`.
+
+Take the human path when a finding needs a human decision, when the repair
+leaves the scope of the linked tickets, or when the push fails. On that path,
+add the `needs-human` label to the PR with `gh`, write the question into a
+comment, leave the draft, and stop. Do not guess.
+
+Report one line at the end: the review verdict, and the number of commits you
+pushed.
 "#;
 
 /// The built-in prompt of a release run.
@@ -362,6 +400,26 @@ names.";
                 !normalized.contains(paragraph),
                 "a ticket prompt must not hold the autonomy paragraph"
             );
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_mandates_a_repair_a_push_and_the_ready_flip() {
+        let prompt = REVIEW_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for required in [
+            "You repair every finding yourself",
+            "ready for review, or labelled `needs-human`",
+            "prove that this worktree holds the PR head",
+            "Push once, at the end of the run",
+            "git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}",
+            "Never pass `--force`. Never merge the PR.",
+            "GitHub refuses a formal review of your own PR",
+            "add the `needs-human` label to the PR",
+        ] {
+            assert!(prompt.contains(required), "missing: {required}");
         }
     }
 }

@@ -4,6 +4,7 @@
 //! The modules below mirror the source layout in `docs/v0.5/SPEC.md`.
 //! Later chunks fill them in.
 
+pub mod catalog;
 pub mod config;
 pub mod daemon;
 pub mod decisions;
@@ -21,6 +22,7 @@ pub mod sched;
 pub mod sock;
 pub mod state;
 pub mod tasks;
+pub mod theory;
 pub mod ticket;
 pub mod trains;
 pub mod tui;

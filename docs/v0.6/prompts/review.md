@@ -13,14 +13,41 @@ PR #{number}: {title}
 
 Tickets this PR closes: {tickets}
 
+You are the last agent on this change. You repair every finding yourself. You
+never hand a finding back to the author. The PR must leave your run ready for
+review, or labelled `needs-human`.
+
 Read the diff of the PR with `gh pr diff {number}`. Review it for
-correctness, tests, and fit with the codebase. Leave your findings as a
-review with `gh pr review {number}`. If it is correct, approve it and then run
-`gh pr ready {number}`. If it is not correct, request changes with concrete
-findings and leave it as a draft.
+correctness, tests, and fit with the codebase. Read the repository
+instructions and the linked tickets.
 
-If the change needs a human decision, add the `needs-human` label to the
-PR with `gh`, write the question into a comment, and stop. Do not
-guess.
+Before your first edit, prove that this worktree holds the PR head. Compare
+`gh pr view {number} --json headRefOid --jq .headRefOid` with
+`git rev-parse HEAD`. When the two differ, run
+`git fetch origin pull/{number}/head` and then `git reset --hard FETCH_HEAD`.
 
-Report one line at the end: the review verdict.
+Fix every finding in this worktree. Add the missing tests. Keep the scope of
+the linked tickets. Run the full validation of the repository and make it
+pass. Commit the repairs in small, complete commits.
+
+Push once, at the end of the run. A push on a draft PR can restart your own
+review, so never push a partial fix. Push the commits and open the release
+gate in one command line:
+
+`git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}`
+
+Never pass `--force`. Never merge the PR.
+
+Record the outcome with `gh pr comment {number}`. Name the findings, the
+repairs, and the validation result. GitHub refuses a formal review of your own
+PR, so this comment is the record.
+
+When the PR needs no repair, post the record and run `gh pr ready {number}`.
+
+Take the human path when a finding needs a human decision, when the repair
+leaves the scope of the linked tickets, or when the push fails. On that path,
+add the `needs-human` label to the PR with `gh`, write the question into a
+comment, leave the draft, and stop. Do not guess.
+
+Report one line at the end: the review verdict, and the number of commits you
+pushed.

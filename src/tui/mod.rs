@@ -15,12 +15,14 @@
 //! `handle_key` for the inbox.
 //!
 //! A view that holds the keyboard for text input keeps a typed `q` away
-//! from the quit handler. The session view holds it while its chat bar is
-//! focused and open; `esc` or `tab` releases the focus, `h` and `l` then
-//! switch the live sessions, and `i` or `enter` takes the focus back.
-//! A session bar that cannot take text, and every other view, leaves the
-//! `1` through `5` view keys and `?` to the shell. The `!` inbox key and
-//! the ctrl-q and ctrl-c quit chords work from every view.
+//! from the quit handler and takes a typed `!` as a character. The session
+//! view holds the keyboard while its chat bar is focused and open; `esc`
+//! or `tab` releases the focus, `h` and `l` then switch the live sessions,
+//! and `i` or `enter` takes the focus back. A session bar that cannot take
+//! text, and every other view, leaves the `1` through `5` view keys and
+//! `?` to the shell. Every state without an open text input opens the
+//! inbox on `!`, and the ctrl-q and ctrl-c quit chords work from every
+//! view.
 
 pub mod inbox;
 pub mod markdown;
@@ -50,9 +52,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::catalog;
 use crate::decisions::DecisionKind;
+use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
-use crate::sock::{Action, Client, Push, StateView, TaskView, WireProtocolMismatch};
+use crate::sock::{Action, Client, Push, StateView, TaskView, TicketAction, WireProtocolMismatch};
 use crate::tasks::TaskState;
 use inbox::{ActionSink, Inbox};
 use session::SessionView;
@@ -108,6 +112,8 @@ enum Msg {
     TicketResult(crate::sock::TicketResult),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
+    /// The parsed `opencode models` probe result of this shell start.
+    HarnessModels(Result<Vec<String>, String>),
     /// The socket reader reached the daemon.
     Connected,
     /// The daemon went away, with the reason for the banner.
@@ -173,6 +179,13 @@ enum Confirm {
         /// The pull request numbers in the batch.
         prs: Vec<u64>,
     },
+    /// Add the `to-refine` label to one ticket.
+    Refine {
+        /// The repository alias.
+        repo: String,
+        /// The issue number.
+        number: u64,
+    },
 }
 
 impl Confirm {
@@ -208,6 +221,20 @@ impl Confirm {
                         prs: prs.clone(),
                     },
                     format!("sent release {repo} {}", pr_text(&prs)),
+                );
+            }
+            Confirm::Refine { repo, number } => {
+                emit(
+                    app,
+                    sink,
+                    Action::Ticket(TicketAction::ToggleLabel {
+                        request: tickets::request_code(),
+                        repo: repo.clone(),
+                        number,
+                        label: crate::gates::TO_REFINE.to_string(),
+                        on: true,
+                    }),
+                    format!("sent to-refine {repo} #{number}"),
                 );
             }
         }
@@ -352,6 +379,19 @@ impl App {
         }
     }
 
+    /// True when a typed character lands in an open text input now.
+    ///
+    /// The session bar takes text only while it is focused and open. A
+    /// closed bar and a bar with no task swallow the letters, so the
+    /// shell keeps the `!` inbox key there. Every other view takes text
+    /// while its own input is open.
+    fn types_text(&self) -> bool {
+        if matches!(self.view, View::Session) && !self.session.input_enabled() {
+            return false;
+        }
+        self.text_focus()
+    }
+
     /// Enter the session view and give the chat bar the focus.
     fn enter_session(&mut self) {
         self.view = View::Session;
@@ -427,13 +467,16 @@ impl App {
 
     /// Apply one key press. Returns false when the app wants to quit.
     ///
-    /// The quit chords and the inbox key work in every state. A view that
-    /// holds text input keeps a typed `q` away from the quit handler.
+    /// The quit chords work in every state. An open text input takes the
+    /// typed `q` and `!` as characters; every other state quits on `q`
+    /// and opens the inbox on `!`.
     fn handle_key(&mut self, key: KeyEvent, sink: &mut impl ActionSink) -> bool {
         if quit_chord(key) {
             return false;
         }
-        if inbox_key(key) {
+        // An overlay covers the text input below it, so the global key
+        // still works while the overlay is open.
+        if inbox_key(key) && (self.help || self.confirm.is_some() || !self.types_text()) {
             self.confirm = None;
             self.help = false;
             self.open_inbox_oldest();
@@ -572,6 +615,16 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+                if key.code == KeyCode::Char('m') && self.tickets.focus_plain() {
+                    if let Some((repo, number)) = self.tickets.focus_key() {
+                        if self.tickets.focus_has_label(crate::gates::TO_REFINE) {
+                            self.show_toast("the ticket already has to-refine");
+                        } else {
+                            self.confirm = Some(Confirm::Refine { repo, number });
+                        }
+                    }
+                    return true;
                 }
                 let nested = self.tickets.focus_open() || self.tickets.typing();
                 if let Some(action) = self
@@ -929,6 +982,7 @@ pub fn run(socket: &Path) -> Result<()> {
         terminal: Terminal::new(backend).context("cannot create the terminal")?,
     };
     let (tx, rx) = channel();
+    spawn_model_probe(tx.clone());
     spawn_key_thread(tx.clone());
     spawn_socket_thread(tx, socket.to_path_buf());
     let mut app = App::default();
@@ -937,6 +991,19 @@ pub fn run(socket: &Path) -> Result<()> {
         client: None,
     };
     run_loop(&mut surface, &mut app, &rx, &mut link)
+}
+
+/// Run `opencode models` once in the background.
+///
+/// The thread sends one message with the parsed model list or the failure
+/// reason. The shell never blocks on this thread; a late result still
+/// refreshes an open model value list.
+fn spawn_model_probe(tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let result =
+            catalog::fetch_opencode_models(&RealExec).map_err(|error| format!("{error:#}"));
+        let _ = tx.send(Msg::HarnessModels(result));
+    });
 }
 
 /// Read crossterm events until the channel dies.
@@ -1124,6 +1191,10 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::SettingsResult(result) => {
             app.settings.observe_result(result);
+            Ok(true)
+        }
+        Msg::HarnessModels(result) => {
+            app.settings.observe_models(result);
             Ok(true)
         }
         Msg::Connected => {
@@ -1372,6 +1443,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let question = match confirm {
         Confirm::Abort { task } => format!("abort {task}?"),
         Confirm::Go { repo, prs } => format!("release {repo}: {}", pr_text(prs)),
+        Confirm::Refine { repo, number } => format!("add to-refine to {repo} #{number}?"),
     };
     let hint = "y confirm - esc cancel";
     let width = question.chars().count().max(hint.len()) as u16 + 6;
@@ -1416,8 +1488,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("h l", "switch session, chat unfocused"),
         ("y n i t c", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ e l c a", "search and ticket actions"),
-        ("h l", "tickets repo / settings scope"),
+        ("/ e L c a m", "search and ticket keys"),
+        ("h l", "repo / ticket / settings scope"),
         ("j k", "settings role"),
         ("Tab", "select settings field"),
         ("Enter", "edit settings value"),
@@ -1554,6 +1626,55 @@ mod tests {
             1_000,
         );
         Decision::permission(&task, request_id, "Write", serde_json::json!({}), opened_ms)
+    }
+
+    /// One ticket summary for the shell ticket tests.
+    fn ticket_summary(repo: &str, number: u64) -> crate::sock::TicketSummary {
+        crate::sock::TicketSummary {
+            repo: repo.to_string(),
+            number,
+            title: "Improve the ticket list".to_string(),
+            labels: vec!["ui".to_string()],
+            updated_at: "2026-08-30T12:00:00Z".to_string(),
+            group: crate::sock::TicketGroup::Untouched,
+        }
+    }
+
+    /// One full issue response for the shell ticket tests.
+    fn ticket_details(repo: &str, number: u64) -> crate::sock::TicketDetails {
+        crate::sock::TicketDetails {
+            request: "shell-details".to_string(),
+            repo: repo.to_string(),
+            issue: crate::model::Issue {
+                number,
+                node_id: format!("node-{number}"),
+                title: "Improve the ticket list".to_string(),
+                body: "Show every issue without leaving the terminal.".to_string(),
+                labels: vec!["ui".to_string()],
+                author: "piotr".to_string(),
+                assignees: Vec::new(),
+                updated_at: "2026-08-30T12:00:00Z".to_string(),
+                github_url: format!("https://github.com/acme/{repo}/issues/{number}"),
+                open: true,
+            },
+            proposal: None,
+            chat_error: None,
+        }
+    }
+
+    /// Open the plain ticket focus on one pushed ticket and clear the sink.
+    fn open_ticket_focus(surface: &mut CountingSurface, app: &mut App, sink: &mut FakeSink) {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tickets.push(ticket_summary("borsuk", 7));
+        run_messages(
+            surface,
+            app,
+            vec![Msg::State(state), key('4'), key_code(KeyCode::Enter)].into_iter(),
+            sink,
+        )
+        .unwrap();
+        sink.0.clear();
+        app.tickets.observe_details(ticket_details("borsuk", 7));
     }
 
     #[test]
@@ -1908,6 +2029,69 @@ mod tests {
     }
 
     #[test]
+    fn a_model_discovery_message_fills_the_open_value_list() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.settings = crate::sock::SettingsView {
+            revision: "rev-one".to_string(),
+            global: crate::config::ExecutionRole::ALL
+                .into_iter()
+                .map(|role| crate::sock::GlobalRoleSettingsView {
+                    role,
+                    settings: crate::config::RoleSettings {
+                        harness: crate::config::Harness::Opencode,
+                        program: "opencode".to_string(),
+                        model: "model-one".to_string(),
+                        effort: None,
+                        extra_args: Vec::new(),
+                        agent: None,
+                        profile: None,
+                        permission_mode: None,
+                        permission_handler: None,
+                        tools: Vec::new(),
+                        disallowed_tools: Vec::new(),
+                        strict_mcp: None,
+                        auto_approve: Some(false),
+                        approval_policy: None,
+                        sandbox: None,
+                    },
+                    limit: None,
+                })
+                .collect(),
+            repositories: Vec::new(),
+        };
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('5'),
+                key('j'),
+                key_code(KeyCode::Tab),
+                key_code(KeyCode::Tab),
+                key_code(KeyCode::Enter),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("discovering models..."), "{screen}");
+
+        handle_message(
+            &mut app,
+            Msg::HarnessModels(Ok(vec!["zai-coding-plan/glm-5.3-flash".to_string()])),
+            &mut sink,
+        )
+        .unwrap();
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("zai-coding-plan/glm-5.3-flash"), "{screen}");
+    }
+
+    #[test]
     fn banner_text_covers_every_state() {
         let mut app = App::default();
         assert_eq!(banner_text(&app), " connecting to the daemon ");
@@ -2134,10 +2318,11 @@ mod tests {
         app.show_session_task();
         app.view = View::Session;
 
+        // esc releases the chat focus, so the shell takes the ! key.
         run_messages(
             &mut surface,
             &mut app,
-            vec![key('!')].into_iter(),
+            vec![key_code(KeyCode::Esc), key('!')].into_iter(),
             &mut sink,
         )
         .unwrap();
@@ -2147,6 +2332,150 @@ mod tests {
             app.inbox.selected_id(),
             Some("perm:borsuk/implement-i140:req-2")
         );
+    }
+
+    #[test]
+    fn a_focused_open_bar_types_bang_and_a_released_bar_leaves_it_to_the_shell() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Session,
+            "the focused open bar keeps the session view"
+        );
+        assert_eq!(app.session.input_text(), "!", "the bar took the ! as text");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            app.view,
+            View::Inbox,
+            "the released focus leaves ! to the shell"
+        );
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+    }
+
+    #[test]
+    fn bang_opens_the_inbox_when_the_session_bar_cannot_type() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        // A closed input disables the focused bar, so ! stays global.
+        let mut state = crate::tui::pipeline::sample_view();
+        state.tasks[0].input = crate::sock::InputMode::Closed {
+            reason: "the session is parked".to_string(),
+        };
+        state.decisions = vec![
+            permission_decision("req-1", 9_000),
+            permission_decision("req-2", 2_000),
+        ];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = Some("borsuk/refine-i142".to_string());
+        app.show_session_task();
+        app.view = View::Session;
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "! left the closed session");
+        assert_eq!(
+            app.inbox.selected_id(),
+            Some("perm:borsuk/implement-i140:req-2"),
+            "the oldest decision is selected"
+        );
+
+        // A session with no shown task disables the focused bar too.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        app.session_task = None;
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "! left the taskless session");
+    }
+
+    #[test]
+    fn bang_types_into_the_inbox_reason_and_the_tickets_search() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('3'), key('n'), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Inbox, "the reason input keeps the view");
+        assert!(app.inbox.typing(), "the reason input stays open");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("reason: !"), "screen: {text}");
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc), key('4'), key('/'), key('!')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Tickets, "the search keeps the view");
+        let text = render_to_string(&mut app);
+        assert!(text.contains(" /!▌"), "screen: {text}");
     }
 
     #[test]
@@ -2508,6 +2837,143 @@ mod tests {
         assert_eq!(
             app.visible_toast(),
             Some("release batch changed; press g again")
+        );
+    }
+
+    #[test]
+    fn m_asks_before_it_adds_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                app.confirm,
+                Some(Confirm::Refine { ref repo, number: 7 }) if repo == "borsuk"
+            ),
+            "m must open the confirm prompt"
+        );
+        assert!(sink.0.is_empty(), "the prompt must send nothing yet");
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains("add to-refine to borsuk #7?"),
+            "screen: {text}"
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.0.len(), 1);
+        let Some(Action::Ticket(TicketAction::ToggleLabel {
+            repo,
+            number,
+            label,
+            on,
+            ..
+        })) = sink.0.first()
+        else {
+            panic!("y must send the to-refine toggle");
+        };
+        assert_eq!(repo, "borsuk");
+        assert_eq!(*number, 7);
+        assert_eq!(label, "to-refine");
+        assert!(*on);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.visible_toast(), Some("sent to-refine borsuk #7"));
+    }
+
+    #[test]
+    fn esc_cancels_the_to_refine_prompt() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m'), key_code(KeyCode::Esc), key('y')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(sink.0.is_empty(), "a cancelled prompt must send nothing");
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn m_reports_a_ticket_that_already_has_to_refine() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+        let mut labeled = ticket_details("borsuk", 7);
+        labeled
+            .issue
+            .labels
+            .push(crate::gates::TO_REFINE.to_string());
+        app.tickets.observe_details(labeled);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(
+            app.confirm.is_none(),
+            "a labeled ticket must skip the prompt"
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("the ticket already has to-refine")
+        );
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn m_stays_out_of_the_nested_ticket_views() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        open_ticket_focus(&mut surface, &mut app, &mut sink);
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key('e'), key('m')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert!(app.confirm.is_none(), "the editor keeps the m key");
+        assert!(!app.tickets.focus_plain(), "the editor holds the keyboard");
+        let screen = render_to_string(&mut app);
+        let title_row = screen
+            .lines()
+            .position(|line| line.contains(" title "))
+            .expect("the editor title block is visible");
+        let draft = screen
+            .lines()
+            .nth(title_row + 1)
+            .expect("the title draft row is visible");
+        assert!(
+            draft.trim_end_matches([' ', '│']).ends_with('m'),
+            "m typed into the editor title: {draft}"
         );
     }
 

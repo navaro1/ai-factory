@@ -1095,7 +1095,7 @@ fn release_lane_lines(
             repo: repo.alias.clone(),
         };
         let box_width = width.saturating_sub(2).max(2);
-        let (title, border_style) = release_batch_title(train);
+        let (title, border_style) = release_batch_title(state, train);
         push_custom_row_line(
             all,
             selected,
@@ -1265,10 +1265,35 @@ fn selectable_line(is_selected: bool, spans: Vec<Span<'static>>) -> Line<'static
 }
 
 /// The batch border title and color for one train state.
-fn release_batch_title(train: &crate::sock::TrainView) -> (&'static str, Style) {
-    if train.in_flight.is_some() {
-        ("RELEASING NOW", Style::default().fg(THEME.ok))
-    } else if !train.batch.is_empty() {
+///
+/// A train in flight owns a release task. That task does not always run.
+/// It can wait in the queue. It can also end while the train stays in
+/// flight. `Train::finish` keeps the train when a label call fails. A
+/// `Done` task can therefore hold the train through every retry.
+///
+/// The title therefore names the two live states and nothing else. It
+/// reports the task, not the train. The board then never claims a release
+/// that no agent runs. The task row inside the box shows the exact state.
+///
+/// `AwaitingUser` joins `Running` for one reason. `live_session_ids` in
+/// this module's parent draws the same line. A release task cannot park
+/// today, because only the refine stage sets that state. A release that
+/// parks needs its own title here. The reaper stops the process of a
+/// parked session and leaves the state behind.
+fn release_batch_title(state: &StateView, train: &crate::sock::TrainView) -> (&'static str, Style) {
+    if let Some(id) = &train.in_flight {
+        let running = state
+            .tasks
+            .iter()
+            .find(|task| task.id == *id)
+            .is_some_and(|task| matches!(task.state, TaskState::Running | TaskState::AwaitingUser));
+        return if running {
+            ("RELEASING NOW", Style::default().fg(THEME.ok))
+        } else {
+            ("RELEASE WAITS", Style::default().fg(THEME.warn))
+        };
+    }
+    if !train.batch.is_empty() {
         ("RETRY REQUIRED", Style::default().fg(THEME.error))
     } else {
         ("NEXT RELEASE", Style::default().fg(THEME.accent))
@@ -2179,6 +2204,43 @@ mod tests {
         assert!(text.contains("#9 new"));
         assert!(text.contains("ryba every 30m"));
         assert!(text.contains("fires 1m"));
+    }
+
+    #[test]
+    fn a_train_whose_release_task_still_waits_does_not_claim_a_running_release() {
+        // A queued task never started. A done or failed task ended, and only
+        // a stuck label cleanup keeps the train. A missing row runs nothing.
+        // None of the four owns a live agent.
+        for state in [
+            None,
+            Some(TaskState::Queued),
+            Some(TaskState::Done),
+            Some(TaskState::Failed("the merge failed".to_string())),
+        ] {
+            let mut view = sample_view();
+            let index = view
+                .tasks
+                .iter()
+                .position(|task| task.id == "borsuk/release")
+                .expect("the sample view holds the release task");
+            match state.clone() {
+                Some(ended) => view.tasks[index].state = ended,
+                None => {
+                    view.tasks.remove(index);
+                }
+            }
+            let mut app = App {
+                state: Some(view),
+                connected: true,
+                ..App::default()
+            };
+
+            let text = render_to_string(&mut app);
+
+            assert!(!text.contains("RELEASING NOW"), "board:\n{text}");
+            assert!(text.contains("RELEASE WAITS"), "board:\n{text}");
+            assert!(text.contains("#5"), "the batch stays visible:\n{text}");
+        }
     }
 
     #[test]
