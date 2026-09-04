@@ -1244,7 +1244,7 @@ impl Daemon {
         }
         let Some(repo_cfg) = self.config.repos.get(&task.repo).cloned() else {
             let reason = format!("repository {} left the config", task.repo);
-            self.fail_run(&task, &reason);
+            self.fail_dispatch(&task, &reason);
             return Err(anyhow!(reason));
         };
         let cwd = match task.stage {
@@ -1264,7 +1264,7 @@ impl Daemon {
             Ok(cwd) => cwd,
             Err(e) => {
                 let reason = format!("cannot prepare the worktree: {e:#}");
-                self.fail_run(&task, &reason);
+                self.fail_dispatch(&task, &reason);
                 return Err(e);
             }
         };
@@ -1272,7 +1272,7 @@ impl Daemon {
             Ok(prompt) => prompt,
             Err(e) => {
                 let reason = format!("cannot render the prompt: {e:#}");
-                self.fail_run(&task, &reason);
+                self.fail_dispatch(&task, &reason);
                 return Err(e);
             }
         };
@@ -1284,7 +1284,7 @@ impl Daemon {
                 Ok(resume) => resume,
                 Err(e) => {
                     let reason = format!("cannot read the session marker: {e:#}");
-                    self.fail_run(&task, &reason);
+                    self.fail_dispatch(&task, &reason);
                     return Err(e);
                 }
             }
@@ -1293,10 +1293,29 @@ impl Daemon {
         };
         if let Err(e) = self.launch_task(&task, prompt, resume) {
             let reason = format!("the runner could not start: {e:#}");
-            self.fail_run(&task, &reason);
+            self.fail_dispatch(&task, &reason);
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// Fail one task before its runner starts, and tell the operator why.
+    ///
+    /// A dispatch failure starts no process, so nothing writes to the task
+    /// log and the session view has nothing to show. The reason lives only in
+    /// the task state and in the daemon standard error, and the operator
+    /// reaches neither from that view. One appended line puts the reason
+    /// where the operator already looks. The transcript renders a line that
+    /// is not JSON verbatim.
+    fn fail_dispatch(&mut self, task: &Task, reason: &str) {
+        if let Err(error) = append_dispatch_failure(&task.log_path, reason) {
+            eprintln!(
+                "task {}: cannot log the dispatch failure to {}: {error:#}",
+                task.id,
+                task.log_path.display()
+            );
+        }
+        self.fail_run(task, reason);
     }
 
     /// Start a run for `task` and move the task to `Running`.
@@ -3334,6 +3353,31 @@ impl Daemon {
     }
 }
 
+/// Append one dispatch failure line to a task log.
+///
+/// The log holds one NDJSON line per runner event. This line is not JSON, so
+/// the transcript parser returns it as a raw entry and the session view shows
+/// it verbatim. The file opens with create and append, like the runner's own
+/// log sink, so the line survives beside every later run of the task.
+fn append_dispatch_failure(log: &Path, reason: &str) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = log.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating log directory {}", parent.display()))?;
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening task log {}", log.display()))?;
+    writeln!(file, "aif: dispatch failed: {reason}")
+        .with_context(|| format!("writing task log {}", log.display()))?;
+    Ok(())
+}
+
 /// The task id of one run event.
 fn event_task(event: &RunEvent) -> &str {
     match event {
@@ -3553,12 +3597,14 @@ mod tests {
         )
     }
 
-    /// The four git calls of a fresh issue worktree.
+    /// The git calls of a fresh issue worktree: clear a stale registration,
+    /// cut the branch from `HEAD`, then prepare the markers.
     fn fresh_issue_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
         let reference = format!("refs/heads/aif/borsuk/issue-{number}");
         let branch = format!("aif/borsuk/issue-{number}");
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
             git_step(
                 repo,
                 &["rev-parse", "--verify", "--quiet", reference.as_str()],
@@ -3585,15 +3631,17 @@ mod tests {
         ]
     }
 
-    /// The git calls of a first dispatch into a PR worktree: cut the branch
-    /// from `HEAD`, prepare the markers, then fetch the GitHub pull ref and
-    /// reset the branch hard to it.
+    /// The git calls of a first dispatch into a PR worktree: clear a stale
+    /// registration, cut the branch from `HEAD`, prepare the markers, then
+    /// fetch the GitHub pull ref in the worktree and reset the branch hard
+    /// to it.
     fn fresh_pr_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
         let reference = format!("refs/heads/aif/borsuk/pr-{number}");
         let branch = format!("aif/borsuk/pr-{number}");
         let pull_ref = format!("pull/{number}/head");
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
             git_step(
                 repo,
                 &["rev-parse", "--verify", "--quiet", reference.as_str()],
@@ -3618,7 +3666,7 @@ mod tests {
             ),
             common_dir_step(worktree, gitdir),
             git_step(
-                repo,
+                worktree,
                 &["fetch", "origin", pull_ref.as_str()],
                 CmdOut::ok(""),
             ),
@@ -3639,7 +3687,8 @@ mod tests {
         ]
     }
 
-    /// The four git calls of a fresh train worktree.
+    /// The git calls of a fresh train worktree: resolve the base, clear a
+    /// stale registration, cut the branch, then prepare the markers.
     fn fresh_train_steps(repo: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
@@ -3648,6 +3697,7 @@ mod tests {
                 &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
                 refused(),
             ),
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
             git_step(
                 repo,
                 &[
@@ -4272,6 +4322,66 @@ mod tests {
         assert_eq!(rig.job(0).task, "borsuk/implement-i143");
         assert_eq!(rig.task("borsuk/refine-i142").attempt, 2);
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
+    }
+
+    #[test]
+    fn a_dispatch_failure_lands_in_the_task_log() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let wt = issue_wt(&dir, 142);
+        let wt_text = wt.to_string_lossy().into_owned();
+        let steps: Vec<Step> = vec![
+            git_step(&repo, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/aif/borsuk/issue-142",
+                ],
+                refused(),
+            ),
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                refused(),
+            ),
+            git_step(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "aif/borsuk/issue-142",
+                    wt_text.as_str(),
+                    "HEAD",
+                ],
+                CmdOut {
+                    status: 128,
+                    stdout: String::new(),
+                    stderr: format!("fatal: '{wt_text}' already exists\n"),
+                },
+            ),
+        ];
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+
+        assert_eq!(rig.job_count(), 0, "no runner starts after the failure");
+        let task = rig.task("borsuk/implement-i142");
+        assert!(
+            matches!(task.state, TaskState::Queued),
+            "state: {}",
+            task.state
+        );
+        let text =
+            fs::read_to_string(&task.log_path).expect("the dispatch failure creates the task log");
+        assert!(
+            text.contains("aif: dispatch failed: cannot prepare the worktree:"),
+            "log: {text}"
+        );
+        assert!(text.contains("already exists"), "log: {text}");
     }
 
     #[test]

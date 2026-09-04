@@ -8,8 +8,9 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::RepoConfig;
 use crate::exec::{CmdOut, Exec};
@@ -179,11 +180,16 @@ impl WorktreeManager {
     /// default branch. The call then fetches the GitHub pull ref
     /// `pull/<n>/head` and resets the branch hard to it, so the worktree
     /// always holds the PR content, whatever branch the PR came from.
+    ///
+    /// Both commands run in the worktree. Git holds `FETCH_HEAD` per
+    /// worktree, so a fetch in the checkout writes a file the reset cannot
+    /// read. A linked worktree shares the remote configuration and the
+    /// object store, so `origin` resolves and the objects land once.
     pub fn ensure_pr(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
         let path = self.pr_path(repo, number);
         let worktree = self.ensure_on(exec, repo, &path, &Self::pr_branch(repo, number))?;
         let reference = format!("pull/{number}/head");
-        let out = git(exec, &repo.path, &["fetch", "origin", reference.as_str()])?;
+        let out = git(exec, &worktree, &["fetch", "origin", reference.as_str()])?;
         require_zero(out, "git fetch")?;
         let out = git(exec, &worktree, &["reset", "--hard", "FETCH_HEAD"])?;
         require_zero(out, "git reset")?;
@@ -209,6 +215,7 @@ impl WorktreeManager {
             self.prepare(exec, path)?;
             return Ok(path.to_path_buf());
         }
+        self.clear_for_add(exec, &repo.path, path)?;
 
         let path_text = path.to_string_lossy().into_owned();
         if self.branch_exists(exec, &repo.path, branch)? {
@@ -255,6 +262,7 @@ impl WorktreeManager {
             self.prepare(exec, &path)?;
             return Ok(path);
         }
+        self.clear_for_add(exec, &repo.path, &path)?;
 
         let path_text = path.to_string_lossy().into_owned();
         if self.branch_exists(exec, &repo.path, &branch)? {
@@ -399,6 +407,32 @@ impl WorktreeManager {
         write_marker(worktree, REVIEWED_SHA_MARKER, sha)
     }
 
+    /// Clear the two states that make `git worktree add` fail forever.
+    ///
+    /// This runs on the create path only, so a reused worktree keeps its
+    /// command order. `git worktree prune` drops a registration whose
+    /// directory is gone. A directory that git does not register survives
+    /// both `prune` and `add -f`, so the manager renames it to
+    /// `<name>.stale-<unix_millis>` beside itself. The rename stays in one
+    /// parent directory, so it never crosses a device, and it keeps any
+    /// uncommitted agent work for the operator to read.
+    fn clear_for_add(&self, exec: &dyn Exec, repo_path: &Path, path: &Path) -> Result<()> {
+        let out = git(exec, repo_path, &["worktree", "prune"])?;
+        require_zero(out, "git worktree prune")?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let stale = stale_sibling(path)?;
+        fs::rename(path, &stale).with_context(|| {
+            format!(
+                "cannot move the stale worktree {} to {}",
+                path.display(),
+                stale.display()
+            )
+        })?;
+        Ok(())
+    }
+
     /// Whether git lists `worktree` as a registered worktree of the
     /// repository at `repo_path`. The caller ensures the path exists.
     fn registered(&self, exec: &dyn Exec, repo_path: &Path, worktree: &Path) -> Result<bool> {
@@ -504,6 +538,34 @@ impl WorktreeManager {
         fs::write(&exclude, text).with_context(|| format!("cannot write {}", exclude.display()))?;
         Ok(())
     }
+}
+
+/// The sibling path that holds a stale worktree directory.
+///
+/// The name is `<original name>.stale-<unix_millis>`. The suffix keeps the
+/// name outside the `issue-<n>` and `pr-<n>` shapes that the doctor parses,
+/// so the doctor skips the moved directory.
+fn stale_sibling(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("the worktree path {} has no name", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("the worktree path {} has no parent", path.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let mut candidate = parent.join(format!("{name}.stale-{stamp}"));
+    // A second failure inside one millisecond must not collide.
+    let mut extra = 0u32;
+    while candidate.exists() {
+        extra += 1;
+        candidate = parent.join(format!("{name}.stale-{stamp}-{extra}"));
+    }
+    Ok(candidate)
 }
 
 /// Run `git -C <dir> <args>` and return the raw output.
@@ -843,12 +905,20 @@ mod tests {
         let wt_text = wt.to_string_lossy().into_owned();
         let repo_text = repo_path.to_string_lossy().into_owned();
         let wt_gitdir = wt.join(".git").display().to_string();
+        let prune_repo = repo_text.clone();
         let verify_repo = repo_text.clone();
         let symref_repo = repo_text.clone();
         let add_repo = repo_text.clone();
         let add_wt = wt_text.clone();
         let gitdir_wt = wt_text.clone();
         let exec = ScriptExec::new()
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", prune_repo.as_str(), "worktree", "prune"]
+                },
+                CmdOut::ok(""),
+            )
             .expect(
                 move |c| {
                     c.program == "git"
@@ -917,7 +987,7 @@ mod tests {
         let path = manager.ensure_issue(&exec, &repo, 7).unwrap();
 
         assert_eq!(path, wt);
-        assert_eq!(exec.calls().len(), 4);
+        assert_eq!(exec.calls().len(), 5);
         let exclude = fs::read_to_string(wt.join(".git").join("info").join("exclude"))
             .expect("the exclude file must exist");
         assert!(exclude.contains(".aif/"));
@@ -934,14 +1004,22 @@ mod tests {
         let wt_text = wt.to_string_lossy().into_owned();
         let repo_text = repo_path.to_string_lossy().into_owned();
         let wt_gitdir = wt.join(".git").display().to_string();
+        let prune_repo = repo_text.clone();
         let verify_repo = repo_text.clone();
         let symref_repo = repo_text.clone();
         let add_repo = repo_text.clone();
         let add_wt = wt_text.clone();
         let gitdir_wt = wt_text.clone();
-        let fetch_repo = repo_text.clone();
+        let fetch_wt = wt_text.clone();
         let reset_wt = wt_text.clone();
         let exec = ScriptExec::new()
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", prune_repo.as_str(), "worktree", "prune"]
+                },
+                CmdOut::ok(""),
+            )
             .expect(
                 move |c| {
                     c.program == "git"
@@ -1009,7 +1087,7 @@ mod tests {
             .expect(
                 move |c| {
                     c.program == "git"
-                        && c.argv() == ["-C", fetch_repo.as_str(), "fetch", "origin", "pull/7/head"]
+                        && c.argv() == ["-C", fetch_wt.as_str(), "fetch", "origin", "pull/7/head"]
                 },
                 CmdOut::ok(""),
             )
@@ -1024,7 +1102,7 @@ mod tests {
         let path = manager.ensure_pr(&exec, &repo, 7).unwrap();
 
         assert_eq!(path, wt);
-        assert_eq!(exec.calls().len(), 6);
+        assert_eq!(exec.calls().len(), 7);
         fs::remove_dir_all(&root).expect("the temp dir must be removable");
     }
 
@@ -1038,11 +1116,19 @@ mod tests {
         let wt_text = wt.to_string_lossy().into_owned();
         let repo_text = repo_path.to_string_lossy().into_owned();
         let wt_gitdir = wt.join(".git").display().to_string();
+        let prune_repo = repo_text.clone();
         let verify_repo = repo_text.clone();
         let add_repo = repo_text.clone();
         let add_wt = wt_text.clone();
         let gitdir_wt = wt_text.clone();
         let exec = ScriptExec::new()
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", prune_repo.as_str(), "worktree", "prune"]
+                },
+                CmdOut::ok(""),
+            )
             .expect(
                 move |c| {
                     c.program == "git"
@@ -1093,7 +1179,7 @@ mod tests {
         let calls = exec.calls();
         assert_eq!(
             calls.len(),
-            3,
+            4,
             "no symbolic-ref call when the branch exists"
         );
         assert!(calls
@@ -1223,6 +1309,177 @@ mod tests {
             .expect("the merged path must succeed");
 
         assert_eq!(exec.calls().len(), 2);
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn ensure_issue_reuses_a_registered_worktree_without_extra_commands() {
+        let root = temp_root("reuse-issue");
+        let repo_path = root.join("repo");
+        let repo = demo_repo(&repo_path);
+        let manager = WorktreeManager::new(root.join("state"));
+        let wt = manager.issue_path(&repo, 7);
+        fs::create_dir_all(&wt).expect("the worktree dir must be creatable");
+        let wt_canon = wt.canonicalize().unwrap().display().to_string();
+        let wt_text = wt.to_string_lossy().into_owned();
+        let repo_text = repo_path.to_string_lossy().into_owned();
+        let wt_gitdir = wt.join(".git").display().to_string();
+        let list = format!("worktree {wt_canon}\nHEAD abc\nbranch refs/heads/aif/demo/issue-7\n\n");
+        let list_repo = repo_text.clone();
+        let gitdir_wt = wt_text.clone();
+        let exec = ScriptExec::new()
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", list_repo.as_str(), "worktree", "list", "--porcelain"]
+                },
+                CmdOut::ok(list),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                gitdir_wt.as_str(),
+                                "rev-parse",
+                                "--path-format=absolute",
+                                "--git-common-dir",
+                            ]
+                },
+                CmdOut::ok(format!("{wt_gitdir}\n")),
+            );
+
+        let path = manager.ensure_issue(&exec, &repo, 7).unwrap();
+
+        assert_eq!(path, wt);
+        assert_eq!(
+            exec.calls().len(),
+            2,
+            "the reuse path adds no recovery command"
+        );
+        fs::remove_dir_all(&root).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn ensure_issue_moves_a_directory_that_git_does_not_register() {
+        let root = temp_root("stale-issue");
+        let repo_path = root.join("repo");
+        let repo = demo_repo(&repo_path);
+        let manager = WorktreeManager::new(root.join("state"));
+        let wt = manager.issue_path(&repo, 7);
+        fs::create_dir_all(&wt).expect("the worktree dir must be creatable");
+        fs::write(wt.join("scratch.txt"), "agent work").expect("the file must be writable");
+        let wt_text = wt.to_string_lossy().into_owned();
+        let repo_text = repo_path.to_string_lossy().into_owned();
+        let wt_gitdir = wt.join(".git").display().to_string();
+        let list_repo = repo_text.clone();
+        let prune_repo = repo_text.clone();
+        let verify_repo = repo_text.clone();
+        let symref_repo = repo_text.clone();
+        let add_repo = repo_text.clone();
+        let add_wt = wt_text.clone();
+        let gitdir_wt = wt_text.clone();
+        let exec = ScriptExec::new()
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", list_repo.as_str(), "worktree", "list", "--porcelain"]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv() == ["-C", prune_repo.as_str(), "worktree", "prune"]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                verify_repo.as_str(),
+                                "rev-parse",
+                                "--verify",
+                                "--quiet",
+                                "refs/heads/aif/demo/issue-7",
+                            ]
+                },
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                symref_repo.as_str(),
+                                "symbolic-ref",
+                                "--quiet",
+                                "refs/remotes/origin/HEAD",
+                            ]
+                },
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                add_repo.as_str(),
+                                "worktree",
+                                "add",
+                                "-b",
+                                "aif/demo/issue-7",
+                                add_wt.as_str(),
+                                "refs/remotes/origin/main",
+                            ]
+                },
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |c| {
+                    c.program == "git"
+                        && c.argv()
+                            == [
+                                "-C",
+                                gitdir_wt.as_str(),
+                                "rev-parse",
+                                "--path-format=absolute",
+                                "--git-common-dir",
+                            ]
+                },
+                CmdOut::ok(format!("{wt_gitdir}\n")),
+            );
+
+        let path = manager.ensure_issue(&exec, &repo, 7).unwrap();
+
+        assert_eq!(path, wt, "the caller still gets the original path");
+        let parent = wt.parent().expect("the worktree has a parent");
+        let stale: Vec<PathBuf> = fs::read_dir(parent)
+            .expect("the parent must be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("issue-7.stale-"))
+            })
+            .collect();
+        assert_eq!(stale.len(), 1, "the stale directory moves beside the path");
+        assert_eq!(
+            fs::read_to_string(stale[0].join("scratch.txt")).unwrap(),
+            "agent work",
+            "the move keeps the uncommitted work"
+        );
         fs::remove_dir_all(&root).expect("the temp dir must be removable");
     }
 

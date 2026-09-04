@@ -1415,6 +1415,21 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn item_worktrees_skips_a_stale_sibling_directory() {
+        let dir = temp_dir("stale-sibling");
+        fs::create_dir_all(dir.join("pr-7")).expect("the worktree dir must be creatable");
+        fs::create_dir_all(dir.join("pr-7.stale-1")).expect("the stale dir must be creatable");
+
+        let found = item_worktrees(&dir).expect("the directory must be readable");
+
+        assert_eq!(found.len(), 1, "the stale sibling is not an item worktree");
+        assert_eq!(found[0].0, WorktreeKind::Pr);
+        assert_eq!(found[0].1, 7);
+        assert_eq!(found[0].2, dir.join("pr-7"));
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
     /// Configuration text with plain stages, optional extra lines per stage
     /// table, and the given repository tables.
     fn config_text(stage_extras: &[(&str, &str)], repos: &str) -> String {
