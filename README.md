@@ -348,8 +348,11 @@ issues inside the active tab.
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
 | List | `enter` | Open the selected issue. |
+| Issue | `j` / `k` or Down / Up | Scroll the issue pane by one line. |
+| Issue | `h` / `l` or Left / Right | Open the previous or the next issue of the tab. |
 | Issue | `e` | Edit the title and description. |
-| Issue | `l` | Open the repository label picker. |
+| Issue | `L` | Open the repository label picker. |
+| Issue | `m` | Add the label `to-refine`. A prompt asks first. |
 | Issue | `c` | Start or resume the configured ticket chat. |
 | Issue | `a` | Apply the latest shown agent proposal. |
 | Editor | `ctrl-s` | Save the content edit. |
@@ -360,6 +363,10 @@ issues inside the active tab.
 | Nested view | `esc` | Return one level. |
 
 The issue focus shows all issue details and the GitHub reference.
+A dim hint line under the pane names these keys.
+The issue move follows the order and the search filter of the list.
+It stops at the first issue and at the last issue of the tab.
+It never changes the repository tab.
 Wide terminals put the details and chat beside each other.
 Narrow terminals put the chat below the details.
 
