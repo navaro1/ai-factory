@@ -438,8 +438,9 @@ Repository topology changes require a daemon restart.
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
-- An interrupted turn restarts from the stage prompt plus the restart
-  notice. The agent reads the worktree to find its place.
+- A re-queued task resumes its saved agent session, and its first prompt
+  carries a short notice about the restart. A session that the harness can
+  no longer resume falls back to a fresh session on the last attempt.
 - A `SIGKILL` or a power loss keeps the snapshot of the last drive, not of
   the last event.
 - Anyone who can set the trigger labels on a repository can start work
