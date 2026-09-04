@@ -2120,6 +2120,19 @@ impl Daemon {
     /// all. This line is the reason the operator sees there. A write failure
     /// goes to standard error and never masks the dispatch failure.
     fn log_dispatch_failure(&self, task: &Task, reason: &str) {
+        self.append_task_log(task, &format!("aif: dispatch failed: {reason}\n"));
+    }
+
+    /// Append one complete line to the log of the task.
+    ///
+    /// The caller supplies the trailing newline. The runner tees its own
+    /// output into the same file in append mode, so both writers add to the
+    /// end and neither one truncates the other. Every daemon-side append
+    /// goes through this one helper, so no site drifts.
+    ///
+    /// A failure goes to standard error and returns. The log is a record,
+    /// never a control path: a full disk must not fail a dispatch or a chat.
+    fn append_task_log(&self, task: &Task, line: &str) {
         if let Some(parent) = task.log_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = fs::create_dir_all(parent) {
@@ -2128,7 +2141,6 @@ impl Daemon {
                 }
             }
         }
-        let line = format!("aif: dispatch failed: {reason}\n");
         let opened = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2855,37 +2867,27 @@ impl Daemon {
     /// The line uses the claude user shape, so the transcript parser of
     /// every harness renders it as the human voice. The runner itself never
     /// echoes a typed message into the log, so this line is the only
-    /// durable record of the text. The `chat` path calls this exactly once
-    /// per accepted message: on the live delivery success, on the live
-    /// delivery failure, and on the queue path. A refused message writes
-    /// nothing. A write failure goes to standard error and never fails the
-    /// chat; the pattern follows `log_dispatch_failure`.
+    /// durable record of the text.
+    ///
+    /// `chat` calls this exactly once per accepted message: on the live
+    /// delivery success, on the live delivery failure, and on the queue
+    /// path. `resume_pending_chats` calls it never, because the queue path
+    /// already wrote the line. A refused message writes nothing.
+    ///
+    /// The daemon sends two messages of its own through `chat`: the ticket
+    /// refinement handoff and the applied-proposal note. The agent receives
+    /// both as user text, so both get the same line and the transcript
+    /// stays a true record of the conversation.
     fn log_chat_line(&self, task: &Task, text: &str) {
-        if let Some(parent) = task.log_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!("cannot create the log directory {}: {e}", parent.display());
-                    return;
-                }
-            }
-        }
-        let content = serde_json::Value::String(text.to_string()).to_string();
-        let line = format!(
-            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":{content}}}}}\n"
+        // `serde_json` escapes the text, so a quotation mark, a backslash,
+        // or a newline stays inside one JSON line.
+        let content = serde_json::Value::String(text.to_string());
+        self.append_task_log(
+            task,
+            &format!(
+                "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":{content}}}}}\n"
+            ),
         );
-        let opened = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&task.log_path);
-        match opened {
-            Ok(mut file) => {
-                use std::io::Write as _;
-                if let Err(e) = file.write_all(line.as_bytes()) {
-                    eprintln!("cannot write to {}: {e}", task.log_path.display());
-                }
-            }
-            Err(e) => eprintln!("cannot open the task log {}: {e}", task.log_path.display()),
-        }
     }
 
     /// The item whose workspace a review task runs in.
@@ -8258,7 +8260,17 @@ mod tests {
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 2);
         assert!(sends.iter().all(|text| text.contains("refinement")));
+        drop(sends);
         assert!(!rig.daemon.table.by_id.contains_key("borsuk/refine-i7"));
+        // The agent received each handoff as user text, so each handoff
+        // gets the same durable line as a typed message. The transcript
+        // stays a true record of the conversation.
+        let logged = logged_lines(&rig.task("borsuk/ticket-i7").log_path);
+        assert_eq!(logged.len(), 2, "each handoff wrote one user line");
+        assert!(
+            logged.iter().all(|line| line.contains("to-refine label")),
+            "the handoff text reaches the transcript: {logged:?}"
+        );
     }
 
     #[test]
@@ -10541,6 +10553,31 @@ mod tests {
             logged_lines(&log),
             vec![r#"{"type":"user","message":{"role":"user","content":"add a regression test"}}"#],
             "the queue path appends exactly one user line"
+        );
+    }
+
+    #[test]
+    fn the_logged_chat_line_reads_back_as_the_typed_text() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        // A quotation mark, a backslash, a newline, and a wide character
+        // must all stay inside one JSON line.
+        let typed = "use \"psql\"\nnot C:\\tools\\psql — ok?";
+
+        rig.act(Action::Chat {
+            task: "borsuk/refine-i142".to_string(),
+            text: typed.to_string(),
+        });
+
+        let lines = logged_lines(&rig.task("borsuk/refine-i142").log_path);
+        assert_eq!(lines.len(), 1, "the typed newline never splits the record");
+        assert_eq!(
+            crate::tui::transcript::parse(&lines[0]),
+            vec![crate::tui::transcript::Entry::User {
+                text: typed.to_string()
+            }],
+            "the session view reads back the exact typed text"
         );
     }
 

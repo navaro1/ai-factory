@@ -523,10 +523,13 @@ impl SessionView {
     /// `page` is the visible transcript height in rows; the shell passes
     /// the pane height, and the view uses it as the PageUp and PageDown
     /// step. A focused bar takes the typing keys: typing feeds the input
-    /// bar, Enter sends one [`Action::Chat`] with the typed text, and the
-    /// daemon's user line reaches the transcript through the log tail at
-    /// the next poll, `ctrl-x` sends [`Action::Abort`],
-    /// PageUp and PageDown scroll, and End returns to following the tail.
+    /// bar, Enter sends one [`Action::Chat`] with the typed text, `ctrl-x`
+    /// sends [`Action::Abort`], PageUp and PageDown scroll, and End returns
+    /// to following the tail.
+    ///
+    /// Enter shows nothing at once. The daemon logs the accepted message,
+    /// and the log tail delivers that line to the transcript at the next
+    /// poll.
     ///
     /// An unfocused bar swallows typing and Enter and returns none,
     /// whatever the bar holds. `ctrl-x` and the scroll keys stay alive, so
@@ -1325,6 +1328,21 @@ mod tests {
         );
         let screen = drawn_screen(&view);
         assert!(screen.contains("› hi"), "re-entry shows the line: {screen}");
+
+        // The ticket chat refocuses with a clear and a fresh show of the
+        // same task. That path restores the user line too.
+        view.clear();
+        assert!(view.ring.is_empty(), "the refocus empties the ring");
+        view.show(&sample_task(&log));
+        view.on_redraw(Instant::now());
+
+        assert_eq!(view.ring.len(), 1, "no duplicate after the refocus");
+        assert_eq!(
+            view.ring.iter().next(),
+            Some(&Entry::User {
+                text: "hi".to_string()
+            })
+        );
     }
 
     #[test]
