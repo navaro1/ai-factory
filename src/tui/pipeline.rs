@@ -1266,19 +1266,20 @@ fn selectable_line(is_selected: bool, spans: Vec<Span<'static>>) -> Line<'static
 
 /// The batch border title and color for one train state.
 ///
-/// A train in flight owns a release task, but that task does not always
-/// run. It can wait in the queue, and it can end while the train stays in
-/// flight: `Train::finish` keeps the train when a label call fails, so a
-/// `Done` task can hold the train through every retry. The title therefore
-/// names the two live states and nothing else. It reports the task, not
-/// the train, so the board never claims a release that no agent runs. The
-/// task row inside the box carries the exact state.
+/// A train in flight owns a release task. That task does not always run.
+/// It can wait in the queue. It can also end while the train stays in
+/// flight. `Train::finish` keeps the train when a label call fails. A
+/// `Done` task can therefore hold the train through every retry.
 ///
-/// `AwaitingUser` joins `Running` for one reason: `live_session_ids` in
+/// The title therefore names the two live states and nothing else. It
+/// reports the task, not the train. The board then never claims a release
+/// that no agent runs. The task row inside the box shows the exact state.
+///
+/// `AwaitingUser` joins `Running` for one reason. `live_session_ids` in
 /// this module's parent draws the same line. A release task cannot park
-/// today, because only the refine stage sets that state. Should a release
-/// ever park, this arm needs its own title, because the reaper stops the
-/// process of a parked session and leaves the state behind.
+/// today, because only the refine stage sets that state. A release that
+/// parks needs its own title here. The reaper stops the process of a
+/// parked session and leaves the state behind.
 fn release_batch_title(state: &StateView, train: &crate::sock::TrainView) -> (&'static str, Style) {
     if let Some(id) = &train.in_flight {
         let running = state

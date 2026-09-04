@@ -1190,9 +1190,9 @@ impl Daemon {
 
     /// True when `prior` still owns the work that `task` waits for.
     ///
-    /// An agent updates GitHub before its runner result arrives. The next gate
-    /// can therefore open first. This guard prevents two stages from using one
-    /// issue at the same time and prevents a release from beating its review.
+    /// An agent updates GitHub before its runner result arrives. The next
+    /// gate can therefore open first. This guard keeps two stages off one
+    /// issue at the same time. It also keeps a release behind its review.
     /// A failed prior task holds the gate too, because its stage never
     /// finished the work.
     fn holds_prior_stage(&self, task: &Task, prior: &Task) -> bool {
@@ -1226,11 +1226,11 @@ impl Daemon {
 
     /// The id of the task before this one that still owns the same work.
     ///
-    /// A failed blocker wins over every other one. It never finishes on its
-    /// own, so it is the task the human must act on. A batch can hold one
-    /// running review and one failed review at the same time; the running
-    /// one ends by itself, and only the failed one stops the release for
-    /// good. The table is a `BTreeMap`, so both choices are stable.
+    /// A failed blocker wins over every other one. It never finishes on
+    /// its own, so it is the task the human must act on. A batch can hold
+    /// one running review and one failed review at the same time. The
+    /// running one ends by itself. Only the failed one stops the release
+    /// permanently. The table is a `BTreeMap`, so both choices are stable.
     fn prior_stage_blocker(&self, task: &Task) -> Option<String> {
         let mut active: Option<&str> = None;
         for prior in self.table.by_id.values() {
@@ -2409,20 +2409,21 @@ impl Daemon {
     /// the name the human sees a task that never starts and no cause. This
     /// is the one place the session view can carry the cause, so it does.
     ///
-    /// A failed blocker never finishes on its own, and it holds the queued
-    /// task forever. Only that case names an action, because only a failed
-    /// task takes a retry. A blocker that still runs needs no action.
+    /// A failed blocker never finishes on its own. It holds the queued task
+    /// forever. Only that case names an action, because only a failed task
+    /// takes a retry. A blocker that still runs needs no action.
     ///
     /// The action names the board, not the inbox. A failed task keeps an
-    /// inbox row only when it spent every attempt. `cancel_task` drops the
-    /// row of the task it cancels, so an aborted task and a cancelled stuck
-    /// row both rest in `Failed` with no row at all. The `R` key of the
-    /// board retries any failed task and needs no row.
+    /// inbox row only when it spent every attempt. `cancel_task` also drops
+    /// the row of the task it cancels. An aborted task keeps no row. A task
+    /// whose stuck row the human cancelled keeps no row either. Both stay
+    /// `Failed`. The `R` key of the board retries any failed task, and it
+    /// needs no row.
     ///
     /// The sentence says "This task" in place of the task id. The chat bar
-    /// centers this text and clips both ends, so every character costs a
-    /// character of the cause. The header row above the bar already names
-    /// the task, so the id here buys nothing.
+    /// centers this text and clips both ends. Every character therefore
+    /// costs a character of the cause. The header row above the bar already
+    /// names the task, so the id here buys nothing.
     fn closed_reason(&self, task: &Task, has_session: bool) -> String {
         if task.state == TaskState::Queued {
             if let Some(blocker) = self.prior_stage_blocker(task) {
@@ -7695,9 +7696,22 @@ mod tests {
             .insert("borsuk/release".to_string(), vec![3, 5]);
 
         let release = rig.task("borsuk/release");
-        assert!(
-            rig.daemon.table.by_id.contains_key("borsuk/review-p3"),
-            "the running review must sort before the failed one"
+        // The test only discriminates while the running review comes first
+        // in the scan. Assert that order, not the mere presence of the row:
+        // a rename that reversed it would leave the assertion below green
+        // without the preference.
+        let order: Vec<&str> = rig
+            .daemon
+            .table
+            .by_id
+            .keys()
+            .map(String::as_str)
+            .filter(|id| *id == "borsuk/review-p3" || *id == "borsuk/review-p5")
+            .collect();
+        assert_eq!(
+            order,
+            vec!["borsuk/review-p3", "borsuk/review-p5"],
+            "the running review must reach the scan before the failed one"
         );
         assert_eq!(
             rig.daemon.input_mode(&release),
