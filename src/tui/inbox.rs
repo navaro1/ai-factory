@@ -38,7 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
@@ -1407,8 +1407,7 @@ fn draw_train_detail(
     train: &crate::sock::TrainView,
     detail: &DetailState,
 ) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     let prs = train_detail_prs(train);
     let Some(number) = detail
         .item_number
@@ -1417,33 +1416,19 @@ fn draw_train_detail(
     else {
         return draw_missing_item_detail(
             f,
-            rows[0],
-            rows[1],
-            state,
-            inbox,
+            area,
             detail,
             format!("PR · {}", train.repo),
             "The train queue is empty.".to_string(),
         );
     };
-    draw_item_detail(
-        f,
-        rows[0],
-        rows[1],
-        state,
-        inbox,
-        detail,
-        &train.repo,
-        number,
-        width,
-    );
+    draw_item_detail(f, area, state, inbox, detail, &train.repo, number, width);
 }
 /// Draw one repository item detail, or the missing-item notice.
 #[allow(clippy::too_many_arguments)]
 fn draw_item_detail(
     f: &mut Frame,
     content_area: Rect,
-    footer_area: Rect,
     state: &StateView,
     inbox: &Inbox,
     detail: &DetailState,
@@ -1464,9 +1449,6 @@ fn draw_item_detail(
         return draw_missing_item_detail(
             f,
             content_area,
-            footer_area,
-            state,
-            inbox,
             detail,
             title,
             "The PR description is unavailable.".to_string(),
@@ -1477,7 +1459,6 @@ fn draw_item_detail(
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
     f.render_widget(content, content_area);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
 }
 
 /// The pull requests of one train detail, in release lane order.
@@ -1490,10 +1471,9 @@ fn train_detail_prs(train: &crate::sock::TrainView) -> Vec<u64> {
 
 /// Draw the oldest-first decision feed.
 fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms: u64) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_span = None;
-    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     if state.decisions.is_empty() {
         lines.push(Line::from(
             "No open decisions. The factory asks here when an agent needs you.",
@@ -1509,7 +1489,7 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms
         lines.push(Line::from(""));
     }
     let title = format!("decisions · {} open · oldest first", state.decisions.len());
-    let inner_height = usize::from(rows[0].height.saturating_sub(2));
+    let inner_height = usize::from(area.height.saturating_sub(2));
     let scroll = selected_span
         .filter(|_| inner_height > 0)
         .map(|(start, end)| {
@@ -1537,8 +1517,7 @@ fn draw_feed(f: &mut Frame, area: Rect, state: &StateView, inbox: &Inbox, now_ms
     let list = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
-    f.render_widget(list, rows[0]);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
+    f.render_widget(list, area);
 }
 
 /// Build one content-first feed item.
@@ -1671,12 +1650,9 @@ fn draw_detail(
     detail: &DetailState,
     now_ms: u64,
 ) {
-    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let width = usize::from(rows[0].width.saturating_sub(4)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     if matches!(decision.kind, DecisionKind::NeedsHuman { .. }) {
-        return draw_ask_detail(
-            f, rows[0], rows[1], state, inbox, decision, detail, now_ms, width,
-        );
+        return draw_ask_detail(f, area, state, inbox, decision, detail, now_ms, width);
     }
     let (title, lines) = match detail_item_key(decision, detail.item_number) {
         Some((kind, number)) => {
@@ -1691,10 +1667,7 @@ fn draw_detail(
             else {
                 return draw_missing_item_detail(
                     f,
-                    rows[0],
-                    rows[1],
-                    state,
-                    inbox,
+                    area,
                     detail,
                     title,
                     format!("The {} description is unavailable.", kind.noun()),
@@ -1704,12 +1677,11 @@ fn draw_detail(
         }
         None => agent_detail_lines(state, inbox, decision, now_ms, width),
     };
-    let scroll = clamped_detail_scroll(detail, lines.len(), rows[0]);
+    let scroll = clamped_detail_scroll(detail, lines.len(), area);
     let content = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
-    f.render_widget(content, rows[0]);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), rows[1]);
+    f.render_widget(content, area);
 }
 
 /// Draw the question screen of one `NeedsHuman` decision.
@@ -1720,7 +1692,6 @@ fn draw_detail(
 fn draw_ask_detail(
     f: &mut Frame,
     content_area: Rect,
-    footer_area: Rect,
     state: &StateView,
     inbox: &Inbox,
     decision: &Decision,
@@ -1835,7 +1806,6 @@ fn draw_ask_detail(
         )))
         .scroll((scroll, 0));
     f.render_widget(content, content_area);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
 }
 
 /// The wrapped display lines of one ask option.
@@ -1851,13 +1821,9 @@ fn ask_option_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>
 }
 
 /// Draw a repository detail whose latest item snapshot is absent.
-#[allow(clippy::too_many_arguments)]
 fn draw_missing_item_detail(
     f: &mut Frame,
     content_area: Rect,
-    footer_area: Rect,
-    state: &StateView,
-    inbox: &Inbox,
     detail: &DetailState,
     title: String,
     message: String,
@@ -1867,7 +1833,6 @@ fn draw_missing_item_detail(
         .block(Block::bordered().title(title))
         .scroll((scroll, 0));
     f.render_widget(content, content_area);
-    f.render_widget(Paragraph::new(footer_text(state, inbox)), footer_area);
 }
 
 /// Clamp a detail offset to the content height from this draw.
@@ -2293,7 +2258,11 @@ fn option_picked(inbox: &Inbox, id: &str, question_index: usize, option_index: u
 }
 
 /// Build the footer line: the key map, a hint, or the text input.
-fn footer_text(state: &StateView, inbox: &Inbox) -> String {
+///
+/// The shell renders this line on the bottom row while the inbox view is
+/// open. Every key map stays at or under 64 characters, so the row fits
+/// the left footer side of an 80-column terminal.
+pub(super) fn footer_text(state: &StateView, inbox: &Inbox) -> String {
     if let Some(hint) = inbox.hint {
         return hint.to_string();
     }
@@ -2313,30 +2282,36 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
                 };
                 match decision.kind {
                     DecisionKind::ReleaseGate { .. } => {
-                        "esc back · j k scroll · h l PR · space include/exclude · g release"
-                            .to_string()
+                        "esc back · j k scroll · h l PR · space toggle · g release".to_string()
                     }
                     DecisionKind::Permission { .. } => {
                         "esc back · j k scroll · y allow · n deny · o session".to_string()
                     }
                     DecisionKind::Question { .. } => {
-                        "esc back · j k scroll · 1-9 pick · s submit · i write · o session"
+                        "esc back · j k scroll · 1-9 pick · s submit · i type · o session"
                             .to_string()
                     }
                     DecisionKind::Stuck { .. } => {
                         "esc back · j k scroll · r retry · c cancel · o session".to_string()
                     }
                     DecisionKind::NeedsHuman { kind, .. } => {
-                        let mut parts =
-                            vec!["esc back", "j k scroll", "t comment", "c clear label"];
-                        if inbox
+                        // The bottom row holds 64 characters. A fetched
+                        // option list takes the two answer keys and gives
+                        // up the scroll hint, so the longest row still
+                        // fits beside the inbox badge.
+                        let picks = inbox
                             .asks
                             .get(id)
-                            .is_some_and(|ask| !ask.options.is_empty())
-                        {
+                            .is_some_and(|ask| !ask.options.is_empty());
+                        let mut parts = vec!["esc back"];
+                        if picks {
                             parts.push("1-9 pick");
                             parts.push("s submit");
+                        } else {
+                            parts.push("j k scroll");
                         }
+                        parts.push("t comment");
+                        parts.push("c clear");
                         if kind == ItemKind::Issue {
                             parts.push("w tickets");
                         }
@@ -2358,18 +2333,16 @@ fn footer_text(state: &StateView, inbox: &Inbox) -> String {
             "PgUp PgDn scroll · j k move · y allow · n deny · enter details".to_string()
         }
         DecisionKind::Question { .. } => {
-            "PgUp PgDn scroll · j k move · 1-9 pick · s submit · i write · enter details"
-                .to_string()
+            "PgUp PgDn · j k move · 1-9 pick · s submit · enter details".to_string()
         }
         DecisionKind::Stuck { .. } => {
             "PgUp PgDn scroll · j k move · r retry · c cancel · enter details".to_string()
         }
         DecisionKind::NeedsHuman { .. } => {
-            "PgUp PgDn scroll · j k move · t comment · c clear label · enter details".to_string()
+            "PgUp PgDn · j k move · t comment · c clear label · enter details".to_string()
         }
         DecisionKind::ReleaseGate { .. } => {
-            "PgUp PgDn scroll · j k move · 1-9 include · space all or none · g release · enter details"
-                .to_string()
+            "j k move · 1-9 include · space all · g release · enter details".to_string()
         }
     }
 }
@@ -2770,7 +2743,7 @@ mod tests {
             screen.contains("Require a current release state before the train starts."),
             "screen: {screen}"
         );
-        assert!(screen.contains("esc back"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).starts_with("esc back"));
     }
 
     #[test]
@@ -3058,7 +3031,7 @@ mod tests {
             "screen: {screen}"
         );
         assert!(screen.contains("narrow terminal."), "screen: {screen}");
-        assert!(screen.contains("esc back"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).contains("esc back"));
         assert!(
             screen.lines().all(|line| line.chars().count() == 44),
             "screen: {screen}"
@@ -3237,9 +3210,9 @@ mod tests {
             screen.contains("2. [ ] postgres server"),
             "screen: {screen}"
         );
-        assert!(
-            screen.contains("1-9 pick · s submit · i write · enter details"),
-            "footer: {screen}"
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "PgUp PgDn · j k move · 1-9 pick · s submit · enter details"
         );
     }
 
@@ -3251,9 +3224,9 @@ mod tests {
 
         assert!(screen.contains("1. [x] #7"), "screen: {screen}");
         assert!(screen.contains("2. [x] #9"), "screen: {screen}");
-        assert!(
-            screen.contains("1-9 include · space all or none · g release · enter details"),
-            "footer: {screen}"
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "j k move · 1-9 include · space all · g release · enter details"
         );
 
         let mut inbox = selected(&state, 4);
@@ -3376,8 +3349,11 @@ mod tests {
             rx.try_recv().is_err(),
             "an unanswered question sends nothing"
         );
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("answer every question"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("answer every question"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
     }
 
     #[test]
@@ -3403,8 +3379,11 @@ mod tests {
         inbox.handle_key(&state, press('s'), &mut tx);
 
         assert!(rx.try_recv().is_err(), "an empty choice sent an answer");
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("answer every question"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("answer every question"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
     }
 
     #[test]
@@ -3591,8 +3570,9 @@ mod tests {
         assert!(screen.contains("1. [ ] Split by stage"), "screen: {screen}");
         assert!(screen.contains("2. [ ] main wins"), "screen: {screen}");
         assert!(
-            screen.contains("1-9 pick · s submit"),
-            "footer names the keys: {screen}"
+            footer_text(&state, &inbox).contains("1-9 pick · s submit"),
+            "the bottom row names the keys: {}",
+            footer_text(&state, &inbox)
         );
 
         inbox.handle_key(&state, press('2'), &mut tx);
@@ -3725,8 +3705,11 @@ mod tests {
         inbox.handle_key(&state, press('2'), &mut tx);
         inbox.handle_key(&state, press('g'), &mut tx);
         assert!(rx.try_recv().is_err());
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("select at least one PR"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("select at least one PR"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
 
         // Space brings the whole batch back.
         inbox.handle_key(&state, press(' '), &mut tx);
@@ -3794,12 +3777,10 @@ mod tests {
 
         inbox.handle_key(&state, press('n'), &mut tx);
         type_text(&mut inbox, &state, "ab", &mut tx);
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("reason: ab_"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).contains("reason: ab_"));
 
         inbox.handle_key(&state, press_code(KeyCode::Backspace), &mut tx);
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("reason: a_"), "screen: {screen}");
+        assert!(footer_text(&state, &inbox).contains("reason: a_"));
 
         inbox.handle_key(&state, press_code(KeyCode::Esc), &mut tx);
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
@@ -3816,8 +3797,11 @@ mod tests {
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
 
         assert!(rx.try_recv().is_err());
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("type the text first"), "hint: {screen}");
+        assert!(
+            footer_text(&state, &inbox).contains("type the text first"),
+            "hint: {}",
+            footer_text(&state, &inbox)
+        );
 
         type_text(&mut inbox, &state, "later", &mut tx);
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
@@ -3904,8 +3888,11 @@ mod tests {
         inbox.handle_key(&changed_state, press('s'), &mut tx);
 
         assert!(rx.try_recv().is_err(), "a stale option sent an answer");
-        let screen = render(&changed_state, &inbox, OPENED);
-        assert!(screen.contains("answer every question"), "hint: {screen}");
+        assert!(
+            footer_text(&changed_state, &inbox).contains("answer every question"),
+            "hint: {}",
+            footer_text(&changed_state, &inbox)
+        );
     }
 
     #[test]
@@ -4095,16 +4082,72 @@ mod tests {
     fn the_footer_shows_the_key_map_of_the_selected_kind() {
         let state = full_state();
         let cases: [(usize, &str); 5] = [
-            (0, "y allow · n deny"),
-            (1, "1-9 pick · s submit · i write · enter details"),
-            (2, "r retry · c cancel"),
-            (3, "t comment · c clear label · enter details"),
-            (4, "1-9 include · space all or none · g release"),
+            (
+                0,
+                "PgUp PgDn scroll · j k move · y allow · n deny · enter details",
+            ),
+            (
+                1,
+                "PgUp PgDn · j k move · 1-9 pick · s submit · enter details",
+            ),
+            (
+                2,
+                "PgUp PgDn scroll · j k move · r retry · c cancel · enter details",
+            ),
+            (
+                3,
+                "PgUp PgDn · j k move · t comment · c clear label · enter details",
+            ),
+            (
+                4,
+                "j k move · 1-9 include · space all · g release · enter details",
+            ),
         ];
         for (index, expected) in cases {
             let inbox = selected(&state, index);
-            let screen = render(&state, &inbox, OPENED);
-            assert!(screen.contains(expected), "row {index}: {screen}");
+            assert_eq!(footer_text(&state, &inbox), expected, "row {index}");
+        }
+    }
+
+    #[test]
+    fn every_footer_key_map_stays_within_the_bottom_row_cap() {
+        let state = full_state();
+        for index in 0..open_count(&state) {
+            let inbox = selected(&state, index);
+            let text = footer_text(&state, &inbox);
+            assert!(
+                text.chars().count() <= crate::tui::HINT_CAP,
+                "row {index} is too long: {text}"
+            );
+        }
+        for index in 0..open_count(&state) {
+            let mut inbox = selected(&state, index);
+            let (mut tx, _rx) = fake_sink();
+            inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+            let text = footer_text(&state, &inbox);
+            assert!(
+                text.chars().count() <= crate::tui::HINT_CAP,
+                "detail {index} is too long: {text}"
+            );
+        }
+
+        // The answer screen adds the pick, submit, and tickets keys. Its
+        // longest form belongs to an issue with a fetched option list.
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        for ask in [ask_view(), pr_ask_view()] {
+            let mut without = ask.clone();
+            without.options.clear();
+            for view in [ask, without] {
+                inbox.observe_ask(&view);
+                let text = footer_text(&state, &inbox);
+                assert!(
+                    text.chars().count() <= crate::tui::HINT_CAP,
+                    "the answer screen is too long: {text}"
+                );
+            }
         }
     }
 
@@ -4190,9 +4233,9 @@ mod tests {
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
         assert!(screen.contains("pr 9"), "body:\n{screen}");
-        assert!(
-            screen.contains("space include/exclude · g release"),
-            "footer:\n{screen}"
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · j k scroll · h l PR · space toggle · g release"
         );
     }
 
@@ -4206,7 +4249,10 @@ mod tests {
         assert!(inbox.detail_open());
         let screen = render(&state, &inbox, OPENED);
         assert!(screen.contains("PR #9 · borsuk"), "detail:\n{screen}");
-        assert!(screen.contains("h l PR"), "footer:\n{screen}");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · j k scroll · h l PR"
+        );
 
         // Left moves through the train queue; Esc closes the detail.
         let (mut tx, rx) = fake_sink();
@@ -4293,6 +4339,14 @@ mod tests {
             // 1970-01-01T02:46:40Z is exactly `OPENED`.
             created_at: Some("1970-01-01T02:46:40Z".to_string()),
             error: None,
+        }
+    }
+
+    /// The same fetched ask on a pull request instead of an issue.
+    fn pr_ask_view() -> AskView {
+        AskView {
+            kind: ItemKind::Pr,
+            ..ask_view()
         }
     }
 
@@ -4414,10 +4468,10 @@ mod tests {
             rx.try_recv().is_err(),
             "a submit without a pick sent an answer"
         );
-        let screen = render(&state, &inbox, OPENED);
         assert!(
-            screen.contains("pick an option, or press t to write"),
-            "hint: {screen}"
+            footer_text(&state, &inbox).contains("pick an option, or press t to write"),
+            "hint: {}",
+            footer_text(&state, &inbox)
         );
     }
 
@@ -4429,19 +4483,21 @@ mod tests {
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
         inbox.observe_ask(&ask_view());
 
-        let screen = render(&state, &inbox, OPENED);
-        assert!(screen.contains("1-9 pick · s submit"), "footer: {screen}");
-        assert!(screen.contains("t comment"), "footer: {screen}");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · 1-9 pick · s submit · t comment · c clear · w tickets"
+        );
 
-        // Without options the pick and submit keys leave the footer.
+        // Without options the pick and submit keys leave the row, and the
+        // scroll hint takes their place.
         let mut without = ask_view();
         without.options.clear();
         inbox.observe_ask(&without);
 
-        let screen = render(&state, &inbox, OPENED);
-        assert!(!screen.contains("1-9 pick"), "footer: {screen}");
-        assert!(!screen.contains("s submit"), "footer: {screen}");
-        assert!(screen.contains("t comment"), "footer: {screen}");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "esc back · j k scroll · t comment · c clear · w tickets"
+        );
     }
 
     #[test]
@@ -4494,11 +4550,12 @@ mod tests {
 
         assert_eq!(outcome, InboxOutcome::None);
         assert!(rx.try_recv().is_err(), "w on a pull request sent an action");
-        let screen = render(&pr, &inbox, OPENED);
         assert!(
-            screen.contains("the tickets view holds issues only; open the link"),
-            "hint: {screen}"
+            footer_text(&pr, &inbox).contains("the tickets view holds issues only; open the link"),
+            "hint: {}",
+            footer_text(&pr, &inbox)
         );
+        let screen = render(&pr, &inbox, OPENED);
         assert!(
             screen.contains("https://github.com/acme/borsuk/issues/7"),
             "screen: {screen}"

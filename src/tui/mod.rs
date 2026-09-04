@@ -1415,16 +1415,46 @@ fn banner_text(app: &App) -> String {
     }
 }
 
-/// Draw the key hints and the inbox badge.
+/// The longest bottom-row hint that an 80-column terminal shows in full.
+///
+/// The left footer side keeps 66 columns beside the 14-column inbox
+/// badge, and the row pads the text with one space on each side. Every
+/// view holds its hints at or below this count. The per-view tests read
+/// it, so the contract lives in one place.
+#[cfg(test)]
+pub(super) const HINT_CAP: usize = 64;
+
+/// The bottom-row hints of the current state.
+///
+/// The overlays win first, then the shell states, and the active view
+/// supplies the hints last. Each hint names only keys that the current
+/// state acts on.
+fn footer_hints(app: &App) -> String {
+    if app.confirm.is_some() {
+        return "y confirm · esc cancel".to_string();
+    }
+    if app.help {
+        return "? or esc close".to_string();
+    }
+    let Some(state) = app.state.as_ref().filter(|_| app.connected) else {
+        return "? help · ctrl-q quit".to_string();
+    };
+    match app.view {
+        View::Pipeline => pipeline::footer_hints(app),
+        View::Session => app.session.footer_hints(),
+        View::Inbox => inbox::footer_text(state, &app.inbox),
+        View::Tickets => app.tickets.footer_hints(),
+        View::Settings => app.settings.footer_hints(),
+    }
+}
+
+/// Draw the contextual key hints and the inbox badge.
 ///
 /// The badge renders in every view, so an open decision stays visible from
 /// anywhere.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let sides = Layout::horizontal([Constraint::Min(20), Constraint::Length(14)]).split(area);
-    let hints = Span::styled(
-        " 1/2/3/4/5 views   h/j/k/l move   ! inbox   ? help   ctrl-q quit ",
-        THEME.dim(),
-    );
+    let hints = Span::styled(format!(" {} ", footer_hints(app)), THEME.dim());
     f.render_widget(Paragraph::new(Line::from(hints)), sides[0]);
     let Some(state) = app.state.as_ref() else {
         return;
@@ -3822,7 +3852,11 @@ mod tests {
 
     #[test]
     fn key_five_opens_the_settings_view_and_updates_the_shell_text() {
-        let mut app = App::default();
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
         let mut sink = FakeSink::default();
 
         assert!(app.handle_key(
@@ -3833,7 +3867,7 @@ mod tests {
         assert_eq!(app.view, View::Settings);
         let text = render_to_string(&mut app);
         assert!(text.contains("5 settings"));
-        assert!(text.contains("1/2/3/4/5 views"));
+        assert!(text.contains("j k role · tab field · enter open · s save · r reload · ? help"));
     }
 
     #[test]
@@ -3893,5 +3927,139 @@ mod tests {
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
+    }
+
+    #[test]
+    fn the_bottom_row_hints_follow_the_overlay_and_shell_precedence() {
+        let mut app = App {
+            confirm: Some(Confirm::Abort {
+                task: "borsuk/refine-i142".to_string(),
+            }),
+            help: true,
+            ..App::default()
+        };
+        assert_eq!(footer_hints(&app), "y confirm · esc cancel");
+
+        app.confirm = None;
+        assert_eq!(footer_hints(&app), "? or esc close");
+
+        app.help = false;
+        assert_eq!(footer_hints(&app), "? help · ctrl-q quit");
+
+        app.connected = true;
+        app.state = Some(crate::tui::pipeline::sample_view());
+        assert_eq!(
+            footer_hints(&app),
+            "j k move · enter open · ? help",
+            "a connected shell serves the active view"
+        );
+
+        app.connected = false;
+        assert_eq!(
+            footer_hints(&app),
+            "? help · ctrl-q quit",
+            "the banner state repeats the quit chord"
+        );
+        assert!(footer_hints(&app).chars().count() <= HINT_CAP);
+    }
+
+    #[test]
+    fn the_shell_renders_one_contextual_row_without_the_static_hint_line() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("j k move · enter open · ? help"), "{text}");
+        assert!(!text.contains("1/2/3/4/5 views"), "{text}");
+        assert!(!text.contains("h/j/k/l move"), "{text}");
+        assert!(!text.contains("ctrl-q quit"), "{text}");
+
+        app.confirm = Some(Confirm::Abort {
+            task: "borsuk/refine-i142".to_string(),
+        });
+        let text = render_to_string(&mut app);
+        assert!(text.contains("y confirm · esc cancel"), "{text}");
+
+        app.confirm = None;
+        app.help = true;
+        let text = render_to_string(&mut app);
+        assert!(text.contains("? or esc close"), "{text}");
+    }
+
+    #[test]
+    fn the_inbox_shows_its_key_map_once_on_the_shell_bottom_row() {
+        let mut state = crate::tui::pipeline::sample_view();
+        state.decisions = vec![permission_decision("req-1", 1_000)];
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            view: View::Inbox,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(
+            text.contains("PgUp PgDn scroll · j k move · y allow · n deny · enter details"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("y allow").count(),
+            1,
+            "the key map renders once, on the bottom row:\n{text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        let body_last = lines[lines.len() - 2];
+        assert!(
+            body_last.starts_with("└"),
+            "the inbox body reaches the bottom row: {body_last}"
+        );
+    }
+
+    #[test]
+    fn the_shell_serves_the_hints_of_every_view_inside_the_row_cap() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let expected = [
+            (View::Pipeline, "j k move · enter open · ? help"),
+            (View::Session, "1 2 3 4 5 views · ? help"),
+            // The sample state holds no decision, so the inbox names
+            // the move and the jump key of an empty feed.
+            (View::Inbox, "j k move · ! oldest"),
+            (
+                View::Tickets,
+                "h l tabs · / search · n new · enter open · ? help",
+            ),
+            (
+                View::Settings,
+                "j k role · tab field · enter open · s save · r reload · ? help",
+            ),
+        ];
+        for (view, hint) in expected {
+            app.view = view;
+            let text = footer_hints(&app);
+            assert_eq!(text, hint, "view {view:?}");
+            assert!(text.chars().count() <= HINT_CAP, "view {view:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_confirm_prompt_from_the_tickets_view_wins_over_the_view_hints() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Tickets,
+            confirm: Some(Confirm::Refine {
+                repo: "borsuk".to_string(),
+                number: 7,
+            }),
+            ..App::default()
+        };
+        assert_eq!(footer_hints(&app), "y confirm · esc cancel");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("y confirm · esc cancel"), "{text}");
     }
 }

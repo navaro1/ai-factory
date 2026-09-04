@@ -952,6 +952,44 @@ fn next_policy(policy: &ReleasePolicy) -> ReleasePolicy {
     }
 }
 
+/// The bottom-row hints of the pipeline state.
+///
+/// The kind of the selected row decides the hint, and a failed ticket
+/// offers the retry key. A pull request of the fixed active batch takes
+/// no `space` key; a pull request of the waiting queue does.
+pub(super) fn footer_hints(app: &App) -> String {
+    let no_selection = || "j k move · enter open · ? help".to_string();
+    let Some(state) = app.state.as_ref() else {
+        return no_selection();
+    };
+    let Some(row) = selected_row(app) else {
+        return no_selection();
+    };
+    match row {
+        Row::Stage { .. } => "+ - limit · p pause · ? help".to_string(),
+        Row::Repo { .. } => "+ - lane · n new · p pause · ? help".to_string(),
+        Row::Ticket { index } => match state.tasks.get(index) {
+            Some(task) if matches!(task.state, TaskState::Failed(_)) => {
+                "enter open · x abort · R retry · ? help".to_string()
+            }
+            _ => "enter open · r refine · x abort · ? help".to_string(),
+        },
+        Row::Train { .. } => "g release · s policy · ? help".to_string(),
+        Row::ReleasePr { repo, pr } => {
+            let stackable = state
+                .trains
+                .iter()
+                .find(|train| train.repo == repo)
+                .is_some_and(|train| train.queue.contains(&pr) && !train.batch.contains(&pr));
+            if stackable {
+                "space stack · enter details · ? help".to_string()
+            } else {
+                "enter details · p pause · ? help".to_string()
+            }
+        }
+    }
+}
+
 /// Draw the pipeline view into `area` at the given Unix time.
 pub(super) fn draw(f: &mut Frame, app: &App, area: Rect, now_ms: u64) {
     let Some(state) = app.state.as_ref() else {
@@ -3816,10 +3854,7 @@ mod tests {
         assert!(app.inbox.detail_open());
         let text = render_to_string(&mut app);
         assert!(text.contains("PR #7 · borsuk"), "detail:\n{text}");
-        assert!(
-            text.contains("space include/exclude"),
-            "gate footer:\n{text}"
-        );
+        assert!(text.contains("space toggle"), "gate footer:\n{text}");
     }
 
     #[test]
@@ -4303,6 +4338,71 @@ mod tests {
             assert!(app.toast.is_none(), "key {character}");
             assert!(app.confirm.is_none(), "key {character}");
             assert_eq!(app.view, View::Pipeline, "key {character}");
+        }
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_selected_row_kind() {
+        let no_selection = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        assert_eq!(
+            footer_hints(&no_selection),
+            "j k move · enter open · ? help"
+        );
+
+        let cases: [(Row, &str); 7] = [
+            (
+                Row::Stage {
+                    stage: Stage::Refine,
+                },
+                "+ - limit · p pause · ? help",
+            ),
+            (
+                Row::Repo {
+                    stage: Stage::Refine,
+                    repo: "borsuk".to_string(),
+                },
+                "+ - lane · n new · p pause · ? help",
+            ),
+            (
+                Row::Ticket { index: 1 },
+                "enter open · r refine · x abort · ? help",
+            ),
+            (
+                Row::Ticket { index: 7 },
+                "enter open · x abort · R retry · ? help",
+            ),
+            (
+                Row::Train {
+                    repo: "borsuk".to_string(),
+                },
+                "g release · s policy · ? help",
+            ),
+            (
+                Row::ReleasePr {
+                    repo: "borsuk".to_string(),
+                    pr: 7,
+                },
+                "space stack · enter details · ? help",
+            ),
+            (
+                Row::ReleasePr {
+                    repo: "borsuk".to_string(),
+                    pr: 5,
+                },
+                "enter details · p pause · ? help",
+            ),
+        ];
+        for (row, expected) in cases {
+            let app = app_with_row(row.clone());
+            assert!(
+                expected.chars().count() <= crate::tui::HINT_CAP,
+                "hint {expected}"
+            );
+            assert_eq!(footer_hints(&app), expected, "row {row:?}");
         }
     }
 }

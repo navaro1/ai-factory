@@ -216,6 +216,51 @@ impl Tickets {
             || self.chat_active
     }
 
+    /// The bottom-row hints of the tickets state.
+    ///
+    /// The open nested view decides the hint; a state that takes typed
+    /// text shows no `? help`. Both forms create with ctrl-s. The plain
+    /// focus swaps one slot to keep the row inside the cap: a waiting
+    /// proposal offers `a`, and a focus without one offers the `m` key
+    /// that the shell binds to the to-refine label.
+    pub fn footer_hints(&self) -> String {
+        if self.focus {
+            if self.chat_active {
+                return "esc back to issue".to_string();
+            }
+            if self.conflict_open {
+                return "g keep remote · p reapply · esc back".to_string();
+            }
+            if self.editor.as_ref().is_some_and(|editor| editor.open) {
+                return "ctrl-s save · tab field · esc close".to_string();
+            }
+            if self.label_picker_open {
+                if self.new_label_form.is_some() {
+                    return "ctrl-s create · tab field · esc cancel".to_string();
+                }
+                return "space apply · n new label · esc close".to_string();
+            }
+            if self.has_proposal() {
+                return "e edit · a apply · L labels · c chat · esc back · ? help".to_string();
+            }
+            return "e edit · L labels · c chat · m refine · esc back · ? help".to_string();
+        }
+        if self.new_ticket.is_some() {
+            return "ctrl-s create · tab field · esc cancel".to_string();
+        }
+        if self.searching {
+            return "type filter · enter apply · esc clear".to_string();
+        }
+        "h l tabs · / search · n new · enter open · ? help".to_string()
+    }
+
+    /// True when the open focus shows a proposal that `a` applies.
+    fn has_proposal(&self) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| details.proposal.is_some())
+    }
+
     /// Unlock a ticket creation after a failed send or socket disconnect.
     pub fn delivery_failed(&mut self, action: Option<&Action>) {
         let Some(form) = self.new_ticket.as_mut() else {
@@ -2745,6 +2790,114 @@ mod tests {
         assert!(tickets.result.is_none());
         assert!(tickets.conflict.is_none());
         assert!(!tickets.conflict_open);
+    }
+
+    #[test]
+    fn the_footer_hints_follow_the_nested_view() {
+        let state = state();
+        let mut tickets = Tickets::default();
+        assert_eq!(
+            tickets.footer_hints(),
+            "h l tabs · / search · n new · enter open · ? help"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('/')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "type filter · enter apply · esc clear"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+
+        // The new-ticket form takes text, so it names no help key.
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert!(tickets.typing());
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s create · tab field · esc cancel"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(tickets.new_ticket.is_none());
+
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+        assert!(tickets.focus_open());
+        assert_eq!(
+            tickets.footer_hints(),
+            "e edit · L labels · c chat · m refine · esc back · ? help"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('e')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s save · tab field · esc close"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+
+        // The capital L opens the picker; the plain l steps the focus.
+        tickets.handle_key(&state, key(KeyCode::Char('L')));
+        assert!(tickets.label_picker_open);
+        assert_eq!(
+            tickets.footer_hints(),
+            "space apply · n new label · esc close"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('n')));
+        assert_eq!(
+            tickets.footer_hints(),
+            "ctrl-s create · tab field · esc cancel"
+        );
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(!tickets.label_picker_open);
+
+        // A waiting proposal takes the slot of the to-refine key.
+        let mut with_proposal = details();
+        with_proposal.proposal = Some(crate::sock::TicketProposal {
+            id: "proposal-7".to_string(),
+            title: "Improve the ticket list".to_string(),
+            body: "A shorter plan.".to_string(),
+            original_title: "Improve the ticket list".to_string(),
+            original_body: "Show every issue without leaving the terminal.".to_string(),
+        });
+        tickets.observe_details(with_proposal);
+        assert_eq!(
+            tickets.footer_hints(),
+            "e edit · a apply · L labels · c chat · esc back · ? help"
+        );
+
+        let conflict = Tickets {
+            focus: true,
+            conflict_open: true,
+            ..Tickets::default()
+        };
+        assert_eq!(
+            conflict.footer_hints(),
+            "g keep remote · p reapply · esc back"
+        );
+
+        let chat = Tickets {
+            focus: true,
+            chat_active: true,
+            ..Tickets::default()
+        };
+        assert_eq!(chat.footer_hints(), "esc back to issue");
+    }
+
+    #[test]
+    fn every_ticket_hint_stays_within_the_bottom_row_cap() {
+        for hint in [
+            "h l tabs · / search · n new · enter open · ? help",
+            "type filter · enter apply · esc clear",
+            "ctrl-s create · tab field · esc cancel",
+            "e edit · L labels · c chat · m refine · esc back · ? help",
+            "e edit · a apply · L labels · c chat · esc back · ? help",
+            "ctrl-s save · tab field · esc close",
+            "space apply · n new label · esc close",
+            "g keep remote · p reapply · esc back",
+            "esc back to issue",
+        ] {
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
+        }
     }
 
     fn type_string(tickets: &mut Tickets, state: &StateView, text: &str) {
