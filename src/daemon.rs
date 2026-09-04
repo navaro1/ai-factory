@@ -2418,6 +2418,11 @@ impl Daemon {
     /// row of the task it cancels, so an aborted task and a cancelled stuck
     /// row both rest in `Failed` with no row at all. The `R` key of the
     /// board retries any failed task and needs no row.
+    ///
+    /// The sentence says "This task" in place of the task id. The chat bar
+    /// centers this text and clips both ends, so every character costs a
+    /// character of the cause. The header row above the bar already names
+    /// the task, so the id here buys nothing.
     fn closed_reason(&self, task: &Task, has_session: bool) -> String {
         if task.state == TaskState::Queued {
             if let Some(blocker) = self.prior_stage_blocker(task) {
@@ -2431,10 +2436,7 @@ impl Daemon {
                 } else {
                     ""
                 };
-                return format!(
-                    "The task \"{}\" waits for task \"{blocker}\" to finish.{action}",
-                    task.id,
-                );
+                return format!("This task waits for \"{blocker}\" to finish.{action}");
             }
         }
         if !has_session {
@@ -7490,9 +7492,7 @@ mod tests {
         assert_eq!(
             rig.daemon.input_mode(&release),
             InputMode::Closed {
-                reason: "The task \"borsuk/release\" waits for task \"borsuk/review-p5\" \
-                         to finish."
-                    .to_string()
+                reason: "This task waits for \"borsuk/review-p5\" to finish.".to_string()
             },
             "a running blocker needs no action, so the reason names none"
         );
@@ -7539,11 +7539,59 @@ mod tests {
         assert_eq!(
             rig.daemon.input_mode(&release),
             InputMode::Closed {
-                reason: "The task \"borsuk/release\" waits for task \"borsuk/review-p5\" \
-                         to finish. That task failed. Press R on its pipeline row to retry it."
+                reason: "This task waits for \"borsuk/review-p5\" to finish. \
+                         That task failed. Press R on its pipeline row to retry it."
                     .to_string()
             },
             "the session view must name the task that holds the release"
+        );
+    }
+
+    /// The widest reason must fit one common terminal.
+    ///
+    /// The chat bar centers the reason and clips both ends, so a long
+    /// sentence loses its subject and its action together. 118 characters
+    /// is the inner width of a 120-column terminal. This test holds the
+    /// sentence inside that width; it fails if a later edit adds words.
+    #[test]
+    fn the_blocker_reason_fits_a_120_column_chat_bar() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .chain(reuse_issue_steps(
+                &rig_repo(&dir),
+                &worktree,
+                &rig_gitdir(&dir),
+            ))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            config.repos.get_mut("borsuk").unwrap().release = ReleasePolicy::Threshold { count: 1 };
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        for _ in 0..3 {
+            rig.event(turn_finished("borsuk/review-p5", false, "review failed"));
+            rig.event(exited("borsuk/review-p5", false, "review failed"));
+        }
+
+        let release = rig.task("borsuk/release");
+        let InputMode::Closed { reason } = rig.daemon.input_mode(&release) else {
+            panic!("a queued release takes no message");
+        };
+
+        // A real id is longer than this rig's. Measure the shape with the
+        // longest pair the live factory carries: "ai-factory/review-p65".
+        let widest = reason.replace("borsuk/review-p5", "ai-factory/review-p65");
+        assert!(
+            widest.chars().count() <= 118,
+            "the reason is {} characters and clips a 120-column bar: {widest}",
+            widest.chars().count(),
         );
     }
 
@@ -7654,8 +7702,8 @@ mod tests {
         assert_eq!(
             rig.daemon.input_mode(&release),
             InputMode::Closed {
-                reason: "The task \"borsuk/release\" waits for task \"borsuk/review-p5\" \
-                         to finish. That task failed. Press R on its pipeline row to retry it."
+                reason: "This task waits for \"borsuk/review-p5\" to finish. \
+                         That task failed. Press R on its pipeline row to retry it."
                     .to_string()
             },
             "a failed blocker never ends by itself, so it wins over a running one"
