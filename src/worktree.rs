@@ -615,6 +615,7 @@ mod tests {
             owner_repo: "owner/demo".to_string(),
             lanes: BTreeMap::new(),
             release: ReleasePolicy::Manual,
+            theory: crate::config::TheoryConfig::default(),
             role_overrides: BTreeMap::new(),
         }
     }

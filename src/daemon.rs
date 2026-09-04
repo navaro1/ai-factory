@@ -3876,6 +3876,7 @@ mod tests {
                 owner_repo: "acme/borsuk".to_string(),
                 lanes: BTreeMap::new(),
                 release: ReleasePolicy::Manual,
+                theory: crate::config::TheoryConfig::default(),
                 role_overrides: BTreeMap::new(),
             },
         );

@@ -21,6 +21,7 @@ pub mod sched;
 pub mod sock;
 pub mod state;
 pub mod tasks;
+pub mod theory;
 pub mod ticket;
 pub mod trains;
 pub mod tui;
