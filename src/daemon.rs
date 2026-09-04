@@ -2779,9 +2779,10 @@ impl Daemon {
     /// two agents never share one worktree. A `Shared` task holds nothing
     /// and nothing holds it.
     fn worktree_holder(&self, task: &Task) -> Option<String> {
-        let Workspace::Exclusive(key) = self.workspace(task) else {
+        let workspace = self.workspace(task);
+        if !matches!(workspace, Workspace::Exclusive(_)) {
             return None;
-        };
+        }
         self.table
             .by_id
             .values()
@@ -2789,7 +2790,7 @@ impl Daemon {
                 other.id != task.id
                     && other.repo == task.repo
                     && matches!(other.state, TaskState::Running | TaskState::AwaitingUser)
-                    && self.workspace(other) == Workspace::Exclusive(key.clone())
+                    && self.workspace(other) == workspace
             })
             .map(|other| other.id.clone())
     }
@@ -2800,9 +2801,10 @@ impl Daemon {
     /// another task of the same repository and exclusive worktree is active.
     /// A `Shared` task never blocks and is never blocked.
     fn sibling_blocker(&self, task: &Task) -> Option<String> {
-        let Workspace::Exclusive(key) = self.workspace(task) else {
+        let workspace = self.workspace(task);
+        if !matches!(workspace, Workspace::Exclusive(_)) {
             return None;
-        };
+        }
         self.table
             .by_id
             .values()
@@ -2810,7 +2812,7 @@ impl Daemon {
                 other.id != task.id
                     && other.repo == task.repo
                     && !other.state.is_terminal()
-                    && self.workspace(other) == Workspace::Exclusive(key.clone())
+                    && self.workspace(other) == workspace
             })
             .map(|other| other.id.clone())
     }
