@@ -959,12 +959,31 @@ impl Daemon {
         self.changed = true;
     }
 
+    /// True when a release train still needs this task.
+    ///
+    /// A train in flight needs its task, so [`Daemon::reconcile_trains`]
+    /// can close the train. A failed train needs its task too: the train
+    /// saved the exact batch to retry, and [`Daemon::retry_task`] reads
+    /// that batch through the task id. The release merges one pull request
+    /// at a time, so a failed batch often leaves GitHub in part. Without
+    /// this guard the retire drops the task the moment the lowest pull
+    /// request of the batch merges, and a `Manual` train can never retry.
+    /// The board applies the same rule: it draws the task inside the retry
+    /// border while the batch is not empty.
+    fn train_needs_task(&self, task: &Task) -> bool {
+        self.trains.values().any(|train| {
+            train.in_flight.as_deref() == Some(task.id.as_str())
+                || (train.repo == task.repo
+                    && task.stage == Stage::Release
+                    && !train.batch().is_empty())
+        })
+    }
+
     /// Drop every pipeline task of one item that left GitHub.
     ///
     /// A ticket chat and a ticket-creation session serve the Tickets view,
-    /// so their purpose keeps them. A release task that a train holds in
-    /// flight stays too, so [`Daemon::reconcile_trains`] can still close
-    /// the train.
+    /// so their purpose keeps them. A release task that its train still
+    /// needs stays too, by [`Daemon::train_needs_task`].
     fn retire_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
         let ids: Vec<String> = self
             .table
@@ -972,12 +991,7 @@ impl Daemon {
             .values()
             .filter(|task| task.repo == repo && task.kind == kind && task.number == number)
             .filter(|task| task.purpose == TaskPurpose::Pipeline)
-            .filter(|task| {
-                !self
-                    .trains
-                    .values()
-                    .any(|train| train.in_flight.as_deref() == Some(task.id.as_str()))
-            })
+            .filter(|task| !self.train_needs_task(task))
             .map(|task| task.id.clone())
             .collect();
         for id in ids {
@@ -999,8 +1013,9 @@ impl Daemon {
     /// The sweep drops no active task. A live session ends through
     /// [`Daemon::cancel_absent_restored`] or [`Daemon::cancel_item_tasks`],
     /// which run first and make the task terminal. The purpose keeps a
-    /// ticket chat and a ticket-creation session, and the in-flight guard
-    /// keeps the release task that a train still holds.
+    /// ticket chat and a ticket-creation session, and
+    /// [`Daemon::train_needs_task`] keeps the release task that a train
+    /// still needs.
     fn retire_absent_items(&mut self, repo: &str, fresh: &RepoSnapshot) {
         let ids: Vec<String> = self
             .table
@@ -1008,12 +1023,7 @@ impl Daemon {
             .values()
             .filter(|task| task.repo == repo && task.state.is_terminal())
             .filter(|task| task.purpose == TaskPurpose::Pipeline)
-            .filter(|task| {
-                !self
-                    .trains
-                    .values()
-                    .any(|train| train.in_flight.as_deref() == Some(task.id.as_str()))
-            })
+            .filter(|task| !self.train_needs_task(task))
             .filter(|task| match task.kind {
                 ItemKind::Issue => fresh
                     .issues
@@ -9320,6 +9330,80 @@ mod tests {
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight, None,
             "reconcile_trains closes the train after the release task ends"
+        );
+    }
+
+    #[test]
+    fn a_failed_release_keeps_its_task_after_one_batch_pr_merges() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = train_wt(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let steps: Vec<Step> = fresh_train_steps(&repo, &worktree, &gitdir)
+            .into_iter()
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_train_steps(&repo, &worktree, &gitdir))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[]), pr(3, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2, 3],
+        });
+        for detail in ["first", "second", "third"] {
+            rig.event(exited("borsuk/release", false, detail));
+        }
+        assert_eq!(rig.daemon.trains["borsuk"].batch(), &[2, 3]);
+        assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
+
+        // The failed batch merged pr 2 before it stopped, so pr 2 leaves
+        // GitHub while the saved retry batch still holds pr 3.
+        rig.poll(vec![], vec![pr(3, false, &[])]);
+
+        assert_eq!(
+            rig.daemon.trains["borsuk"].batch(),
+            &[3],
+            "the merged pull request leaves the retry batch"
+        );
+        assert!(
+            rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the release task outlives the pull request that names it, \
+             because the train still holds a batch to retry"
+        );
+
+        rig.act(Action::Answer {
+            decision_id: "stuck:borsuk/release:3".to_string(),
+            response: Response::Retry,
+        });
+
+        assert_eq!(rig.job_count(), 4, "the retry starts a fresh run");
+        assert!(rig.job(3).prompt.contains("#3"));
+        assert!(!rig.job(3).prompt.contains("#2"));
+    }
+
+    #[test]
+    fn a_finished_release_retires_after_its_batch_merges() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = train_wt(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let steps = fresh_train_steps(&repo, &worktree, &gitdir);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        rig.event(turn_finished("borsuk/release", true, "released"));
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Done);
+        assert!(rig.daemon.trains["borsuk"].batch().is_empty());
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "an idle train keeps no release task"
         );
     }
 
