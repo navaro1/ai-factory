@@ -854,6 +854,10 @@ pub enum Response { Allow, Deny { message: String },
   `human:<repo>:<kind><number>`, `gate:<repo>`.
 - `validate(&Decision, &Response) -> Result<()>` refuses a mismatched pair, for
   example `Go` against a `Permission`.
+- A `Question` decision's `questions` field holds the `AskUserQuestion` tool
+  input VERBATIM, so the question list sits under its `questions` key. Every
+  reader of the field must accept that object and a bare array, because a
+  reader that accepts only one shape shows a question the human cannot answer.
 - A `Question` answer's `updated_input` has the shape
   `{"answers": {header: label}}`, matching the runner fixture. The daemon must
   pass it through to the runner VERBATIM; reshaping it breaks AskUserQuestion.

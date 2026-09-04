@@ -1371,7 +1371,12 @@ mod tests {
         assert_eq!(asks[0].options, vec!["a".to_string(), "b".to_string()]);
         assert!(asks[1].options.is_empty());
 
-        // A wrapped object and a wrong shape both yield nothing.
+        // The recorded tool input wraps the same list under `questions`.
+        let wrapped = ask_questions(&serde_json::json!({"questions": value}));
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].options, vec!["a".to_string(), "b".to_string()]);
+
+        // A wrong shape yields nothing.
         assert!(ask_questions(&serde_json::json!(null)).is_empty());
         assert!(ask_questions(&serde_json::json!("no")).is_empty());
     }
