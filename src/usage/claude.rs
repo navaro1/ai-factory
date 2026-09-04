@@ -536,6 +536,28 @@ mod tests {
     }
 
     #[test]
+    fn a_curl_that_never_runs_reports_the_reason_without_the_token() {
+        // The curl argument vector carries the bearer token, so a failure
+        // to run curl must never carry the argument vector into the error.
+        // The record error reaches the state file, the socket, and the band.
+        let credentials = write_credentials(TOKEN);
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "claude" && call.argv() == ["auth", "status"],
+            CmdOut::ok(auth_status_oauth()),
+        );
+
+        let error = probe_claude(&exec, "claude", &credentials, 0).unwrap_err();
+
+        let text = format!("{error:#}");
+        let _ = std::fs::remove_file(&credentials);
+        assert!(!text.contains(TOKEN), "the error leaked the token: {text}");
+        assert!(
+            text.contains("cannot run curl"),
+            "the error must name the failure: {text}"
+        );
+    }
+
+    #[test]
     fn the_api_mode_skips_the_usage_call_without_an_admin_key() {
         let guard = lock_env();
         std::env::remove_var("ANTHROPIC_ADMIN_KEY");

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ExecutionRole, Harness};
@@ -357,9 +357,9 @@ pub(crate) fn opencode_auth_path(home: &Path) -> PathBuf {
 ///
 /// The argument vector ends with `-w '\n%{http_code}'`, so one capture
 /// carries the body and the HTTP status. The token never appears in an
-/// error message.
-// The wave-2 probe chunks call this helper; the stubs do not yet.
-#[allow(dead_code)]
+/// error message: an [`Exec`] failure renders the argument vector, which
+/// holds the bearer header, so this function keeps only the input or output
+/// reason of the failed start.
 pub(crate) fn curl_get(
     exec: &dyn Exec,
     url: &str,
@@ -375,9 +375,7 @@ pub(crate) fn curl_get(
     args.push(url);
     args.push("-w");
     args.push("\n%{http_code}");
-    let output = exec
-        .run("curl", &args, None)
-        .context("cannot run curl for the usage probe")?;
+    let output = exec.run("curl", &args, None).map_err(redact_curl_failure)?;
     let Some((body, status)) = output.stdout.rsplit_once('\n') else {
         return Err(anyhow!("the usage probe response carries no status line"));
     };
@@ -388,13 +386,26 @@ pub(crate) fn curl_get(
     Ok((body.to_string(), status))
 }
 
+/// Name one failed `curl` start without its argument vector.
+///
+/// The argument vector holds the bearer header. An input or output reason
+/// never does, so the message keeps that reason and drops everything else.
+/// `aif doctor` names a missing `curl` on its own line.
+fn redact_curl_failure(error: anyhow::Error) -> anyhow::Error {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        Some(reason) => anyhow!("cannot run curl for the usage probe: {reason}"),
+        None => anyhow!("cannot run curl for the usage probe"),
+    }
+}
+
 /// Normalize a provider utilization figure to 0-100.
 ///
 /// Providers report either a 0-1 share or a 0-100 percentage. A value in
 /// `(0, 1]` reads as a share; every other value reads as a percentage and
 /// clamps into range.
-// The wave-2 probe chunks call this helper; the stubs do not yet.
-#[allow(dead_code)]
 pub(crate) fn utilization_to_percent(raw: f64) -> f64 {
     if raw > 0.0 && raw <= 1.0 {
         raw * 100.0
@@ -407,8 +418,6 @@ pub(crate) fn utilization_to_percent(raw: f64) -> f64 {
 ///
 /// The code never assumes a fixed minute count: known windows get their
 /// human name and every other duration keeps its own length in the label.
-// The wave-2 probe chunks call this helper; the stubs do not yet.
-#[allow(dead_code)]
 pub(crate) fn window_label(minutes: u64) -> String {
     match minutes {
         60 => "hourly".to_string(),
@@ -439,16 +448,12 @@ pub(crate) fn window_label(minutes: u64) -> String {
 }
 
 /// Convert Unix seconds to Unix milliseconds, saturating on overflow.
-// The wave-2 probe chunks call this helper; the stubs do not yet.
-#[allow(dead_code)]
 pub(crate) fn unix_seconds_to_ms(seconds: u64) -> u64 {
     seconds.saturating_mul(1_000)
 }
 
 /// Read one test fixture out of `src/usage/fixtures`.
-// The wave-2 probe chunks call this helper; the stubs do not yet.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn fixture(name: &str) -> String {
     std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -612,6 +617,23 @@ model = "zai-coding-plan/glm-5.3"
         let calls = exec.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].argv().contains(&"-w"));
+    }
+
+    #[test]
+    fn a_curl_start_failure_names_the_reason_without_the_bearer_header() {
+        use crate::exec::ScriptExec;
+        // Every Exec renders the argument vector in its failure, and that
+        // vector carries the bearer header. The reason of the failed start
+        // reaches the state file, the socket, and the drawn band, so it may
+        // never carry the token.
+        let exec = ScriptExec::new();
+
+        let error = curl_get(&exec, "https://example.test/usage", "secret-token", &[]).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(!text.contains("secret-token"), "leaked the token: {text}");
+        assert!(!text.contains("Authorization"), "leaked the header: {text}");
+        assert_eq!(text, "cannot run curl for the usage probe");
     }
 
     #[test]
