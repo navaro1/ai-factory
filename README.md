@@ -351,15 +351,41 @@ The Settings view edits all six execution roles. It supports global and reposito
 | Key | Action |
 |---|---|
 | `h` / `l` | Select the global or repository scope. |
-| `j` / `k` | Select a role. |
+| `j` / `k` | Select a role, or a row inside an open list. |
 | `Tab` | Select a field. |
-| `Enter` | Edit text or select a value. |
+| `Enter` | Open the value list of the field, or apply the marked row. |
 | `d` | Remove the selected repository override. |
 | `s` | Save the draft. |
 | `r` | Reload the file. |
-| `Esc` | Cancel an edit or confirm draft removal. |
+| `Esc` | Close a list, cancel an edit, or confirm draft removal. |
 
-Argument and tool lists use a row editor. Narrow terminals stack the role list above the form.
+`Enter` opens a value list on these fields: `harness`, `program`, `model`,
+`effort`, `agent`, `profile`, `permission mode`, `permission handler`,
+`approval policy`, and `sandbox`. The list starts on the current value. Type
+to filter the rows, `Backspace` shortens the filter, `Enter` applies the
+marked row, and `Esc` closes the list without a change.
+
+The candidates join three sources: the fixed values the harness documents,
+the values the pushed settings state holds for the same field and harness,
+and the discovered OpenCode models. `aif` runs `opencode models` once in the
+background at start. The model list of an OpenCode role shows
+`discovering models...` until the result arrives, and one dim reason row
+when the probe fails. The state values and the custom row stay available.
+
+An optional field starts with a `(none)` row that clears the field. The open
+fields (`program`, `model`, `effort`, `agent`, `profile`,
+`permission handler`) end with a `custom value...` row that opens the text
+box, so no legal value becomes unreachable. `strict MCP` and `auto approve`
+stay toggles. The argument and tool lists keep the row editor, and `limit`
+keeps the text box.
+
+A harness change sets the program, picks a default model, and clears every
+field of the old harness. `auto approve` turns off under OpenCode. One
+notice line under the form names the new harness and every field that the
+change reset. The line disappears at a save, a reload, a draft discard, or
+the next harness change.
+
+Narrow terminals stack the role list above the form.
 The daemon rejects a stale save if the file changed after the draft loaded.
 Repository topology changes require a daemon restart.
 
