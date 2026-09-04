@@ -313,6 +313,8 @@ impl Settings {
     /// An open editor names its own keys and shows no `? help`. The form
     /// names the navigation keys and the keys of the active scope: the
     /// repository scope removes its override, the global scope reloads.
+    /// On the form `j` and `k` step the execution role; inside the list
+    /// editor they step one row.
     pub fn footer_hints(&self) -> String {
         if let Some(editor) = self.list_editor.as_ref() {
             if editor.row_editor.is_some() {
@@ -327,9 +329,9 @@ impl Settings {
             return "type filter · enter apply · esc close".to_string();
         }
         if self.scope > 0 {
-            return "j k row · tab field · enter open · s save · d remove · ? help".to_string();
+            return "j k role · tab field · enter open · s save · d remove · ? help".to_string();
         }
-        "j k row · tab field · enter open · s save · r reload · ? help".to_string()
+        "j k role · tab field · enter open · s save · r reload · ? help".to_string()
     }
 
     /// Store the result of the `opencode models` probe and refresh an
@@ -3148,14 +3150,14 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(
             settings.footer_hints(),
-            "j k row · tab field · enter open · s save · r reload · ? help"
+            "j k role · tab field · enter open · s save · r reload · ? help"
         );
 
         settings.handle_key(&state, key(KeyCode::Char('l')));
         assert_eq!(settings.scope, 1);
         assert_eq!(
             settings.footer_hints(),
-            "j k row · tab field · enter open · s save · d remove · ? help"
+            "j k role · tab field · enter open · s save · d remove · ? help"
         );
 
         settings.scope = 0;
@@ -3193,11 +3195,13 @@ mod tests {
         assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
 
         for hint in [
-            "j k row · tab field · enter open · s save · r reload · ? help",
-            "j k row · tab field · enter open · s save · d remove · ? help",
+            "j k role · tab field · enter open · s save · r reload · ? help",
+            "j k role · tab field · enter open · s save · d remove · ? help",
             "j k row · a add · d delete · enter edit · esc close",
+            "type filter · enter apply · esc close",
+            "enter apply · esc cancel",
         ] {
-            assert!(hint.chars().count() <= 64, "hint {hint}");
+            assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
         }
     }
 }

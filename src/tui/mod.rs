@@ -1415,12 +1415,20 @@ fn banner_text(app: &App) -> String {
     }
 }
 
+/// The longest bottom-row hint that an 80-column terminal shows in full.
+///
+/// The left footer side keeps 66 columns beside the 14-column inbox
+/// badge, and the row pads the text with one space on each side. Every
+/// view holds its hints at or below this count. The per-view tests read
+/// it, so the contract lives in one place.
+#[cfg(test)]
+pub(super) const HINT_CAP: usize = 64;
+
 /// The bottom-row hints of the current state.
 ///
 /// The overlays win first, then the shell states, and the active view
 /// supplies the hints last. Each hint names only keys that the current
-/// state acts on. The cap keeps the row inside the 66-column left footer
-/// side of an 80-column terminal, next to the 14-column inbox badge.
+/// state acts on.
 fn footer_hints(app: &App) -> String {
     if app.confirm.is_some() {
         return "y confirm · esc cancel".to_string();
@@ -1428,17 +1436,13 @@ fn footer_hints(app: &App) -> String {
     if app.help {
         return "? or esc close".to_string();
     }
-    if app.state.is_none() || !app.connected {
+    let Some(state) = app.state.as_ref().filter(|_| app.connected) else {
         return "? help · ctrl-q quit".to_string();
-    }
+    };
     match app.view {
         View::Pipeline => pipeline::footer_hints(app),
         View::Session => app.session.footer_hints(),
-        View::Inbox => app
-            .state
-            .as_ref()
-            .map(|state| inbox::footer_text(state, &app.inbox))
-            .unwrap_or_else(|| "? help · ctrl-q quit".to_string()),
+        View::Inbox => inbox::footer_text(state, &app.inbox),
         View::Tickets => app.tickets.footer_hints(),
         View::Settings => app.settings.footer_hints(),
     }
@@ -3863,7 +3867,7 @@ mod tests {
         assert_eq!(app.view, View::Settings);
         let text = render_to_string(&mut app);
         assert!(text.contains("5 settings"));
-        assert!(text.contains("j k row · tab field · enter open · s save · r reload · ? help"));
+        assert!(text.contains("j k role · tab field · enter open · s save · r reload · ? help"));
     }
 
     #[test]
@@ -3956,7 +3960,7 @@ mod tests {
             "? help · ctrl-q quit",
             "the banner state repeats the quit chord"
         );
-        assert!(footer_hints(&app).chars().count() <= 64);
+        assert!(footer_hints(&app).chars().count() <= HINT_CAP);
     }
 
     #[test]
@@ -4010,5 +4014,52 @@ mod tests {
             body_last.starts_with("└"),
             "the inbox body reaches the bottom row: {body_last}"
         );
+    }
+
+    #[test]
+    fn the_shell_serves_the_hints_of_every_view_inside_the_row_cap() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        let expected = [
+            (View::Pipeline, "j k move · enter open · ? help"),
+            (View::Session, "1 2 3 4 5 views · ? help"),
+            // The sample state holds no decision, so the inbox names
+            // the move and the jump key of an empty feed.
+            (View::Inbox, "j k move · ! oldest"),
+            (
+                View::Tickets,
+                "h l tabs · / search · n new · enter open · ? help",
+            ),
+            (
+                View::Settings,
+                "j k role · tab field · enter open · s save · r reload · ? help",
+            ),
+        ];
+        for (view, hint) in expected {
+            app.view = view;
+            let text = footer_hints(&app);
+            assert_eq!(text, hint, "view {view:?}");
+            assert!(text.chars().count() <= HINT_CAP, "view {view:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_confirm_prompt_from_the_tickets_view_wins_over_the_view_hints() {
+        let mut app = App {
+            state: Some(crate::tui::pipeline::sample_view()),
+            connected: true,
+            view: View::Tickets,
+            confirm: Some(Confirm::Refine {
+                repo: "borsuk".to_string(),
+                number: 7,
+            }),
+            ..App::default()
+        };
+        assert_eq!(footer_hints(&app), "y confirm · esc cancel");
+        let text = render_to_string(&mut app);
+        assert!(text.contains("y confirm · esc cancel"), "{text}");
     }
 }

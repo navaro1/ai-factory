@@ -4398,7 +4398,10 @@ mod tests {
         ];
         for (row, expected) in cases {
             let app = app_with_row(row.clone());
-            assert!(expected.chars().count() <= 64, "hint {expected}");
+            assert!(
+                expected.chars().count() <= crate::tui::HINT_CAP,
+                "hint {expected}"
+            );
             assert_eq!(footer_hints(&app), expected, "row {row:?}");
         }
     }

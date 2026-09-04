@@ -4116,7 +4116,7 @@ mod tests {
             let inbox = selected(&state, index);
             let text = footer_text(&state, &inbox);
             assert!(
-                text.chars().count() <= 64,
+                text.chars().count() <= crate::tui::HINT_CAP,
                 "row {index} is too long: {text}"
             );
         }
@@ -4126,9 +4126,28 @@ mod tests {
             inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
             let text = footer_text(&state, &inbox);
             assert!(
-                text.chars().count() <= 64,
+                text.chars().count() <= crate::tui::HINT_CAP,
                 "detail {index} is too long: {text}"
             );
+        }
+
+        // The answer screen adds the pick, submit, and tickets keys. Its
+        // longest form belongs to an issue with a fetched option list.
+        let state = ask_state();
+        let mut inbox = selected(&state, 0);
+        let (mut tx, _rx) = fake_sink();
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        for ask in [ask_view(), pr_ask_view()] {
+            let mut without = ask.clone();
+            without.options.clear();
+            for view in [ask, without] {
+                inbox.observe_ask(&view);
+                let text = footer_text(&state, &inbox);
+                assert!(
+                    text.chars().count() <= crate::tui::HINT_CAP,
+                    "the answer screen is too long: {text}"
+                );
+            }
         }
     }
 
@@ -4320,6 +4339,14 @@ mod tests {
             // 1970-01-01T02:46:40Z is exactly `OPENED`.
             created_at: Some("1970-01-01T02:46:40Z".to_string()),
             error: None,
+        }
+    }
+
+    /// The same fetched ask on a pull request instead of an issue.
+    fn pr_ask_view() -> AskView {
+        AskView {
+            kind: ItemKind::Pr,
+            ..ask_view()
         }
     }
 
