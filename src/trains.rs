@@ -246,14 +246,29 @@ impl Train {
         Ok(id)
     }
 
+    /// Re-link a restored release task to this train after a restart.
+    ///
+    /// The snapshot holds the release task and its batch, but not the train
+    /// bookkeeping. The daemon restore calls this once per repository, so
+    /// the batch behaves like an active train again: a second fire is
+    /// refused, the stacked cache keeps the batch, and [`Train::finish`]
+    /// closes it exactly once.
+    pub fn resume_in_flight(&mut self, task_id: &str, prs: &[u64]) {
+        if self.in_flight.is_some() {
+            return;
+        }
+        self.in_flight = Some(task_id.to_string());
+        self.fired = Some(prs.to_vec());
+    }
+
     /// Close the batch in flight and return it.
     ///
     /// On success, this call clears each stacked label and the local cache.
     /// Unstacked pull requests need no label call. On failure, this call
     /// returns the batch to the queue and saves the exact retry set.
     ///
-    /// A label error keeps the train active. A later call can retry the label
-    /// cleanup. A call without an active batch changes nothing.
+    /// A label error keeps the train active. A later call can retry the
+    /// label cleanup. A call without an active batch changes nothing.
     pub fn finish(&mut self, ok: bool, owner_repo: &str, gh: &GhClient<'_>) -> Result<Vec<u64>> {
         if self.in_flight.is_none() {
             return Ok(Vec::new());
