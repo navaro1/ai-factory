@@ -32,6 +32,7 @@ const CLOSE: &str = "</aif-ask-v1>";
 
 /// One named answer an agent offers with its question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AskOption {
     /// The short answer text a pick posts back to GitHub.
     pub label: String,
@@ -179,6 +180,8 @@ mod tests {
             block(r#"{"question":"Q","options":[{"label":" "}]}"#),
             // An unknown JSON field.
             block(r#"{"question":"Q","extra":1,"options":[{"label":"A"}]}"#),
+            // An unknown option field.
+            block(r#"{"question":"Q","options":[{"label":"A","extra":1}]}"#),
             // A multi-line JSON body.
             format!("{OPEN}\n{{\n\"question\":\"Q\"\n}}\n{CLOSE}"),
             // Two open tags.

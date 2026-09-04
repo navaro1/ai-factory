@@ -368,6 +368,8 @@ impl Inbox {
         });
         self.asks
             .retain(|id, _| state.decisions.iter().any(|decision| decision.id == *id));
+        self.requested_asks
+            .retain(|id| state.decisions.iter().any(|decision| decision.id == *id));
         self.ask_picks
             .retain(|id, _| state.decisions.iter().any(|decision| decision.id == *id));
         if self.input.as_ref().is_some_and(|input| {
@@ -4372,21 +4374,32 @@ mod tests {
     }
 
     #[test]
-    fn a_push_that_closes_the_row_drops_its_ask_and_pick() {
+    fn a_push_that_closes_the_row_drops_its_ask_pick_and_request_guard() {
         let state = ask_state();
         let mut inbox = selected(&state, 0);
         let (mut tx, _rx) = fake_sink();
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(inbox.take_pending_ask(&state).is_some());
         inbox.observe_ask(&ask_view());
         inbox.handle_key(&state, press('2'), &mut tx);
         assert!(inbox.asks.contains_key("human:borsuk:i142"));
+        assert!(inbox.requested_asks.contains("human:borsuk:i142"));
         assert!(inbox.ask_picks.contains_key("human:borsuk:i142"));
 
         let next = state_with(vec![Decision::release_gate("borsuk", vec![7], OPENED)]);
         inbox.observe(&next);
 
         assert!(inbox.asks.is_empty());
+        assert!(inbox.requested_asks.is_empty());
         assert!(inbox.ask_picks.is_empty());
+
+        let reopened = ask_state();
+        inbox.observe(&reopened);
+        inbox.handle_key(&reopened, press_code(KeyCode::Enter), &mut tx);
+        assert!(
+            inbox.take_pending_ask(&reopened).is_some(),
+            "a new row for the same item must fetch its new question"
+        );
     }
 
     #[test]
