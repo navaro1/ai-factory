@@ -1051,9 +1051,9 @@ impl Daemon {
     /// and waits for the exit; the exit reopens the task when messages
     /// remain. A task in `Queued` or `AwaitingUser` gets one run: the first
     /// message is the prompt, and the session id continues the old
-    /// conversation. The scheduler decides whether the run may start, so
-    /// stage limits, lane reservations, and pauses all apply to a follow-up
-    /// turn.
+    /// conversation. The pipeline order and scheduler decide whether the run
+    /// may start, so prior stages, limits, lane reservations, and pauses all
+    /// apply to a follow-up turn.
     fn resume_pending_chats(&mut self) {
         let ids: Vec<String> = self.pending_chats.keys().cloned().collect();
         for id in ids {
@@ -1071,6 +1071,9 @@ impl Daemon {
             if task.state.is_terminal() {
                 self.pending_chats.remove(&id);
                 eprintln!("the pending chat for {id}: the task is {}", task.state);
+                continue;
+            }
+            if self.prior_stage_active(&task) {
                 continue;
             }
             let session_id = match self.followup_session_id(&task) {
@@ -8331,7 +8334,7 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_to_the_implement_starts_while_the_refine_is_active() {
+    fn a_follow_up_to_the_implement_waits_while_the_refine_is_active() {
         for refine_state in [
             TaskState::Queued,
             TaskState::Running,
@@ -8382,9 +8385,18 @@ mod tests {
                 rig.daemon.input_mode(&task),
                 InputMode::Closed { .. }
             ));
-            rig.daemon
-                .chat("borsuk/implement-i142", "start from the specification");
+            rig.act(Action::Chat {
+                task: "borsuk/implement-i142".to_string(),
+                text: "start from the specification".to_string(),
+            });
 
+            let implement_runs = (0..rig.job_count())
+                .filter(|&index| rig.job(index).task == "borsuk/implement-i142")
+                .count();
+            assert_eq!(
+                implement_runs, 1,
+                "the implement follow-up waits for the refine state {refine_state:?}"
+            );
             assert_eq!(
                 rig.daemon
                     .pending_chats
@@ -8527,25 +8539,25 @@ mod tests {
             .review_tickets
             .insert("borsuk/review-p7".to_string(), BTreeSet::from([142]));
 
-        // Every stage appears: the refine stage and the ticket chat share
-        // the repository checkout, and every other stage owns one exclusive
-        // worktree whose key name matches the directory name on disk.
-        let cases = [
-            ("borsuk/refine-i142", Workspace::Shared),
-            ("borsuk/ticket-i142", Workspace::Shared),
-            (
+        // The stage walk keeps this test complete when the pipeline grows.
+        let stage_cases = Stage::ALL.map(|stage| match stage {
+            Stage::Refine => ("borsuk/refine-i142", Workspace::Shared),
+            Stage::Implement => (
                 "borsuk/implement-i142",
                 Workspace::Exclusive(WorktreeKey::Issue(142)),
             ),
-            (
+            Stage::Review => (
                 "borsuk/review-p7",
                 Workspace::Exclusive(WorktreeKey::Issue(142)),
             ),
+            Stage::Release => ("borsuk/release", Workspace::Exclusive(WorktreeKey::Train)),
+        });
+        let extra_cases = [
+            ("borsuk/ticket-i142", Workspace::Shared),
             ("borsuk/review-p8", Workspace::Exclusive(WorktreeKey::Pr(8))),
-            ("borsuk/release", Workspace::Exclusive(WorktreeKey::Train)),
         ];
         let checkout = rig_repo(&dir);
-        for (id, expected) in cases {
+        for (id, expected) in stage_cases.into_iter().chain(extra_cases) {
             let task = rig.task(id);
             assert_eq!(rig.daemon.workspace(&task), expected, "workspace of {id}");
             let expected_cwd = match &expected {
