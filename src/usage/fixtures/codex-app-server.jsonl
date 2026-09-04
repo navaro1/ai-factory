@@ -1,0 +1,2 @@
+{"id":1,"result":{"serverInfo":{"name":"codex-app-server","version":"0.6.0"}}}
+{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12.5,"windowDurationMins":300,"resetsAt":1788307200},"secondary":{"usedPercent":3.25,"windowDurationMins":10080,"resetsAt":1788912000}},"planType":"pro","rateLimitReachedType":null,"rateLimitResetCredits":{"availableCount":42},"credits":{"balance":18.5}}}
