@@ -18,7 +18,7 @@ refine ──▶ implement ──▶ review ──▶ release
 |---|---|---|
 | refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
-| review | OpenCode, GPT-5.6 | The agent reviews the change and marks the pull request ready. |
+| review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
 
 A release train is one batch of one or more pull requests. The factory merges
@@ -160,6 +160,27 @@ Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` fo
 
 `aif doctor` checks each configured harness program once. It applies the Claude version floor only to Claude roles.
 
+### Stop the daemon and update
+
+`aif stop` sends the stop action to the daemon. The daemon stops every live
+agent session, waits for the exits, writes its state, and exits. The wait can
+take up to 40 seconds.
+
+The same exit path serves a logout, a reboot, `systemctl --user stop
+aif-daemon`, and `Ctrl-C` on a foreground `aifd run`. Each one sends a signal
+that the daemon turns into the same stop action.
+
+To update AI Factory, run:
+
+```sh
+aif stop
+./install.sh
+aif
+```
+
+The factory resumes: pause marks, attempt counts, queued messages, stuck
+rows, and the tasks that ran at the stop come back.
+
 ### Start paused
 
 `--paused` starts a new daemon with the factory paused. The daemon polls,
@@ -180,7 +201,8 @@ A queued ticket that a pause blocks shows `paused` instead of `queued`.
 
 ## The five views
 
-Keys `1` through `5` switch the views. `!` opens the oldest inbox row.
+Keys `1` through `5` switch the views. `!` opens the oldest inbox row,
+except while an open text input takes the `!` as a typed character.
 `?` opens the help overlay. `q` quits the UI.
 The status bar of every view shows the open decision count.
 
@@ -243,7 +265,8 @@ task, and the bar never promises what the daemon refuses:
   output again.
 - The chat bar holds the keyboard while it is focused. Press `esc` or
   `tab` to release it, `h` and `l` to move to the previous or next live
-  session, and `i` or `enter` to take the keyboard back.
+  session, and `i` or `enter` to take the keyboard back. A focused and
+  open bar takes `!` as text; a released bar leaves `!` to the shell.
 - A bar that cannot take a message holds no keyboard. With no shown task,
   a closed input, or a released focus, keys `1` through `5` switch the
   views and `?` opens the help.
@@ -331,15 +354,41 @@ The Settings view edits all six execution roles. It supports global and reposito
 | Key | Action |
 |---|---|
 | `h` / `l` | Select the global or repository scope. |
-| `j` / `k` | Select a role. |
+| `j` / `k` | Select a role, or a row inside an open list. |
 | `Tab` | Select a field. |
-| `Enter` | Edit text or select a value. |
+| `Enter` | Open the value list of the field, or apply the marked row. |
 | `d` | Remove the selected repository override. |
 | `s` | Save the draft. |
 | `r` | Reload the file. |
-| `Esc` | Cancel an edit or confirm draft removal. |
+| `Esc` | Close a list, cancel an edit, or confirm draft removal. |
 
-Argument and tool lists use a row editor. Narrow terminals stack the role list above the form.
+`Enter` opens a value list on these fields: `harness`, `program`, `model`,
+`effort`, `agent`, `profile`, `permission mode`, `permission handler`,
+`approval policy`, and `sandbox`. The list starts on the current value. Type
+to filter the rows, `Backspace` shortens the filter, `Enter` applies the
+marked row, and `Esc` closes the list without a change.
+
+The candidates join three sources: the fixed values the harness documents,
+the values the pushed settings state holds for the same field and harness,
+and the discovered OpenCode models. `aif` runs `opencode models` once in the
+background at start. The model list of an OpenCode role shows
+`discovering models...` until the result arrives, and one dim reason row
+when the probe fails. The state values and the custom row stay available.
+
+An optional field starts with a `(none)` row that clears the field. The open
+fields (`program`, `model`, `effort`, `agent`, `profile`,
+`permission handler`) end with a `custom value...` row that opens the text
+box, so no legal value becomes unreachable. `strict MCP` and `auto approve`
+stay toggles. The argument and tool lists keep the row editor, and `limit`
+keeps the text box.
+
+A harness change sets the program, picks a default model, and clears every
+field of the old harness. `auto approve` turns off under OpenCode. One
+notice line under the form names the new harness and every field that the
+change reset. The line disappears at a save, a reload, a draft discard, or
+the next harness change.
+
+Narrow terminals stack the role list above the form.
 The daemon rejects a stale save if the file changed after the draft loaded.
 Repository topology changes require a daemon restart.
 
@@ -349,16 +398,28 @@ Repository topology changes require a daemon restart.
   record.
 - The worktree of each issue carries the agent session id and the last
   reviewed commit as marker files.
-- `state.json` holds runtime overrides, role bindings, release times, and ticket chat metadata.
+- `state.json` holds runtime overrides, role bindings, release times, and
+  ticket chat metadata.
+- `state.json` also holds one `runtime` object. It carries the pause marks,
+  the task table with its attempt counts, the queued chat messages, the
+  review ticket sets, the release batches, and the stuck rows. The daemon
+  writes the object with every drive, so a crash keeps a snapshot that is at
+  most one drive old.
 - Task logs hold the full transcripts.
-- After a restart, the first poll rebuilds everything. Work resumes in
-  place.
+- After a restart, the first poll rebuilds everything from GitHub, and the
+  runtime object restores the rest. A task that ran at the stop becomes
+  queued again and resumes its agent session. Its first prompt carries a
+  short notice about the restart.
+- The stop sequence stops every live agent session before the daemon exits,
+  so no agent process stays behind as an orphan.
 
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
-- A restart kills the agent processes of the running tasks. The gates
-  re-open that work at the next poll.
+- An interrupted turn restarts from the stage prompt plus the restart
+  notice. The agent reads the worktree to find its place.
+- A `SIGKILL` or a power loss keeps the snapshot of the last drive, not of
+  the last event.
 - Anyone who can set the trigger labels on a repository can start work
   there.
 - A permission answer is valid for one request only. You answer the same
@@ -366,6 +427,8 @@ Repository topology changes require a daemon restart.
 - An implement or review turn that already runs can not change course. A
   message waits for the next turn.
 - A release gate row refreshes at the poll after you stack a pull request.
+- A review push on a draft pull request can restart that review at the next
+  poll.
 
 ## Development
 
