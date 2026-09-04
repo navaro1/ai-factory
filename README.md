@@ -217,6 +217,14 @@ The release lane puts the next, active, or retry batch inside a border.
 The waiting pull requests start below the border.
 The oldest request is at the top, and the newest request is at the bottom.
 
+One piece of work holds one row. A finished task loses its row as soon as a
+later lane shows the same work: a done refine yields to its implement, a done
+implement yields to the review of its pull request, and a done review yields
+to the release train that holds that pull request. A failed task keeps its row
+until a later lane picks the work up, so you can always retry it. The daemon
+drops the tasks of an issue or a pull request that left GitHub, so a merge
+leaves no row behind.
+
 | Key | Action |
 |---|---|
 | `j` / `k` or Up / Down | Move the selection inside a lane. |

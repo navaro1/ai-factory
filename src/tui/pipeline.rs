@@ -85,7 +85,9 @@ pub(super) fn rows(state: &StateView) -> Vec<Row> {
                 .tasks
                 .iter()
                 .enumerate()
-                .filter(|(_, task)| task.stage == stage && task.repo == repo.alias)
+                .filter(|(_, task)| {
+                    task.stage == stage && task.repo == repo.alias && !superseded(state, task)
+                })
                 .map(|(index, _)| index)
                 .collect();
             let train = (stage == Stage::Release)
@@ -203,8 +205,14 @@ fn release_batch_task_id(train: &crate::sock::TrainView) -> Option<String> {
 }
 
 /// True when the stage shows no repository group and no train.
+///
+/// The count covers only the tasks the board draws, so a stage whose last
+/// terminal task a later lane shows counts as empty.
 fn stage_is_empty(state: &StateView, stage: Stage) -> bool {
-    let any_task = state.tasks.iter().any(|task| task.stage == stage);
+    let any_task = state
+        .tasks
+        .iter()
+        .any(|task| task.stage == stage && !superseded(state, task));
     let any_train = stage == Stage::Release && !state.trains.is_empty();
     !any_task && !any_train
 }
@@ -1072,12 +1080,9 @@ fn release_lane_lines(
             &mut lines,
         );
         let Some(train) = train else {
-            for (index, _) in state
-                .tasks
-                .iter()
-                .enumerate()
-                .filter(|(_, task)| task.stage == Stage::Release && task.repo == repo.alias)
-            {
+            for (index, _) in state.tasks.iter().enumerate().filter(|(_, task)| {
+                task.stage == Stage::Release && task.repo == repo.alias && !superseded(state, task)
+            }) {
                 let row = Row::Ticket { index };
                 push_row_line(state, all, selected, &row, now_ms, &mut lines);
             }
@@ -1192,6 +1197,7 @@ fn release_lane_lines(
             task.stage == Stage::Release
                 && task.repo == repo.alias
                 && Some(task.id.as_str()) != batch_task.as_deref()
+                && !superseded(state, task)
         }) {
             let row = Row::Ticket { index };
             push_row_line(state, all, selected, &row, now_ms, &mut lines);
@@ -1493,6 +1499,68 @@ fn linked_prs(state: &StateView, repo: &str, ticket: u64) -> Vec<u64> {
         .filter(|link| link.repo == repo && link.ticket == ticket)
         .map(|link| link.pr)
         .collect()
+}
+
+/// True when the release train of `repo` holds this pull request.
+///
+/// The queue, the stacked cache, and the active or retry batch all keep the
+/// pull request on the board, so the release lane already shows the work.
+fn train_holds(state: &StateView, repo: &str, pr: u64) -> bool {
+    state.trains.iter().any(|train| {
+        train.repo == repo
+            && (train.queue.contains(&pr)
+                || train.stacked.contains(&pr)
+                || train.batch.contains(&pr))
+    })
+}
+
+/// True when a review task of `repo` covers pull request `pr`.
+fn review_task_exists(state: &StateView, repo: &str, pr: u64) -> bool {
+    state.tasks.iter().any(|task| {
+        task.stage == Stage::Review
+            && task.repo == repo
+            && task.kind == ItemKind::Pr
+            && task.number == pr
+    })
+}
+
+/// True when a later lane already shows this piece of work.
+///
+/// A non-terminal task always keeps its row: only a task that reached `Done`
+/// or `Failed` can lose it. A terminal task loses its row when the board
+/// draws the same work in a later lane. The rule is a presentation rule, so
+/// the daemon keeps the task and every view that resolves it by id still
+/// works.
+fn superseded(state: &StateView, task: &TaskView) -> bool {
+    if !task.state.is_terminal() {
+        return false;
+    }
+    let linked_lanes_hold =
+        |pr: u64| review_task_exists(state, &task.repo, pr) || train_holds(state, &task.repo, pr);
+    match task.stage {
+        Stage::Refine => {
+            state.tasks.iter().any(|later| {
+                later.repo == task.repo
+                    && later.id != task.id
+                    && later.kind == ItemKind::Issue
+                    && later.number == task.number
+                    && later.stage != Stage::Refine
+            }) || linked_prs(state, &task.repo, task.number)
+                .iter()
+                .copied()
+                .any(linked_lanes_hold)
+        }
+        Stage::Implement => linked_prs(state, &task.repo, task.number)
+            .iter()
+            .copied()
+            .any(linked_lanes_hold),
+        Stage::Review => train_holds(state, &task.repo, task.number),
+        Stage::Release => state
+            .trains
+            .iter()
+            .find(|train| train.repo == task.repo)
+            .is_some_and(|train| train.in_flight.is_none() && train.batch.is_empty()),
+    }
 }
 
 /// The ticket numbers linked to one PR, ascending.
@@ -2311,6 +2379,346 @@ mod tests {
         assert_eq!(text.matches("queued · i142").count(), 1, "board:\n{text}");
         assert_eq!(text.matches("· i140").count(), 1, "board:\n{text}");
         assert!(text.contains("running · p5"), "release task:\n{text}");
+    }
+
+    /// A view with the sample repositories and an otherwise empty board.
+    fn minimal_view() -> StateView {
+        let mut state = sample_view();
+        state.tasks.clear();
+        state.trains.clear();
+        state.links.clear();
+        state
+    }
+
+    /// The ids of the tasks the board draws, in row order.
+    fn shown_ticket_ids(state: &StateView) -> Vec<String> {
+        rows(state)
+            .iter()
+            .filter_map(|row| match row {
+                Row::Ticket { index } => state.tasks.get(*index).map(|task| task.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One release train view with the given holds and no batch in flight.
+    fn train(repo: &str, queue: Vec<u64>, stacked: Vec<u64>, batch: Vec<u64>) -> TrainView {
+        TrainView {
+            repo: repo.to_string(),
+            queue,
+            stacked,
+            batch,
+            policy: ReleasePolicy::Manual,
+            next_fire_ms: None,
+            in_flight: None,
+        }
+    }
+
+    #[test]
+    fn a_done_refine_row_yields_to_the_implement_lane() {
+        let mut state = minimal_view();
+        state.tasks = vec![
+            task(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                TaskState::Done,
+                1,
+            ),
+            task(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                TaskState::Queued,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            shown_ticket_ids(&state),
+            vec!["borsuk/implement-i142".to_string()]
+        );
+        assert!(stage_is_empty(&state, Stage::Refine));
+
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("no tasks"), "refine lane:\n{text}");
+        assert!(text.contains("queued · i142"), "board:\n{text}");
+        assert_eq!(text.matches("· i142").count(), 1, "board:\n{text}");
+    }
+
+    #[test]
+    fn a_linked_review_row_hides_a_done_implement_row() {
+        let mut state = minimal_view();
+        state.tasks = vec![
+            task(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                TaskState::Done,
+                1,
+            ),
+            task(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Pr,
+                7,
+                TaskState::Queued,
+                1,
+            ),
+        ];
+        state.links = vec![link("borsuk", 142, 7)];
+
+        assert_eq!(
+            shown_ticket_ids(&state),
+            vec!["borsuk/review-p7".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_train_holding_the_pr_hides_a_done_review_row() {
+        for holds in [
+            // In the queue only.
+            train("borsuk", vec![7], Vec::new(), Vec::new()),
+            // In the stacked cache only.
+            train("borsuk", Vec::new(), vec![7], Vec::new()),
+            // In the batch only.
+            train("borsuk", Vec::new(), Vec::new(), vec![7]),
+        ] {
+            let mut state = minimal_view();
+            state.tasks = vec![task(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Pr,
+                7,
+                TaskState::Done,
+                1,
+            )];
+            state.trains = vec![holds];
+
+            assert!(
+                shown_ticket_ids(&state).is_empty(),
+                "the review row must vanish"
+            );
+
+            let mut app = App {
+                state: Some(state),
+                connected: true,
+                ..App::default()
+            };
+            let text = render_to_string(&mut app);
+            assert!(text.contains("#7"), "release lane:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_train_that_holds_the_linked_pr_hides_a_done_implement_row() {
+        // The review task already ended and retired, so only the train
+        // reports the work. The link is the sole path from issue to lane.
+        let mut state = minimal_view();
+        state.tasks = vec![task(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            TaskState::Done,
+            1,
+        )];
+        state.links = vec![link("borsuk", 142, 7)];
+        state.trains = vec![train("borsuk", vec![7], Vec::new(), Vec::new())];
+
+        assert!(shown_ticket_ids(&state).is_empty());
+        assert!(stage_is_empty(&state, Stage::Implement));
+    }
+
+    #[test]
+    fn a_linked_later_lane_hides_a_done_refine_row_without_an_implement_task() {
+        // No implement task exists, so the first clause of the refine rule
+        // matches nothing. The link to a pull request in a later lane must
+        // still hide the row.
+        let review = task(
+            "borsuk",
+            Stage::Review,
+            ItemKind::Pr,
+            7,
+            TaskState::Queued,
+            1,
+        );
+        for (tasks, trains) in [
+            (vec![review.clone()], Vec::new()),
+            (
+                Vec::new(),
+                vec![train("borsuk", vec![7], Vec::new(), Vec::new())],
+            ),
+        ] {
+            let mut state = minimal_view();
+            state.tasks = vec![task(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                TaskState::Done,
+                1,
+            )];
+            state.tasks.extend(tasks);
+            state.links = vec![link("borsuk", 142, 7)];
+            state.trains = trains;
+
+            assert!(
+                !shown_ticket_ids(&state).contains(&"borsuk/refine-i142".to_string()),
+                "the refine row must yield to the linked lane"
+            );
+            assert!(stage_is_empty(&state, Stage::Refine));
+        }
+    }
+
+    #[test]
+    fn an_unlinked_pull_request_leaves_a_done_implement_row_alone() {
+        // The train holds pull request 7, but no link joins it to issue
+        // 142, so the board still owes the human that implement row.
+        let mut state = minimal_view();
+        state.tasks = vec![task(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            TaskState::Done,
+            1,
+        )];
+        state.trains = vec![train("borsuk", vec![7], Vec::new(), Vec::new())];
+
+        assert_eq!(
+            shown_ticket_ids(&state),
+            vec!["borsuk/implement-i142".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_failed_review_row_stays_while_no_train_holds_the_pr() {
+        let mut state = minimal_view();
+        state.tasks = vec![task(
+            "borsuk",
+            Stage::Review,
+            ItemKind::Pr,
+            9,
+            TaskState::Failed("exit 1".to_string()),
+            1,
+        )];
+
+        assert_eq!(
+            shown_ticket_ids(&state),
+            vec!["borsuk/review-p9".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_running_refine_row_stays_beside_an_implement_task() {
+        let mut state = minimal_view();
+        state.tasks = vec![
+            task(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                TaskState::Running,
+                1,
+            ),
+            task(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                TaskState::Queued,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            shown_ticket_ids(&state),
+            vec![
+                "borsuk/refine-i142".to_string(),
+                "borsuk/implement-i142".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_idle_train_hides_a_done_release_row_but_a_retry_batch_keeps_its_row() {
+        // A closed train shows no release task row.
+        let mut state = minimal_view();
+        let mut done = task(
+            "borsuk",
+            Stage::Release,
+            ItemKind::Pr,
+            5,
+            TaskState::Done,
+            1,
+        );
+        done.id = crate::tasks::scoped_id("borsuk", "release");
+        state.tasks = vec![done];
+        state.trains = vec![train("borsuk", Vec::new(), Vec::new(), Vec::new())];
+
+        assert!(shown_ticket_ids(&state).is_empty());
+
+        // A saved retry batch draws its release task inside the border.
+        let mut state = minimal_view();
+        let mut failed = task(
+            "borsuk",
+            Stage::Release,
+            ItemKind::Pr,
+            5,
+            TaskState::Failed("merge failed".to_string()),
+            1,
+        );
+        failed.id = crate::tasks::scoped_id("borsuk", "release");
+        state.tasks = vec![failed];
+        state.trains = vec![train("borsuk", Vec::new(), Vec::new(), vec![5])];
+
+        assert_eq!(shown_ticket_ids(&state), vec!["borsuk/release".to_string()]);
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_string(&mut app);
+        assert!(text.contains("RETRY REQUIRED"), "board:\n{text}");
+        assert!(text.contains("failed · p5"), "batch border:\n{text}");
+    }
+
+    #[test]
+    fn the_key_of_a_hidden_task_selects_nothing() {
+        let mut state = minimal_view();
+        state.tasks = vec![
+            task(
+                "borsuk",
+                Stage::Refine,
+                ItemKind::Issue,
+                142,
+                TaskState::Done,
+                1,
+            ),
+            task(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                TaskState::Queued,
+                1,
+            ),
+        ];
+        let key = RowKey::Ticket("borsuk/refine-i142".to_string());
+
+        assert_eq!(selection_for_key(&state, &key), Selection::None);
+        assert!(!rows(&state)
+            .iter()
+            .any(|row| matches!(row, Row::Ticket { index: 0 })));
     }
 
     #[test]
