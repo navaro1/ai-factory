@@ -1136,16 +1136,32 @@ struct QuestionView {
     multi_select: bool,
 }
 
-/// Parse the `questions` array of a `Question` decision.
+/// Parse the questions of a `Question` decision.
+///
+/// The payload carries the question list in one of two shapes, and the
+/// reader accepts both, whichever harness recorded it. A bare array is the
+/// list itself. An object is the whole tool input, so the list sits under
+/// its `questions` key. The claude runner stores the tool input verbatim,
+/// so the object shape is the one the daemon writes today.
 ///
 /// An entry can omit a question text, a header, or readable option labels.
-/// The parser uses the data that the entry contains. A value that is not an
-/// array produces no questions.
+/// The parser uses the data that the entry contains. Every other value
+/// produces no questions.
 fn parse_questions(value: &serde_json::Value) -> Vec<QuestionView> {
-    let Some(entries) = value.as_array() else {
+    let Some(entries) = question_entries(value) else {
         return Vec::new();
     };
     entries.iter().filter_map(parse_question).collect()
+}
+
+/// Find the question list inside one `Question` decision payload.
+///
+/// The list is the value itself when the value is an array. Otherwise the
+/// list is the `questions` member of the value.
+fn question_entries(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    value
+        .as_array()
+        .or_else(|| value.get("questions").and_then(serde_json::Value::as_array))
 }
 
 /// Parse one question object of the array.
@@ -1686,7 +1702,7 @@ fn draw_detail(
             };
             (title, lines)
         }
-        None => agent_detail_lines(state, decision, now_ms, width),
+        None => agent_detail_lines(state, inbox, decision, now_ms, width),
     };
     let scroll = clamped_detail_scroll(detail, lines.len(), rows[0]);
     let content = Paragraph::new(Text::from(lines))
@@ -1867,8 +1883,13 @@ fn clamped_detail_scroll(detail: &DetailState, line_count: usize, area: Rect) ->
 }
 
 /// Build the initial task context screen until transcript context is available.
+///
+/// The screen repeats the choices of the row, so the human can pick an
+/// option from the context screen as well as from the feed. The footer
+/// names the keys that act on them.
 fn agent_detail_lines(
     state: &StateView,
+    inbox: &Inbox,
     decision: &Decision,
     now_ms: u64,
     width: usize,
@@ -1885,6 +1906,17 @@ fn agent_detail_lines(
         "",
         Style::default().fg(THEME.text).add_modifier(Modifier::BOLD),
     );
+    let choices = choice_lines(
+        state,
+        decision,
+        inbox,
+        width,
+        Style::default().fg(THEME.text),
+    );
+    if !choices.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(choices);
+    }
     lines.push(Line::from(""));
     lines.push(Line::styled("Recent agent context", THEME.dim()));
     let Some(task_id) = task_id(decision) else {
@@ -3460,6 +3492,124 @@ mod tests {
 
         assert_eq!(parsed[0].key, "Storage");
         assert_eq!(parsed[1].key, "Which cache?");
+    }
+
+    /// The `AskUserQuestion` input as the claude runner records it: the
+    /// whole tool input, so the question list sits under `questions`.
+    fn recorded_tool_input() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "A Failed prior task: does it block the next stage?",
+                "header": "Gate rule",
+                "options": [
+                    {"label": "Split by stage", "description": "a terminal refine frees implement"},
+                    {"label": "main wins", "description": "a failed refine blocks implement"},
+                ],
+                "multiSelect": false,
+            }]
+        })
+    }
+
+    #[test]
+    fn parse_questions_reads_a_bare_array_and_a_recorded_tool_input() {
+        let bare = parse_questions(&serde_json::json!([
+            {"question": "Which database?", "header": "Storage", "options": []},
+        ]));
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].key, "Storage");
+
+        let recorded = parse_questions(&recorded_tool_input());
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].key, "Gate rule");
+        assert_eq!(recorded[0].options.len(), 2);
+        assert_eq!(recorded[0].options[0].0, "Split by stage");
+        assert!(!recorded[0].multi_select);
+
+        // Every other shape carries no question list.
+        for other in [
+            serde_json::json!(null),
+            serde_json::json!("no"),
+            serde_json::json!({"questions": "no"}),
+            serde_json::json!({}),
+        ] {
+            assert!(parse_questions(&other).is_empty(), "shape: {other}");
+        }
+    }
+
+    #[test]
+    fn a_recorded_tool_input_question_shows_its_options_and_submits_a_pick() {
+        let decision = Decision::question(&worker(), "req-ask", recorded_tool_input(), OPENED);
+        let state = state_with(vec![decision]);
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(
+            !screen.contains("unreadable"),
+            "the options must read: {screen}"
+        );
+        assert!(
+            screen.contains("A Failed prior task: does it block the next stage?"),
+            "message: {screen}"
+        );
+        assert!(screen.contains("1. [ ] Split by stage"), "screen: {screen}");
+        assert!(screen.contains("2. [ ] main wins"), "screen: {screen}");
+
+        inbox.handle_key(&state, press('1'), &mut tx);
+        assert!(
+            render(&state, &inbox, OPENED).contains("1. [x] Split by stage"),
+            "the pick must show"
+        );
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "perm:borsuk/implement-i142:req-ask".to_string(),
+                response: Response::Answers {
+                    updated_input: serde_json::json!({
+                        "answers": {"Gate rule": "Split by stage"},
+                    }),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn the_question_context_screen_shows_the_options_and_takes_a_pick() {
+        let decision = Decision::question(&worker(), "req-ask", recorded_tool_input(), OPENED);
+        let state = state_with(vec![decision]);
+        let (mut tx, rx) = fake_sink();
+        let mut inbox = selected(&state, 0);
+
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        assert!(inbox.detail_open());
+
+        let screen = render(&state, &inbox, OPENED);
+        assert!(screen.contains("QUESTION · borsuk"), "title: {screen}");
+        assert!(screen.contains("1. [ ] Split by stage"), "screen: {screen}");
+        assert!(screen.contains("2. [ ] main wins"), "screen: {screen}");
+        assert!(
+            screen.contains("1-9 pick · s submit"),
+            "footer names the keys: {screen}"
+        );
+
+        inbox.handle_key(&state, press('2'), &mut tx);
+        assert!(
+            render(&state, &inbox, OPENED).contains("2. [x] main wins"),
+            "the context screen shows the pick"
+        );
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Action::Answer {
+                decision_id: "perm:borsuk/implement-i142:req-ask".to_string(),
+                response: Response::Answers {
+                    updated_input: serde_json::json!({"answers": {"Gate rule": "main wins"}}),
+                },
+            }
+        );
     }
 
     #[test]
