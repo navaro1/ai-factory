@@ -796,6 +796,7 @@ impl Daemon {
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
         }
+        self.retire_absent_items(repo, &fresh);
         self.complete_parked_refines(repo, &fresh);
         if !unchanged {
             self.reconcile_unready(repo, &fresh);
@@ -818,7 +819,9 @@ impl Daemon {
     /// snapshot, so a task whose issue or pull request closed while the
     /// daemon was down only meets its end here. Release tasks stay out:
     /// the train, not one pull request, is their unit. Ticket sessions
-    /// carry item number 0 and stay out for the same reason.
+    /// carry item number 0 and stay out for the same reason. The cancel
+    /// stops the live session; [`Daemon::retire_absent_items`] then drops
+    /// the task in the same poll.
     fn cancel_absent_restored(&mut self, repo: &str, fresh: &RepoSnapshot) {
         let ids: Vec<String> = self
             .table
@@ -940,6 +943,49 @@ impl Daemon {
                     .trains
                     .values()
                     .any(|train| train.in_flight.as_deref() == Some(task.id.as_str()))
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        for id in ids {
+            self.retire_task(&id);
+        }
+    }
+
+    /// Drop every terminal pipeline task whose item is no longer open.
+    ///
+    /// [`Daemon::reconcile_removed`] compares two snapshots, so it sees only
+    /// the poll that watches an item leave. The daemon saves no snapshot, so
+    /// a restart forgets every earlier item. A pull request merged while the
+    /// daemon was down therefore never meets that path, and its done task
+    /// keeps a stale board row for ever. This sweep needs no earlier
+    /// snapshot: it reads the fresh one alone, so it also clears the rows a
+    /// restart carried over. It runs on every poll and repeats without
+    /// effect.
+    ///
+    /// The sweep drops no active task. A live session ends through
+    /// [`Daemon::cancel_absent_restored`] or [`Daemon::cancel_item_tasks`],
+    /// which run first and make the task terminal. The purpose keeps a
+    /// ticket chat and a ticket-creation session, and the in-flight guard
+    /// keeps the release task that a train still holds.
+    fn retire_absent_items(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let ids: Vec<String> = self
+            .table
+            .by_id
+            .values()
+            .filter(|task| task.repo == repo && task.state.is_terminal())
+            .filter(|task| task.purpose == TaskPurpose::Pipeline)
+            .filter(|task| {
+                !self
+                    .trains
+                    .values()
+                    .any(|train| train.in_flight.as_deref() == Some(task.id.as_str()))
+            })
+            .filter(|task| match task.kind {
+                ItemKind::Issue => fresh
+                    .issues
+                    .get(&task.number)
+                    .is_none_or(|issue| !issue.open),
+                ItemKind::Pr => fresh.prs.get(&task.number).is_none_or(|pr| !pr.open),
             })
             .map(|task| task.id.clone())
             .collect();
@@ -5954,7 +6000,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_task_of_a_closed_issue_is_cancelled_at_the_first_poll() {
+    fn a_restored_task_of_a_closed_issue_is_retired_at_the_first_poll() {
         let dir = temp_root();
         let worktree = issue_wt(&dir, 142);
         {
@@ -5974,12 +6020,44 @@ mod tests {
         );
         second.poll(vec![], vec![]);
 
-        assert_eq!(
-            second.task("borsuk/implement-i142").state,
-            TaskState::Failed("cancelled".to_string()),
-            "the first poll cancels the restored task of the closed issue"
+        assert!(
+            !second
+                .daemon
+                .table
+                .by_id
+                .contains_key("borsuk/implement-i142"),
+            "the first poll cancels and then retires the restored task of the closed issue"
         );
         assert_eq!(second.job_count(), 0);
+    }
+
+    #[test]
+    fn a_restored_done_review_of_a_merged_pr_is_retired_at_the_first_poll() {
+        let dir = temp_root();
+        {
+            let steps =
+                fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
+            first.poll(vec![], vec![pr(5, true, &[])]);
+            first.poll(vec![], vec![pr(5, false, &[])]);
+            first.event(turn_finished("borsuk/review-p5", true, "approved"));
+            assert_eq!(first.task("borsuk/review-p5").state, TaskState::Done);
+        }
+
+        let mut second = Rig::make_in(dir, vec![], |_| {});
+        second.drive();
+        assert!(
+            second.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the restore carries the done review task over"
+        );
+
+        second.poll(vec![], vec![]);
+
+        assert!(
+            !second.daemon.table.by_id.contains_key("borsuk/review-p5"),
+            "the first poll retires the done review of the merged pull request, \
+             although no earlier snapshot names it"
+        );
     }
 
     #[test]
