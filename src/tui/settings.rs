@@ -3921,6 +3921,31 @@ mod tests {
         assert!(text(&settings, &state, 100, 30).contains("prompt saved"));
     }
 
+    /// A daemon that sends no prompt leaves the row readable and every
+    /// prompt key inert. The wire revision refuses such a daemon, so this
+    /// is the last guard, not the first.
+    #[test]
+    fn a_state_without_prompts_shows_the_row_and_refuses_every_prompt_key() {
+        let mut state = state();
+        state.settings.prompts.clear();
+        let mut settings = Settings::default();
+        settings.set_field(Field::Prompt);
+        assert_eq!(settings.selected_field_for(Some(&state)), Field::Prompt);
+        assert!(text(&settings, &state, 100, 30).contains("unavailable; restart the daemon"));
+
+        assert!(settings.handle_key(&state, key(KeyCode::Enter)).is_none());
+        assert!(!settings.typing(), "no editor opens without a prompt");
+        assert!(text(&settings, &state, 100, 30).contains("the daemon sent no prompt"));
+
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .is_none());
+        assert!(text(&settings, &state, 100, 30).contains("the daemon sent no prompt"));
+    }
+
     /// A result belongs to the editor that sent it. A result for another
     /// request must never close a buffer full of typed text.
     #[test]
