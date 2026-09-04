@@ -1301,6 +1301,7 @@ mod tests {
                     group: TicketGroup::ToRefine,
                 },
             ],
+            prs: Vec::new(),
             trains: Vec::new(),
             paused: PausedView {
                 global: false,
