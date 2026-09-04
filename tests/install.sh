@@ -51,6 +51,8 @@ grep -Fq '| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave
     "${config_dir}/prompts/refine.md"
 grep -Fq 'start all agents for that wave in one tool turn' \
     "${config_dir}/prompts/implement.md"
+grep -Fq 'Push once, at the end of the run' \
+    "${config_dir}/prompts/review.md"
 
 for file in factory.example.toml factory.toml; do
     grep -q '/home/you/Workplace/borsuk' "${config_dir}/${file}" || {
