@@ -128,6 +128,10 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
                 }
                 break;
             }
+            ProcEvent::StderrLine(_) => {
+                // Codex speaks its protocol on stdout; the stderr tee already
+                // reached the task log, and codex never asks.
+            }
             ProcEvent::Error(message) => eprintln!("task {task}: {message}"),
             ProcEvent::Stopped(outcome) => {
                 eprintln!("task {task}: unexpected codex stop outcome: {outcome:?}")
@@ -318,6 +322,7 @@ mod tests {
             resume: resume.map(String::from),
             yolo: false,
             allowed_tools: None,
+            allowed_permissions: Vec::new(),
         }
     }
 

@@ -700,6 +700,11 @@ impl SessionWorker {
             };
             let keep_going = match message {
                 WorkerMsg::Proc(ProcEvent::Line(line)) => self.on_line(&line),
+                WorkerMsg::Proc(ProcEvent::StderrLine(_)) => {
+                    // claude speaks its protocol on stdout; the stderr tee
+                    // already reached the task log.
+                    true
+                }
                 WorkerMsg::Proc(ProcEvent::Exit { code, ok }) => {
                     self.on_exit(code, ok, &mut exit_sent)
                 }
@@ -1042,6 +1047,7 @@ not json at all
             resume: resume.map(String::from),
             yolo,
             allowed_tools: None,
+            allowed_permissions: Vec::new(),
         }
     }
 
