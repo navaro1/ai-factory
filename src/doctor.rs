@@ -172,8 +172,9 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
                 label: "config".to_string(),
                 status: Status::Pass,
                 detail: format!(
-                    "{} parses, {} repositories",
+                    "{} parses, schema {}, {} repositories",
                     env.config_path.display(),
+                    config.schema_version,
                     config.repos.len()
                 ),
             });
@@ -2355,6 +2356,13 @@ mod tests {
             .find(|check| check.label == "config")
             .expect("the config check must exist");
         assert_eq!(config.status, Status::Pass);
+        assert_eq!(
+            config.detail,
+            format!(
+                "{} parses, schema 1, 1 repositories",
+                fx.config_path.display()
+            )
+        );
         let acme = checks
             .iter()
             .find(|check| check.label == "repo acme")
