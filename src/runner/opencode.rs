@@ -6,8 +6,12 @@
 //! assistant text, a part with type `tool` carries tool activity, and a
 //! `step_finish` line ends one step. One run can carry several steps, so a
 //! step ending is not the task ending; the task ends only when the process
-//! exits, as [`RunEvent::Exit`]. A malformed or unknown line is logged and
-//! skipped, never fatal.
+//! exits, as [`RunEvent::Exit`]. That exit reports success only when the run
+//! also reached the end of the agent loop: a child that exits while its last
+//! step still waits for tool results stopped in the middle of the task, so
+//! the exit reports a failure and the daemon retries the task instead of
+//! completing it. A malformed or unknown line is logged and skipped, never
+//! fatal.
 //!
 //! opencode without `--auto` cannot ask through stdout: it prints every
 //! permission ask on stderr and auto-rejects it. This runner reads those
@@ -32,6 +36,12 @@ const PROGRAM: &str = "opencode";
 
 /// The summary length limit for a tool part without a usable title.
 const SUMMARY_CHARS: usize = 120;
+
+/// The step reason opencode reports when the model asked for another tool.
+const TOOL_CALLS_REASON: &str = "tool-calls";
+
+/// The step reason opencode reports for an agent-side error.
+const ERROR_REASON: &str = "error";
 
 /// The environment variable that carries the inline permissions config.
 ///
@@ -230,7 +240,15 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
                 }
             }
             ProcEvent::Exit { code, ok } => {
+                let failed_step = parser.failed;
+                let unfinished = parser.unfinished();
                 let detail = match code {
+                    Some(code) if ok && failed_step => {
+                        format!("opencode reported a failed step before exit code {code}")
+                    }
+                    Some(code) if ok && unfinished => {
+                        format!("opencode exited with code {code} before the agent finished")
+                    }
                     Some(code) => format!("opencode exited with code {code}"),
                     None => "opencode was killed by a signal".to_string(),
                 };
@@ -238,7 +256,7 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
                 if tx
                     .send(RunEvent::Exit {
                         task: task.clone(),
-                        ok,
+                        ok: ok && !failed_step && !unfinished,
                         detail,
                     })
                     .is_err()
@@ -324,12 +342,15 @@ fn parse_auto_reject(line: &str) -> Option<(String, Vec<String>)> {
 /// The NDJSON parser for one opencode run.
 ///
 /// It holds the run-wide state: the task id stamped on every event, whether
-/// `Started` went out, and the first session id the output carried.
+/// `Started` went out, the first session id the output carried, whether one
+/// step reported an error, and the reason of the last step that finished.
 #[derive(Debug, Clone)]
 struct NdjsonParser {
     task: String,
     started: bool,
     session_id: Option<String>,
+    failed: bool,
+    last_reason: Option<String>,
 }
 
 impl NdjsonParser {
@@ -339,7 +360,23 @@ impl NdjsonParser {
             task: task.as_ref().to_string(),
             started: false,
             session_id: None,
+            failed: false,
+            last_reason: None,
         }
+    }
+
+    /// Whether the run stopped in the middle of the agent loop.
+    ///
+    /// opencode ends a step with the reason `tool-calls` when the model
+    /// asked for another tool, and the next step carries the answer. A run
+    /// that delivered its answer ends its last step with another reason,
+    /// such as `stop`. So a child that exits while its last step still
+    /// waits for tool results, or that never finished one step, stopped
+    /// before the agent did the work the prompt asked for.
+    fn unfinished(&self) -> bool {
+        self.last_reason
+            .as_deref()
+            .is_none_or(|reason| reason == TOOL_CALLS_REASON)
     }
 
     /// Parse one output line into zero or more run events.
@@ -434,14 +471,18 @@ impl NdjsonParser {
     ///
     /// One run carries several steps, so several `TurnEnd` events can
     /// precede the one [`RunEvent::Exit`]. A step ending is not the task
-    /// ending. A step failed only when its reason names an error; the exit
-    /// code of the whole child is reported separately as [`RunEvent::Exit`].
+    /// ending. A step failed only when its reason names an error. The
+    /// method also keeps the error flag and the last reason of the run, and
+    /// [`RunEvent::Exit`] reports both together with the exit code.
     fn on_step_finish(&mut self, part: &Value) -> Vec<RunEvent> {
         let reason = part.get("reason").and_then(Value::as_str);
+        let summary = reason.unwrap_or("step finished").to_string();
+        self.failed |= reason == Some(ERROR_REASON);
+        self.last_reason = Some(summary.clone());
         vec![RunEvent::TurnEnd {
             task: self.task.clone(),
-            ok: reason != Some("error"),
-            summary: reason.unwrap_or("step finished").to_string(),
+            ok: reason != Some(ERROR_REASON),
+            summary,
             cost_usd: part.get("cost").and_then(Value::as_f64),
         }]
     }
@@ -950,6 +991,96 @@ not json at all
         assert_eq!(strip_ansi("cut\u{1b}"), "cut");
     }
 
+    #[test]
+    fn a_step_finish_keeps_its_reason_for_the_exit_verdict() {
+        let mut parser = NdjsonParser::new("t/x");
+        assert!(parser.unfinished(), "a run without one finished step");
+
+        parser.parse_line(
+            r#"{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls"}}"#,
+        );
+        assert!(parser.unfinished(), "the last step still waits for tools");
+        assert!(!parser.failed);
+
+        parser
+            .parse_line(r#"{"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}"#);
+        assert!(!parser.unfinished(), "the last step ended the agent loop");
+        assert!(!parser.failed);
+
+        parser
+            .parse_line(r#"{"type":"step_finish","part":{"type":"step-finish","reason":"error"}}"#);
+        assert!(parser.failed, "one error reason marks the whole run");
+    }
+
+    /// A child that stops between tool calls exits with code 0, so only the
+    /// step state tells the daemon that no answer arrived. The exit must
+    /// fail; otherwise the task completes with the work undone.
+    #[test]
+    fn a_clean_exit_between_tool_calls_fails_the_run() {
+        let dir = temp_dir("cut-off");
+        let cut_off = FIXTURE
+            .rsplit_once('\n')
+            .expect("the fixture carries several lines")
+            .0;
+        let fixture = dir.join("fixture.ndjson");
+        fs::write(&fixture, cut_off).unwrap();
+        script(
+            &dir,
+            PROGRAM,
+            &format!("#!/bin/sh\ncat '{}'\nexit 0\n", fixture.display()),
+        );
+        let job = job(&dir, None);
+        let mut settings = legacy_settings(&job);
+        settings.program = dir.join(PROGRAM).display().to_string();
+        let mut runner = OpenCodeRunner::new(settings);
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let events = collect_until_exit(&rx);
+        session.stop().unwrap();
+
+        assert_eq!(
+            events.last(),
+            Some(&RunEvent::Exit {
+                task: TASK.to_string(),
+                ok: false,
+                detail: "opencode exited with code 0 before the agent finished".to_string(),
+            })
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An errored step with a clean exit code must fail the run too.
+    #[test]
+    fn a_clean_exit_after_a_failed_step_fails_the_run() {
+        let dir = temp_dir("failed-step");
+        let line = r#"{"type":"step_finish","sessionID":"ses_fix01","part":{"type":"step-finish","reason":"error"}}"#;
+        let fixture = dir.join("fixture.ndjson");
+        fs::write(&fixture, line).unwrap();
+        script(
+            &dir,
+            PROGRAM,
+            &format!("#!/bin/sh\ncat '{}'\nexit 0\n", fixture.display()),
+        );
+        let job = job(&dir, None);
+        let mut settings = legacy_settings(&job);
+        settings.program = dir.join(PROGRAM).display().to_string();
+        let mut runner = OpenCodeRunner::new(settings);
+
+        let (mut session, rx) = start_with_retry(&mut runner, &job);
+        let events = collect_until_exit(&rx);
+        session.stop().unwrap();
+
+        assert_eq!(
+            events.last(),
+            Some(&RunEvent::Exit {
+                task: TASK.to_string(),
+                ok: false,
+                detail: "opencode reported a failed step before exit code 0".to_string(),
+            })
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Start the run, retrying the transient `Text file busy` race.
     ///
     /// The test writes its fake child and executes it at once. On this
@@ -1176,10 +1307,14 @@ exit 1
     #[test]
     fn allowed_permissions_reach_the_child_as_the_open_code_permission_env() {
         let dir = temp_dir("permission-env");
+        // The child ends one step with the reason `stop`, so the run models
+        // a healthy agent loop and the exit verdict stays on the env check.
         script(
             &dir,
             PROGRAM,
-            "#!/bin/sh\nprintf '%s' \"$OPENCODE_PERMISSION\" > env.txt\nexit 0\n",
+            "#!/bin/sh\nprintf '%s' \"$OPENCODE_PERMISSION\" > env.txt\n\
+             echo '{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n\
+             exit 0\n",
         );
         let mut job = job(&dir, None);
         job.allowed_permissions = vec![AllowedPermission {
