@@ -732,6 +732,20 @@ mod tests {
     }
 
     #[test]
+    fn probe_zai_clamps_a_percent_field_outside_the_range() {
+        let body = r#"{"data":{"limits":[
+            {"type":"CREDIT_LIMIT","unit":"CREDIT","percentage":150},
+            {"type":"CREDIT_LIMIT","unit":"CREDIT","percentage":-5}
+        ]}}"#;
+        let exec = curl_exec(ZAI_USAGE_URL, body, 200);
+
+        let record = probe_zai(&exec, "zai-token", 0).unwrap();
+
+        assert_eq!(record.windows[0].used_percent, 100.0);
+        assert_eq!(record.windows[1].used_percent, 0.0);
+    }
+
+    #[test]
     fn probe_zai_reads_the_live_pro_plan_payload() {
         // The live pro-plan payload of 2026-09-05. The dashboard showed
         // 1% used and 12% used for these two windows.
