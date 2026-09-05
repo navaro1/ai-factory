@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{Config, RepoConfig};
 use crate::exec::{Exec, RealExec};
 use crate::gh::GhClient;
 use crate::model::RepoSnapshot;
@@ -77,6 +77,29 @@ pub struct Pollers {
 pub fn spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Pollers {
     let exec_for = |_alias: &str| Arc::new(RealExec) as Arc<dyn Exec>;
     spawn_all(cfg, tx, &exec_for, POLL_INTERVAL, MAX_BACKOFF)
+}
+
+/// Spawn the poller thread of one repository with the production cadence.
+///
+/// The thread loops like every poller of [`spawn_pollers`]: it fetches,
+/// sends on `tx`, and waits [`POLL_INTERVAL`] on its wake channel, with the
+/// [`MAX_BACKOFF`] cap after failures. The call returns the wake sender, so
+/// the caller can force an early pass and drop the sender to end the
+/// poller. It returns `None` when the thread cannot start; the case sends
+/// [`DaemonMsg::PollFailed`].
+pub fn spawn_poller(repo: &RepoConfig, tx: Sender<DaemonMsg>) -> Option<Sender<()>> {
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let exec: Arc<dyn Exec> = Arc::new(RealExec);
+    spawn_one(
+        repo.alias.clone(),
+        repo.owner_repo.clone(),
+        exec,
+        tx,
+        wake_rx,
+        POLL_INTERVAL,
+        MAX_BACKOFF,
+    )
+    .map(|_handle| wake_tx)
 }
 
 /// Spawn every poller with an explicit [`Exec`] factory and waits.
@@ -983,5 +1006,18 @@ path = "/repos/b"
     #[test]
     fn daemon_msg_has_the_shutdown_variant() {
         assert_eq!(format!("{:?}", DaemonMsg::Shutdown), "Shutdown");
+    }
+
+    #[test]
+    fn spawn_poller_returns_the_wake_sender_of_one_repository() {
+        let config = two_repo_config();
+        let repo = config.repos.get("a").unwrap().clone();
+        // The receiver dies at once, so the first pass ends the thread
+        // through the send error; the test only checks the wake contract.
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let wake = spawn_poller(&repo, tx).expect("the poller thread must start");
+        // The sender stays usable while the poller lives.
+        assert!(wake.send(()).is_ok());
     }
 }

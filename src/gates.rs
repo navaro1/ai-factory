@@ -274,6 +274,12 @@ impl GateTracker {
         self.was_ready
             .retain(|key| key.repo != repo || key.kind != kind || key.number != number);
     }
+
+    /// Drop the whole memory of one repository, as when its configuration
+    /// goes away while the daemon runs.
+    pub fn forget_repo(&mut self, repo: &str) {
+        self.was_ready.retain(|key| key.repo != repo);
+    }
 }
 
 #[cfg(test)]
@@ -579,6 +585,20 @@ mod tests {
         // Forgetting another item does not revive this one.
         tracker.forget("borsuk", ItemKind::Issue, 2);
         assert!(tracker.observe("borsuk", &ready).is_empty());
+    }
+
+    #[test]
+    fn forget_repo_drops_the_whole_memory_of_one_repository() {
+        let mut tracker = GateTracker::new();
+        let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
+
+        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert_eq!(tracker.observe("qubitsok", &ready).len(), 1);
+        tracker.forget_repo("borsuk");
+        // The removed repository fires again on a return; the kept one
+        // holds its memory.
+        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert!(tracker.observe("qubitsok", &ready).is_empty());
     }
 
     #[test]
