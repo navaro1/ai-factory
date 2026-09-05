@@ -718,7 +718,7 @@ enabled = true
 minutes = 10
 "#;
         let config = crate::config::Config::parse(text).unwrap();
-        let (_poll_tx, poll_rx) = channel();
+        let (poll_tx, poll_rx) = channel();
         let (wake_tx, _wake_rx) = channel();
         let mut wake = std::collections::BTreeMap::new();
         wake.insert("borsuk".to_string(), wake_tx);
@@ -730,6 +730,7 @@ minutes = 10
             std::sync::Arc::new(exec),
             dir.join("state"),
             dir.join("prompts"),
+            poll_tx,
             poll_rx,
             wake,
             action_rx,

@@ -117,12 +117,13 @@ fn run(config_path: Option<&Path>, socket_path: &Path, paused: bool) -> anyhow::
         eprintln!("aifd: the factory starts paused; nothing dispatches until the operator resumes");
     }
     let (poll_tx, poll_rx) = mpsc::channel();
-    let pollers = poll::spawn_pollers(&config, poll_tx);
+    let pollers = poll::spawn_pollers(&config, poll_tx.clone());
     let mut daemon = Daemon::new(
         config,
         config_path.clone(),
         revision,
         prompts_dir(Some(&config_path)),
+        poll_tx,
         poll_rx,
         pollers.wake,
         merged_rx,
