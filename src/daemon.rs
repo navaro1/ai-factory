@@ -36,7 +36,7 @@ use crate::config::{
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
-use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
+use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork, NEEDS_HUMAN_LABEL};
 use crate::gh::GhClient;
 use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
@@ -60,9 +60,6 @@ use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
 use crate::worktree::{WorktreeKind, WorktreeManager, TRAIN_DIR};
-
-/// The label that asks a human to decide something on GitHub.
-pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
 
 /// How long a parked session stays alive without activity before the reaper
 /// stops its process.
@@ -1369,7 +1366,8 @@ impl Daemon {
                         .get(&task.number)
                         .is_none_or(|pr| !review_ready(pr))
                         && !(task.state == TaskState::Running
-                            && review_transitioned(fresh, task.number))
+                            && (review_transitioned(fresh, task.number)
+                                || review_handed_off(fresh, task.number)))
                 }
                 Stage::Refine | Stage::Release => false,
             })
@@ -2450,6 +2448,24 @@ impl Daemon {
     /// Complete one task and apply its stage-specific success action.
     fn complete_task(&mut self, task: &Task) {
         if task.stage == Stage::Review {
+            match self.review_contract_met(task) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let reason = format!(
+                        "the review left pull request {} a draft with no {NEEDS_HUMAN_LABEL} label",
+                        task.number
+                    );
+                    eprintln!("task {}: {reason}", task.id);
+                    self.fail_run(task, &reason);
+                    return;
+                }
+                Err(error) => {
+                    let reason = format!("cannot read the reviewed pull request: {error:#}");
+                    eprintln!("task {}: {reason}", task.id);
+                    self.fail_run(task, &reason);
+                    return;
+                }
+            }
             if let Err(error) = self.write_review_marker(task) {
                 let reason = format!("cannot write the reviewed-sha marker: {error:#}");
                 eprintln!("task {}: {reason}", task.id);
@@ -2532,6 +2548,31 @@ impl Daemon {
             }
             Err(e) => eprintln!("cannot open the task log {}: {e}", task.log_path.display()),
         }
+    }
+
+    /// Whether one finished review run met the two-outcome contract.
+    ///
+    /// The review stage ends in one of two ways: the agent finds nothing and
+    /// marks the pull request ready for review, or it repairs every finding,
+    /// pushes, and marks it ready. The `needs-human` label names the one
+    /// explicit rest state between them, where the agent leaves the draft on
+    /// purpose. A run that leaves a plain draft did neither, so it did not do
+    /// the work the stage exists for.
+    ///
+    /// The last poll cannot answer this. The agent flipped the draft seconds
+    /// ago, so the snapshot still reports a draft. The daemon reads the live
+    /// pull request instead.
+    ///
+    /// A pull request that is no longer open left the pipeline, and
+    /// [`Daemon::reconcile_removed`] drops its tasks on the next poll. This
+    /// reports success for it, so the daemon does not start a retry that
+    /// GitHub already made pointless.
+    fn review_contract_met(&self, task: &Task) -> Result<bool> {
+        let Some(repo_cfg) = self.config.repos.get(&task.repo) else {
+            bail!("no such repository \"{}\"", task.repo);
+        };
+        let pr = GhClient::new(&*self.exec).fetch_pull(&repo_cfg.owner_repo, task.number)?;
+        Ok(!pr.open || !pr.draft || pr.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
     }
 
     /// Write the `.aif/reviewed-sha` marker of a finished review.
@@ -4874,6 +4915,19 @@ fn review_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
         .is_some_and(|pr| pr.open && !pr.draft)
 }
 
+/// True when GitHub shows the review handed the pull request to a human.
+///
+/// The agent adds the `needs-human` label first and writes its question
+/// comment after. The label closes the review gate, so a poll between those
+/// two steps would otherwise cancel the run and leave the operator a label
+/// with no question. This transition is as valid as the ready flip.
+fn review_handed_off(fresh: &RepoSnapshot, number: u64) -> bool {
+    fresh
+        .prs
+        .get(&number)
+        .is_some_and(|pr| pr.open && pr.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+}
+
 /// The effective prompt view of every role that has a template, in role
 /// order. The theory roles carry no template, so they get no view.
 ///
@@ -5006,6 +5060,34 @@ mod tests {
     /// A successful `gh api -i` body: one status line and an empty body.
     fn gh_ok() -> CmdOut {
         CmdOut::ok("HTTP/1.1 204 No Content\r\n\r\n")
+    }
+
+    /// The `fetch_pull` step that one review completion reads.
+    ///
+    /// [`Daemon::review_contract_met`] runs this call before it completes a
+    /// review task, so every test that finishes a review scripts one step.
+    /// `draft` and the labels shape the verdict.
+    fn gh_pull_step(number: u64, draft: bool, labels: &[&str]) -> Step {
+        let url = format!("repos/acme/borsuk/pulls/{number}");
+        let names = labels
+            .iter()
+            .map(|name| format!("{{\"name\":\"{name}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(
+            "{{\"number\":{number},\"node_id\":\"prnode-{number}\",\"title\":\"pr {number}\",\
+             \"body\":null,\"state\":\"open\",\"labels\":[{names}],\"draft\":{draft},\
+             \"head\":{{\"sha\":\"sha{number}\",\"ref\":\"branch-{number}\"}}}}"
+        );
+        gh_step(
+            &["api", "-i", "-X", "GET", &url],
+            CmdOut::ok(format!("HTTP/1.1 200 OK\r\n\r\n{body}")),
+        )
+    }
+
+    /// The `fetch_pull` step of a review that met the contract.
+    fn gh_pull_ready(number: u64) -> Step {
+        gh_pull_step(number, false, &[])
     }
 
     /// A status-1 output, which git uses for "the reference is absent".
@@ -5966,6 +6048,7 @@ mod tests {
         let steps: Vec<Step> =
             fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
                 .into_iter()
+                .chain(std::iter::once(gh_pull_ready(5)))
                 .chain(fresh_issue_steps(
                     &rig_repo(&dir),
                     &issue_wt(&dir, 6),
@@ -5990,6 +6073,82 @@ mod tests {
         rig.event(turn_finished("borsuk/review-p6", false, "lint"));
         assert_eq!(rig.task("borsuk/review-p6").attempt, 2);
         assert!(!issue_wt(&dir, 6).join(".aif").join("reviewed-sha").exists());
+    }
+
+    /// The review stage has two outcomes, and both leave the pull request
+    /// ready for review. A run that ends on a plain draft did neither, so
+    /// the clean exit is not a success and the task retries.
+    #[test]
+    fn a_review_that_leaves_a_plain_draft_fails_and_retries() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(std::iter::once(gh_pull_step(5, true, &[])))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+
+        rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
+
+        let task = rig.task("borsuk/review-p5");
+        assert_eq!(
+            task.state,
+            TaskState::Queued,
+            "a review that left the draft alone must run again"
+        );
+        assert_eq!(task.attempt, 2);
+        assert!(
+            !worktree.join(".aif").join("reviewed-sha").exists(),
+            "a review that did no work marks no reviewed head"
+        );
+    }
+
+    /// The agent adds the `needs-human` label first and writes its question
+    /// comment after. The label closes the review gate, so a poll between
+    /// those two steps must not cancel the run. A cancelled run leaves the
+    /// label with no question, and the operator reads an empty inbox row.
+    #[test]
+    fn a_needs_human_label_keeps_the_running_review_alive() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
+
+        rig.poll(vec![], vec![pr(5, true, &[NEEDS_HUMAN_LABEL])]);
+
+        assert_eq!(
+            rig.task("borsuk/review-p5").state,
+            TaskState::Running,
+            "the agent must reach its question comment"
+        );
+    }
+
+    /// The `needs-human` label is the explicit rest state of the stage. The
+    /// agent left the draft on purpose, so the run met the contract.
+    #[test]
+    fn a_review_that_labels_needs_human_completes() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 5);
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(std::iter::once(gh_pull_step(5, true, &[NEEDS_HUMAN_LABEL])))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+
+        rig.event(turn_finished(
+            "borsuk/review-p5",
+            true,
+            "asked the operator",
+        ));
+
+        assert_eq!(
+            rig.task("borsuk/review-p5").state,
+            TaskState::Done,
+            "the labelled rest state ends the run"
+        );
     }
 
     #[test]
@@ -6228,6 +6387,7 @@ mod tests {
                 &worktree,
                 &rig_gitdir(&dir),
             ))
+            .chain(std::iter::once(gh_pull_ready(5)))
             .collect();
         let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
         rig.poll(vec![], vec![pr(5, true, &[])]);
@@ -6257,7 +6417,10 @@ mod tests {
     fn a_review_without_a_stored_sha_takes_the_polled_head() {
         let dir = temp_root();
         let worktree = issue_wt(&dir, 5);
-        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
+        let steps: Vec<Step> = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir))
+            .into_iter()
+            .chain(std::iter::once(gh_pull_ready(5)))
+            .collect();
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![], vec![pr(5, true, &[])]);
         rig.daemon
@@ -7979,8 +8142,11 @@ mod tests {
     fn a_restored_done_review_of_a_merged_pr_is_retired_at_the_first_poll() {
         let dir = temp_root();
         {
-            let steps =
-                fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+            let steps: Vec<Step> =
+                fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                    .into_iter()
+                    .chain(std::iter::once(gh_pull_ready(5)))
+                    .collect();
             let mut first = Rig::make_in(dir.clone(), steps, |_| {});
             first.poll(vec![], vec![pr(5, true, &[])]);
             first.poll(vec![], vec![pr(5, false, &[])]);
@@ -10683,7 +10849,11 @@ mod tests {
     #[test]
     fn a_dropped_pr_retires_its_done_review_task() {
         let dir = temp_root();
-        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(std::iter::once(gh_pull_ready(5)))
+                .collect();
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![], vec![pr(5, true, &[])]);
         rig.poll(vec![], vec![pr(5, false, &[])]);
@@ -10930,7 +11100,11 @@ mod tests {
     #[test]
     fn a_ready_pull_poll_keeps_the_review_until_runner_success() {
         let dir = temp_root();
-        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(std::iter::once(gh_pull_ready(5)))
+                .collect();
         let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
         rig.poll(vec![], vec![pr(5, true, &[])]);
         let session = rig.session(0);
@@ -10955,6 +11129,7 @@ mod tests {
         let steps: Vec<Step> =
             fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
                 .into_iter()
+                .chain(std::iter::once(gh_pull_ready(5)))
                 .chain(fresh_train_steps(
                     &rig_repo(&dir),
                     &train_wt(&dir),

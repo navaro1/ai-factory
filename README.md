@@ -27,6 +27,16 @@ the pull requests in order.
 Labels drive the flow: `to-refine`, `refined`, `needs-human`, and
 `release-stacked`. Add the label `to-refine` to an issue to start the work.
 
+The review stage ends in one of two ways. The agent finds nothing and marks
+the pull request ready for review. Or the agent repairs every finding, pushes,
+and marks the pull request ready. A run that ends on a plain draft did
+neither, so the daemon fails that run and the task runs again.
+
+The `needs-human` label is the one rest state between the two. The agent adds
+the label when a decision is yours, and it leaves the draft. The label closes
+the review gate, so a push cannot restart the review. When you answer, the
+daemon removes the label, the gate opens again, and one fresh review starts.
+
 The loop is event-driven. The daemon sleeps until a real deadline and wakes
 only for real events. The only periodic clock is the 20-second GitHub poll
 of each repository. The poll is conditional: an unchanged repository costs
@@ -558,7 +568,7 @@ The role returns to the built-in prompt.
   continues the recorded session of the task.
 - A release gate row refreshes at the poll after you stack a pull request.
 - A review push on a draft pull request can restart that review at the next
-  poll.
+  poll. A pull request with the `needs-human` label rests instead.
 - A review of a pull request from a fork takes the `needs-human` path before a
   repair.
 
