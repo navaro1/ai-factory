@@ -443,6 +443,10 @@ impl<'a> GhClient<'a> {
     }
 
     /// Remove one label from an issue or a pull request.
+    ///
+    /// A label that is already absent is a success: GitHub answers 404,
+    /// and the wanted state holds. The daemon removes labels that an
+    /// agent may have removed a moment earlier, so the race is routine.
     pub fn remove_label(&self, owner_repo: &str, number: u64, label: &str) -> Result<()> {
         let label = encode_path_segment(label);
         let url = format!("repos/{owner_repo}/issues/{number}/labels/{label}");
@@ -451,6 +455,13 @@ impl<'a> GhClient<'a> {
             .exec
             .run("gh", &args, None)
             .context("gh api failed to run")?;
+        let parsed = parse_response(&out.stdout).with_context(|| {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            format!("gh api exited with status {}: {detail}", out.status)
+        })?;
+        if parsed.status == 404 {
+            return Ok(());
+        }
         checked_response(&out).map(|_| ())
     }
 
@@ -1646,6 +1657,28 @@ mod tests {
         );
         let client = GhClient::new(&exec);
         client.remove_label("acme/borsuk", 7, "to-refine").unwrap();
+
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn remove_label_treats_an_absent_label_as_removed() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                "repos/acme/borsuk/issues/7/labels/refined",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 404", &[], r#"{"message":"Label does not exist"}"#),
+                stderr: "gh: Label does not exist (HTTP 404)\n".to_string(),
+            },
+        );
+        let client = GhClient::new(&exec);
+        client.remove_label("acme/borsuk", 7, "refined").unwrap();
 
         assert_eq!(exec.calls().len(), 1);
     }
