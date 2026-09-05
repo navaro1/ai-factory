@@ -423,6 +423,17 @@ impl ValueList {
     }
 }
 
+/// The add-repository form with one alias row and one path row.
+#[derive(Debug, Clone)]
+struct AddForm {
+    /// The alias of the new repository.
+    alias: String,
+    /// The checkout path of the new repository.
+    path: String,
+    /// The active row: 0 for the alias, 1 for the path.
+    row: usize,
+}
+
 /// The Settings view state.
 #[derive(Debug, Default)]
 pub struct Settings {
@@ -433,6 +444,8 @@ pub struct Settings {
     text_editor: Option<TextEditor>,
     list_editor: Option<ListEditor>,
     value_list: Option<ValueList>,
+    /// The open add-repository form, over the whole view.
+    add_form: Option<AddForm>,
     /// The open prompt editor, over the whole view.
     prompt_editor: Option<PromptEditor>,
     /// The state of the one `opencode models` probe per shell start.
@@ -445,6 +458,9 @@ pub struct Settings {
     discard_confirm: bool,
     /// True after one `d` on the prompt row. The next `d` sends the reset.
     reset_confirm: bool,
+    /// True after one `X` on a repository scope. The next `X` removes the
+    /// repository.
+    remove_repo_confirm: bool,
 }
 
 impl Settings {
@@ -454,15 +470,17 @@ impl Settings {
             || self.list_editor.is_some()
             || self.value_list.is_some()
             || self.prompt_editor.is_some()
+            || self.add_form.is_some()
     }
 
     /// The bottom-row hints of the settings state.
     ///
     /// An open editor names its own keys and shows no `? help`. The form
     /// names the navigation keys and the keys of the active scope: the
-    /// repository scope removes its override, the global scope reloads.
-    /// On the form `j` and `k` step the execution role; inside the list
-    /// editor they step one row.
+    /// repository scope removes its override and the repository, the
+    /// global scope reloads. `a` opens the add-repository form on both
+    /// scopes. On the form `j` and `k` step the execution role; inside
+    /// the list editor they step one row.
     pub fn footer_hints(&self) -> String {
         if self.prompt_editor.is_some() {
             return "ctrl-s save · esc close · arrows move".to_string();
@@ -480,9 +498,9 @@ impl Settings {
             return "type filter · enter apply · esc close".to_string();
         }
         if self.scope > 0 {
-            return "j k role · tab field · enter open · s save · d remove · ? help".to_string();
+            return "j k role · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help".to_string();
         }
-        "j k role · tab field · enter open · s save · r reload · ? help".to_string()
+        "j k role · tab field · enter open · s save · r reload · a add repo · ? help".to_string()
     }
 
     /// Store the result of the `opencode models` probe and refresh an
@@ -616,11 +634,13 @@ impl Settings {
     /// Drop every pending confirmation of the form.
     ///
     /// The shell calls this for a key it handles itself, such as a view
-    /// switch. Without it a `d` armed before the switch would delete the
-    /// prompt file on the first `d` after the operator comes back.
+    /// switch. Without it a `d` or `X` armed before the switch would
+    /// remove the prompt file or the repository on the first key after
+    /// the operator comes back.
     pub fn drop_confirmations(&mut self) {
         self.reset_confirm = false;
         self.discard_confirm = false;
+        self.remove_repo_confirm = false;
     }
 
     /// Apply one Settings key and return a daemon action when needed.
@@ -643,10 +663,15 @@ impl Settings {
             self.handle_value_list_key(state, key);
             return None;
         }
+        if self.add_form.is_some() {
+            return self.handle_add_key(state, key);
+        }
         self.clamp(state);
-        // A second `d` on the prompt row confirms the reset. Any other key
+        // A second `d` on the prompt row confirms the reset, and a second
+        // `X` on a repository scope confirms the removal. Any other key
         // drops the pending confirmation.
         let reset_pending = std::mem::take(&mut self.reset_confirm);
+        let remove_pending = std::mem::take(&mut self.remove_repo_confirm);
         if self.draft.is_some()
             && matches!(
                 key.code,
@@ -695,6 +720,20 @@ impl Settings {
             KeyCode::Enter => self.enter_field(state),
             KeyCode::Char('s') => return self.save(state),
             KeyCode::Char('r') => return self.reload(),
+            KeyCode::Char('a') => {
+                if self.request_pending() {
+                    return None;
+                }
+                self.add_form = Some(AddForm {
+                    alias: String::new(),
+                    path: String::new(),
+                    row: 0,
+                });
+                self.status = None;
+            }
+            KeyCode::Char('X') if self.scope > 0 => {
+                return self.remove_repository(state, remove_pending)
+            }
             KeyCode::Char('d')
                 if self.scope == 0 && self.selected_field_for(Some(state)) == Field::Prompt =>
             {
@@ -1254,6 +1293,101 @@ impl Settings {
         })
     }
 
+    /// Ask for a second `X`, then send the removal of the scoped repository.
+    ///
+    /// The question names the repository, the active tasks that the
+    /// removal stops, and the worktrees that stay on disk.
+    fn remove_repository(&mut self, state: &StateView, confirmed: bool) -> Option<Action> {
+        let alias = self.repositories(state).get(self.scope - 1).cloned()?;
+        if !confirmed {
+            if self.request_pending() {
+                return None;
+            }
+            let count = state
+                .tasks
+                .iter()
+                .filter(|task| task.repo == alias && !task.state.is_terminal())
+                .count();
+            self.remove_repo_confirm = true;
+            self.status = Some((
+                SettingsResultStatus::Failed,
+                format!(
+                    "press X again to remove {alias}: it stops {count} active task(s); \
+                     worktrees stay"
+                ),
+            ));
+            return None;
+        }
+        if self.request_pending() {
+            return None;
+        }
+        let request = request_code();
+        self.pending_request = Some(request.clone());
+        Some(Action::SaveSettings {
+            request,
+            base_revision: state.settings.revision.clone(),
+            edit: SettingsEdit::RemoveRepository { alias },
+        })
+    }
+
+    /// Apply one key while the add-repository form is open.
+    ///
+    /// `Enter` moves from the alias row to the path row and sends the add
+    /// on the path row. `Esc` closes the form and sends nothing. The
+    /// daemon rejects an invalid alias or path, and the result shows the
+    /// reason.
+    fn handle_add_key(&mut self, state: &StateView, key: KeyEvent) -> Option<Action> {
+        let mut close = false;
+        let mut send = None;
+        let form = self.add_form.as_mut()?;
+        match key.code {
+            KeyCode::Esc => close = true,
+            KeyCode::Up | KeyCode::BackTab => form.row = form.row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => form.row = (form.row + 1).min(1),
+            KeyCode::Enter => {
+                if form.row == 0 {
+                    form.row = 1;
+                } else {
+                    close = true;
+                    send = Some((form.alias.trim().to_string(), form.path.trim().to_string()));
+                }
+            }
+            KeyCode::Backspace => match form.row {
+                0 => {
+                    form.alias.pop();
+                }
+                _ => {
+                    form.path.pop();
+                }
+            },
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match form.row {
+                    0 => form.alias.push(character),
+                    _ => form.path.push(character),
+                }
+            }
+            _ => {}
+        }
+        if close {
+            self.add_form = None;
+        }
+        let (alias, path) = send?;
+        if self.request_pending() {
+            return None;
+        }
+        let request = request_code();
+        self.pending_request = Some(request.clone());
+        Some(Action::SaveSettings {
+            request,
+            base_revision: state.settings.revision.clone(),
+            edit: SettingsEdit::AddRepository { alias, path },
+        })
+    }
+
     fn request_pending(&mut self) -> bool {
         if self.pending_request.is_none() {
             return false;
@@ -1567,9 +1701,14 @@ impl Settings {
 
     fn scope_line(&self, state: &StateView) -> Line<'static> {
         let mut spans = vec![Span::styled(" scopes ", Style::default().fg(THEME.dim))];
-        let labels = std::iter::once("global".to_string()).chain(self.repositories(state));
-        for (index, label) in labels.enumerate() {
-            let style = if index == self.scope {
+        let mut labels = vec!["global".to_string()];
+        labels.extend(self.repositories(state));
+        // A removal can leave the cursor past the last label. The line
+        // clamps the highlight here; `handle_key` clamps the cursor
+        // itself.
+        let scope = self.scope.min(labels.len() - 1);
+        for (index, label) in labels.iter().enumerate() {
+            let style = if index == scope {
                 Style::default()
                     .fg(if index == 0 { THEME.accent } else { THEME.repo })
                     .add_modifier(Modifier::BOLD)
@@ -1806,6 +1945,36 @@ impl Settings {
             frame.render_widget(
                 Paragraph::new(lines)
                     .block(Block::bordered().title(format!(" {} rows ", editor.field.label()))),
+                panel,
+            );
+        } else if let Some(form) = &self.add_form {
+            let panel = centered(58, 6, area);
+            frame.render_widget(Clear, panel);
+            let rows = [("alias", &form.alias, 0usize), ("path", &form.path, 1)];
+            let mut lines = Vec::new();
+            for (label, value, index) in rows {
+                let active = form.row == index;
+                let cursor = if active { ">" } else { " " };
+                let label_style = if active {
+                    Style::default()
+                        .fg(THEME.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    THEME.dim()
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(cursor),
+                    Span::raw(" "),
+                    Span::styled(format!("{:<19}", label), label_style),
+                    Span::raw(value.as_str()),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "enter next / send · esc cancel",
+                THEME.dim(),
+            )));
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title(" add repository ")),
                 panel,
             );
         }
@@ -2078,6 +2247,18 @@ impl Settings {
         self.text_editor
             .as_ref()
             .map(|editor| editor.buffer.clone())
+    }
+
+    #[cfg(test)]
+    fn add_form_row(&self) -> Option<usize> {
+        self.add_form.as_ref().map(|form| form.row)
+    }
+
+    #[cfg(test)]
+    fn add_form_buffers(&self) -> Option<(String, String)> {
+        self.add_form
+            .as_ref()
+            .map(|form| (form.alias.clone(), form.path.clone()))
     }
 }
 
@@ -4254,14 +4435,14 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(
             settings.footer_hints(),
-            "j k role · tab field · enter open · s save · r reload · ? help"
+            "j k role · tab field · enter open · s save · r reload · a add repo · ? help"
         );
 
         settings.handle_key(&state, key(KeyCode::Char('l')));
         assert_eq!(settings.scope, 1);
         assert_eq!(
             settings.footer_hints(),
-            "j k role · tab field · enter open · s save · d remove · ? help"
+            "j k role · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help"
         );
 
         settings.scope = 0;
@@ -4299,13 +4480,237 @@ mod tests {
         assert_eq!(settings.footer_hints(), "enter apply · esc cancel");
 
         for hint in [
-            "j k role · tab field · enter open · s save · r reload · ? help",
-            "j k role · tab field · enter open · s save · d remove · ? help",
+            "j k role · tab field · enter open · s save · r reload · a add repo · ? help",
+            "j k role · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help",
             "j k row · a add · d delete · enter edit · esc close",
             "type filter · enter apply · esc close",
             "enter apply · esc cancel",
         ] {
             assert!(hint.chars().count() <= crate::tui::HINT_CAP, "hint {hint}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Add and remove a repository
+    // ------------------------------------------------------------------
+
+    /// `a` opens the add form, the rows take the typed text, and the last
+    /// `Enter` sends the add against the revision the view holds.
+    #[test]
+    fn the_add_form_sends_add_repository_with_the_typed_values() {
+        let state = state();
+        let mut settings = Settings::default();
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('a')))
+            .is_none());
+        assert!(settings.typing(), "the add form owns the keys");
+        assert_eq!(settings.add_form_row(), Some(0));
+
+        type_text(&mut settings, &state, "hazel");
+        settings.handle_key(&state, key(KeyCode::Enter));
+        assert_eq!(
+            settings.add_form_row(),
+            Some(1),
+            "enter moves to the path row"
+        );
+        type_text(&mut settings, &state, "/tmp/hazel");
+        assert_eq!(
+            settings.add_form_buffers(),
+            Some(("hazel".to_string(), "/tmp/hazel".to_string()))
+        );
+
+        let action = settings
+            .handle_key(&state, key(KeyCode::Enter))
+            .expect("the last enter sends the add");
+        let Action::SaveSettings {
+            request,
+            base_revision,
+            edit,
+        } = action
+        else {
+            panic!("wrong action");
+        };
+        assert!(!request.is_empty());
+        assert_eq!(base_revision, "rev-one");
+        assert_eq!(
+            edit,
+            SettingsEdit::AddRepository {
+                alias: "hazel".to_string(),
+                path: "/tmp/hazel".to_string()
+            }
+        );
+        assert_eq!(settings.add_form_row(), None, "the form closes");
+        assert!(!settings.typing());
+    }
+
+    /// `Esc` closes the add form and sends nothing.
+    #[test]
+    fn esc_closes_the_add_form_and_sends_nothing() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('a')));
+        type_text(&mut settings, &state, "hazel");
+        assert!(settings.handle_key(&state, key(KeyCode::Esc)).is_none());
+        assert!(!settings.typing());
+        assert_eq!(settings.add_form_row(), None);
+    }
+
+    /// Up, Down, Tab, and BackTab switch the two rows of the add form.
+    #[test]
+    fn the_add_form_moves_between_the_alias_and_the_path_row() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('a')));
+        settings.handle_key(&state, key(KeyCode::Tab));
+        assert_eq!(settings.add_form_row(), Some(1));
+        settings.handle_key(&state, key(KeyCode::Down));
+        assert_eq!(
+            settings.add_form_row(),
+            Some(1),
+            "the step clamps at the last row"
+        );
+        settings.handle_key(&state, key(KeyCode::Up));
+        settings.handle_key(&state, key(KeyCode::BackTab));
+        assert_eq!(
+            settings.add_form_row(),
+            Some(0),
+            "the step clamps at the first row"
+        );
+    }
+
+    /// The add form draws both rows with their text and the key hint.
+    #[test]
+    fn the_add_form_draws_the_rows_and_the_hint() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('a')));
+        type_text(&mut settings, &state, "hazel");
+        settings.handle_key(&state, key(KeyCode::Tab));
+        type_text(&mut settings, &state, "/tmp/hazel");
+        let output = text(&settings, &state, 100, 30);
+        assert!(output.contains("add repository"), "{output}");
+        assert!(output.contains("alias"), "{output}");
+        assert!(output.contains("path"), "{output}");
+        assert!(output.contains("hazel"), "{output}");
+        assert!(output.contains("/tmp/hazel"), "{output}");
+        assert!(output.contains("enter next / send"), "{output}");
+        assert!(output.contains("esc cancel"), "{output}");
+    }
+
+    /// `X` on a repository scope asks once with the active task count,
+    /// then removes the repository. Any other key drops the question.
+    #[test]
+    fn x_on_a_repository_scope_asks_then_removes_the_repository() {
+        let mut state = state();
+        let mut active = state.tasks[0].clone();
+        active.state = crate::tasks::TaskState::Running;
+        let mut done = state.tasks[1].clone();
+        done.state = crate::tasks::TaskState::Done;
+        state.tasks = vec![active, done];
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        assert_eq!(settings.scope_label(&state), "borsuk");
+
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('X')))
+            .is_none());
+        let output = text(&settings, &state, 120, 30);
+        assert!(
+            output.contains("press X again to remove borsuk"),
+            "{output}"
+        );
+        assert!(output.contains("it stops 1 active task(s)"), "{output}");
+        assert!(output.contains("worktrees stay"), "{output}");
+
+        settings.handle_key(&state, key(KeyCode::Tab));
+        assert!(
+            settings
+                .handle_key(&state, key(KeyCode::Char('X')))
+                .is_none(),
+            "another key dropped the confirmation, so X asks again"
+        );
+
+        let action = settings
+            .handle_key(&state, key(KeyCode::Char('X')))
+            .expect("the second X removes the repository");
+        let Action::SaveSettings {
+            base_revision,
+            edit: SettingsEdit::RemoveRepository { alias },
+            ..
+        } = action
+        else {
+            panic!("wrong action");
+        };
+        assert_eq!(alias, "borsuk");
+        assert_eq!(base_revision, "rev-one");
+    }
+
+    /// The global scope removes nothing: `X` acts only on a repository.
+    #[test]
+    fn x_on_the_global_scope_does_nothing() {
+        let state = state();
+        let mut settings = Settings::default();
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('X')))
+            .is_none());
+        assert!(
+            !text(&settings, &state, 100, 30).contains("press X again"),
+            "the global scope shows no removal question"
+        );
+    }
+
+    /// A pending settings request blocks both new keys like every other
+    /// request, and the status says so.
+    #[test]
+    fn a_pending_request_blocks_the_add_and_remove_keys() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.reload().unwrap();
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('a')))
+            .is_none());
+        assert_eq!(settings.add_form_row(), None, "the form stays closed");
+        assert!(text(&settings, &state, 100, 30).contains("a settings request is pending"));
+
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        assert!(settings
+            .handle_key(&state, key(KeyCode::Char('X')))
+            .is_none());
+        assert!(text(&settings, &state, 100, 30).contains("a settings request is pending"));
+        assert!(
+            settings
+                .handle_key(&state, key(KeyCode::Char('X')))
+                .is_none(),
+            "the first X never armed, so the second X cannot send"
+        );
+    }
+
+    /// A removal can shrink the scope list under the cursor. The scope
+    /// line clamps the highlight onto the last label.
+    #[test]
+    fn the_scope_line_clamps_the_highlight_after_a_removal() {
+        let state = state();
+        let mut settings = Settings {
+            scope: 5,
+            ..Default::default()
+        };
+        let bold = |line: Line<'static>| -> Vec<String> {
+            line.spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                .map(|span| span.content.to_string())
+                .collect()
+        };
+        assert_eq!(
+            bold(settings.scope_line(&state)),
+            vec!["< borsuk > ".to_string()],
+            "the last label takes the highlight"
+        );
+
+        settings.scope = 0;
+        assert_eq!(
+            bold(settings.scope_line(&state)),
+            vec!["< global > ".to_string()]
+        );
     }
 }
