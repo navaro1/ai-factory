@@ -24,6 +24,7 @@
 //! inbox on `!`, and the ctrl-q and ctrl-c quit chords work from every
 //! view.
 
+pub mod agents;
 pub mod inbox;
 pub mod markdown;
 pub mod pipeline;
