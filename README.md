@@ -360,8 +360,8 @@ task, and the bar never promises what the daemon refuses:
 
 | Bar hint | What happens |
 |---|---|
-| `enter send` | A live claude chat takes the message at once. |
-| `resumes the parked chat` | The message restarts a parked claude session. |
+| `enter send` | A live claude or codex chat takes the message at once. |
+| `resumes the parked chat` | The message restarts a parked claude or codex session. |
 | `lands after this turn` | An opencode turn runs. The message becomes the next turn. |
 | `starts a follow-up turn` | The task finished. The message continues the same session. |
 | a reason, and a dim bar | The task takes no message. The reason says why. |
