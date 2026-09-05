@@ -1,4 +1,17 @@
 //! The Codex runner for noninteractive JSON Lines tasks.
+//!
+//! `codex exec --json` prints one event per line: `thread.started`,
+//! `turn.started`, `item.started`, `item.completed`, `turn.completed`,
+//! `turn.failed`, and `error`. Headless codex never asks: its approval
+//! policy is `never`, so a command the sandbox refuses ends as one
+//! `item.completed` line of type `command_execution` with the status
+//! `declined`. That line is the one approval request codex can carry, and
+//! the runner turns it into a [`RunEvent::Ask`] permission row. An operator
+//! grant reaches the next run as an allowed permission, and the runner then
+//! starts codex with `--sandbox danger-full-access`, because headless codex
+//! has no finer grant. Codex exec has no question channel at all: an agent
+//! that needs a person uses the `needs-human` label and the ask block of
+//! the prompts, which the daemon reads from GitHub.
 
 use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -9,6 +22,15 @@ use serde_json::Value;
 use crate::config::RoleSettings;
 use crate::proc::{self, ProcEvent, ProcHandle, RunSpec};
 use crate::runner::{Job, RunEvent, Runner, Session};
+
+/// The sandbox a granted permission runs under.
+const GRANTED_SANDBOX: &str = "danger-full-access";
+
+/// The item type of a shell command the agent ran.
+const COMMAND_ITEM: &str = "command_execution";
+
+/// The item status codex reports for a command its policy refused.
+const DECLINED_STATUS: &str = "declined";
 
 fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
@@ -26,7 +48,12 @@ fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
             toml::Value::String(policy.clone())
         ));
     }
-    if let Some(sandbox) = settings.sandbox.as_ref() {
+    // A grant from the inbox lifts the sandbox: headless codex cannot
+    // approve one command, so the retry runs with full access instead.
+    if !job.allowed_permissions.is_empty() {
+        args.push("--sandbox".to_string());
+        args.push(GRANTED_SANDBOX.to_string());
+    } else if let Some(sandbox) = settings.sandbox.as_ref() {
         args.push("--sandbox".to_string());
         args.push(sandbox.clone());
     }
@@ -130,7 +157,8 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
             }
             ProcEvent::StderrLine(_) => {
                 // Codex speaks its protocol on stdout; the stderr tee already
-                // reached the task log, and codex never asks.
+                // reached the task log. A refused command arrives on stdout
+                // as a declined item, never on stderr.
             }
             ProcEvent::Error(message) => eprintln!("task {task}: {message}"),
             ProcEvent::Stopped(outcome) => {
@@ -248,6 +276,10 @@ impl JsonlParser {
             return Vec::new();
         }
         let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !started && kind == COMMAND_ITEM && self.declined(item) {
+            self.active_items.remove(id);
+            return vec![self.declined_ask(id, item)];
+        }
         if !started && !id.is_empty() && self.active_items.remove(id) {
             return Vec::new();
         }
@@ -259,6 +291,39 @@ impl JsonlParser {
             name: kind.to_string(),
             summary: item_summary(kind, item),
         }]
+    }
+}
+
+impl JsonlParser {
+    /// Whether a completed command item reports the `declined` status.
+    fn declined(&self, item: &Value) -> bool {
+        item.get("status").and_then(Value::as_str) == Some(DECLINED_STATUS)
+    }
+
+    /// The permission row of one declined command.
+    ///
+    /// The row names the command as its one pattern, so the grant that the
+    /// daemon records reads like the opencode grants. The item id is the
+    /// request id; codex numbers items per thread, so a retry that declines
+    /// the same command refreshes the same row.
+    fn declined_ask(&self, id: &str, item: &Value) -> RunEvent {
+        let command = item
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        RunEvent::Ask {
+            task: self.task.clone(),
+            request_id: if id.is_empty() {
+                "declined".to_string()
+            } else {
+                id.to_string()
+            },
+            tool: COMMAND_ITEM.to_string(),
+            input: serde_json::json!({ "command": command, "patterns": [command] }),
+            suggestions: Value::Null,
+            needs_human: false,
+        }
     }
 }
 
@@ -462,6 +527,75 @@ mod tests {
                     cost_usd: None,
                 },
             ]
+        );
+    }
+
+    /// Headless codex refuses a command as one declined item. That item is
+    /// the only approval request the harness can carry, so it must open a
+    /// permission row that names the command.
+    #[test]
+    fn a_declined_command_opens_a_permission_row() {
+        let mut parser = JsonlParser::new("borsuk/review-p142");
+        assert!(parser
+            .parse_line(r#"{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"curl https://example.test","status":"in_progress"}}"#)
+            .iter()
+            .any(|event| matches!(event, RunEvent::Tool { .. })));
+        let events = parser.parse_line(
+            r#"{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"curl https://example.test","aggregated_output":"","exit_code":null,"status":"declined"}}"#,
+        );
+        assert_eq!(
+            events,
+            vec![RunEvent::Ask {
+                task: "borsuk/review-p142".to_string(),
+                request_id: "item_3".to_string(),
+                tool: "command_execution".to_string(),
+                input: serde_json::json!({
+                    "command": "curl https://example.test",
+                    "patterns": ["curl https://example.test"],
+                }),
+                suggestions: Value::Null,
+                needs_human: false,
+            }]
+        );
+        assert!(
+            parser.active_items.is_empty(),
+            "the declined item is no longer active"
+        );
+
+        // A completed command stays a plain tool event.
+        let events = parser.parse_line(
+            r#"{"type":"item.completed","item":{"id":"item_4","type":"command_execution","command":"ls","aggregated_output":"","exit_code":0,"status":"completed"}}"#,
+        );
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, RunEvent::Tool { .. })));
+    }
+
+    /// A grant from the inbox reaches codex as the full-access sandbox,
+    /// because headless codex cannot approve one command on its own.
+    #[test]
+    fn a_granted_permission_lifts_the_sandbox() {
+        let mut settings = settings();
+        settings.sandbox = Some("workspace-write".to_string());
+        let mut job = job(None);
+        assert!(
+            build_args(&job, &settings)
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "workspace-write"]),
+            "the configured sandbox holds without a grant"
+        );
+
+        job.allowed_permissions = vec![crate::runner::AllowedPermission {
+            permission: "command_execution".to_string(),
+            patterns: vec!["curl https://example.test".to_string()],
+        }];
+        let args = build_args(&job, &settings);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "danger-full-access"]));
+        assert!(
+            !args.contains(&"workspace-write".to_string()),
+            "the grant replaces the configured sandbox"
         );
     }
 
