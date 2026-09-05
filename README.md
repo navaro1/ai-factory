@@ -384,6 +384,42 @@ runs can not change course. So a message waits for the turn to end, and then
 starts the next turn in the same agent session. The agent keeps the context of
 its earlier work.
 
+#### Subagents panel
+
+A session that spawns subagents shows them in a left panel 32 columns wide,
+beside the transcript. The panel hides below 64 terminal columns.
+
+The panel has three parts:
+
+- `session` — the harness, the model, the context tokens, the session spend,
+  and the quota windows, reset time, factory spend, org spend, and credits
+  of the billed identity the task binds.
+- `subagents` — one row per agent subagent: status, type, name,
+  description, token count, tool-use count, last tool.
+- `background` — one row per backgrounded bash task.
+
+Context prints as a token value, never a percentage: no verified
+context-window size per model exists.
+
+claude rows report live progress from `task_started`, `task_progress`, and
+`task_notification`. An opencode `task` call appears once, already done:
+opencode reports no live progress. codex has no subagent.
+
+| Key | What it does |
+|---|---|
+| `ctrl-a` | Take or release the panel focus. Works whatever the chat bar does. |
+| `Up` / `Down` | Move the selection, while the panel holds the focus. |
+| `enter` | Open the selected subagent, while the panel holds the focus. |
+| `esc` | Close the open subagent view, else release the panel focus. |
+
+Pressing `enter` on a claude row replaces the transcript pane with that child
+transcript: its prose, tool calls, and tool results in order. For an opencode
+row the pane shows the single output entry and states that opencode streams
+no child transcript.
+
+The main transcript still excludes subagent output. Only the panel and the
+drill-in show it.
+
 ### Decisions inbox, view 3
 
 The inbox is the core of the product. Everything that an agent cannot
@@ -651,6 +687,11 @@ head starts. A push moves the head and starts a review as before.
 - A run that ends with a `needs-human` label counts as finished, because the
   agent took the human path. Answer the row in the inbox to start the stage
   again.
+- The subagents panel shows the context as a token count, never as a
+  percentage: no verified context-window size per model exists.
+- An opencode subagent appears in the panel only after it ends; opencode
+  reports no live subagent progress.
+- A codex session shows no subagent rows: its protocol names no child agent.
 
 ## Development
 

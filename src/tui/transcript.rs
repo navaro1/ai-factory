@@ -168,8 +168,25 @@ fn claude_assistant(value: &Value, raw: &str) -> Vec<Entry> {
     {
         return Vec::new();
     }
-    let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+    let items = claude_assistant_blocks(value);
+    if items.is_empty() && claude_block_payload(value).is_none() {
         return raw_fallback(raw);
+    }
+    items
+}
+
+/// The content array of one claude `assistant` or `user` line, when present.
+fn claude_block_payload(value: &Value) -> Option<&Vec<Value>> {
+    value.pointer("/message/content").and_then(Value::as_array)
+}
+
+/// Walk the content blocks of one claude `assistant` line.
+///
+/// The call applies no `parent_tool_use_id` skip; [`parse`] guards that
+/// and [`child_entries`] wants the blocks of child lines too.
+fn claude_assistant_blocks(value: &Value) -> Vec<Entry> {
+    let Some(blocks) = claude_block_payload(value) else {
+        return Vec::new();
     };
     let mut items = Vec::new();
     for block in blocks {
@@ -203,8 +220,22 @@ fn claude_assistant(value: &Value, raw: &str) -> Vec<Entry> {
 /// A string content is a message the human sent into the session. An array
 /// content holds tool results; a result with `is_error` is marked.
 fn claude_user(value: &Value, raw: &str) -> Vec<Entry> {
+    let items = claude_user_entries(value);
+    if items.is_empty() {
+        raw_fallback(raw)
+    } else {
+        items
+    }
+}
+
+/// Walk the content of one claude `user` line without the raw fallback.
+///
+/// [`parse`] turns an unusable payload into a raw line; [`child_entries`]
+/// wants an empty vector instead, because a child line that holds no
+/// displayable block contributes nothing.
+fn claude_user_entries(value: &Value) -> Vec<Entry> {
     let Some(content) = value.pointer("/message/content") else {
-        return raw_fallback(raw);
+        return Vec::new();
     };
     if let Some(text) = content.as_str() {
         return vec![Entry::User {
@@ -212,7 +243,7 @@ fn claude_user(value: &Value, raw: &str) -> Vec<Entry> {
         }];
     }
     let Some(blocks) = content.as_array() else {
-        return raw_fallback(raw);
+        return Vec::new();
     };
     let mut items = Vec::new();
     for block in blocks {
@@ -225,10 +256,20 @@ fn claude_user(value: &Value, raw: &str) -> Vec<Entry> {
             failed,
         });
     }
-    if items.is_empty() {
-        raw_fallback(raw)
-    } else {
-        items
+    items
+}
+
+/// Build the entries of one claude subagent log line.
+///
+/// A child line carries a non-null `parent_tool_use_id`. The main
+/// [`parse`] skips such lines; the subagents panel collects their blocks
+/// through this function instead. The block logic matches the parent
+/// lines exactly. A line of no known child shape yields no entries.
+pub fn child_entries(value: &Value) -> Vec<Entry> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("assistant") => claude_assistant_blocks(value),
+        Some("user") => claude_user_entries(value),
+        _ => Vec::new(),
     }
 }
 
