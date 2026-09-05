@@ -842,7 +842,7 @@ impl SessionView {
     /// Build the subagents panel lines for one full-height left pane.
     ///
     /// The panel holds three parts: the session meters and quota rows of
-    /// the billed identity, one two-line row per agent subagent, and one
+    /// the billed identity, one row per agent subagent, and one
     /// row per backgrounded bash task. Every line is cut to the panel
     /// width; no input can make a line wider.
     fn panel_lines(&self, usage: &[UsageView]) -> Vec<Line<'static>> {
@@ -972,7 +972,7 @@ impl SessionView {
         lines
     }
 
-    /// The one or two panel lines of one roster row.
+    /// The panel lines of one roster row.
     fn agent_row_lines(
         &self,
         row: &crate::tui::agents::AgentRow,

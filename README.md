@@ -394,7 +394,7 @@ The panel has three parts:
 - `session` — the harness, the model, the context tokens, the session spend,
   and the quota windows, reset time, factory spend, org spend, and credits
   of the billed identity the task binds.
-- `subagents` — one two-line row per agent subagent: status, type, name,
+- `subagents` — one row per agent subagent: status, type, name,
   description, token count, tool-use count, last tool.
 - `background` — one row per backgrounded bash task.
 
