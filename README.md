@@ -168,19 +168,37 @@ of each identity always shows, and it survives a restart. The probes read
 the credentials of the operator home and never store or log a token.
 
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
-OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
+OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, `sandbox`, and `auto_approve`; the approval policy and the sandbox travel on the thread, not the command line.
 
-Headless codex never asks. A command its sandbox refuses ends as one
-declined item, and that item opens a permission row in the inbox. A grant
-runs the task again with `--sandbox danger-full-access`, because headless
-codex has no finer grant. Codex has no question channel: a codex agent that
-needs a person uses the `needs-human` label, as the prompts describe.
+Codex runs as a live session over `codex app-server`. The daemon can chat
+into a parked codex task, resume it by thread id, and answer it. A command
+or file approval opens a permission row in the inbox, and a codex question
+opens a question row, exactly as a claude question does. `approval_policy`
+defaults to `on-request` and `sandbox` defaults to `workspace-write`.
+
+Set `auto_approve = true` on every unattended codex role. The runner then
+accepts each approval at once and no row waits for a person. Leave the field
+off for a supervised role: every approval reaches the inbox and waits there.
+A real question always reaches the inbox in both modes. `approval_policy =
+"never"` is the codex-side answer instead: codex then refuses a command
+rather than asking about it.
+
+Codex asks a question through its `request_user_input` tool. The tool stays
+locked until the feature flag
+`features.default_mode_request_user_input=true` unlocks it, and the runner
+passes that flag on every start.
+
+Every codex thread starts the MCP servers of `~/.codex/config.toml`. The
+recorded probe started telegram, stripe, and todoist for a plain review
+thread. Give a codex role its own `profile` when that role must not start
+them.
 
 Set `auto_approve = true` on every unattended opencode role. Without it,
 opencode auto-rejects every permission request. Tools that read outside the
 project directory then fail, and the task loses its evidence. The run can
 still end `ok`. `aif doctor` reports a `permissions` warning for each opencode
-role that lacks the approval. A rejected request also opens an inbox row, so
+role that lacks the approval. The warning is about opencode alone: a codex
+role without `auto_approve` is the supervised mode, not a fault. A rejected request also opens an inbox row, so
 you can grant the permission for the next run of that task.
 
 A repository role table can override individual fields. A harness change requires a complete role block.
@@ -612,8 +630,9 @@ head starts. A push moves the head and starts a review as before.
 - A `needs-human` label that a person removes on GitHub, instead of through
   the inbox, leaves the reviewed-head mark in place. The same head gets no
   fresh review until a push or an inbox answer.
-- A codex command the sandbox refused opens a permission row. The grant
-  lifts the whole sandbox for the next run of that task, not one command.
+- A codex approval opens a permission row. Press `y` to accept the command
+  or the file change, or `n` to decline it. The agent keeps working after a
+  decline.
 - A review of a pull request from a fork takes the `needs-human` path before a
   repair.
 - A run that ends with a `needs-human` label counts as finished, because the

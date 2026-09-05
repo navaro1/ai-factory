@@ -8246,9 +8246,9 @@ mod tests {
     ///
     /// The restored task dispatches with its saved session id, and the
     /// dispatch binds the configured harness. The runner unit tests pin the
-    /// exact resume argv (`--resume <id>` for claude, `--session <id>` for
-    /// opencode, `exec resume <id>` for codex); this rig pins the dispatch
-    /// contract that feeds them.
+    /// exact resume shape (`--resume <id>` for claude, `--session <id>` for
+    /// opencode, a `thread/resume` request for codex); this rig pins the
+    /// dispatch contract that feeds them.
     ///
     /// `set_role_harness` clears every field of another harness, so the role
     /// binding that the first rig persists still validates when the second
