@@ -530,6 +530,21 @@ The role returns to the built-in prompt.
 - The stop sequence stops every live agent session before the daemon exits,
   so no agent process stays behind as an orphan.
 
+The daemon confirms each finished stage on GitHub before it marks the task
+done. An agent that exits with success did not always do the work, and the
+gates react to a change, not to a state. A stage that ends without its
+change would therefore never start again. Each stage has one result:
+
+| Stage | What the daemon checks |
+|---|---|
+| Refine | The ticket carries the `refined` label. |
+| Implement | A pull request closes the ticket. |
+| Review | The pull request left the draft state. |
+| Release | Every pull request of the batch is merged. |
+
+A run that ends without its result waits for the next poll. After about a
+minute it fails, and the task retries like any other failure.
+
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
@@ -561,6 +576,9 @@ The role returns to the built-in prompt.
   poll.
 - A review of a pull request from a fork takes the `needs-human` path before a
   repair.
+- A run that ends with a `needs-human` label counts as finished, because the
+  agent took the human path. Answer the row in the inbox to start the stage
+  again.
 
 ## Development
 
