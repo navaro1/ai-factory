@@ -2,8 +2,9 @@
 //!
 //! The loop blocks on one inbound channel until the next real deadline, so a
 //! quiet factory costs nothing. Every message runs [`Daemon::drive`], which
-//! admits gated work, fires due trains, refreshes release gates, reaps idle
-//! sessions, and dispatches queued tasks. [`Daemon::drive`] is idempotent and
+//! settles the finished runs that wait for GitHub, admits gated work, fires
+//! due trains, refreshes release gates, reaps idle sessions, and dispatches
+//! queued tasks. [`Daemon::drive`] is idempotent and
 //! never recurses, so it is safe to run after every message.
 //!
 //! The loop never polls a clock. It sleeps until the earliest of the trains'
@@ -745,7 +746,8 @@ impl Daemon {
         self.drive();
     }
 
-    /// One pass of the factory: admit, fire, gate, reap, dispatch, persist.
+    /// One pass of the factory: settle, admit, fire, gate, reap, dispatch,
+    /// and persist.
     ///
     /// The pass is idempotent: a second pass with no new message dispatches
     /// nothing, fires nothing, and writes nothing. The pass never recurses.
@@ -2397,8 +2399,9 @@ impl Daemon {
     /// Apply one turn end.
     ///
     /// A live-input refine task waits for a user. Another live-input task
-    /// completes or fails from the turn result. A one-shot turn is only a
-    /// step boundary.
+    /// fails from the turn result, or settles through
+    /// [`Daemon::settle_finished_run`]. A one-shot turn is only a step
+    /// boundary.
     fn on_turn_end(&mut self, id: &str, ok: bool, summary: &str) {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
@@ -2440,7 +2443,8 @@ impl Daemon {
 
     /// Apply one run exit.
     ///
-    /// A terminal task ignores the exit. A parked task stays resumable.
+    /// A terminal task ignores the exit. A parked task stays resumable, and
+    /// so does a task that waits for its GitHub transition.
     /// A one-shot exit supplies the task result.
     /// A live-input exit without a prior result fails the active task.
     /// After the terminal state is set, a queued chat message reopens the
