@@ -36,7 +36,7 @@ use crate::config::{
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
-use crate::gates::{implement_ready, review_ready, GateTracker, ReadyWork};
+use crate::gates::{self, implement_ready, review_ready, GateTracker, ReadyWork};
 use crate::gh::GhClient;
 use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
@@ -83,6 +83,13 @@ pub const USAGE_WAIT_CAP_MINUTES: u64 = 60;
 /// The value covers the full stop ladder of `src/proc.rs`: 10 s after the
 /// protocol interrupt, 5 s after `SIGTERM`, and 5 s after `SIGKILL`.
 pub const SHUTDOWN_GRACE_MS: u64 = 25_000;
+
+/// How long a finished run may wait for GitHub to show its stage
+/// transition.
+///
+/// The value covers about two 20-second polls and a margin, so a run that
+/// did the work never fails because the next poll was slow.
+pub const CONFIRM_GRACE_MS: u64 = 50_000;
 
 /// The one message sent for each new ticket refinement interval.
 pub const TICKET_REFINEMENT_MESSAGE: &str =
@@ -216,6 +223,10 @@ pub struct Daemon {
     release_batches: BTreeMap<String, Vec<u64>>,
     /// The ticket-PR links of each repository, rebuilt on every poll.
     links: BTreeMap<String, Links>,
+    /// The finished pipeline runs that wait for GitHub to confirm their
+    /// stage transition, with the moment each one gives up. The map is
+    /// runtime only: a restart re-derives the work from the labels.
+    confirming: BTreeMap<String, u64>,
     /// The source issue worktree of each review task.
     /// The ticket set of each review task, pinned at admit time. The
     /// supersede check compares it against the fresh poll.
@@ -556,6 +567,7 @@ impl Daemon {
             trains,
             release_batches,
             links: BTreeMap::new(),
+            confirming: BTreeMap::new(),
             review_tickets,
             ticket_controller,
             ticket_conversations,
@@ -741,6 +753,7 @@ impl Daemon {
         if self.shutdown {
             return;
         }
+        self.settle_confirming(None);
         self.admit_ready();
         self.rebuild_stacked();
         self.fire_due_trains();
@@ -787,6 +800,12 @@ impl Daemon {
             earliest = Some(match earliest {
                 Some(so_far) => so_far.min(at),
                 None => at,
+            });
+        }
+        for at in self.confirming.values() {
+            earliest = Some(match earliest {
+                Some(so_far) => so_far.min(*at),
+                None => *at,
             });
         }
         if self.config.usage.enabled {
@@ -1129,6 +1148,7 @@ impl Daemon {
         self.snapshot.apply(repo, fresh.clone());
         self.links
             .insert(repo.to_string(), Links::derive(repo, &fresh));
+        self.settle_confirming(Some(repo));
         self.pending_stacked.insert(repo.to_string());
         if let Some(old) = old.filter(|_| !unchanged) {
             self.reconcile_removed(repo, &old, &fresh);
@@ -1253,6 +1273,7 @@ impl Daemon {
             return;
         }
         self.role_bindings.remove(id);
+        self.confirming.remove(id);
         self.review_tickets.remove(id);
         self.release_batches.remove(id);
         self.pending_chats.remove(id);
@@ -2144,6 +2165,7 @@ impl Daemon {
             return;
         }
         self.stop_session(id, "cannot stop the failed session");
+        self.confirming.remove(id);
         let final_attempt = task.attempt >= tasks::MAX_ATTEMPTS;
         if let Err(e) =
             self.table
@@ -2397,7 +2419,7 @@ impl Daemon {
             self.changed = true;
             self.reconcile(Some(&task.repo));
         } else if ok {
-            self.complete_task(&task);
+            self.settle_finished_run(&task);
         } else {
             let reason = if summary.is_empty() {
                 "the agent turn failed"
@@ -2421,6 +2443,11 @@ impl Daemon {
             return;
         }
         self.sessions.remove(id);
+        // A task that waits for its GitHub transition keeps its state. Its
+        // process is gone, and the confirmation sweep decides the result.
+        if self.confirming.contains_key(id) {
+            return;
+        }
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
@@ -2441,9 +2468,194 @@ impl Daemon {
             };
             self.fail_run(&task, &reason);
         } else if ok {
-            self.complete_task(&task);
+            self.settle_finished_run(&task);
         } else {
             self.fail_run(&task, detail);
+        }
+    }
+
+    /// Finish one successful run: complete it, or wait for GitHub.
+    ///
+    /// An agent that exits with success has not always done the work. The
+    /// daemon marks a pipeline task `Done` only after GitHub shows the
+    /// stage transition, because the gates are edge-triggered: a stage that
+    /// ends without its transition would never open again, and the board
+    /// row would say done for ever. A run without the transition therefore
+    /// waits in [`Daemon::confirming`] and asks its repository for a poll
+    /// at once. A non-pipeline task carries no stage transition, so it
+    /// completes here.
+    fn settle_finished_run(&mut self, task: &Task) {
+        if self.stage_transitioned(task) {
+            self.complete_task(task);
+            return;
+        }
+        self.confirming.insert(
+            task.id.clone(),
+            self.now_ms.saturating_add(CONFIRM_GRACE_MS),
+        );
+        self.changed = true;
+        self.reconcile(Some(&task.repo));
+    }
+
+    /// True when GitHub shows the stage transition of one finished task.
+    ///
+    /// Each stage has one visible result: the refine labels the ticket, the
+    /// implement opens a pull request for it, the review takes the pull
+    /// request out of the draft state, and the release merges every pull
+    /// request of its batch. An item that carries `needs-human` counts as
+    /// transitioned: the agent took the documented human path, and the
+    /// inbox row carries the work from there. A task that is not a pipeline
+    /// task has no transition to check.
+    fn stage_transitioned(&self, task: &Task) -> bool {
+        if task.purpose != TaskPurpose::Pipeline {
+            return true;
+        }
+        if task.stage == Stage::Release {
+            return self.open_batch_prs(task).is_empty();
+        }
+        let Some(fresh) = self.snapshot.repos.get(&task.repo) else {
+            return false;
+        };
+        let number = task.number;
+        let needs_human = match task.kind {
+            ItemKind::Issue => fresh
+                .issues
+                .get(&number)
+                .is_some_and(|issue| issue.labels.iter().any(|l| l == NEEDS_HUMAN_LABEL)),
+            ItemKind::Pr => fresh
+                .prs
+                .get(&number)
+                .is_some_and(|pull| pull.labels.iter().any(|l| l == NEEDS_HUMAN_LABEL)),
+        };
+        if needs_human {
+            return true;
+        }
+        match task.stage {
+            Stage::Refine => refine_transitioned(fresh, number),
+            // The `refined` label is not part of the check. The agent is
+            // asked to remove it, and `complete_task` removes a forgotten
+            // one, so a pull request alone proves the implementation.
+            Stage::Implement => self
+                .links
+                .get(&task.repo)
+                .is_some_and(|links| !links.prs_of(number).is_empty()),
+            Stage::Review => {
+                review_transitioned(fresh, number)
+                    || fresh.prs.get(&number).is_none_or(|pull| !pull.open)
+            }
+            Stage::Release => true,
+        }
+    }
+
+    /// The pull requests of a release batch that GitHub still shows open,
+    /// ascending. An empty answer means the batch is through.
+    ///
+    /// A task without a batch entry has nothing to check, so it reports
+    /// none. A repository without a snapshot reports the whole batch: the
+    /// daemon cannot confirm a merge it never polled.
+    fn open_batch_prs(&self, task: &Task) -> Vec<u64> {
+        let Some(batch) = self.release_batches.get(&task.id) else {
+            return Vec::new();
+        };
+        let Some(fresh) = self.snapshot.repos.get(&task.repo) else {
+            return batch.clone();
+        };
+        let mut open: Vec<u64> = batch
+            .iter()
+            .copied()
+            .filter(|number| fresh.prs.get(number).is_some_and(|pull| pull.open))
+            .collect();
+        open.sort_unstable();
+        open
+    }
+
+    /// Complete or fail the finished runs that wait for their transition.
+    ///
+    /// `repo` limits the sweep to one repository, for the poll that just
+    /// arrived. `None` sweeps every repository, so a deadline expires even
+    /// while the polls fail.
+    fn settle_confirming(&mut self, repo: Option<&str>) {
+        let waiting: Vec<(String, u64)> = self
+            .confirming
+            .iter()
+            .map(|(id, deadline)| (id.clone(), *deadline))
+            .collect();
+        for (id, deadline) in waiting {
+            let Some(task) = self.table.by_id.get(&id).cloned() else {
+                self.confirming.remove(&id);
+                continue;
+            };
+            if repo.is_some_and(|alias| task.repo != alias) {
+                continue;
+            }
+            if task.state.is_terminal() {
+                self.confirming.remove(&id);
+                continue;
+            }
+            if self.stage_transitioned(&task) {
+                self.confirming.remove(&id);
+                self.complete_task(&task);
+            } else if self.now_ms >= deadline {
+                self.confirming.remove(&id);
+                let reason = self.unconfirmed_reason(&task);
+                self.fail_run(&task, &reason);
+            }
+        }
+    }
+
+    /// The failure reason of a run that never showed its transition.
+    fn unconfirmed_reason(&self, task: &Task) -> String {
+        let number = task.number;
+        match task.stage {
+            Stage::Refine => {
+                format!("the refine run ended, but ticket #{number} still carries `to-refine`")
+            }
+            Stage::Implement => {
+                format!("the implement run ended, but no PR closes ticket #{number}")
+            }
+            Stage::Review => format!("the review run ended, but PR #{number} is still a draft"),
+            Stage::Release => {
+                let open = self.open_batch_prs(task).first().copied().unwrap_or(number);
+                format!("the release run ended, but PR #{open} is still open")
+            }
+        }
+    }
+
+    /// Remove a `refined` label that a finished implementation left behind.
+    ///
+    /// The prompt asks the agent to remove the label, and a forgotten one
+    /// keeps the implement gate open, so the next poll would start the
+    /// stage again. A failed call goes to standard error only: the work is
+    /// done, and the label alone must not fail the task.
+    fn clear_refined_label(&self, task: &Task) {
+        if task.purpose != TaskPurpose::Pipeline {
+            return;
+        }
+        let labelled = self.snapshot.repos.get(&task.repo).is_some_and(|fresh| {
+            fresh
+                .issues
+                .get(&task.number)
+                .is_some_and(|issue| issue.labels.iter().any(|l| l == gates::REFINED))
+        });
+        if !labelled {
+            return;
+        }
+        let Some(owner_repo) = self
+            .config
+            .repos
+            .get(&task.repo)
+            .map(|repo| repo.owner_repo.clone())
+        else {
+            return;
+        };
+        let gh = GhClient::new(&*self.exec);
+        if let Err(error) = gh.remove_label(&owner_repo, task.number, gates::REFINED) {
+            eprintln!(
+                "cannot remove {} from {} issue {}: {error:#}",
+                gates::REFINED,
+                task.repo,
+                task.number
+            );
         }
     }
 
@@ -2465,6 +2677,7 @@ impl Daemon {
             return;
         }
         self.changed = true;
+        self.confirming.remove(&task.id);
         // A live-input task without a saved message loses its restart data
         // at `Done`. A saved message keeps the marker until its next turn.
         // A resumable one-shot task keeps the marker for later follow-ups.
@@ -2477,7 +2690,8 @@ impl Daemon {
         self.allowed_permissions.remove(&task.id);
         match task.stage {
             Stage::Release => self.finish_train(&task.repo, true, false),
-            Stage::Refine | Stage::Implement | Stage::Review => {}
+            Stage::Implement => self.clear_refined_label(task),
+            Stage::Refine | Stage::Review => {}
         }
         self.reopen_for_pending_chat(&task.id);
     }
@@ -4112,6 +4326,7 @@ impl Daemon {
     fn cancel_task(&mut self, id: &str, deliver_pending_chat: bool) {
         let task = self.table.by_id.get(id).cloned();
         self.stop_session(id, "cannot stop the session during the abort");
+        self.confirming.remove(id);
         let carries_chat = deliver_pending_chat && self.pending_chats.contains_key(id);
         if !carries_chat {
             self.pending_chats.remove(id);
@@ -5433,6 +5648,13 @@ mod tests {
         }
     }
 
+    /// One open, ready pull request whose branch closes `ticket`.
+    fn linked_pr(number: u64, ticket: u64) -> Pr {
+        let mut pull = pr(number, false, &[]);
+        pull.head_ref = format!("aif/borsuk/issue-{ticket}");
+        pull
+    }
+
     /// A daemon over fake runners, a scripted command runner, and a pinned
     /// clock.
     struct Rig {
@@ -5558,6 +5780,14 @@ mod tests {
                     prs: pr_map,
                 },
             }));
+        }
+
+        /// Apply one poll that shows the finished implementation of
+        /// ticket 142: the ticket lost its labels, and pull request 5
+        /// closes it. A running implement task confirms its stage
+        /// transition from this poll.
+        fn poll_implemented(&mut self) {
+            self.poll(vec![issue(142, &[])], vec![linked_pr(5, 142)]);
         }
 
         fn event(&mut self, event: RunEvent) {
@@ -5981,12 +6211,15 @@ mod tests {
             Some("sha5")
         );
 
+        // GitHub shows the review transition: the pull request left the
+        // draft state.
+        rig.poll(vec![], vec![pr(5, false, &[])]);
         rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
         assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
         let marker = issue_wt(&dir, 5).join(".aif").join("reviewed-sha");
         assert_eq!(fs::read_to_string(marker).unwrap().trim_end(), "sha5");
 
-        rig.poll(vec![], vec![pr(5, true, &[]), pr(6, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[]), pr(6, true, &[])]);
         rig.event(turn_finished("borsuk/review-p6", false, "lint"));
         assert_eq!(rig.task("borsuk/review-p6").attempt, 2);
         assert!(!issue_wt(&dir, 6).join(".aif").join("reviewed-sha").exists());
@@ -6198,6 +6431,7 @@ mod tests {
         let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 5, &rig_gitdir(&dir));
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, false, &[])]);
         fs::create_dir_all(worktree.join(".aif").join("reviewed-sha")).unwrap();
 
         rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
@@ -6246,6 +6480,7 @@ mod tests {
             "the retry reviews the same head as the failed task"
         );
 
+        rig.poll(vec![], vec![pr(5, false, &[])]);
         rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
 
         assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
@@ -6266,6 +6501,7 @@ mod tests {
             .get_mut("borsuk/review-p5")
             .unwrap()
             .head_sha = None;
+        rig.poll(vec![], vec![pr(5, false, &[])]);
 
         rig.event(turn_finished("borsuk/review-p5", true, "lgtm"));
 
@@ -6557,6 +6793,7 @@ mod tests {
 
         // The retry adapts without the permission and finishes.
         rig.event(started("borsuk/implement-i142", "ses-142b"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "done"));
 
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
@@ -6626,6 +6863,7 @@ mod tests {
 
         // The granted run completes and leaves no rules behind.
         rig.event(started("borsuk/implement-i142", "ses-142c"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "done"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
         assert!(rig.daemon.allowed_permissions.is_empty());
@@ -7472,6 +7710,7 @@ mod tests {
 
         assert_eq!(second.job_count(), 1);
         assert_eq!(second.job(0).resume.as_deref(), Some("session-142"));
+        second.poll_implemented();
         second.event(turn_finished("borsuk/implement-i142", true, "done"));
         assert_eq!(
             second
@@ -7632,10 +7871,20 @@ mod tests {
         );
 
         second.event(turn_finished("borsuk/release", true, "released"));
-        assert_eq!(second.task("borsuk/release").state, TaskState::Done);
+        assert_eq!(
+            second.task("borsuk/release").state,
+            TaskState::Running,
+            "the release waits for GitHub to show the merge"
+        );
+
+        // The merge reaches the next poll. The release completes, and the
+        // finished task retires with its empty batch.
+        second.poll(vec![], vec![]);
+        assert!(!second.daemon.table.by_id.contains_key("borsuk/release"));
+        assert_eq!(second.daemon.trains["borsuk"].in_flight, None);
 
         second.set_now(T0 + 61 * 60_000);
-        second.poll(vec![], vec![pr(2, false, &[])]);
+        second.poll(vec![], vec![]);
         assert_eq!(
             second.job_count(),
             1,
@@ -7925,6 +8174,7 @@ mod tests {
             vec!["add a regression test".to_string()]
         );
 
+        second.poll_implemented();
         second.event(exited("borsuk/implement-i142", true, "done"));
 
         assert_eq!(second.job_count(), 2, "the saved follow-up starts second");
@@ -8704,6 +8954,7 @@ mod tests {
         });
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "sid-142"));
+        rig.poll_implemented();
         let session = rig.session(0);
         session.fail_send.store(true, Ordering::SeqCst);
 
@@ -10242,6 +10493,7 @@ mod tests {
                 .collect();
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.poll_implemented();
         rig.event(turn_finished("borsuk/implement-i142", true, "done"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
 
@@ -10449,6 +10701,9 @@ mod tests {
             .ends_with("borsuk__release-p2.jsonl"));
 
         rig.event(turn_finished("borsuk/release", true, "released"));
+        // The merge of pull request 2 confirms the release, so the train
+        // takes a second batch.
+        rig.poll(vec![], vec![pr(5, false, &["release-stacked"])]);
         rig.act(Action::Go {
             repo: "borsuk".to_string(),
             prs: vec![5],
@@ -10827,8 +11082,12 @@ mod tests {
             prs: vec![2],
         });
         rig.event(turn_finished("borsuk/release", true, "released"));
-        assert_eq!(rig.task("borsuk/release").state, TaskState::Done);
-        assert!(rig.daemon.trains["borsuk"].batch().is_empty());
+        assert_eq!(
+            rig.task("borsuk/release").state,
+            TaskState::Running,
+            "the release waits for the merge of its batch"
+        );
+        assert_eq!(rig.daemon.trains["borsuk"].batch(), &[2]);
 
         rig.poll(vec![], vec![]);
 
@@ -11392,6 +11651,10 @@ mod tests {
         );
         assert_eq!(rig.job_count(), 1);
 
+        rig.poll(
+            vec![issue(142, &[]), issue(143, &["refined"])],
+            vec![linked_pr(5, 142)],
+        );
         rig.event(turn_finished("borsuk/implement-i142", true, "done"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
         assert_eq!(
@@ -11421,6 +11684,7 @@ mod tests {
         rig.event(turn_finished("borsuk/implement-i142", true, "one step"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
 
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
     }
@@ -11452,6 +11716,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
         // A daemon restart loses the session id in the table. The marker in
@@ -11483,6 +11748,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         rig.daemon
             .table
@@ -11509,6 +11775,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
 
         rig.daemon
             .chat("borsuk/implement-i142", "add a regression test");
@@ -11554,6 +11821,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 2);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
 
         rig.daemon.chat("borsuk/implement-i142", "first follow-up");
         rig.daemon.chat("borsuk/implement-i142", "second follow-up");
@@ -11642,6 +11910,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         rig.act(Action::Pause {
             scope: PauseScope::Stage {
@@ -11785,6 +12054,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
 
@@ -11803,6 +12073,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         rig.act(Action::Pause {
             scope: PauseScope::Stage {
@@ -12014,6 +12285,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         // A ticket chat of the same issue works in the shared checkout, so
         // it holds no worktree. It is a prior stage, so it holds the turn.
@@ -12282,6 +12554,7 @@ mod tests {
             let mut rig = opencode_rig(&dir, 0);
             rig.poll(vec![issue(142, &["refined"])], vec![]);
             rig.event(started("borsuk/implement-i142", "ses-142"));
+            rig.poll_implemented();
             rig.event(exited("borsuk/implement-i142", true, "code 0"));
             assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
             // A refine task of the same ticket that is not terminal. The
@@ -12372,10 +12645,11 @@ mod tests {
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
-        // The one-shot refine reports its result and completes.
+        // The one-shot refine reports its result, and the poll that shows
+        // the `refined` label completes it.
         rig.event(exited("borsuk/refine-i142", true, "code 0"));
-        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
         assert_eq!(rig.job_count(), 2, "the implement gate opened");
         rig.event(started("borsuk/implement-i142", "ses-142"));
 
@@ -12407,6 +12681,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
         // An active conversation about the same ticket works in the shared
         // checkout, so it owns no worktree.
@@ -12712,6 +12987,7 @@ mod tests {
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
         let task = rig.task("borsuk/implement-i142");
         assert_eq!(rig.daemon.input_mode(&task), InputMode::NextTurn);
 
@@ -12904,6 +13180,7 @@ mod tests {
 
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
 
         // The running turn cannot take the message, so the count rises
         // until its exit frees the follow-up.
