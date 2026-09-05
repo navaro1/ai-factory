@@ -1704,11 +1704,6 @@ impl Config {
         }
         delta
     }
-
-    /// True when a reload can retain every live repository controller.
-    pub fn has_same_topology(&self, other: &Self) -> bool {
-        self.topology_delta(other).is_empty()
-    }
 }
 
 fn role_parts(role: ExecutionRole) -> (&'static str, &'static str) {
@@ -2329,8 +2324,8 @@ mod repo_edit_tests {
         // Identical configurations produce the empty delta.
         let same = parse(&config_text());
         assert!(before.topology_delta(&same).is_empty());
-        assert!(before.has_same_topology(&same));
-        assert!(!before.has_same_topology(&after));
+        assert!(before.topology_delta(&same).is_empty());
+        assert!(!before.topology_delta(&after).is_empty());
     }
 }
 
