@@ -358,7 +358,8 @@ pub struct SessionView {
     tailer: Option<LogTailer>,
     ring: Ring<Entry>,
     roster: AgentRoster,
-    /// The panel row the selection marks, as an index into the rows.
+    /// The panel row the selection marks, as a position in the panel
+    /// display order: the agent rows first, then the bash rows.
     selected: usize,
     /// The task id of the open drill-in row, when one is open.
     open: Option<String>,
@@ -682,22 +683,25 @@ impl SessionView {
 
     /// Apply one key press while the subagents panel holds the focus.
     ///
-    /// `Up` and `Down` move the selection over the roster rows. Enter
-    /// opens the drill-in of the selected row. `esc` closes an open
-    /// drill-in first and releases the panel focus second. The scroll
-    /// keys keep working on the transcript pane.
+    /// `Up` and `Down` move the selection in the order the panel shows
+    /// the rows: the agent rows first, then the bash rows. Enter opens
+    /// the drill-in of the selected row. `esc` closes an open drill-in
+    /// first and releases the panel focus second. The scroll keys keep
+    /// working on the transcript pane.
     fn panel_key(&mut self, key: KeyEvent, page: usize) {
-        let rows = self.roster.rows().len();
+        let last = self.panel_order().len().saturating_sub(1);
+        self.selected = self.selected.min(last);
         match key.code {
             KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1).min(rows.saturating_sub(1));
+                self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(rows.saturating_sub(1));
+                self.selected = (self.selected + 1).min(last);
             }
             KeyCode::Enter => {
-                if let Some(row) = self.roster.rows().get(self.selected) {
-                    self.open = Some(row.task_id.clone());
+                let index = self.panel_order().get(self.selected).copied();
+                if let Some(index) = index {
+                    self.open = Some(self.roster.rows()[index].task_id.clone());
                 }
             }
             KeyCode::Esc => {
@@ -718,6 +722,32 @@ impl SessionView {
             }
             _ => {}
         }
+    }
+
+    /// The roster row indices in panel display order.
+    ///
+    /// The panel shows the agent rows first, then the bash rows, and
+    /// each group keeps its creation order. The selection and the
+    /// highlight follow this order, not the creation order, so the
+    /// keys move the highlight the way the panel draws it.
+    fn panel_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = self
+            .roster
+            .rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.kind == AgentKind::Agent)
+            .map(|(index, _)| index)
+            .collect();
+        order.extend(
+            self.roster
+                .rows()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.kind == AgentKind::Bash)
+                .map(|(index, _)| index),
+        );
+        order
     }
 
     /// Build the transcript display lines for one pane width.
@@ -828,38 +858,32 @@ impl SessionView {
         if self.binding_harness() == Some(Harness::Opencode) {
             lines.push(Line::styled("(opencode: no live progress)", dim));
         }
-        let agent_rows: Vec<(usize, &crate::tui::agents::AgentRow)> = self
+        let agent_rows: Vec<&crate::tui::agents::AgentRow> = self
             .roster
             .rows()
             .iter()
-            .enumerate()
-            .filter(|(_, row)| row.kind == AgentKind::Agent)
+            .filter(|row| row.kind == AgentKind::Agent)
             .collect();
         if agent_rows.is_empty() {
             lines.push(Line::styled("no subagents", dim));
         }
-        for &(index, row) in &agent_rows {
-            let selected = index
-                == self
-                    .selected
-                    .min(self.roster.rows().len().saturating_sub(1));
-            lines.extend(self.agent_row_lines(row, selected));
+        let selected = self
+            .selected
+            .min(self.panel_order().len().saturating_sub(1));
+        for (position, &row) in agent_rows.iter().enumerate() {
+            lines.extend(self.agent_row_lines(row, position == selected));
         }
-        let bash_rows: Vec<(usize, &crate::tui::agents::AgentRow)> = self
+        let bash_rows: Vec<&crate::tui::agents::AgentRow> = self
             .roster
             .rows()
             .iter()
-            .enumerate()
-            .filter(|(_, row)| row.kind == AgentKind::Bash)
+            .filter(|row| row.kind == AgentKind::Bash)
             .collect();
         if !bash_rows.is_empty() {
             lines.push(Line::styled(String::new(), dim));
             lines.push(Line::styled("background", title));
-            for &(index, row) in &bash_rows {
-                let selected = index
-                    == self
-                        .selected
-                        .min(self.roster.rows().len().saturating_sub(1));
+            for (offset, &row) in bash_rows.iter().enumerate() {
+                let selected = agent_rows.len() + offset == selected;
                 lines.extend(self.agent_row_lines(row, selected));
             }
         }
@@ -2933,6 +2957,37 @@ mod tests {
         assert_eq!(view.handle_key(ctrl_a, 10), None);
         assert!(view.panel_focus());
         assert!(!view.chat_focus());
+    }
+
+    #[test]
+    fn the_selection_walks_the_visible_order_across_the_sections() {
+        let dir = TempDir::new("panel-order");
+        let log = dir.path().join("task.jsonl");
+        let mut view = SessionView::new();
+        view.show(&sample_task(&log));
+        // The bash task is spawned first, so the roster holds the bash
+        // row first while the panel shows the agent row above it.
+        let bash = r#"{"type":"system","subtype":"task_started","task_id":"bash-1","tool_use_id":"toolu_c","description":"run the tests","task_type":"local_bash","is_backgrounded":true}"#;
+
+        feed(&mut view, &log, &[bash, SPAWN_STARTED]);
+
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(view.handle_key(ctrl_a, 10), None);
+        assert_eq!(view.selected, 0, "the top visible row starts selected");
+
+        // Enter opens the agent row, the first row the panel shows.
+        view.handle_key(key(KeyCode::Enter), 10);
+        assert_eq!(view.open.as_deref(), Some("task-1"));
+
+        // Down walks into the background section, and Up walks back.
+        view.handle_key(key(KeyCode::Down), 10);
+        assert_eq!(view.selected, 1);
+        view.handle_key(key(KeyCode::Enter), 10);
+        assert_eq!(view.open.as_deref(), Some("bash-1"));
+        view.handle_key(key(KeyCode::Down), 10);
+        assert_eq!(view.selected, 1, "the last visible row holds");
+        view.handle_key(key(KeyCode::Up), 10);
+        assert_eq!(view.selected, 0);
     }
 
     #[test]
