@@ -182,15 +182,27 @@ fn collect_zai_fields(value: &Value, report: &mut ZaiReport) {
 
 /// Build one normalized window from one z.ai limit entry.
 ///
-/// The fields are read tolerantly: the utilization may arrive as
+/// The fields are read tolerantly: the used share may arrive as
 /// `percentage` or `utilization`, the reset arrives as epoch milliseconds
 /// in `nextResetTime`, and the label comes from the unit and the number.
+///
+/// `percentage` already counts in percent units, so it only clamps. A live
+/// pro-plan payload of 2026-09-05 reported `percentage: 1` and
+/// `percentage: 12` for the two windows that the z.ai dashboard showed as
+/// 1% used and 12% used. A 0-1 heuristic here read `1` as a full window and
+/// drew `0% left`. `utilization` keeps the share heuristic, because no
+/// observed payload names its scale.
 fn zai_window(entry: &Value) -> UsageWindow {
     let used_percent = entry
         .get("percentage")
-        .or_else(|| entry.get("utilization"))
         .and_then(Value::as_f64)
-        .map(utilization_to_percent)
+        .map(|value| value.clamp(0.0, 100.0))
+        .or_else(|| {
+            entry
+                .get("utilization")
+                .and_then(Value::as_f64)
+                .map(utilization_to_percent)
+        })
         .or_else(|| {
             // No utilization field: derive the share from used and allowance.
             let used = entry.get("currentValue").and_then(Value::as_f64)?;
@@ -213,6 +225,26 @@ fn zai_window(entry: &Value) -> UsageWindow {
     }
 }
 
+/// The unit text of one z.ai limit entry.
+///
+/// The modern shape names the unit, for example `TIME_LIMIT_HOUR`. The
+/// legacy shape sends a numeric code instead. A live pro-plan payload of
+/// 2026-09-05 sent `unit: 3` for the window that the z.ai dashboard named
+/// "5-hour limit" and `unit: 6` for the window it named "Weekly limit".
+/// Only these two codes are proven, so every other code stays empty and
+/// keeps the old label fallback.
+fn zai_unit_text(entry: &Value) -> &str {
+    let unit = entry.get("unit");
+    if let Some(text) = unit.and_then(Value::as_str) {
+        return text;
+    }
+    match unit.and_then(Value::as_u64) {
+        Some(3) => "hour",
+        Some(6) => "week",
+        _ => "",
+    }
+}
+
 /// Label one z.ai window from the unit and the number of its limit entry.
 ///
 /// A week window is `weekly`, an hour window carries its length, for
@@ -222,7 +254,7 @@ fn zai_window_label(entry: &Value) -> String {
         .get("number")
         .and_then(Value::as_f64)
         .filter(|value| *value > 0.0);
-    let unit = entry.get("unit").and_then(Value::as_str).unwrap_or("");
+    let unit = zai_unit_text(entry);
     let unit_lower = unit.to_ascii_lowercase();
     if unit_lower.contains("week") {
         return window_label(10_080);
@@ -589,7 +621,7 @@ mod tests {
     #[test]
     fn probe_zai_falls_back_to_the_legacy_path_on_a_404() {
         let legacy_body = r#"{"data":{"level":"GLM Coding Plan","limits":[
-            {"type":"TOKENS_LIMIT","usage":120000,"currentValue":30000,"percentage":0.25,
+            {"type":"TOKENS_LIMIT","usage":120000,"currentValue":30000,"percentage":25,
              "nextResetTime":1788220800000}
         ]}}"#;
         let exec = ScriptExec::new()
@@ -686,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_zai_accepts_percentage_values_on_both_scales() {
+    fn probe_zai_reads_the_percent_field_and_the_share_field() {
         let body = r#"{"data":{"limits":[
             {"type":"CREDIT_LIMIT","unit":"CREDIT","percentage":42.0},
             {"type":"CREDIT_LIMIT","unit":"CREDIT","utilization":0.9}
@@ -697,6 +729,42 @@ mod tests {
 
         assert_eq!(record.windows[0].used_percent, 42.0);
         assert_eq!(record.windows[1].used_percent, 90.0);
+    }
+
+    #[test]
+    fn probe_zai_reads_the_live_pro_plan_payload() {
+        // The live pro-plan payload of 2026-09-05. The dashboard showed
+        // 1% used and 12% used for these two windows.
+        let body = r#"{"data":{"level":"pro","limits":[
+            {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":12000,
+             "currentValue":45,"remaining":11954,"percentage":1,
+             "nextResetTime":1788610133982},
+            {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":60000,
+             "currentValue":7755,"remaining":52244,"percentage":12,
+             "nextResetTime":1789044510997}
+        ]}}"#;
+        let exec = curl_exec(ZAI_USAGE_URL, body, 200);
+
+        let record = probe_zai(&exec, "zai-token", 0).unwrap();
+
+        assert_eq!(record.windows.len(), 2);
+        assert_eq!(record.windows[0].label, "5 hour");
+        assert_eq!(record.windows[0].used_percent, 1.0);
+        assert_eq!(record.windows[1].label, "weekly");
+        assert_eq!(record.windows[1].used_percent, 12.0);
+    }
+
+    #[test]
+    fn probe_zai_keeps_the_kind_label_for_an_unknown_numeric_unit() {
+        let body = r#"{"data":{"limits":[
+            {"type":"CREDIT_LIMIT","unit":9,"number":2,"percentage":30}
+        ]}}"#;
+        let exec = curl_exec(ZAI_USAGE_URL, body, 200);
+
+        let record = probe_zai(&exec, "zai-token", 0).unwrap();
+
+        assert_eq!(record.windows[0].label, "2 CREDIT");
+        assert_eq!(record.windows[0].used_percent, 30.0);
     }
 
     #[test]

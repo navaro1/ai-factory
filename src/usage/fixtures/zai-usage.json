@@ -9,7 +9,7 @@
         "unit": "TIME_LIMIT_HOUR",
         "usage": 1200,
         "currentValue": 300,
-        "percentage": 0.25,
+        "percentage": 25.0,
         "nextResetTime": 1788220800000
       },
       {
