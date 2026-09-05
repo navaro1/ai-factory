@@ -73,6 +73,20 @@ impl TicketController {
         self.last_mutation_ms.insert(repo.to_string(), confirmed_ms);
     }
 
+    /// Drop every cached record of one repository.
+    ///
+    /// The daemon calls this when a repository leaves the configuration
+    /// while the daemon runs, so the removed alias holds no cache entry.
+    pub fn forget_repo(&mut self, repo: &str) {
+        self.last_mutation_ms.remove(repo);
+        self.label_catalogs.remove(repo);
+    }
+
+    #[cfg(test)]
+    fn label_catalog_holds(&self, repo: &str) -> bool {
+        self.label_catalogs.contains_key(repo)
+    }
+
     /// Apply one action against the last confirmed repository snapshot.
     pub fn handle(
         &mut self,
@@ -1195,6 +1209,39 @@ mod tests {
         assert_eq!(first.labels[0].name, "ui");
         assert!(first.error.is_none());
         assert!(second.error.as_deref().unwrap().contains("GitHub"));
+    }
+
+    #[test]
+    fn forget_repo_drops_the_mutation_time_and_the_label_catalog() {
+        let exec = Arc::new(ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/labels?per_page=100&page=1",
+            ]),
+            ok(r#"[{"name":"ui","color":"55e6ff"},{"name":"urgent","color":"ff6b7a"}]"#),
+        ));
+        let mut controller = TicketController::new(exec);
+        let effects = controller.handle(
+            TicketAction::Labels {
+                request: "labels-1".to_string(),
+                repo: "borsuk".to_string(),
+            },
+            &snapshot(issue("Old title", "Old body")),
+            &config(),
+            1_000,
+        );
+        assert!(matches!(&effects.pushes[0], Push::TicketLabels(_)));
+        assert!(controller.label_catalog_holds("borsuk"));
+        controller.record_confirmed_mutation("borsuk", 2_000);
+        assert_eq!(controller.last_mutation_ms("borsuk"), Some(2_000));
+
+        controller.forget_repo("borsuk");
+
+        assert_eq!(controller.last_mutation_ms("borsuk"), None);
+        assert!(!controller.label_catalog_holds("borsuk"));
     }
 
     #[test]

@@ -1422,14 +1422,16 @@ fn banner_text(app: &App) -> String {
     }
 }
 
-/// The longest bottom-row hint that an 80-column terminal shows in full.
+/// The longest bottom-row hint that the shell shows.
 ///
 /// The left footer side keeps 66 columns beside the 14-column inbox
-/// badge, and the row pads the text with one space on each side. Every
-/// view holds its hints at or below this count. The per-view tests read
-/// it, so the contract lives in one place.
+/// badge on an 80-column terminal, so the longest settings hint needs a
+/// wider terminal in full; a narrower one truncates the tail, and the
+/// help overlay lists the same keys. Every view holds its hints at or
+/// below this count. The per-view tests read it, so the contract lives
+/// in one place.
 #[cfg(test)]
-pub(super) const HINT_CAP: usize = 64;
+pub(super) const HINT_CAP: usize = 92;
 
 /// The bottom-row hints of the current state.
 ///
@@ -1527,7 +1529,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 /// The number of key rows in the help overlay.
 ///
 /// Two columns split the rows, so an odd count would drop the middle one.
-const HELP_ROWS: usize = 34;
+const HELP_ROWS: usize = 36;
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -1568,6 +1570,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("s r", "save / reload settings"),
         ("d", "remove repository override"),
         ("d", "prompt row: restore the built-in"),
+        ("a", "settings: add a repository"),
+        ("X", "settings: remove this repository"),
         ("ctrl-s", "save the ticket or prompt editor"),
     ];
     let mut sorted = rows.to_vec();
@@ -3939,7 +3943,10 @@ mod tests {
         assert_eq!(app.view, View::Settings);
         let text = render_to_string(&mut app);
         assert!(text.contains("5 settings"));
-        assert!(text.contains("j k role · tab field · enter open · s save · r reload · ? help"));
+        // The hint is longer than the 66 footer columns of an 80-column
+        // terminal, so the render shows only its head. The row-cap test
+        // holds the full text.
+        assert!(text.contains("j k role · tab field · enter open · s save · r reload"));
     }
 
     #[test]
@@ -3996,6 +4003,8 @@ mod tests {
             "save / reload settings",
             "remove repository override",
             "prompt row: restore the built-in",
+            "settings: add a repository",
+            "settings: remove this repository",
             "save the ticket or prompt editor",
             "home / cancel settings edit",
         ] {
@@ -4109,7 +4118,7 @@ mod tests {
             ),
             (
                 View::Settings,
-                "j k role · tab field · enter open · s save · r reload · ? help",
+                "j k role · tab field · enter open · s save · r reload · a add repo · ? help",
             ),
         ];
         for (view, hint) in expected {

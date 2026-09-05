@@ -490,6 +490,8 @@ The Settings view edits every execution role. It supports global and repository 
 | `Tab` | Select a field. |
 | `Enter` | Open the value list of the field, or apply the marked row. On `prompt`, open the prompt editor. |
 | `d` | Remove the selected repository override. On `prompt`, restore the built-in prompt after a second `d`. |
+| `a` | Open the add-repository form with an `alias` row and a `path` row. |
+| `X` | Remove the repository of the scope after a second `X`. |
 | `s` | Save the draft. |
 | `r` | Reload the file and the prompt files. |
 | `Esc` | Close a list, cancel an edit, or confirm draft removal. |
@@ -524,7 +526,18 @@ the next harness change.
 
 Narrow terminals stack the role list above the form.
 The daemon rejects a stale save if the file changed after the draft loaded.
-Repository topology changes require a daemon restart.
+
+Adding and removing a repository applies live while the daemon runs.
+`a` opens the add-repository form on every scope. The form has an `alias`
+row and a `path` row. `Enter` moves from the alias to the path and sends
+the add there. `Esc` closes the form without a send. The daemon rejects
+an unknown alias or path, and the message names the reason.
+`X` on a repository scope asks once, then removes the repository.
+A removal stops every process of that repository and reports the stopped
+count. A removal keeps every worktree on disk; `aif doctor --clean` stays
+the only path that removes a worktree. A change of `path`, `lanes`, the
+git remote, or `release` of a repository that stays still requires a
+daemon restart. Remove the repository and add it again to move a path.
 
 #### The prompt of a role
 

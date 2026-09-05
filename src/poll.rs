@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{Config, RepoConfig};
 use crate::exec::{Exec, RealExec};
 use crate::gh::GhClient;
 use crate::model::RepoSnapshot;
@@ -77,6 +77,45 @@ pub struct Pollers {
 pub fn spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Pollers {
     let exec_for = |_alias: &str| Arc::new(RealExec) as Arc<dyn Exec>;
     spawn_all(cfg, tx, &exec_for, POLL_INTERVAL, MAX_BACKOFF)
+}
+
+/// Spawn the poller thread of one repository with the production cadence.
+///
+/// The thread loops like every poller of [`spawn_pollers`]: it fetches,
+/// sends on `tx`, and waits [`POLL_INTERVAL`] on its wake channel, with the
+/// [`MAX_BACKOFF`] cap after failures. The call returns the wake sender, so
+/// the caller can force an early pass and drop the sender to end the
+/// poller. It returns `None` when the thread cannot start; the case sends
+/// [`DaemonMsg::PollFailed`].
+pub fn spawn_poller(repo: &RepoConfig, tx: Sender<DaemonMsg>) -> Option<Sender<()>> {
+    let exec: Arc<dyn Exec> = Arc::new(RealExec);
+    spawn_poller_with(repo, tx, exec, POLL_INTERVAL, MAX_BACKOFF).map(|(_, wake)| wake)
+}
+
+/// Spawn the poller thread of one repository with an explicit runner and
+/// cadence.
+///
+/// The call returns the thread handle and the wake sender, so a test can
+/// join the thread and force an early pass. It returns `None` when the
+/// thread cannot start; the case sends [`DaemonMsg::PollFailed`].
+fn spawn_poller_with(
+    repo: &RepoConfig,
+    tx: Sender<DaemonMsg>,
+    exec: Arc<dyn Exec>,
+    interval: Duration,
+    max_backoff: Duration,
+) -> Option<(JoinHandle<()>, Sender<()>)> {
+    let (wake_tx, wake_rx) = mpsc::channel();
+    spawn_one(
+        repo.alias.clone(),
+        repo.owner_repo.clone(),
+        exec,
+        tx,
+        wake_rx,
+        interval,
+        max_backoff,
+    )
+    .map(|handle| (handle, wake_tx))
 }
 
 /// Spawn every poller with an explicit [`Exec`] factory and waits.
@@ -983,5 +1022,95 @@ path = "/repos/b"
     #[test]
     fn daemon_msg_has_the_shutdown_variant() {
         assert_eq!(format!("{:?}", DaemonMsg::Shutdown), "Shutdown");
+    }
+
+    #[test]
+    fn spawn_poller_returns_the_wake_sender_of_one_repository() {
+        let mut config = two_repo_config();
+        config.repos.get_mut("a").unwrap().owner_repo = "acme/one".to_string();
+        let repo = config.repos.get("a").unwrap().clone();
+        // The interval is ten seconds, so the second pass can only come
+        // from the returned wake sender.
+        let exec = Arc::new(
+            pass_steps(
+                ScriptExec::new(),
+                (
+                    vec![
+                        "api",
+                        "-i",
+                        "-X",
+                        "GET",
+                        "repos/acme/one/issues?state=open&per_page=100&page=1",
+                    ],
+                    CmdOut::ok(response(
+                        "HTTP/2 200",
+                        &["etag: \"i1\""],
+                        &format!("[{}]", issue_json(1)),
+                    )),
+                ),
+                (
+                    vec![
+                        "api",
+                        "-i",
+                        "-X",
+                        "GET",
+                        "repos/acme/one/pulls?state=open&per_page=100&page=1",
+                    ],
+                    CmdOut::ok(response(
+                        "HTTP/2 200",
+                        &["etag: \"p1\""],
+                        &format!("[{}]", pr_json(2, "aaa")),
+                    )),
+                ),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"i1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/one/issues?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &[], "")),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"p1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/one/pulls?state=open&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response("HTTP/2 304", &[], "")),
+            ),
+        );
+        let (tx, rx) = mpsc::channel();
+        let (handle, wake) = spawn_poller_with(
+            &repo,
+            tx,
+            exec,
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        )
+        .expect("the poller thread must start");
+
+        let DaemonMsg::Polled { repo: alias, .. } = next_msg(&rx, "the first poll") else {
+            panic!("the first message was not Polled");
+        };
+        assert_eq!(alias, "a");
+        wake.send(()).unwrap();
+        let DaemonMsg::Polled { repo: alias, .. } = next_msg(&rx, "the woken poll") else {
+            panic!("the wake did not produce a Polled message");
+        };
+        assert_eq!(alias, "a");
+
+        // The wake sender stays usable while the poller lives, and the
+        // poller ends when the sender drops.
+        drop(wake);
+        handle.join().unwrap();
     }
 }

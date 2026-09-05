@@ -313,6 +313,9 @@ pub struct Daemon {
 
     /// The inbound end of the poller channel.
     poll_rx: Receiver<DaemonMsg>,
+    /// The outbound end of the poller channel. The poller of an added
+    /// repository gets a clone, so it reports into the same channel.
+    poll_tx: Sender<DaemonMsg>,
     /// The outbound end of the runner channel; runners get clones.
     run_tx: Sender<RunEvent>,
     /// The inbound end of the runner channel.
@@ -339,6 +342,7 @@ impl Daemon {
         config_path: PathBuf,
         settings_revision: String,
         prompts_dir: PathBuf,
+        poll_tx: Sender<DaemonMsg>,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
@@ -359,6 +363,7 @@ impl Daemon {
             exec,
             state_dir,
             prompts_dir,
+            poll_tx,
             poll_rx,
             wake,
             action_rx,
@@ -390,6 +395,7 @@ impl Daemon {
         exec: Arc<dyn Exec>,
         state_dir: PathBuf,
         prompts_dir: PathBuf,
+        poll_tx: Sender<DaemonMsg>,
         poll_rx: Receiver<DaemonMsg>,
         wake: BTreeMap<String, Sender<()>>,
         action_rx: Receiver<Action>,
@@ -609,6 +615,7 @@ impl Daemon {
             pusher: None,
             ticket_pusher: None,
             poll_rx,
+            poll_tx,
             run_tx,
             run_rx,
             action_rx: Some(action_rx),
@@ -1157,8 +1164,14 @@ impl Daemon {
     /// Store a fresh snapshot and derive everything GitHub drives.
     ///
     /// A poll that repeats the previous snapshot marks nothing changed, so
-    /// it writes no state and raises no dirty flag.
+    /// it writes no state and raises no dirty flag. A poll whose alias the
+    /// config no longer holds changes nothing: the poller of a removed
+    /// repository sends one last message while its old fetch drains.
     fn apply_poll(&mut self, repo: &str, fresh: RepoSnapshot, started_ms: u64) {
+        if !self.config.repos.contains_key(repo) {
+            eprintln!("the poll of {repo} names a repository the config no longer holds");
+            return;
+        }
         if self
             .ticket_controller
             .last_mutation_ms(repo)
@@ -3344,13 +3357,17 @@ impl Daemon {
                 return;
             }
         };
-        if !self.config.has_same_topology(&candidate) {
+        let delta = self.config.topology_delta(&candidate);
+        if !delta.changed.is_empty() {
             self.push_settings_result(
                 request,
                 SettingsOperation::Save,
                 SettingsResultStatus::RestartRequired,
                 current_revision,
-                Some("repository topology changes require a daemon restart".to_string()),
+                Some(format!(
+                    "the path, lane, remote, or release change of {} requires a daemon restart",
+                    delta.changed.join(", ")
+                )),
             );
             return;
         }
@@ -3395,13 +3412,13 @@ impl Daemon {
             }
         }
         let revision = config::file_revision(&candidate_text);
-        self.activate_config(candidate, revision.clone());
+        let notes = self.activate_config(candidate, revision.clone());
         self.push_settings_result(
             request,
             SettingsOperation::Save,
             SettingsResultStatus::Saved,
             revision,
-            None,
+            (!notes.is_empty()).then(|| notes.join("; ")),
         );
     }
 
@@ -3437,23 +3454,27 @@ impl Daemon {
                 return;
             }
         };
-        if !self.config.has_same_topology(&candidate) {
+        let delta = self.config.topology_delta(&candidate);
+        if !delta.changed.is_empty() {
             self.push_settings_result(
                 request,
                 SettingsOperation::Reload,
                 SettingsResultStatus::RestartRequired,
                 revision,
-                Some("repository topology changes require a daemon restart".to_string()),
+                Some(format!(
+                    "the path, lane, remote, or release change of {} requires a daemon restart",
+                    delta.changed.join(", ")
+                )),
             );
             return;
         }
-        self.activate_config(candidate, revision.clone());
+        let notes = self.activate_config(candidate, revision.clone());
         self.push_settings_result(
             request,
             SettingsOperation::Reload,
             SettingsResultStatus::Reloaded,
             revision,
-            None,
+            (!notes.is_empty()).then(|| notes.join("; ")),
         );
     }
 
@@ -3465,8 +3486,117 @@ impl Daemon {
         Ok((text, revision))
     }
 
-    /// Install a validated non-topology configuration in the running daemon.
-    fn activate_config(&mut self, config: Config, revision: String) {
+    /// Bring one configured repository live in the running daemon.
+    ///
+    /// The call prepares the checkout marker, starts the train, seeds the
+    /// lane reservations, and spawns the poller thread. The caller activates
+    /// the configuration first, so the alias resolves in `self.config`. On
+    /// failure the repository stays configured and the error names the
+    /// cause; the written config file never rolls back.
+    fn add_repository(&mut self, alias: &str) -> Result<()> {
+        let Some(repo) = self.config.repos.get(alias).cloned() else {
+            bail!("repo.{alias}: no configured repository");
+        };
+        self.worktrees
+            .prepare_checkout(&*self.exec, &repo.path)
+            .with_context(|| format!("repo.{alias}: cannot prepare the checkout marker"))?;
+        if !self.trains.contains_key(alias) {
+            self.trains.insert(alias.to_string(), Train::new(alias));
+        }
+        for (stage, count) in &repo.lanes {
+            self.limits
+                .lanes
+                .insert((*stage, alias.to_string()), *count);
+        }
+        if let Some(wake) = crate::poll::spawn_poller(&repo, self.poll_tx.clone()) {
+            self.wake.insert(alias.to_string(), wake);
+        } else {
+            eprintln!("repo.{alias}: cannot start the poller thread");
+        }
+        self.changed = true;
+        Ok(())
+    }
+
+    /// Retire one removed repository and every live record it owns.
+    ///
+    /// The call cancels every active task of the alias first, so the
+    /// process escalation runs while the old configuration still resolves
+    /// the worktree paths, and then retires every remaining row. The return
+    /// counts the stopped active tasks. The call never touches a worktree
+    /// directory on disk: a removal keeps every checkout.
+    fn remove_repository(&mut self, alias: &str) -> usize {
+        let active: Vec<String> = self
+            .table
+            .active()
+            .iter()
+            .filter(|task| task.repo == alias)
+            .map(|task| task.id.clone())
+            .collect();
+        let stopped = active.len();
+        for id in &active {
+            self.cancel_task(id, false);
+        }
+        let ids: Vec<String> = self
+            .table
+            .by_id
+            .values()
+            .filter(|task| task.repo == alias)
+            .map(|task| task.id.clone())
+            .collect();
+        for id in &ids {
+            self.retire_task(id);
+        }
+        // The wake sender dies with the entry, so the poller thread ends.
+        self.wake.remove(alias);
+        self.snapshot.repos.remove(alias);
+        self.gates.forget_repo(alias);
+        self.trains.remove(alias);
+        self.links.remove(alias);
+        self.policies.remove(alias);
+        self.pending_stacked.remove(alias);
+        self.restore_repos.remove(alias);
+        let conversations: Vec<(String, u64)> = self
+            .ticket_conversations
+            .keys()
+            .filter(|(repo, _)| repo == alias)
+            .cloned()
+            .collect();
+        for key in conversations {
+            self.ticket_conversations.remove(&key);
+        }
+        self.limits.lanes.retain(|(_, repo), _| repo != alias);
+        self.paused.lanes.retain(|(_, repo), _| repo != alias);
+        self.ticket_controller.forget_repo(alias);
+        self.pending_ready.retain(|work| work.repo != alias);
+        // A release gate names its repository, not a task, so the retire
+        // above cannot drop it and no later drive would revisit the alias.
+        let open: Vec<String> = self
+            .decisions
+            .open()
+            .iter()
+            .filter(|row| row.repo == alias)
+            .map(|row| row.id.clone())
+            .collect();
+        for id in open {
+            self.decisions.take(&id);
+        }
+        self.changed = true;
+        stopped
+    }
+
+    /// Install a validated configuration in the running daemon.
+    ///
+    /// The call removes the repositories the candidate drops while the old
+    /// configuration still resolves their worktree paths, then swaps the
+    /// configuration and brings the added repositories live. The return
+    /// carries one human-readable note per reconciled alias.
+    fn activate_config(&mut self, config: Config, revision: String) -> Vec<String> {
+        let mut notes = Vec::new();
+        let delta = self.config.topology_delta(&config);
+        for alias in &delta.removed {
+            let stopped = self.remove_repository(alias);
+            notes.push(format!("removed {alias}: stopped {stopped} active task(s)"));
+        }
         for stage in Stage::ALL {
             let old_limit = self.config.stage(stage).limit;
             if self.limits.limit(stage) == old_limit {
@@ -3476,6 +3606,13 @@ impl Daemon {
         self.config = config;
         self.settings_revision = revision;
         self.changed = true;
+        for alias in &delta.added {
+            match self.add_repository(alias) {
+                Ok(()) => notes.push(format!("added {alias}")),
+                Err(error) => notes.push(format!("added {alias}: {error:#}")),
+            }
+        }
+        notes
     }
 
     /// Write the prompt file of one role and refresh the prompt views.
@@ -5977,7 +6114,7 @@ mod tests {
             let jobs = Arc::new(Mutex::new(Vec::new()));
             let sessions = Arc::new(Mutex::new(Vec::new()));
             let roles = Arc::new(Mutex::new(Vec::new()));
-            let (_poll_tx, poll_rx) = mpsc::channel::<DaemonMsg>();
+            let (poll_tx, poll_rx) = mpsc::channel::<DaemonMsg>();
             let (wake_tx, wake_rx) = mpsc::channel::<()>();
             let mut wake = BTreeMap::new();
             wake.insert("borsuk".to_string(), wake_tx);
@@ -5995,6 +6132,7 @@ mod tests {
                 exec.clone(),
                 state.clone(),
                 prompts.clone(),
+                poll_tx,
                 poll_rx,
                 wake,
                 action_rx,
@@ -10087,7 +10225,7 @@ mod tests {
             replacement: external.clone(),
             changed: AtomicBool::new(false),
         });
-        let (_poll_tx, poll_rx) = mpsc::channel();
+        let (poll_tx, poll_rx) = mpsc::channel();
         let (_action_tx, action_rx) = mpsc::channel();
         let jobs = Arc::new(Mutex::new(Vec::new()));
         let sessions = Arc::new(Mutex::new(Vec::new()));
@@ -10099,6 +10237,7 @@ mod tests {
             exec,
             dir.join("state"),
             dir.join("prompts"),
+            poll_tx,
             poll_rx,
             BTreeMap::new(),
             action_rx,
@@ -10206,8 +10345,12 @@ mod tests {
         assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
     }
 
+    /// A reload whose only topology difference is one added repository
+    /// answers `Reloaded` and brings the repository live: the config gains
+    /// the alias, the lane reservations follow, the file keeps its content,
+    /// and the pushed state view names the new repository.
     #[test]
-    fn a_topology_reload_keeps_the_old_live_topology() {
+    fn a_topology_reload_brings_an_added_repository_live() {
         let dir = temp_root();
         let repo = rig_repo(&dir);
         let added = dir.join("second-repo");
@@ -10226,12 +10369,13 @@ mod tests {
                     &["remote", "get-url", "origin"],
                     CmdOut::ok("git@github.com:acme/second.git\n"),
                 ),
+                common_dir_step(&added, &added.join(".git")),
             ],
             |_| {},
         );
         let config_path = rig.repo.parent().unwrap().join("factory.toml");
         let topology = format!(
-            "{}\n[repo.second]\npath = \"{}\"\n",
+            "{}\n[repo.second]\npath = \"{}\"\n\n[repo.second.lanes]\nrefine = 1\n",
             settings_config_text(&rig.repo, "m"),
             added.display()
         );
@@ -10239,6 +10383,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         rig.daemon
             .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let (view_tx, view_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| view_tx.send(view).unwrap()));
 
         rig.act(Action::ReloadSettings {
             request: "reload-topology".to_string(),
@@ -10247,14 +10394,490 @@ mod tests {
         let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
             panic!("the topology reload must push a settings result");
         };
+        assert_eq!(result.status, crate::sock::SettingsResultStatus::Reloaded);
+        assert_eq!(result.message.as_deref(), Some("added second"));
+        assert_eq!(rig.daemon.config.repos.len(), 2);
+        assert_eq!(rig.daemon.config.repos["second"].path, added);
+        assert!(rig.daemon.trains.contains_key("second"));
+        assert!(rig.daemon.wake.contains_key("second"));
         assert_eq!(
-            result.status,
-            crate::sock::SettingsResultStatus::RestartRequired
+            rig.daemon
+                .limits
+                .lanes
+                .get(&(Stage::Refine, "second".to_string())),
+            Some(&1),
+            "the lane reservations of the added repository go live"
         );
-        assert_eq!(result.revision, crate::config::file_revision(&topology));
-        assert_eq!(rig.daemon.config.repos.len(), 1);
-        assert!(rig.daemon.config.repos.contains_key("borsuk"));
         assert_eq!(fs::read_to_string(config_path).unwrap(), topology);
+        let view = view_rx
+            .try_recv()
+            .expect("the reload must push a state view");
+        assert!(view.repos.iter().any(|repo| repo.alias == "second"));
+    }
+
+    /// A save with `AddRepository` answers `Saved`, writes the file with the
+    /// old tables intact, and brings the repository live: the config, the
+    /// trains, and the poller wake senders gain the alias, and the pushed
+    /// state view names it. The candidate of the typed edit carries only a
+    /// `path`, so the seeded lane map stays empty here; the reload test
+    /// above covers the lanes.
+    #[test]
+    fn a_save_that_adds_a_repository_answers_saved_and_starts_its_poller() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let added = dir.join("second-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(added.join(".git")).unwrap();
+        let mut rig = Rig::make_in(
+            dir,
+            vec![
+                git_step(
+                    &repo,
+                    &["remote", "get-url", "origin"],
+                    CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+                ),
+                git_step(
+                    &added,
+                    &["remote", "get-url", "origin"],
+                    CmdOut::ok("git@github.com:acme/second.git\n"),
+                ),
+                common_dir_step(&added, &added.join(".git")),
+            ],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let (view_tx, view_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| view_tx.send(view).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "add-second".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: SettingsEdit::AddRepository {
+                alias: "second".to_string(),
+                path: added.display().to_string(),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the add must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(result.message.as_deref(), Some("added second"));
+        let written = fs::read_to_string(config_path).unwrap();
+        assert_eq!(result.revision, crate::config::file_revision(&written));
+        assert!(written.starts_with(&original), "the old tables survive");
+        assert!(written.contains(&format!("[repo.second]\npath = \"{}\"", added.display())));
+        assert_eq!(rig.daemon.config.repos.len(), 2);
+        assert_eq!(rig.daemon.config.repos["second"].path, added);
+        assert_eq!(rig.daemon.trains["second"].repo, "second");
+        assert!(rig.daemon.wake.contains_key("second"));
+        assert!(
+            rig.daemon.limits.lanes.is_empty(),
+            "the candidate carries no lanes, so the map gains nothing"
+        );
+        let mut view = None;
+        while let Ok(next) = view_rx.try_recv() {
+            view = Some(next);
+        }
+        let view = view.expect("the add must push a state view");
+        assert!(view.repos.iter().any(|repo| repo.alias == "second"));
+        assert!(view
+            .settings
+            .repositories
+            .iter()
+            .any(|row| row.repository == "second"));
+    }
+
+    /// A save that removes a repository answers `Saved` with the stopped
+    /// active-task count, and every live record of the alias disappears:
+    /// the tasks retire with their sessions stopped, the runtime maps and
+    /// the open decisions drop the alias, `state.json` names it no more,
+    /// and the pushed state view shows the reduced factory. The checkout
+    /// and its worktrees stay on disk.
+    #[test]
+    fn a_save_that_removes_a_repository_answers_saved_and_stops_its_tasks() {
+        let dir = temp_root();
+        fs::create_dir_all(rig_repo(&dir).join(".git")).unwrap();
+        let worktree = dir
+            .join("state")
+            .join("worktrees")
+            .join("borsuk")
+            .join("issue-142");
+        fs::create_dir_all(&worktree).unwrap();
+        let mut rig = Rig::make_in(dir, vec![], |config| {
+            config
+                .repos
+                .get_mut("borsuk")
+                .unwrap()
+                .lanes
+                .insert(Stage::Refine, 1);
+        });
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+
+        // Seed every alias-keyed record: a running refine task, a running
+        // ticket conversation, the release policy, a paused lane, a
+        // needs-human decision, and the confirmed-mutation cache.
+        rig.poll(
+            vec![
+                issue(142, &["to-refine"]),
+                issue(143, &["needs-human"]),
+                issue(7, &[]),
+            ],
+            vec![],
+        );
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+        rig.act(Action::Policy {
+            repo: "borsuk".to_string(),
+            policy: ReleasePolicy::Interval { minutes: 60 },
+        });
+        rig.act(Action::Pause {
+            scope: PauseScope::Lane {
+                stage: Stage::Release,
+                repo: "borsuk".to_string(),
+            },
+            paused: true,
+        });
+        rig.daemon
+            .ticket_controller
+            .record_confirmed_mutation("borsuk", 42);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let (view_tx, view_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| view_tx.send(view).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "remove-borsuk".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: SettingsEdit::RemoveRepository {
+                alias: "borsuk".to_string(),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the removal must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("removed borsuk: stopped 2 active task(s)")
+        );
+        assert!(rig.daemon.config.repos.is_empty());
+        assert!(!fs::read_to_string(config_path)
+            .unwrap()
+            .contains("repo.borsuk"));
+        let refine = rig.session(0);
+        let chat = rig.session(1);
+        assert!(
+            refine.stopped.load(Ordering::SeqCst),
+            "the refine session receives the stop"
+        );
+        assert!(
+            chat.stopped.load(Ordering::SeqCst),
+            "the ticket session receives the stop"
+        );
+        assert!(rig
+            .daemon
+            .table
+            .by_id
+            .keys()
+            .all(|id| !id.starts_with("borsuk/")));
+        assert!(!rig.daemon.snapshot.repos.contains_key("borsuk"));
+        assert!(!rig.daemon.links.contains_key("borsuk"));
+        assert!(!rig.daemon.trains.contains_key("borsuk"));
+        assert!(!rig.daemon.wake.contains_key("borsuk"));
+        assert!(!rig.daemon.policies.contains_key("borsuk"));
+        assert!(!rig.daemon.pending_stacked.contains("borsuk"));
+        assert!(!rig
+            .daemon
+            .limits
+            .lanes
+            .contains_key(&(Stage::Refine, "borsuk".to_string())));
+        assert!(!rig
+            .daemon
+            .paused
+            .lanes
+            .contains_key(&(Stage::Release, "borsuk".to_string())));
+        assert!(!rig
+            .daemon
+            .ticket_conversations
+            .contains_key(&("borsuk".to_string(), 7)));
+        assert_eq!(
+            rig.daemon.ticket_controller.last_mutation_ms("borsuk"),
+            None
+        );
+        assert!(
+            rig.daemon
+                .decisions
+                .open()
+                .iter()
+                .all(|row| row.repo != "borsuk"),
+            "the needs-human row of the removed repository goes"
+        );
+        assert!(worktree.exists(), "a removal never deletes a worktree");
+        assert!(rig.repo.exists(), "a removal never deletes the checkout");
+
+        rig.daemon.force_save_state();
+        let state = fs::read_to_string(&rig.daemon.state_path).unwrap();
+        assert!(!state.contains("borsuk"), "state.json: {state}");
+
+        rig.drive();
+        let mut view = None;
+        while let Ok(next) = view_rx.try_recv() {
+            view = Some(next);
+        }
+        let view = view.expect("the removal must push a state view");
+        assert!(view.repos.is_empty());
+        assert!(view.trains.is_empty());
+        assert!(view.lanes.is_empty());
+        assert!(view.links.is_empty());
+        assert!(view.settings.repositories.is_empty());
+    }
+
+    /// A removal stops an in-flight release: the release task retires, its
+    /// live session receives the stop, and the train of the repository goes.
+    #[test]
+    fn a_removal_stops_an_in_flight_release_task() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir))
+                .into_iter()
+                .chain(reuse_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.poll(vec![], vec![pr(2, false, &[]), pr(3, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2, 3],
+        });
+        rig.event(started("borsuk/release", "session-release"));
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release")
+        );
+        let session = rig.session(0);
+
+        rig.act(Action::SaveSettings {
+            request: "remove-release".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: SettingsEdit::RemoveRepository {
+                alias: "borsuk".to_string(),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the removal must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("removed borsuk: stopped 1 active task(s)")
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the release task retires with its repository"
+        );
+        assert!(session.stopped.load(Ordering::SeqCst));
+        assert!(!rig.daemon.trains.contains_key("borsuk"));
+        assert!(rig.daemon.config.repos.is_empty());
+    }
+
+    /// A save that changes the `path` of a staying repository answers
+    /// `RestartRequired`, and the live configuration keeps the old path.
+    #[test]
+    fn a_path_change_of_a_staying_repository_answers_restart_required() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let moved = dir.join("moved-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(moved.join(".git")).unwrap();
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &moved,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let changed = settings_config_text(&moved, "m");
+        fs::write(&config_path, &changed).unwrap();
+        let mut settings = Config::parse(&changed).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "after-save".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "move-path".to_string(),
+            base_revision: crate::config::file_revision(&changed),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the path change must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::RestartRequired);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("borsuk")),
+            "the message names the changed alias"
+        );
+        assert_eq!(rig.daemon.config.repos["borsuk"].path, rig.repo);
+        assert_eq!(fs::read_to_string(config_path).unwrap(), changed);
+    }
+
+    /// A save that resolves a new git remote for a staying repository
+    /// answers `RestartRequired`: the poller of the live alias keeps the
+    /// remote it started with, so the daemon cannot switch the remote in
+    /// place. The live configuration and the file keep the old state.
+    #[test]
+    fn a_remote_change_of_a_staying_repository_answers_restart_required() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/other.git\n"),
+            )],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "after-save".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "move-remote".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the remote change must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::RestartRequired);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("borsuk")),
+            "the message names the changed alias"
+        );
+        assert_eq!(rig.daemon.config.repos["borsuk"].owner_repo, "acme/borsuk");
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+    }
+
+    /// A save that adds a repository whose path holds no `.git` answers
+    /// `Invalid` with the git error, and neither the file nor the live
+    /// configuration changes.
+    #[test]
+    fn a_save_adding_a_repository_without_git_answers_invalid() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+            )],
+            |_| {},
+        );
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+        let plain = rig.repo.parent().unwrap().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "add-plain".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: SettingsEdit::AddRepository {
+                alias: "second".to_string(),
+                path: plain.display().to_string(),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the invalid add must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Invalid);
+        let message = result.message.expect("the result must name the git error");
+        assert!(message.contains("second"), "message: {message}");
+        assert!(
+            message.contains("holds no .git entry"),
+            "message: {message}"
+        );
+        assert_eq!(rig.daemon.config.repos.len(), 1);
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+    }
+
+    /// A poll message whose alias the config does not hold changes nothing:
+    /// the snapshot, the links, and the task table stay empty.
+    #[test]
+    fn a_poll_for_a_repository_the_config_dropped_changes_nothing() {
+        let mut rig = Rig::make(vec![]);
+        rig.daemon.handle(Inbound::Poll(DaemonMsg::Polled {
+            started_ms: T0,
+            repo: "gone".to_string(),
+            snapshot: RepoSnapshot::default(),
+        }));
+        rig.daemon.handle(Inbound::Poll(DaemonMsg::PollFailed {
+            repo: "gone".to_string(),
+            error: "the fetch failed".to_string(),
+        }));
+
+        assert!(rig.daemon.snapshot.repos.is_empty());
+        assert!(rig.daemon.links.is_empty());
+        assert!(rig.daemon.table.by_id.is_empty());
+        assert!(rig.daemon.decisions.open().is_empty());
     }
 
     #[test]

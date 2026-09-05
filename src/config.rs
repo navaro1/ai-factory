@@ -166,6 +166,18 @@ pub enum SettingsEdit {
         /// The partial override. `None` removes the override table.
         settings: Option<RoleOverride>,
     },
+    /// Insert one repository with a single `path` key.
+    AddRepository {
+        /// The repository alias.
+        alias: String,
+        /// The checkout path of the repository.
+        path: String,
+    },
+    /// Delete one repository table with every sub-table under it.
+    RemoveRepository {
+        /// The repository alias.
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1493,6 +1505,47 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
                 table.remove(role_name(*role));
             }
         }
+        SettingsEdit::AddRepository { alias, path } => {
+            if !valid_alias(alias) {
+                bail!("repo.\"{alias}\": alias must match [a-z0-9._-]+");
+            }
+            if path.trim().is_empty() {
+                bail!("repo.{alias}.path must not be empty");
+            }
+            let duplicate = document
+                .get("repo")
+                .and_then(toml_edit::Item::as_table)
+                .is_some_and(|repos| repos.contains_key(alias));
+            if duplicate {
+                bail!("repo.{alias}: the alias is already configured");
+            }
+            if !document.contains_key("repo") {
+                document.insert("repo", toml_edit::table());
+            }
+            let Some(repos) = document
+                .get_mut("repo")
+                .and_then(toml_edit::Item::as_table_mut)
+            else {
+                bail!("repo: the [repo] entry is not a table");
+            };
+            let mut table = toml_edit::Table::new();
+            table["path"] = toml_edit::value(path.as_str());
+            repos.insert(alias, toml_edit::Item::Table(table));
+        }
+        SettingsEdit::RemoveRepository { alias } => {
+            let present = document
+                .get("repo")
+                .and_then(toml_edit::Item::as_table)
+                .is_some_and(|repos| repos.contains_key(alias));
+            if !present {
+                bail!("repo.{alias}: no configured repository");
+            }
+            let repos = document
+                .get_mut("repo")
+                .and_then(toml_edit::Item::as_table_mut)
+                .expect("the repo entry checked as a table above");
+            repos.remove(alias);
+        }
     }
     let candidate = document.to_string();
     Config::parse(&candidate).context("the edited factory configuration is invalid")?;
@@ -1594,6 +1647,31 @@ pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
     finish_config_atomic(prepare_config_atomic(path, text)?)
 }
 
+/// The repository-set difference between two parsed configurations.
+///
+/// `added` and `removed` name the aliases that only one side holds. `changed`
+/// names an alias that both sides hold but whose `path`, git remote,
+/// `lanes`, or `release` differs; such an alias cannot switch live.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TopologyDelta {
+    /// The aliases the other configuration holds and this one does not.
+    pub added: Vec<String>,
+    /// The aliases this configuration holds and the other one does not.
+    pub removed: Vec<String>,
+    /// The aliases that stay but change their `path`, git remote, `lanes`,
+    /// or `release`.
+    pub changed: Vec<String>,
+}
+
+impl TopologyDelta {
+    /// True when the two configurations share the same repository set and
+    /// every shared alias keeps its `path`, git remote, `lanes`, and
+    /// `release`.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
 impl Config {
     /// Parse and resolve a candidate through an injected command runner.
     pub fn parse_resolved(text: &str, exec: &dyn Exec) -> Result<Self> {
@@ -1602,18 +1680,35 @@ impl Config {
         Ok(config)
     }
 
-    /// True when a reload can retain every live repository controller.
-    pub fn has_same_topology(&self, other: &Self) -> bool {
-        self.repos.len() == other.repos.len()
-            && self.repos.iter().all(|(alias, repo)| {
-                other.repos.get(alias).is_some_and(|candidate| {
-                    repo.alias == candidate.alias
-                        && repo.path == candidate.path
-                        && repo.owner_repo == candidate.owner_repo
-                        && repo.lanes == candidate.lanes
-                        && repo.release == candidate.release
-                })
-            })
+    /// Compare the repository set of this configuration against the other.
+    ///
+    /// The alias lists follow repository alias order, because the parsed
+    /// repositories live in a sorted map. A staying alias whose git remote
+    /// (`owner_repo`) changed also counts as changed: the poller thread of
+    /// the live alias keeps polling the remote it started with, so the
+    /// daemon cannot switch the remote in place.
+    pub fn topology_delta(&self, other: &Self) -> TopologyDelta {
+        let mut delta = TopologyDelta::default();
+        for (alias, repo) in &self.repos {
+            match other.repos.get(alias) {
+                None => delta.removed.push(alias.clone()),
+                Some(candidate) => {
+                    if repo.path != candidate.path
+                        || repo.owner_repo != candidate.owner_repo
+                        || repo.lanes != candidate.lanes
+                        || repo.release != candidate.release
+                    {
+                        delta.changed.push(alias.clone());
+                    }
+                }
+            }
+        }
+        for alias in other.repos.keys() {
+            if !self.repos.contains_key(alias) {
+                delta.added.push(alias.clone());
+            }
+        }
+        delta
     }
 }
 
@@ -2032,6 +2127,217 @@ mod lifecycle_tests {
         assert_eq!(file_revision("same"), file_revision("same"));
         assert_ne!(file_revision("same"), file_revision("same\n"));
         assert_ne!(file_revision("same"), file_revision("other"));
+    }
+}
+
+#[cfg(test)]
+mod repo_edit_tests {
+    use super::*;
+
+    fn config_text() -> String {
+        let mut text = "# keep this factory comment\nschema_version = 1\n".to_string();
+        for stage in Stage::ALL {
+            text.push_str(&format!(
+                "\n[stage.{stage}]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 3\n"
+            ));
+        }
+        text.push_str("\n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n");
+        text.push_str("\n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n");
+        text.push_str("\n[repo.demo]\npath = \"/tmp/demo\"\n");
+        text.push_str("\n[repo.demo.stage.review]\nmodel = \"repo-review\"\n");
+        text.push_str("\n[repo.demo.theory]\npath = \"docs/theory\"\n");
+        text
+    }
+
+    fn parse(text: &str) -> Config {
+        Config::parse(text).unwrap()
+    }
+
+    #[test]
+    fn an_add_inserts_the_repo_table_and_keeps_every_comment_and_table() {
+        let text = config_text();
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::AddRepository {
+                alias: "fresh".to_string(),
+                path: "/tmp/fresh".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(edited.contains("# keep this factory comment"));
+        assert!(edited.contains("[repo.demo]"));
+        assert!(edited.contains("[repo.demo.stage.review]"));
+        assert!(edited.contains("[repo.demo.theory]"));
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(
+            parsed.repos["fresh"].path,
+            PathBuf::from("/tmp/fresh"),
+            "edited text:\n{edited}"
+        );
+        assert_eq!(parsed.repos.len(), 2);
+    }
+
+    #[test]
+    fn an_add_of_a_configured_alias_fails_and_names_it() {
+        let text = config_text();
+
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::AddRepository {
+                alias: "demo".to_string(),
+                path: "/tmp/other".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("demo"), "message was: {message}");
+        assert!(message.contains("already configured"), "message: {message}");
+    }
+
+    #[test]
+    fn an_add_rejects_a_bad_alias_and_an_empty_path() {
+        let text = config_text();
+        for alias in ["", "BIG", "sp ace", "sl/ash"] {
+            let error = edit_config_text(
+                &text,
+                &SettingsEdit::AddRepository {
+                    alias: alias.to_string(),
+                    path: "/tmp/x".to_string(),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("alias must match"),
+                "alias {alias:?} gave: {error:#}"
+            );
+        }
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::AddRepository {
+                alias: "fresh".to_string(),
+                path: "   ".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("path must not be empty"),
+            "error was: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_remove_deletes_the_table_with_every_sub_table() {
+        let text = config_text();
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::RemoveRepository {
+                alias: "demo".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(edited.contains("# keep this factory comment"));
+        assert!(!edited.contains("[repo.demo]"));
+        assert!(!edited.contains("repo-review"));
+        assert!(!edited.contains("docs/theory"));
+        let parsed = Config::parse(&edited).unwrap();
+        assert!(parsed.repos.is_empty());
+    }
+
+    #[test]
+    fn a_remove_of_an_absent_alias_fails_and_names_it() {
+        let text = config_text();
+
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::RemoveRepository {
+                alias: "ghost".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("ghost"), "message was: {message}");
+        assert!(message.contains("no configured repository"), "{message}");
+    }
+
+    #[test]
+    fn an_add_that_breaks_a_file_rule_fails_at_the_parse_check() {
+        // The file allows a lane sum of 3, so a fresh lane of 4 must fail.
+        let text = config_text();
+
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::AddRepository {
+                alias: "fresh".to_string(),
+                path: "/tmp/fresh".to_string(),
+            },
+        )
+        .and_then(|edited| {
+            let widened = edited.replace(
+                "[repo.fresh]\npath = \"/tmp/fresh\"",
+                "[repo.fresh]\npath = \"/tmp/fresh\"\nlanes = { refine = 4 }",
+            );
+            // Re-run the same parse check the edit ends with.
+            Config::parse(&widened).map(|_| widened)
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("lane reservations"),
+            "error was: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_topology_delta_reports_added_removed_and_changed_aliases() {
+        let before = parse(&config_text());
+        let mut after_text = config_text()
+            .replace("path = \"/tmp/demo\"", "path = \"/tmp/moved\"")
+            .replace("limit = 3", "limit = 4");
+        after_text.push_str("\n[repo.fresh]\npath = \"/tmp/fresh\"\n");
+        let after = parse(&after_text);
+
+        let delta = before.topology_delta(&after);
+
+        assert_eq!(delta.added, vec!["fresh".to_string()]);
+        assert!(delta.removed.is_empty());
+        assert_eq!(delta.changed, vec!["demo".to_string()]);
+        assert!(!delta.is_empty());
+        // The reverse direction reports the removal and keeps the change.
+        let reverse = after.topology_delta(&before);
+        assert_eq!(reverse.removed, vec!["fresh".to_string()]);
+        assert_eq!(reverse.changed, vec!["demo".to_string()]);
+        // A lane change alone marks the alias changed.
+        let mut lanes_text = config_text();
+        lanes_text.push_str("\n[repo.demo.lanes]\nrefine = 1\n");
+        let lanes = parse(&lanes_text);
+        let delta = before.topology_delta(&lanes);
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+        assert_eq!(delta.changed, vec!["demo".to_string()]);
+        // A release policy change alone marks the alias changed.
+        let policy_text = format!(
+            "{}\n[repo.demo.release]\npolicy = \"interval\"\nminutes = 30\n",
+            config_text()
+        );
+        let policy = parse(&policy_text);
+        let delta = before.topology_delta(&policy);
+        assert_eq!(delta.changed, vec!["demo".to_string()]);
+        // A git remote change alone marks the alias changed: the poller of
+        // the live alias keeps its start remote.
+        let mut remote = parse(&config_text());
+        remote.repos.get_mut("demo").unwrap().owner_repo = "acme/other".to_string();
+        let delta = before.topology_delta(&remote);
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+        assert_eq!(delta.changed, vec!["demo".to_string()]);
+        // Identical configurations produce the empty delta.
+        let same = parse(&config_text());
+        assert!(before.topology_delta(&same).is_empty());
+        assert!(!before.topology_delta(&after).is_empty());
     }
 }
 
