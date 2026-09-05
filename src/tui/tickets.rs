@@ -1261,7 +1261,7 @@ impl Tickets {
         let chat_inner = chat_block.inner(panes[1]);
         frame.render_widget(chat_block, panes[1]);
         if self.chat.task_id().is_some() {
-            self.chat.draw(frame, chat_inner, &[]);
+            self.chat.draw(frame, chat_inner, &[], &state.usage);
         } else {
             let chat_text = self
                 .details

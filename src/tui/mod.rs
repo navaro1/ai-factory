@@ -540,6 +540,20 @@ impl App {
                         _ => {}
                     }
                 }
+                // The subagents panel owns the steering keys while it
+                // holds the focus. The shell takes no Enter, Esc, h,
+                // or l here: the view handles them itself.
+                if self.session.panel_focus() {
+                    if let Some(action) = self.session.handle_key(key, self.session_page()) {
+                        let text = match &action {
+                            Action::Chat { task, .. } => format!("sent chat {task}"),
+                            Action::Abort { task } => format!("sent abort {task}"),
+                            _ => "sent".to_string(),
+                        };
+                        emit(self, sink, action, text);
+                    }
+                    return true;
+                }
                 match key.code {
                     KeyCode::Esc if focused => self.session.set_chat_focus(false),
                     KeyCode::Esc => self.view = View::Pipeline,
@@ -1321,12 +1335,10 @@ fn render_with_clock(
             pipeline::draw(f, app, body, now);
         }
         View::Session => {
-            let decisions = app
-                .state
-                .as_ref()
-                .map(|state| state.decisions.as_slice())
-                .unwrap_or(&[]);
-            app.session.draw(f, body, decisions);
+            let state = app.state.as_ref();
+            let decisions = state.map(|state| state.decisions.as_slice()).unwrap_or(&[]);
+            let usage = state.map(|state| state.usage.as_slice()).unwrap_or(&[]);
+            app.session.draw(f, body, decisions, usage);
         }
         View::Inbox => {
             if let Some(state) = app.state.as_ref() {
@@ -1528,7 +1540,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 /// The number of key rows in the help overlay.
 ///
 /// Two columns split the rows, so an odd count would drop the middle one.
-const HELP_ROWS: usize = 34;
+const HELP_ROWS: usize = 36;
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -1559,6 +1571,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("End", "follow the tail"),
         ("esc tab i", "leave or take the chat focus"),
         ("h l", "switch session, chat unfocused"),
+        ("ctrl-a", "take or release the subagents panel"),
+        ("Up Down enter", "panel select and open"),
         ("y n i t c s w 1-9", "inbox answers"),
         ("g", "fire the release gate"),
         ("/ n e L c a m", "search and ticket keys"),
@@ -2287,6 +2301,8 @@ mod tests {
             "move between lanes",
             "leave or take the chat focus",
             "switch session, chat unfocused",
+            "take or release the subagents panel",
+            "panel select and open",
             "toggle the selected PR",
             "ctrl-q",
             "send the chat message",
@@ -3620,6 +3636,65 @@ mod tests {
                 text: "hi".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn the_shell_leaves_the_panel_keys_to_the_session_view() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(crate::tui::pipeline::sample_view()), key('2')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(app.session.chat_focus());
+
+        // ctrl-a takes the panel focus and releases the chat focus,
+        // whatever the chat bar holds.
+        let ctrl_a = Msg::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        run_messages(&mut surface, &mut app, vec![ctrl_a].into_iter(), &mut sink).unwrap();
+        assert!(app.session.panel_focus());
+        assert!(!app.session.chat_focus());
+
+        // The shell takes no Enter, Esc, h, or l while the panel holds
+        // the focus: Enter sends no chat, the letters reach no input bar,
+        // and esc stays out of the shell's own home key.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                key_code(KeyCode::Enter),
+                key('h'),
+                key('l'),
+                key_code(KeyCode::Esc),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Session, "esc must not go home");
+        assert!(
+            app.session.input_text().is_empty(),
+            "the letters must not type"
+        );
+        assert!(sink.0.is_empty(), "enter must send no chat: {:?}", sink.0);
+        assert!(
+            !app.session.panel_focus(),
+            "esc releases the panel focus with no drill-in open"
+        );
+
+        // A released focus hands the shell keys back: esc goes home.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![key_code(KeyCode::Esc)].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(app.view, View::Pipeline, "the shell owns esc again");
     }
 
     #[test]
