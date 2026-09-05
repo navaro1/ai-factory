@@ -4248,6 +4248,39 @@ impl Daemon {
             return;
         }
         self.changed = true;
+        // The gate tracker still remembers the item as ready, so nothing
+        // would fire again and the stage would stop here. Forgetting the
+        // item makes the next poll re-open every gate of it, and
+        // `admit_ready` replaces a terminal task with a fresh one that
+        // resumes the saved session through the worktree marker.
+        self.gates.forget(&repo, kind, number);
+        // A parked agent waits for exactly this answer, so it gets the
+        // text as a chat message instead of a new run.
+        if let Some(text) = comment {
+            if let Some(id) = self.parked_task_of(&repo, kind, number) {
+                self.chat(&id, text);
+            }
+        }
+        self.reconcile(Some(&repo));
+    }
+
+    /// The parked pipeline task of one item that takes a typed answer.
+    ///
+    /// Only a live-input session waits inside a turn. A one-shot task has
+    /// no process to answer, so the fresh gate run carries the item on.
+    fn parked_task_of(&self, repo: &str, kind: ItemKind, number: u64) -> Option<String> {
+        self.table
+            .active()
+            .into_iter()
+            .find(|task| {
+                task.repo == repo
+                    && task.kind == kind
+                    && task.number == number
+                    && task.purpose == TaskPurpose::Pipeline
+                    && task.state == TaskState::AwaitingUser
+                    && self.task_capabilities(task).live_input
+            })
+            .map(|task| task.id.clone())
     }
 
     /// Post one comment on an issue or pull request with `gh api`.
@@ -8655,6 +8688,91 @@ mod tests {
             "cancel removes the label without a comment"
         );
         assert!(rig.decision("human:borsuk:i10").is_none());
+    }
+
+    /// The two scripted calls of one answered `needs-human` row on
+    /// issue 142: the comment and the label removal.
+    fn answer_steps(body: &str) -> Vec<Step> {
+        let field = format!("body={body}");
+        vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    field.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "DELETE",
+                    "repos/acme/borsuk/issues/142/labels/needs-human",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// An answered row restarts the stage of its item. The one-shot refine
+    /// ended, so the next poll queues a fresh refine task.
+    #[test]
+    fn an_answered_row_starts_the_stage_of_a_finished_one_shot_task_again() {
+        let mut rig = Rig::make_with(answer_steps("use Postgres"), |config| {
+            set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
+        });
+        rig.poll(vec![issue(142, &["to-refine", NEEDS_HUMAN_LABEL])], vec![]);
+        rig.event(exited("borsuk/refine-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert_eq!(rig.job_count(), 1);
+
+        rig.act(Action::Answer {
+            decision_id: "human:borsuk:i142".to_string(),
+            response: Response::Text {
+                text: "use Postgres".to_string(),
+            },
+        });
+        assert_eq!(rig.job_count(), 1, "the answer alone starts no run");
+
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        let task = rig.task("borsuk/refine-i142");
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.attempt, 1, "the fresh task starts at attempt 1");
+        assert_eq!(rig.job_count(), 2, "the answer restarts the refine");
+    }
+
+    /// A parked agent waits inside its turn, so the answer reaches it as a
+    /// chat message and its session continues.
+    #[test]
+    fn an_answered_row_delivers_its_text_to_the_parked_session() {
+        let mut rig = Rig::make(answer_steps("use Postgres"));
+        rig.poll(vec![issue(142, &["to-refine", NEEDS_HUMAN_LABEL])], vec![]);
+        rig.event(turn_ended("borsuk/refine-i142"));
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::AwaitingUser
+        );
+
+        rig.act(Action::Answer {
+            decision_id: "human:borsuk:i142".to_string(),
+            response: Response::Text {
+                text: "use Postgres".to_string(),
+            },
+        });
+
+        assert_eq!(
+            rig.session(0).sends.lock().unwrap().as_slice(),
+            &["use Postgres".to_string()],
+            "the parked agent reads the answer"
+        );
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert_eq!(rig.job_count(), 1, "the parked session takes no new run");
     }
 
     /// One GitHub comment object for the ask fixtures.
