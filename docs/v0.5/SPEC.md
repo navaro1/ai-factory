@@ -101,9 +101,42 @@ Our answer:
 `question`, `header`, `options[{label,description}]`, and `multiSelect`. This
 flag separates a real question to the human from an ordinary tool approval.
 
-Output line types: `system` (subtypes `hook_started`, `hook_response`, `init`,
-`thinking_tokens`, `permission_denied`), `assistant`, `user`,
-`rate_limit_event`, `control_request`, `control_response`, `result`.
+Output line types: `system` (subtypes `background_tasks_changed`,
+`hook_started`, `hook_response`, `init`, `permission_denied`,
+`task_notification`, `task_progress`, `task_started`, `thinking_tokens`),
+`assistant`, `user`, `rate_limit_event`, `control_request`,
+`control_response`, `result`.
+
+Subagent lifecycle, probed 2026-09-05 from live logs. Four `system` subtypes
+report it. Every line carries `type`, `subtype`, `uuid`, and `session_id`.
+
+- `task_started` adds `task_id`, `tool_use_id`, `description`, `task_type`,
+  and for an agent also `subagent_type`, `is_backgrounded`, `spawn_depth`,
+  `prompt`.
+- `task_progress` adds `task_id`, `tool_use_id`, `description`,
+  `subagent_type`, `last_tool_name`, `usage` (which holds `total_tokens`,
+  `tool_uses`, `duration_ms`).
+- `task_notification` adds `task_id`, `tool_use_id`, `status`, `summary`,
+  `output_file`. Only `status == "completed"` has been observed.
+- `background_tasks_changed` adds `tasks[]`; each entry holds `task_id`,
+  `task_type`, `description`.
+- `task_type` is `local_agent` or `local_bash`. A `local_bash` row carries no
+  `subagent_type` and no `spawn_depth`.
+
+The spawn is an ordinary `tool_use` block on a parent `assistant` line. The
+tool name is `Agent`; the input keys are `description`, `subagent_type`,
+`name`, and `prompt`.
+
+A child line carries a non-null `parent_tool_use_id` equal to the `id` of the
+`Agent` tool_use block, plus top-level `subagent_type` and
+`task_description`. Both `assistant` and `user` child lines appear; a child
+`user` line holds `tool_result` blocks.
+
+A parent `assistant` line (`parent_tool_use_id` null) carries
+`message.usage` with `input_tokens`, `cache_creation_input_tokens`,
+`cache_read_input_tokens`, and `output_tokens`; the sum of the three input
+numbers is the prompt size. The `system`/`init` line names the model in
+`model`.
 
 An `assistant` line, probed on this machine, carries `message`,
 `parent_tool_use_id`, `request_id`, `session_id`, `timestamp`, `type`, `uuid`.
@@ -154,9 +187,26 @@ opencode a step ending is not the task ending: task completion is the process
 `Exit`, never a `TurnEnd`. This differs from claude, where a `result` line ends
 a turn and an interactive task then waits for the human.
 
+A `step_finish` part carries `part.tokens` with `total`, `input`, `output`,
+`reasoning`, and `cache` (which holds `write` and `read`), and `part.cost`.
+The sum of `input` and `cache.read` is the context size. A summed `part.cost`
+is only meaningful above zero, because a subscription plan reports 0.
+
+The `task` tool shape, probed 2026-09-05: a `tool_use` line with
+`part.tool == "task"` whose `part.state` holds `status`, `title`, `input`
+(`description`, `prompt`, `subagent_type`), `output`, `time` (`start`, `end`),
+and `metadata` (`parentSessionId`, `sessionId`, `model` with
+`{providerID, modelID}`, `truncated`). The line appears ONCE with `status`
+already `"completed"`. No pending or running line exists, so an opencode
+subagent is visible only after it ends.
+
 Both provider routes are confirmed to work on this machine:
 `zai-coding-plan/glm-5.3-flash` and `openai/gpt-5.6-sol --variant xhigh`.
 Neither needs an API key; both use the subscription login.
+
+The codex protocol names no child agent; its item types are `userMessage`,
+`agentMessage`, `commandExecution`, `fileChange`, `mcpToolCall`, `webSearch`,
+and `reasoning`, so codex sessions have no subagent panel rows.
 
 ## Dependency waves
 
