@@ -2708,6 +2708,13 @@ impl Daemon {
         }
         self.changed = true;
         self.confirming.remove(&task.id);
+        // A finished pipeline agent has no next turn: its input closes at
+        // `Done`. The process would still hold a live slot of the stage,
+        // and a release task keeps one id across batches, so the next batch
+        // could never start. The refine path stops its session the same way.
+        if task.purpose == TaskPurpose::Pipeline && self.task_capabilities(task).live_input {
+            self.stop_session(&task.id, "cannot stop the completed session");
+        }
         // A live-input task without a saved message loses its restart data
         // at `Done`. A saved message keeps the marker until its next turn.
         // A resumable one-shot task keeps the marker for later follow-ups.
@@ -9226,40 +9233,32 @@ mod tests {
         assert_eq!(rig.job(1).resume.as_deref(), Some("sid-142"));
     }
 
+    /// A finished pipeline task closes its input, so its process must not
+    /// stay alive: the daemon stops it at `Done`, and a later chat message
+    /// is refused instead of being queued for a resume.
     #[test]
-    fn a_failed_live_chat_on_a_terminal_task_reopens_for_resume() {
+    fn a_completed_pipeline_task_stops_its_process_and_refuses_a_chat() {
         let mut rig = Rig::make(vec![]);
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         let session = rig.session(0);
-        session.fail_send.store(true, Ordering::SeqCst);
         let task = rig.task("borsuk/refine-i142");
         rig.daemon.complete_task(&task);
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert!(
+            session.stopped.load(Ordering::SeqCst),
+            "the completed task stops its process"
+        );
 
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "continue after this process exits".to_string(),
         });
 
-        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
-        assert_eq!(
-            rig.daemon
-                .pending_chats
-                .get("borsuk/refine-i142")
-                .map(Vec::as_slice),
-            Some(&["continue after this process exits".to_string()][..])
-        );
-
-        rig.event(exited(
-            "borsuk/refine-i142",
-            false,
-            "the completed process closed its input",
-        ));
-
-        assert_eq!(rig.job_count(), 2);
-        assert_eq!(rig.job(1).prompt, "continue after this process exits");
-        assert_eq!(rig.job(1).resume.as_deref(), Some("sid-142"));
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert!(!rig.daemon.pending_chats.contains_key("borsuk/refine-i142"));
+        rig.event(exited("borsuk/refine-i142", false, "stopped"));
+        assert_eq!(rig.job_count(), 1, "no resume starts");
     }
 
     #[test]
@@ -11037,6 +11036,51 @@ mod tests {
                 .ends_with("borsuk__release-p5.jsonl"),
             "the log keeps the batch number"
         );
+    }
+
+    /// A finished claude release keeps one task id across batches. Its
+    /// process must not outlive the task, or the live slot of the release
+    /// stage stays taken and the next batch never starts.
+    #[test]
+    fn a_finished_release_frees_its_session_for_the_next_batch() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir))
+                .into_iter()
+                .chain(reuse_train_steps(
+                    &rig_repo(&dir),
+                    &train_wt(&dir),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[]), pr(5, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2],
+        });
+        assert_eq!(rig.job_count(), 1);
+
+        rig.event(turn_finished("borsuk/release", true, "released"));
+        rig.poll(vec![], vec![pr(5, false, &[])]);
+        let first = rig.session(0);
+        assert!(
+            first.stopped.load(Ordering::SeqCst),
+            "the completed release stops its process"
+        );
+
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![5],
+        });
+        assert_eq!(
+            rig.task("borsuk/release").state,
+            TaskState::Queued,
+            "the next batch waits for the exit of the stopped process"
+        );
+        rig.event(exited("borsuk/release", true, "stopped"));
+        assert_eq!(rig.job_count(), 2, "the next batch starts");
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Running);
     }
 
     #[test]
