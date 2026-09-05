@@ -151,6 +151,24 @@ impl<'a> GhClient<'a> {
         issue_response(&out, "fetch_issue")
     }
 
+    /// Fetch one pull request.
+    ///
+    /// The poll snapshot cannot answer a question about a pull request that
+    /// an agent changed seconds ago, so a caller that needs the live draft
+    /// flag or the live labels reads them here.
+    pub fn fetch_pull(&self, owner_repo: &str, number: u64) -> Result<Pr> {
+        let url = format!("repos/{owner_repo}/pulls/{number}");
+        let args = ["api", "-i", "-X", "GET", url.as_str()];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let response = checked_response(&out)?;
+        let value: Value = serde_json::from_str(&response.body)
+            .context("gh api returned a broken fetch_pull body")?;
+        pr_from_value(&value)
+    }
+
     /// Fetch the raw status fields of one mentioned issue or pull request.
     ///
     /// A 404 answer maps to `None`, so the caller can cache the not-found
@@ -1716,6 +1734,28 @@ mod tests {
         assert_eq!(issue.node_id, "IC_42");
         assert_eq!(issue.title, "decision");
         assert_eq!(issue.body, "why");
+    }
+
+    #[test]
+    fn fetch_pull_runs_the_exact_gh_call_and_maps_the_pull_request() {
+        let body = r#"{"number":7,"node_id":"PR_7","title":"tidy","body":null,"state":"open","labels":[{"name":"needs-human"}],"draft":true,"head":{"sha":"abc","ref":"aif/demo/issue-7"}}"#;
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "-i", "-X", "GET", "repos/acme/borsuk/pulls/7"]),
+            CmdOut::ok(response("HTTP/2 200", &[], body)),
+        );
+        let client = GhClient::new(&exec);
+
+        let pull = client.fetch_pull("acme/borsuk", 7).unwrap();
+
+        assert_eq!(pull.number, 7);
+        assert_eq!(pull.node_id, "PR_7");
+        assert_eq!(pull.title, "tidy");
+        assert_eq!(pull.body, "");
+        assert_eq!(pull.labels, vec!["needs-human".to_string()]);
+        assert!(pull.open);
+        assert!(pull.draft);
+        assert_eq!(pull.head_sha, "abc");
+        assert_eq!(pull.head_ref, "aif/demo/issue-7");
     }
 
     /// A JSON array of comment objects whose bodies carry their index.
