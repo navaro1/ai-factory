@@ -3365,7 +3365,7 @@ impl Daemon {
                 SettingsResultStatus::RestartRequired,
                 current_revision,
                 Some(format!(
-                    "the path, lane, or release change of {} requires a daemon restart",
+                    "the path, lane, remote, or release change of {} requires a daemon restart",
                     delta.changed.join(", ")
                 )),
             );
@@ -3462,7 +3462,7 @@ impl Daemon {
                 SettingsResultStatus::RestartRequired,
                 revision,
                 Some(format!(
-                    "the path, lane, or release change of {} requires a daemon restart",
+                    "the path, lane, remote, or release change of {} requires a daemon restart",
                     delta.changed.join(", ")
                 )),
             );
@@ -10756,6 +10756,58 @@ mod tests {
         );
         assert_eq!(rig.daemon.config.repos["borsuk"].path, rig.repo);
         assert_eq!(fs::read_to_string(config_path).unwrap(), changed);
+    }
+
+    /// A save that resolves a new git remote for a staying repository
+    /// answers `RestartRequired`: the poller of the live alias keeps the
+    /// remote it started with, so the daemon cannot switch the remote in
+    /// place. The live configuration and the file keep the old state.
+    #[test]
+    fn a_remote_change_of_a_staying_repository_answers_restart_required() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let mut rig = Rig::make_in(
+            dir,
+            vec![git_step(
+                &repo,
+                &["remote", "get-url", "origin"],
+                CmdOut::ok("git@github.com:acme/other.git\n"),
+            )],
+            |_| {},
+        );
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+        let mut settings = Config::parse(&original).unwrap().roles[&ExecutionRole::Refine].clone();
+        settings.model = "after-save".to_string();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::SaveSettings {
+            request: "move-remote".to_string(),
+            base_revision: crate::config::file_revision(&original),
+            edit: SettingsEdit::Global {
+                role: ExecutionRole::Refine,
+                settings,
+                limit: Some(2),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the remote change must push a settings result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::RestartRequired);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("borsuk")),
+            "the message names the changed alias"
+        );
+        assert_eq!(rig.daemon.config.repos["borsuk"].owner_repo, "acme/borsuk");
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
     }
 
     /// A save that adds a repository whose path holds no `.git` answers

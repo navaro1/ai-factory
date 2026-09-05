@@ -1650,21 +1650,23 @@ pub fn write_config_atomic(path: &Path, text: &str) -> Result<()> {
 /// The repository-set difference between two parsed configurations.
 ///
 /// `added` and `removed` name the aliases that only one side holds. `changed`
-/// names an alias that both sides hold but whose `path`, `lanes`, or `release`
-/// differs; such an alias cannot switch live.
+/// names an alias that both sides hold but whose `path`, git remote,
+/// `lanes`, or `release` differs; such an alias cannot switch live.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TopologyDelta {
     /// The aliases the other configuration holds and this one does not.
     pub added: Vec<String>,
     /// The aliases this configuration holds and the other one does not.
     pub removed: Vec<String>,
-    /// The aliases that stay but change their `path`, `lanes`, or `release`.
+    /// The aliases that stay but change their `path`, git remote, `lanes`,
+    /// or `release`.
     pub changed: Vec<String>,
 }
 
 impl TopologyDelta {
     /// True when the two configurations share the same repository set and
-    /// every shared alias keeps its `path`, `lanes`, and `release`.
+    /// every shared alias keeps its `path`, git remote, `lanes`, and
+    /// `release`.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
     }
@@ -1681,7 +1683,10 @@ impl Config {
     /// Compare the repository set of this configuration against the other.
     ///
     /// The alias lists follow repository alias order, because the parsed
-    /// repositories live in a sorted map.
+    /// repositories live in a sorted map. A staying alias whose git remote
+    /// (`owner_repo`) changed also counts as changed: the poller thread of
+    /// the live alias keeps polling the remote it started with, so the
+    /// daemon cannot switch the remote in place.
     pub fn topology_delta(&self, other: &Self) -> TopologyDelta {
         let mut delta = TopologyDelta::default();
         for (alias, repo) in &self.repos {
@@ -1689,6 +1694,7 @@ impl Config {
                 None => delta.removed.push(alias.clone()),
                 Some(candidate) => {
                     if repo.path != candidate.path
+                        || repo.owner_repo != candidate.owner_repo
                         || repo.lanes != candidate.lanes
                         || repo.release != candidate.release
                     {
@@ -2321,9 +2327,15 @@ mod repo_edit_tests {
         let policy = parse(&policy_text);
         let delta = before.topology_delta(&policy);
         assert_eq!(delta.changed, vec!["demo".to_string()]);
+        // A git remote change alone marks the alias changed: the poller of
+        // the live alias keeps its start remote.
+        let mut remote = parse(&config_text());
+        remote.repos.get_mut("demo").unwrap().owner_repo = "acme/other".to_string();
+        let delta = before.topology_delta(&remote);
+        assert!(delta.added.is_empty() && delta.removed.is_empty());
+        assert_eq!(delta.changed, vec!["demo".to_string()]);
         // Identical configurations produce the empty delta.
         let same = parse(&config_text());
-        assert!(before.topology_delta(&same).is_empty());
         assert!(before.topology_delta(&same).is_empty());
         assert!(!before.topology_delta(&after).is_empty());
     }

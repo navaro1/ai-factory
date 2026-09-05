@@ -535,9 +535,9 @@ an unknown alias or path, and the message names the reason.
 `X` on a repository scope asks once, then removes the repository.
 A removal stops every process of that repository and reports the stopped
 count. A removal keeps every worktree on disk; `aif doctor --clean` stays
-the only path that removes a worktree. A change of `path`, `lanes`, or
-`release` of a repository that stays still requires a daemon restart.
-Remove the repository and add it again to move a path.
+the only path that removes a worktree. A change of `path`, `lanes`, the
+git remote, or `release` of a repository that stays still requires a
+daemon restart. Remove the repository and add it again to move a path.
 
 #### The prompt of a role
 
