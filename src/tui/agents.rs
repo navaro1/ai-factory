@@ -211,7 +211,9 @@ impl AgentRoster {
 
     /// Apply one `task_started` line: create the row, or reopen it.
     fn task_started(&mut self, value: &Value) {
-        let task_id = str_field(value, "task_id").unwrap_or_default();
+        let Some(task_id) = str_field(value, "task_id") else {
+            return;
+        };
         let kind = if str_field(value, "task_type").as_deref() == Some("local_bash") {
             AgentKind::Bash
         } else {
@@ -969,6 +971,7 @@ mod tests {
             json!({"type": "tool_use", "part": {"type": "tool"}}),
             json!({"type": "step_finish"}),
             json!({"type": "system", "subtype": "task_notification"}),
+            json!({"type": "system", "subtype": "task_started"}),
             json!({"type": "system", "subtype": "background_tasks_changed"}),
             json!(null),
             json!("text"),
