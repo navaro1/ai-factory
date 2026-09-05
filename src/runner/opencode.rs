@@ -7,9 +7,10 @@
 //! `step_finish` line ends one step. One run can carry several steps, so a
 //! step ending is not the task ending; the task ends only when the process
 //! exits, as [`RunEvent::Exit`]. That exit reports success only when the run
-//! also reached the end of the agent loop: a child that exits while its last
-//! step still waits for tool results stopped in the middle of the task, so
-//! the exit reports a failure and the daemon retries the task instead of
+//! also reached the end of the agent loop, which the last step reports with
+//! the reason `stop`. A child that exits while it still waits for tool
+//! results, or after a cut answer, stopped in the middle of the task, so the
+//! exit reports a failure and the daemon retries the task instead of
 //! completing it. A malformed or unknown line is logged and skipped, never
 //! fatal.
 //!
@@ -37,8 +38,8 @@ const PROGRAM: &str = "opencode";
 /// The summary length limit for a tool part without a usable title.
 const SUMMARY_CHARS: usize = 120;
 
-/// The step reason opencode reports when the model asked for another tool.
-const TOOL_CALLS_REASON: &str = "tool-calls";
+/// The one step reason that names a complete model answer.
+const STOP_REASON: &str = "stop";
 
 /// The step reason opencode reports for an agent-side error.
 const ERROR_REASON: &str = "error";
@@ -247,7 +248,10 @@ fn forward_events(task: String, rx: Receiver<ProcEvent>, tx: Sender<RunEvent>) {
                         format!("opencode reported a failed step before exit code {code}")
                     }
                     Some(code) if ok && unfinished => {
-                        format!("opencode exited with code {code} before the agent finished")
+                        let reason = parser.last_reason.as_deref().unwrap_or("no finished step");
+                        format!(
+                            "opencode exited with code {code} before the agent finished ({reason})"
+                        )
                     }
                     Some(code) => format!("opencode exited with code {code}"),
                     None => "opencode was killed by a signal".to_string(),
@@ -365,18 +369,22 @@ impl NdjsonParser {
         }
     }
 
-    /// Whether the run stopped in the middle of the agent loop.
+    /// Whether the run stopped before the end of the agent loop.
     ///
-    /// opencode ends a step with the reason `tool-calls` when the model
-    /// asked for another tool, and the next step carries the answer. A run
-    /// that delivered its answer ends its last step with another reason,
-    /// such as `stop`. So a child that exits while its last step still
-    /// waits for tool results, or that never finished one step, stopped
-    /// before the agent did the work the prompt asked for.
+    /// opencode reports the finish reason of every step, and only `stop`
+    /// names a model that delivered a complete answer. `tool-calls` means
+    /// the model asked for another tool and the next step carries the
+    /// answer. `length` means the answer hit the token limit, so the text
+    /// is cut. `error`, `content-filter`, and `unknown` each name a
+    /// failure. A run with no finished step never delivered anything.
+    ///
+    /// The rule therefore names the one success instead of listing the
+    /// failures: an unknown reason counts as unfinished. A wrong verdict in
+    /// this direction retries the task and finally opens a stuck row, which
+    /// the operator sees. The other direction completes an empty task in
+    /// silence, and that is the defect this guard exists for.
     fn unfinished(&self) -> bool {
-        self.last_reason
-            .as_deref()
-            .is_none_or(|reason| reason == TOOL_CALLS_REASON)
+        self.last_reason.as_deref() != Some(STOP_REASON)
     }
 
     /// Parse one output line into zero or more run events.
@@ -1007,6 +1015,16 @@ not json at all
         assert!(!parser.unfinished(), "the last step ended the agent loop");
         assert!(!parser.failed);
 
+        parser.parse_line(
+            r#"{"type":"step_finish","part":{"type":"step-finish","reason":"length"}}"#,
+        );
+        assert!(parser.unfinished(), "a cut answer did not finish the loop");
+
+        parser.parse_line(
+            r#"{"type":"step_finish","part":{"type":"step-finish","reason":"banana"}}"#,
+        );
+        assert!(parser.unfinished(), "an unknown reason is not a success");
+
         parser
             .parse_line(r#"{"type":"step_finish","part":{"type":"step-finish","reason":"error"}}"#);
         assert!(parser.failed, "one error reason marks the whole run");
@@ -1043,7 +1061,9 @@ not json at all
             Some(&RunEvent::Exit {
                 task: TASK.to_string(),
                 ok: false,
-                detail: "opencode exited with code 0 before the agent finished".to_string(),
+                detail: "opencode exited with code 0 before the agent finished \
+                         (no finished step)"
+                    .to_string(),
             })
         );
         fs::remove_dir_all(dir).unwrap();

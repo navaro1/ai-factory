@@ -1366,7 +1366,8 @@ impl Daemon {
                         .get(&task.number)
                         .is_none_or(|pr| !review_ready(pr))
                         && !(task.state == TaskState::Running
-                            && review_transitioned(fresh, task.number))
+                            && (review_transitioned(fresh, task.number)
+                                || review_handed_off(fresh, task.number)))
                 }
                 Stage::Refine | Stage::Release => false,
             })
@@ -4914,6 +4915,19 @@ fn review_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
         .is_some_and(|pr| pr.open && !pr.draft)
 }
 
+/// True when GitHub shows the review handed the pull request to a human.
+///
+/// The agent adds the `needs-human` label first and writes its question
+/// comment after. The label closes the review gate, so a poll between those
+/// two steps would otherwise cancel the run and leave the operator a label
+/// with no question. This transition is as valid as the ready flip.
+fn review_handed_off(fresh: &RepoSnapshot, number: u64) -> bool {
+    fresh
+        .prs
+        .get(&number)
+        .is_some_and(|pr| pr.open && pr.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+}
+
 /// The effective prompt view of every role that has a template, in role
 /// order. The theory roles carry no template, so they get no view.
 ///
@@ -6087,6 +6101,27 @@ mod tests {
         assert!(
             !worktree.join(".aif").join("reviewed-sha").exists(),
             "a review that did no work marks no reviewed head"
+        );
+    }
+
+    /// The agent adds the `needs-human` label first and writes its question
+    /// comment after. The label closes the review gate, so a poll between
+    /// those two steps must not cancel the run. A cancelled run leaves the
+    /// label with no question, and the operator reads an empty inbox row.
+    #[test]
+    fn a_needs_human_label_keeps_the_running_review_alive() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Running);
+
+        rig.poll(vec![], vec![pr(5, true, &[NEEDS_HUMAN_LABEL])]);
+
+        assert_eq!(
+            rig.task("borsuk/review-p5").state,
+            TaskState::Running,
+            "the agent must reach its question comment"
         );
     }
 
