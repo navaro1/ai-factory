@@ -1247,6 +1247,13 @@ impl Daemon {
     }
 
     /// Cancel every active task of one item and stop its live session.
+    ///
+    /// A release task stays out, as it does in
+    /// [`Daemon::cancel_absent_restored`]: the train, not one pull request,
+    /// is its unit. The release task carries the lowest pull request of its
+    /// batch, and the agent merges the batch in ascending order, so the
+    /// first merge would otherwise cancel the run in the middle of its
+    /// work.
     fn cancel_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
         let ticket_conversation = self
             .ticket_conversations
@@ -1256,6 +1263,7 @@ impl Daemon {
             .active()
             .iter()
             .filter(|task| task.repo == repo && task.kind == kind && task.number == number)
+            .filter(|task| task.stage != Stage::Release)
             .filter(|task| task.purpose != TaskPurpose::TicketChat || !ticket_conversation)
             .map(|task| task.id.clone())
             .collect();
@@ -11005,18 +11013,64 @@ mod tests {
 
         rig.poll(vec![], vec![]);
 
-        assert!(
-            rig.daemon.table.by_id.contains_key("borsuk/release"),
-            "the in-flight release task survives the retire"
+        assert_eq!(
+            rig.task("borsuk/release").state,
+            TaskState::Running,
+            "the merge of its own pull request never cancels the release"
         );
         assert!(
             !rig.daemon.table.by_id.contains_key("borsuk/review-p5"),
             "the dropped review retires"
         );
+
+        rig.event(turn_finished("borsuk/release", true, "released"));
+
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Done);
         assert_eq!(
             rig.daemon.trains["borsuk"].in_flight, None,
-            "reconcile_trains closes the train after the release task ends"
+            "the finished release closes the train"
         );
+    }
+
+    #[test]
+    fn a_merged_first_pull_request_keeps_the_running_release() {
+        let dir = temp_root();
+        let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[]), pr(3, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2, 3],
+        });
+        rig.event(started("borsuk/release", "session-release"));
+
+        // The agent merges the batch in ascending order, so the lowest
+        // pull request leaves GitHub first. It names the release task.
+        rig.poll(vec![], vec![pr(3, false, &[])]);
+
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Running);
+        assert_eq!(
+            rig.daemon.trains["borsuk"].in_flight.as_deref(),
+            Some("borsuk/release"),
+            "the train stays in flight for the rest of the batch"
+        );
+        assert_eq!(rig.daemon.trains["borsuk"].batch(), &[3]);
+
+        rig.event(turn_finished("borsuk/release", true, "released"));
+        assert_eq!(
+            rig.task("borsuk/release").state,
+            TaskState::Running,
+            "pull request 3 is still open"
+        );
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the confirmed release completes and retires with its batch"
+        );
+        assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
+        assert!(rig.daemon.trains["borsuk"].batch().is_empty());
     }
 
     #[test]
@@ -11686,6 +11740,192 @@ mod tests {
 
         rig.poll_implemented();
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+    }
+
+    // ------------------------------------------------------------------
+    // The GitHub confirmation of a finished run
+    // ------------------------------------------------------------------
+
+    /// A finished implementation waits for GitHub. The poll that shows the
+    /// pull request completes it, and the same poll still carries the
+    /// `refined` label, so the daemon removes the forgotten label.
+    #[test]
+    fn a_polled_pull_request_completes_a_finished_implementation() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = issue_wt(&dir, 142);
+        let gitdir = rig_gitdir(&dir);
+        let steps: Vec<Step> = fresh_issue_steps(&repo, &worktree, 142, &gitdir)
+            .into_iter()
+            .chain(vec![gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "DELETE",
+                    "repos/acme/borsuk/issues/142/labels/refined",
+                ],
+                gh_ok(),
+            )])
+            .chain(reuse_issue_steps(&repo, &worktree, &gitdir))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
+        });
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Running,
+            "the exit alone never completes the task"
+        );
+        let mut pull = pr(5, true, &[]);
+        pull.head_ref = "aif/borsuk/issue-142".to_string();
+
+        rig.poll(vec![issue(142, &["refined"])], vec![pull]);
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
+        assert!(
+            rig.exec.calls().iter().any(|call| {
+                call.program == "gh"
+                    && call.argv()
+                        == [
+                            "api",
+                            "-i",
+                            "-X",
+                            "DELETE",
+                            "repos/acme/borsuk/issues/142/labels/refined",
+                        ]
+            }),
+            "the forgotten label leaves GitHub: {:?}",
+            rig.exec.calls()
+        );
+    }
+
+    /// A review that ends without its transition fails after the grace and
+    /// retries. The last attempt names the pull request in its stuck row.
+    #[test]
+    fn an_unconfirmed_review_fails_after_the_grace_and_retries() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = issue_wt(&dir, 5);
+        let gitdir = rig_gitdir(&dir);
+        let steps: Vec<Step> = fresh_issue_steps(&repo, &worktree, 5, &gitdir)
+            .into_iter()
+            .chain(reuse_issue_steps(&repo, &worktree, &gitdir))
+            .chain(reuse_issue_steps(&repo, &worktree, &gitdir))
+            .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            set_role_harness(config, ExecutionRole::Review, Harness::Opencode);
+        });
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            rig.event(exited("borsuk/review-p5", true, "code 0"));
+            assert_eq!(
+                rig.task("borsuk/review-p5").state,
+                TaskState::Running,
+                "the finished run waits for the poll"
+            );
+            rig.set_now(T0 + u64::from(attempt) * CONFIRM_GRACE_MS);
+            rig.drive();
+        }
+
+        assert_eq!(rig.task("borsuk/review-p5").attempt, MAX_ATTEMPTS);
+        assert_eq!(rig.job_count() as u32, MAX_ATTEMPTS, "each failure retries");
+        let row = rig
+            .decision(&format!("stuck:borsuk/review-p5:{MAX_ATTEMPTS}"))
+            .expect("the last attempt opens a stuck row");
+        assert!(
+            matches!(row.kind, DecisionKind::Stuck { ref reason, .. }
+                if reason == "the review run ended, but PR #5 is still a draft"),
+            "the row names the missing transition: {:?}",
+            row.kind
+        );
+    }
+
+    /// A run that hands its item to a human is finished. The label is the
+    /// documented human path, so the task completes without its gate
+    /// transition, and the inbox row carries the work from there.
+    #[test]
+    fn a_needs_human_ticket_completes_its_refine_at_once() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
+        });
+        rig.poll(vec![issue(142, &["to-refine", NEEDS_HUMAN_LABEL])], vec![]);
+
+        rig.event(exited("borsuk/refine-i142", true, "code 0"));
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+        assert!(rig.daemon.confirming.is_empty());
+        assert!(
+            rig.decision("human:borsuk:i142").is_some(),
+            "the inbox row carries the ticket from here"
+        );
+    }
+
+    /// A release completes only after every pull request of its batch left
+    /// GitHub. The completion drains the train, and the finished task
+    /// retires with its merged batch.
+    #[test]
+    fn a_release_waits_for_the_whole_batch_to_merge() {
+        let dir = temp_root();
+        let steps = fresh_train_steps(&rig_repo(&dir), &train_wt(&dir), &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![], vec![pr(2, false, &[]), pr(3, false, &[])]);
+        rig.act(Action::Go {
+            repo: "borsuk".to_string(),
+            prs: vec![2, 3],
+        });
+
+        rig.event(turn_finished("borsuk/release", true, "released"));
+
+        assert_eq!(
+            rig.task("borsuk/release").state,
+            TaskState::Running,
+            "one pull request of the batch is still open"
+        );
+        rig.poll(vec![], vec![pr(3, false, &[])]);
+        assert_eq!(rig.task("borsuk/release").state, TaskState::Running);
+
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/release"),
+            "the completed release retires with its merged batch"
+        );
+        assert_eq!(rig.daemon.trains["borsuk"].in_flight, None);
+        assert!(rig.daemon.trains["borsuk"].batch().is_empty());
+    }
+
+    /// The process of a task that waits for its transition may exit. The
+    /// exit drops the session and nothing else: the poll decides.
+    #[test]
+    fn an_exit_never_fails_a_run_that_waits_for_its_transition() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(turn_finished("borsuk/implement-i142", true, "done"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.state, TaskState::Running, "the exit fails nothing");
+        assert_eq!(task.attempt, 1);
+
+        rig.poll_implemented();
+
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
     }
 
