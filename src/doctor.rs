@@ -159,13 +159,22 @@ pub struct DoctorEnv<'a> {
     pub exec: &'a dyn Exec,
 }
 
+/// Report the version of the `aif` package itself.
+fn aif_version_check() -> Check {
+    Check {
+        label: "aif".to_string(),
+        status: Status::Pass,
+        detail: format!("aif {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 /// Run every read-only check and return them in report order.
 ///
 /// The report never changes anything. A failed config does not stop the
 /// report: the tools and the daemon are still checked, and everything that
 /// needs the config is skipped.
 pub fn report(env: &DoctorEnv) -> Vec<Check> {
-    let mut checks = Vec::new();
+    let mut checks = vec![aif_version_check()];
     match read_config(env) {
         Ok(config) => {
             checks.push(Check {
@@ -2252,6 +2261,10 @@ mod tests {
 
         let checks = report(&env);
 
+        let first = checks.first().expect("the report must have rows");
+        assert_eq!(first.label, "aif");
+        assert_eq!(first.status, Status::Pass);
+        assert_eq!(first.detail, format!("aif {}", env!("CARGO_PKG_VERSION")));
         let config = checks
             .iter()
             .find(|check| check.label == "config")
@@ -2423,6 +2436,21 @@ mod tests {
         // The nine tool, auth, and repository answers plus the usage curl
         // version check of the enabled [usage] table.
         assert_eq!(exec.calls().len(), 10, "calls: {:?}", exec.calls());
+        fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn the_first_row_of_a_full_report_is_the_aif_row() {
+        let fx = fixture();
+        let exec = repo_answers(ScriptExec::new(), &fx.repo_path);
+        let env = fixture_env(&fx, &exec);
+
+        let checks = report(&env);
+
+        let first = checks.first().expect("the report must have rows");
+        assert_eq!(first.label, "aif");
+        assert_eq!(first.status, Status::Pass);
+        assert_eq!(first.detail, format!("aif {}", env!("CARGO_PKG_VERSION")));
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
