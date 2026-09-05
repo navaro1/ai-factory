@@ -23,6 +23,13 @@ const RATE_LIMITS_ID: i64 = 2;
 /// The overall conversation timeout of the production probe.
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The transport that keeps the app server on stdin and stdout.
+///
+/// The help text calls this the default, but codex 0.153 writes nothing to
+/// stdout and exits at once when the flag is absent. So the probe always
+/// names the transport.
+const STDIO_TRANSPORT: &str = "stdio://";
+
 /// The billing mode that the auth file and the environment select.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -142,15 +149,17 @@ fn probe_plan(program: &str, now_ms: u64, timeout: Duration) -> Result<UsageReco
 
 /// Run the app-server conversation and return the rate limits result object.
 ///
-/// The probe spawns `<program> app-server`, writes the initialize request,
-/// the initialized notification, and the rate limits read as JSONL lines,
-/// and reads the answer lines until the line with the matching id arrives.
-/// The overall timeout covers the whole conversation: on a timeout the probe
-/// kills the child and reports the reason. The child never outlives this
-/// function, whatever the outcome is.
+/// The probe spawns `<program> app-server --listen stdio://`, writes the
+/// initialize request, the initialized notification, and the rate limits
+/// read as JSONL lines, and reads the answer lines until the line with the
+/// matching id arrives. The overall timeout covers the whole conversation:
+/// on a timeout the probe kills the child and reports the reason. The child
+/// never outlives this function, whatever the outcome is.
 fn rate_limits_from_app_server(program: &str, timeout: Duration) -> Result<Value> {
     let mut child = Command::new(program)
         .arg("app-server")
+        .arg("--listen")
+        .arg(STDIO_TRANSPORT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -166,17 +175,17 @@ fn rate_limits_from_app_server(program: &str, timeout: Duration) -> Result<Value
         .ok_or_else(|| anyhow!("the codex app-server has no stdout pipe"))?;
     let deadline = Instant::now() + timeout;
 
-    // The writer sends the three protocol messages and then closes the
-    // pipe, so the app server sees the end of the requests.
-    let writer = std::thread::spawn(move || {
-        let requests = format!(
-            "{}\n{}\n{}\n",
-            r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"aif-usage","version":"0.6.0"}}}"#,
-            r#"{"method":"initialized"}"#,
-            r#"{"id":2,"method":"account/rateLimits/read","params":{}}"#,
-        );
-        let _ = stdin.write_all(requests.as_bytes());
-    });
+    // The three protocol messages are a few hundred bytes, far below the
+    // pipe buffer, so this write returns even if the child reads nothing.
+    // A failed write leaves the diagnosis to the read loop below.
+    let requests = format!(
+        "{}\n{}\n{}\n",
+        r#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"aif-usage","version":"0.6.0"}}}"#,
+        r#"{"method":"initialized","params":null}"#,
+        r#"{"id":2,"method":"account/rateLimits/read"}"#,
+    );
+    let _ = stdin.write_all(requests.as_bytes());
+    let _ = stdin.flush();
 
     // The reader forwards the answer lines to this thread. A blocking read
     // here could outlive the timeout, so the reader owns it and this thread
@@ -205,9 +214,12 @@ fn rate_limits_from_app_server(program: &str, timeout: Duration) -> Result<Value
         }
     }
 
+    // The app server shuts down when stdin reaches its end, and the rate
+    // limits read needs a network round trip. So the pipe stays open until
+    // the answer, the timeout, or the exit of the child ends the loop.
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    let _ = writer.join();
     let _ = reader.join();
     match answer {
         Some(result) => Ok(result),
@@ -254,10 +266,32 @@ fn parse_window(window: &Value) -> Option<UsageWindow> {
     })
 }
 
+/// One field of the result, from `rateLimits` first, then the top level.
+///
+/// Codex 0.153 moved `planType` and `credits` inside the `rateLimits`
+/// object. The top-level read stays as the fallback for an older app
+/// server. A JSON null counts as absent on both levels.
+fn result_field<'a>(result: &'a Value, name: &str) -> Option<&'a Value> {
+    result
+        .get("rateLimits")
+        .and_then(|limits| limits.get(name))
+        .filter(|value| !value.is_null())
+        .or_else(|| result.get(name).filter(|value| !value.is_null()))
+}
+
+/// One number that the app server reports as a JSON number or as a string.
+///
+/// The live `credits.balance` is a decimal string, so `as_f64` alone drops
+/// it.
+fn number_value(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
 /// The plan name from the `planType` string of the result.
 fn plan_name(result: &Value) -> Option<String> {
-    result
-        .get("planType")
+    result_field(result, "planType")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(String::from)
@@ -268,11 +302,11 @@ fn plan_name(result: &Value) -> Option<String> {
 /// A `credits` object wins with its `balance` or `remaining` field, and the
 /// reset credit count is the fallback.
 fn credits_remaining(result: &Value) -> Option<f64> {
-    let credits = result.get("credits");
+    let credits = result_field(result, "credits");
     for field in ["balance", "remaining"] {
         if let Some(value) = credits
             .and_then(|credits| credits.get(field))
-            .and_then(Value::as_f64)
+            .and_then(number_value)
         {
             return Some(value);
         }
@@ -288,8 +322,7 @@ fn credits_remaining(result: &Value) -> Option<f64> {
 /// it out of the result until the panel grows a row for it.
 #[cfg(test)]
 fn rate_limit_reached_type(result: &Value) -> Option<String> {
-    result
-        .get("rateLimitReachedType")
+    result_field(result, "rateLimitReachedType")
         .and_then(Value::as_str)
         .map(String::from)
 }
@@ -419,12 +452,46 @@ mod tests {
     }
 
     /// The app server that answers both requests from the fixture and exits.
+    ///
+    /// The script refuses to answer without the stdio transport arguments,
+    /// so the happy path also proves that the probe names the transport.
     fn happy_app_server(dir: &Path) -> PathBuf {
         let (init, limits) = fixture_lines();
         let body = r#"#!/bin/sh
+case "$*" in
+  "app-server --listen stdio://") ;;
+  *) exit 3 ;;
+esac
 while IFS= read -r line; do
   case "$line" in
     *'"account/rateLimits/read"'*)
+      printf '%s\n' '__LIMITS__'
+      exit 0 ;;
+    *'"initialize"'*) printf '%s\n' '__INIT__' ;;
+  esac
+done
+"#
+        .replace("__INIT__", &init)
+        .replace("__LIMITS__", &limits);
+        script(dir, "codex", &body)
+    }
+
+    /// The app server that answers the rate limits read only while stdin
+    /// stays open, the way the real app server behaves.
+    ///
+    /// The real server shuts down at the end of stdin, and the rate limits
+    /// read needs a network round trip. This script models that: it waits
+    /// for more input after the read request, and it exits without an
+    /// answer when that wait ends at the closed pipe.
+    fn stdin_sensitive_app_server(dir: &Path) -> PathBuf {
+        let (init, limits) = fixture_lines();
+        let body = r#"#!/bin/bash
+while IFS= read -r line; do
+  case "$line" in
+    *'"account/rateLimits/read"'*)
+      IFS= read -r -t 1 _extra
+      # bash returns 1 at the end of the pipe and above 128 on a timeout.
+      if [ $? -eq 1 ]; then exit 0; fi
       printf '%s\n' '__LIMITS__'
       exit 0 ;;
     *'"initialize"'*) printf '%s\n' '__INIT__' ;;
@@ -562,6 +629,33 @@ exec sleep 30
         );
     }
 
+    /// Read the rate limits of one real codex binary.
+    ///
+    /// The test is ignored by default and needs `AIF_CODEX_PROGRAM` to name
+    /// a real codex binary with a logged-in ChatGPT plan. Run it with
+    /// `AIF_CODEX_PROGRAM=/path/to/codex cargo test real_codex_rate_limits
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_codex_rate_limits() {
+        let Ok(program) = std::env::var("AIF_CODEX_PROGRAM") else {
+            eprintln!("skipped: set AIF_CODEX_PROGRAM to a real codex binary to run this test");
+            return;
+        };
+
+        let result = rate_limits_from_app_server(&program, Duration::from_secs(30))
+            .expect("the real app server answers the rate limits read");
+
+        eprintln!("plan: {:?}", plan_name(&result));
+        eprintln!("credits: {:?}", credits_remaining(&result));
+        let windows = rate_limit_windows(&result);
+        for window in &windows {
+            eprintln!("window: {} used {}%", window.label, window.used_percent);
+        }
+        assert!(plan_name(&result).is_some(), "the plan name must parse");
+        assert!(!windows.is_empty(), "at least one window must parse");
+    }
+
     #[test]
     fn the_timeout_kills_the_child_and_reports_the_reason() {
         let dir = temp_dir("timeout");
@@ -605,10 +699,8 @@ exec sleep 30
         assert_eq!(response_result(&init, 2), None);
         let init_result = response_result(&init, 1).unwrap();
         assert_eq!(
-            init_result
-                .pointer("/serverInfo/name")
-                .and_then(Value::as_str),
-            Some("codex-app-server")
+            init_result.get("codexHome").and_then(Value::as_str),
+            Some("/home/agent/.codex")
         );
         assert_eq!(response_result("not json", 2), None);
         assert!(response_result(&limits, 2).is_some());
@@ -646,9 +738,63 @@ exec sleep 30
     }
 
     #[test]
+    fn the_nested_plan_and_credits_win_over_the_top_level() {
+        let live = json!({
+            "rateLimits": {"planType": "pro", "credits": {"balance": "0"}},
+            "rateLimitResetCredits": {"availableCount": 1}
+        });
+        assert_eq!(plan_name(&live).as_deref(), Some("pro"));
+        // A zero balance is a real answer, so the reset count stays unused.
+        assert_eq!(credits_remaining(&live), Some(0.0));
+
+        let old = json!({"planType": "plus", "credits": {"balance": 4.0}});
+        assert_eq!(plan_name(&old).as_deref(), Some("plus"));
+        assert_eq!(credits_remaining(&old), Some(4.0));
+
+        // A null on the nested level never hides the top-level value.
+        let mixed = json!({
+            "rateLimits": {"planType": null, "credits": null},
+            "planType": "team",
+            "credits": {"balance": 9.0}
+        });
+        assert_eq!(plan_name(&mixed).as_deref(), Some("team"));
+        assert_eq!(credits_remaining(&mixed), Some(9.0));
+    }
+
+    #[test]
+    fn a_null_secondary_window_leaves_only_the_primary_one() {
+        let result = json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 29.0, "windowDurationMins": 10080},
+                "secondary": null
+            }
+        });
+
+        let windows = rate_limit_windows(&result);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "weekly");
+        assert_eq!(windows[0].used_percent, 29.0);
+    }
+
+    #[test]
+    fn the_probe_keeps_stdin_open_until_the_answer_arrives() {
+        let dir = temp_dir("stdin-open");
+        let program = stdin_sensitive_app_server(&dir);
+        let auth_path = write_auth_file(&dir, &plan_auth());
+
+        let record = probe_with_retry(&program, &auth_path, Duration::from_secs(5)).unwrap();
+
+        assert_eq!(record.plan.as_deref(), Some("pro"));
+        assert_eq!(record.windows.len(), 2);
+    }
+
+    #[test]
     fn the_reached_flag_parses_when_present() {
-        let result = json!({"rateLimitReachedType": "primary"});
+        let result = json!({"rateLimits": {"rateLimitReachedType": "primary"}});
         assert_eq!(rate_limit_reached_type(&result).as_deref(), Some("primary"));
+        let old = json!({"rateLimitReachedType": "secondary"});
+        assert_eq!(rate_limit_reached_type(&old).as_deref(), Some("secondary"));
         assert_eq!(rate_limit_reached_type(&json!({})), None);
     }
 
