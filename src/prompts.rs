@@ -49,6 +49,10 @@ ask for approval of a plan, a design, or a change. Do not stop to report a
 plan, and do not end a turn with a question. Decide with the facts you have
 and act. Stop early only through the escape this prompt names.
 
+Before any other step, read the newest comments of the ticket with `gh`. An
+operator answer to a question from an earlier run arrives there. Such an
+answer settles the question. Act on it, and never ask that question again.
+
 Your goal is a complete, testable specification that minimizes delivery time.
 Do not implement the change.
 
@@ -108,6 +112,10 @@ Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a
 plan, and do not end a turn with a question. Decide with the facts you have
 and act. Stop early only through the escape this prompt names.
+
+Before any other step, read the newest comments of the ticket with `gh`. An
+operator answer to a question from an earlier run arrives there. Such an
+answer settles the question. Act on it, and never ask that question again.
 
 Your goal is a complete change that meets every acceptance criterion with the
 shortest safe delivery time. Follow the repository instructions and keep the
@@ -169,6 +177,10 @@ Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a
 plan, and do not end a turn with a question. Decide with the facts you have
 and act. Stop early only through the escape this prompt names.
+
+Before any other step, read the newest comments of the PR with `gh`. An
+operator answer to a question from an earlier run arrives there. Such an
+answer settles the question. Act on it, and never ask that question again.
 
 PR #{number}: {title}
 

@@ -2627,6 +2627,9 @@ mod tests {
         );
     }
 
+    /// The warning is about opencode alone. A codex role without
+    /// `auto_approve` is a valid supervised mode: it sends each approval to
+    /// the inbox and waits for a person, so it must raise no warning.
     #[test]
     fn approving_and_non_opencode_roles_pass_the_permissions_check() {
         let example = Config::parse(include_str!("../docs/v0.5/factory.example.toml"))
@@ -2651,8 +2654,23 @@ mod tests {
                 1,
             );
         let codex_review = Config::parse(&codex_review).expect("the codex roles must parse");
+        // A codex role that says `auto_approve = false` out loud is the
+        // supervised mode, not a misconfiguration.
+        let supervised_codex = permissions_review_text("")
+            .replacen(
+                "[stage.review]\nharness = \"opencode\"\nmodel = \"m\"\n",
+                "[stage.review]\nharness = \"codex\"\nmodel = \"m\"\nauto_approve = false\n",
+                1,
+            )
+            .replacen(
+                "[stage.implement]\nharness = \"opencode\"\nmodel = \"m\"\nauto_approve = true\n",
+                "[stage.implement]\nharness = \"codex\"\nmodel = \"m\"\nauto_approve = true\n",
+                1,
+            );
+        let supervised_codex =
+            Config::parse(&supervised_codex).expect("the codex roles must parse");
 
-        for config in [&example, &claude_only, &codex_review] {
+        for config in [&example, &claude_only, &codex_review, &supervised_codex] {
             let checks = permission_checks(config);
             assert_eq!(checks.len(), 1, "checks: {checks:?}");
             assert_eq!(checks[0].label, "permissions");

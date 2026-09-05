@@ -116,6 +116,49 @@ fn a_legacy_runner_key_has_a_direct_migration_error() {
     );
 }
 
+/// A codex role reads `auto_approve` as the client-side yolo policy: the
+/// runner answers each approval without a person. Claude selects the same
+/// behaviour through its permission mode, so it still rejects the field.
+#[test]
+fn a_codex_role_accepts_auto_approve_and_a_claude_role_still_rejects_it() {
+    let text = ROLES.replace(
+        "[stage.review]\nharness = \"codex\"",
+        "[stage.review]\nharness = \"codex\"\nauto_approve = true",
+    );
+    let config = Config::parse(&text).expect("a codex role must accept auto_approve");
+    assert_eq!(
+        config.roles[&ExecutionRole::Review].auto_approve,
+        Some(true)
+    );
+
+    let text = ROLES.replace(
+        "[repo.demo.stage.review]\nmodel",
+        "[repo.demo.stage.review]\nauto_approve = true\nmodel",
+    );
+    Config::parse(&text).expect("a codex repository override must accept auto_approve");
+
+    let text = ROLES.replace(
+        "[stage.refine]\nharness = \"claude\"",
+        "[stage.refine]\nharness = \"claude\"\nauto_approve = true",
+    );
+    let error = Config::parse(&text).expect_err("a claude role must reject auto_approve");
+    assert!(
+        error.to_string().contains("unsupported"),
+        "error: {error:#}"
+    );
+
+    // Every other foreign field stays rejected on a codex role.
+    let text = ROLES.replace(
+        "[stage.review]\nharness = \"codex\"",
+        "[stage.review]\nharness = \"codex\"\nagent = \"builder\"",
+    );
+    let error = Config::parse(&text).expect_err("a codex role must reject agent");
+    assert!(
+        error.to_string().contains("unsupported"),
+        "error: {error:#}"
+    );
+}
+
 #[test]
 fn a_repository_override_cannot_add_a_field_from_another_harness() {
     let text = ROLES.replace(

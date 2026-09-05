@@ -168,13 +168,37 @@ of each identity always shows, and it survives a restart. The probes read
 the credentials of the operator home and never store or log a token.
 
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
-OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
+OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, `sandbox`, and `auto_approve`; the approval policy and the sandbox travel on the thread, not the command line.
+
+Codex runs as a live session over `codex app-server`. The daemon can chat
+into a parked codex task, resume it by thread id, and answer it. A command
+or file approval opens a permission row in the inbox, and a codex question
+opens a question row, exactly as a claude question does. `approval_policy`
+defaults to `on-request` and `sandbox` defaults to `workspace-write`.
+
+Set `auto_approve = true` on every unattended codex role. The runner then
+accepts each approval at once and no row waits for a person. Leave the field
+off for a supervised role: every approval reaches the inbox and waits there.
+A real question always reaches the inbox in both modes. `approval_policy =
+"never"` is the codex-side answer instead: codex then refuses a command
+rather than asking about it.
+
+Codex asks a question through its `request_user_input` tool. The tool stays
+locked until the feature flag
+`features.default_mode_request_user_input=true` unlocks it, and the runner
+passes that flag on every start.
+
+Every codex thread starts the MCP servers of `~/.codex/config.toml`. The
+recorded probe started telegram, stripe, and todoist for a plain review
+thread. Give a codex role its own `profile` when that role must not start
+them.
 
 Set `auto_approve = true` on every unattended opencode role. Without it,
 opencode auto-rejects every permission request. Tools that read outside the
 project directory then fail, and the task loses its evidence. The run can
 still end `ok`. `aif doctor` reports a `permissions` warning for each opencode
-role that lacks the approval. A rejected request also opens an inbox row, so
+role that lacks the approval. The warning is about opencode alone: a codex
+role without `auto_approve` is the supervised mode, not a fault. A rejected request also opens an inbox row, so
 you can grant the permission for the next run of that task.
 
 A repository role table can override individual fields. A harness change requires a complete role block.
@@ -550,6 +574,30 @@ The role returns to the built-in prompt.
 - The stop sequence stops every live agent session before the daemon exits,
   so no agent process stays behind as an orphan.
 
+The daemon confirms each finished stage on GitHub before it marks the task
+done. An agent that exits with success did not always do the work, and the
+gates react to a change, not to a state. A stage that ends without its
+change would therefore never start again. Each stage has one result:
+
+| Stage | What the daemon checks |
+|---|---|
+| Refine | The ticket carries the `refined` label. |
+| Implement | A pull request closes the ticket. |
+| Review | The pull request left the draft state. |
+| Release | Every pull request of the batch is merged. |
+
+A run that ends without its result waits for the next poll. After about a
+minute it fails, and the task retries like any other failure.
+
+A running process that prints nothing for 30 minutes is stalled, not slow:
+every harness prints a step, a tool, or a text line long before that. The
+daemon stops the process and the task retries like any other failure.
+
+A finished review writes the head sha it reviewed into the worktree. A head
+with that mark gets no second review, not even after a daemon restart. An
+answer through the inbox clears the mark, so the fresh review of the same
+head starts. A push moves the head and starts a review as before.
+
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
@@ -579,8 +627,17 @@ The role returns to the built-in prompt.
 - A release gate row refreshes at the poll after you stack a pull request.
 - A review push on a draft pull request can restart that review at the next
   poll. A pull request with the `needs-human` label rests instead.
+- A `needs-human` label that a person removes on GitHub, instead of through
+  the inbox, leaves the reviewed-head mark in place. The same head gets no
+  fresh review until a push or an inbox answer.
+- A codex approval opens a permission row. Press `y` to accept the command
+  or the file change, or `n` to decline it. The agent keeps working after a
+  decline.
 - A review of a pull request from a fork takes the `needs-human` path before a
   repair.
+- A run that ends with a `needs-human` label counts as finished, because the
+  agent took the human path. Answer the row in the inbox to start the stage
+  again.
 
 ## Development
 

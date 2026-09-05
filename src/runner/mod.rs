@@ -36,7 +36,12 @@ pub const fn capabilities(harness: Harness) -> Capabilities {
             resume: true,
             permission_responses: true,
         },
-        Harness::Opencode | Harness::Codex => Capabilities {
+        Harness::Codex => Capabilities {
+            live_input: true,
+            resume: true,
+            permission_responses: true,
+        },
+        Harness::Opencode => Capabilities {
             live_input: false,
             resume: true,
             permission_responses: false,
@@ -266,23 +271,25 @@ mod tests {
 
     #[test]
     fn harness_capabilities_control_live_input_resume_and_permission_answers() {
-        assert_eq!(
-            capabilities(Harness::Claude),
-            Capabilities {
-                live_input: true,
-                resume: true,
-                permission_responses: true,
-            }
-        );
-        for harness in [Harness::Opencode, Harness::Codex] {
+        // Claude and codex both run a live, steerable session.
+        for harness in [Harness::Claude, Harness::Codex] {
             assert_eq!(
                 capabilities(harness),
                 Capabilities {
-                    live_input: false,
+                    live_input: true,
                     resume: true,
-                    permission_responses: false,
+                    permission_responses: true,
                 }
             );
         }
+        // OpenCode stays one-shot: it resumes, but it cannot be steered.
+        assert_eq!(
+            capabilities(Harness::Opencode),
+            Capabilities {
+                live_input: false,
+                resume: true,
+                permission_responses: false,
+            }
+        );
     }
 }

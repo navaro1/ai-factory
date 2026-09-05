@@ -1079,7 +1079,9 @@ impl Settings {
         settings.program = next.program().to_string();
         settings.model = model.clone();
         clear_harness_fields(settings);
-        if next == Harness::Opencode {
+        // Both approving harnesses start from the safe answer: every
+        // request reaches a person until the operator turns it off.
+        if matches!(next, Harness::Opencode | Harness::Codex) {
             settings.auto_approve = Some(false);
         }
         if let DraftValue::Repository {
@@ -1432,9 +1434,12 @@ impl Settings {
                 Field::StrictMcp,
             ]),
             Harness::Opencode => fields.extend([Field::Agent, Field::AutoApprove]),
-            Harness::Codex => {
-                fields.extend([Field::Profile, Field::ApprovalPolicy, Field::Sandbox])
-            }
+            Harness::Codex => fields.extend([
+                Field::Profile,
+                Field::ApprovalPolicy,
+                Field::Sandbox,
+                Field::AutoApprove,
+            ]),
         }
         if self.scope == 0 && self.selected_role_for().stage().is_some() {
             fields.push(Field::Limit);
@@ -1940,7 +1945,11 @@ impl Settings {
             warnings.push("Claude permission checks are disabled");
         }
         if settings.auto_approve == Some(true) {
-            warnings.push("OpenCode approval checks are disabled");
+            warnings.push(if settings.harness == Harness::Codex {
+                "Codex approval checks are disabled"
+            } else {
+                "OpenCode approval checks are disabled"
+            });
         }
         if settings.approval_policy.as_deref() == Some("never") {
             warnings.push("Codex approval checks are disabled");
@@ -2152,6 +2161,7 @@ fn complete_override(settings: &RoleSettings) -> RoleOverride {
             value.profile = settings.profile.clone();
             value.approval_policy = settings.approval_policy.clone();
             value.sandbox = settings.sandbox.clone();
+            value.auto_approve = settings.auto_approve;
         }
     }
     value
@@ -2469,7 +2479,7 @@ mod tests {
             },
             disallowed_tools: vec![],
             strict_mcp: (harness == Harness::Claude).then_some(false),
-            auto_approve: (harness == Harness::Opencode).then_some(false),
+            auto_approve: matches!(harness, Harness::Opencode | Harness::Codex).then_some(false),
             approval_policy: (harness == Harness::Codex).then(|| "on-request".to_string()),
             sandbox: (harness == Harness::Codex).then(|| "workspace-write".to_string()),
         }
@@ -2998,6 +3008,62 @@ mod tests {
         assert_eq!(current.sandbox, None);
         assert_eq!(current.auto_approve, Some(false));
         assert_eq!(settings.selected_field(), Field::Harness);
+    }
+
+    /// A codex role answers approvals the same two ways an opencode role
+    /// does: `auto_approve = true` answers them client side, and the field
+    /// left off sends each one to the inbox.
+    #[test]
+    fn a_codex_role_carries_the_auto_approve_row_and_its_own_warning() {
+        let mut state = state();
+        for value in &mut state.settings.global {
+            value.settings = role(Harness::Codex);
+        }
+        for value in &mut state.settings.repositories {
+            value.settings = role(Harness::Codex);
+        }
+        let settings = Settings::default();
+        assert!(
+            settings
+                .visible_fields(&state)
+                .contains(&Field::AutoApprove),
+            "a codex role must offer the auto approve row"
+        );
+        assert_eq!(settings.warnings(&state), Vec::<&str>::new());
+
+        for value in &mut state.settings.global {
+            value.settings.auto_approve = Some(true);
+        }
+        for value in &mut state.settings.repositories {
+            value.settings.auto_approve = Some(true);
+        }
+        assert_eq!(
+            settings.warnings(&state),
+            vec!["Codex approval checks are disabled"],
+            "the warning must name codex, not opencode"
+        );
+    }
+
+    #[test]
+    fn a_change_to_codex_starts_from_the_supervised_auto_approve_value() {
+        let mut state = state();
+        for value in &mut state.settings.global {
+            value.settings = role(Harness::Claude);
+        }
+        for value in &mut state.settings.repositories {
+            value.settings = role(Harness::Claude);
+        }
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Enter));
+        // The value list sorts by name: claude, codex, opencode.
+        settings.handle_key(&state, key(KeyCode::Down));
+        settings.handle_key(&state, key(KeyCode::Enter));
+        let current = settings.current_settings(&state).expect("the draft exists");
+        assert_eq!(current.harness, Harness::Codex);
+        assert_eq!(current.auto_approve, Some(false));
+        assert!(settings
+            .visible_fields(&state)
+            .contains(&Field::AutoApprove));
     }
 
     #[test]

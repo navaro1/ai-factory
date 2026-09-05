@@ -877,19 +877,25 @@ fn validate_override(value: &RoleOverride, key: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Reject every field the selected harness does not carry.
+///
+/// `auto_approve` belongs to two harnesses: opencode passes it to its own
+/// runner, and codex reads it as the client-side yolo policy that answers
+/// each approval without a person. Claude rejects it, because a claude role
+/// selects the same behaviour through its permission mode.
 fn validate_fields(
     harness: Harness,
     agent: bool,
     profile: bool,
     claude: bool,
-    opencode: bool,
+    auto_approve: bool,
     codex: bool,
     key: &str,
 ) -> Result<()> {
     let invalid = match harness {
-        Harness::Claude => profile || opencode || codex,
+        Harness::Claude => profile || auto_approve || codex,
         Harness::Opencode => profile || claude || codex,
-        Harness::Codex => agent || claude || opencode,
+        Harness::Codex => agent || claude,
     };
     if invalid {
         bail!(
