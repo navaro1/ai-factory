@@ -223,6 +223,16 @@ aif
 The factory resumes: pause marks, attempt counts, queued messages, stuck
 rows, and the tasks that ran at the stop come back.
 
+`./install.sh` does not refresh an installed prompt file under
+`~/.config/aif/prompts/`. After an upgrade, run this command in the
+repository checkout:
+
+```sh
+cp docs/v0.6/prompts/*.md ~/.config/aif/prompts/
+```
+
+The copy replaces your edits to the installed prompt files.
+
 ### Start paused
 
 `--paused` starts a new daemon with the factory paused. The daemon polls,
