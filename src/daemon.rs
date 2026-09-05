@@ -91,6 +91,15 @@ pub const SHUTDOWN_GRACE_MS: u64 = 25_000;
 /// did the work never fails because the next poll was slow.
 pub const CONFIRM_GRACE_MS: u64 = 50_000;
 
+/// How long a running task may print nothing before the daemon stops its
+/// process and retries the run.
+///
+/// Every harness prints a step, a tool, or a text line long before this,
+/// so a silent process is a stalled one, not a slow model. The failure
+/// counts as one attempt: the retry ladder and the stuck row apply as for
+/// any other failure.
+pub const RUN_SILENCE_MS: u64 = 30 * 60_000;
+
 /// The one message sent for each new ticket refinement interval.
 pub const TICKET_REFINEMENT_MESSAGE: &str =
     "The issue now has the to-refine label. Continue the refinement analysis in this session.";
@@ -761,6 +770,7 @@ impl Daemon {
         self.refresh_release_gates();
         self.reconcile_trains();
         self.reap_idle_sessions();
+        self.fail_silent_runs();
         self.poll_usage();
         self.resume_pending_chats();
         self.dispatch_queued();
@@ -798,6 +808,21 @@ impl Daemon {
                 .copied()
                 .unwrap_or(self.now_ms);
             let at = last.saturating_add(self.idle_reap_ms);
+            earliest = Some(match earliest {
+                Some(so_far) => so_far.min(at),
+                None => at,
+            });
+        }
+        for task in self.table.active() {
+            if task.state != TaskState::Running || !self.sessions.contains_key(&task.id) {
+                continue;
+            }
+            let last = self
+                .last_event_ms
+                .get(&task.id)
+                .copied()
+                .unwrap_or(self.now_ms);
+            let at = last.saturating_add(RUN_SILENCE_MS);
             earliest = Some(match earliest {
                 Some(so_far) => so_far.min(at),
                 None => at,
@@ -1544,6 +1569,9 @@ impl Daemon {
                     continue;
                 }
             }
+            if work.stage == Stage::Review && self.head_already_reviewed(&work, &review_tickets) {
+                continue;
+            }
             let log = self.log_path(&work.repo, work.stage, work.kind, work.number);
             let replaces_task = self.table.by_id.values().any(|task| {
                 task.repo == work.repo
@@ -1722,6 +1750,42 @@ impl Daemon {
                 self.stop_session(&id, "cannot stop the parked session");
                 self.changed = true;
             }
+        }
+    }
+
+    /// Fail every running task whose process printed nothing for
+    /// [`RUN_SILENCE_MS`].
+    ///
+    /// The failure stops the process and requeues the task, so a stalled
+    /// harness does not hold its stage slot for ever. The last attempt
+    /// opens a stuck row like any other failure.
+    fn fail_silent_runs(&mut self) {
+        let silent: Vec<Task> = self
+            .table
+            .active()
+            .into_iter()
+            .filter(|task| {
+                task.state == TaskState::Running
+                    && self.sessions.contains_key(&task.id)
+                    && !self.stopping_sessions.contains_key(&task.id)
+            })
+            .filter(|task| {
+                let last = self
+                    .last_event_ms
+                    .get(&task.id)
+                    .copied()
+                    .unwrap_or(self.now_ms);
+                self.now_ms >= last.saturating_add(RUN_SILENCE_MS)
+            })
+            .cloned()
+            .collect();
+        for task in silent {
+            let reason = format!(
+                "no output for {} minutes; the process is stopped",
+                RUN_SILENCE_MS / 60_000
+            );
+            eprintln!("task {}: {reason}", task.id);
+            self.fail_run(&task, &reason);
         }
     }
 
@@ -3772,6 +3836,59 @@ impl Daemon {
         }
     }
 
+    /// Whether the reviewed-sha marker of the worktree of `work` names its
+    /// head.
+    ///
+    /// The gate memory is empty after a restart, so every open draft pull
+    /// request looks new, and a pull request that an earlier review left a
+    /// draft would get a second review of the same head. The marker on disk
+    /// outlives the restart. An operator answer clears it, so the fresh
+    /// review after an answer still starts. A marker read failure counts as
+    /// not reviewed: a spare review costs less than a lost one.
+    fn head_already_reviewed(&self, work: &ReadyWork, tickets: &BTreeSet<u64>) -> bool {
+        let Some(head) = work.head_sha.as_deref() else {
+            return false;
+        };
+        let Some(repo_cfg) = self.config.repos.get(&work.repo) else {
+            return false;
+        };
+        let path = self.review_worktree_path(repo_cfg, work.number, tickets);
+        match self.worktrees.read_reviewed_sha(&path) {
+            Ok(Some(sha)) if sha == head => {
+                eprintln!(
+                    "{} pr {}: head {} was reviewed already; the gate does not fire",
+                    work.repo, work.number, head
+                );
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                eprintln!(
+                    "{} pr {}: cannot read the reviewed-sha marker: {error:#}",
+                    work.repo, work.number
+                );
+                false
+            }
+        }
+    }
+
+    /// The worktree a review of pull request `number` runs in.
+    ///
+    /// A pull request that closes exactly one ticket reviews in the worktree
+    /// of that ticket; any other pull request gets its own. This mirrors
+    /// [`Daemon::review_item`] for a review that has no task yet.
+    fn review_worktree_path(
+        &self,
+        repo_cfg: &RepoConfig,
+        number: u64,
+        tickets: &BTreeSet<u64>,
+    ) -> PathBuf {
+        match tickets.iter().next().filter(|_| tickets.len() == 1) {
+            Some(&ticket) => self.worktrees.issue_path(repo_cfg, ticket),
+            None => self.worktrees.pr_path(repo_cfg, number),
+        }
+    }
+
     /// The working directory identity of one task.
     ///
     /// The refine stage, the ticket session, and the ticket chat share the
@@ -4308,6 +4425,20 @@ impl Daemon {
         // `admit_ready` replaces a terminal task with a fresh one that
         // resumes the saved session through the worktree marker.
         self.gates.forget(&repo, kind, number);
+        // The reviewed-sha marker says this head was reviewed, and the
+        // gate would skip it. The answer asks for a fresh review of the
+        // same head, so the marker goes.
+        if kind == ItemKind::Pr {
+            let tickets: BTreeSet<u64> = self
+                .links
+                .get(&repo)
+                .map(|links| links.tickets_of(number).into_iter().collect())
+                .unwrap_or_default();
+            let path = self.review_worktree_path(&repo_cfg, number, &tickets);
+            if let Err(error) = self.worktrees.clear_reviewed_sha(&path) {
+                eprintln!("{repo} pr {number}: cannot clear the reviewed-sha marker: {error:#}");
+            }
+        }
         // A parked agent waits for exactly this answer, so it gets the
         // text as a chat message instead of a new run.
         if let Some(text) = comment {
@@ -6727,6 +6858,124 @@ mod tests {
         assert_eq!(fs::read_to_string(marker).unwrap().trim_end(), "sha5");
     }
 
+    /// The gate memory is empty after a restart, so a draft pull request
+    /// that a legacy review left a draft would get a second review of the
+    /// same head. The reviewed-sha marker on disk outlives the restart.
+    #[test]
+    fn a_reviewed_head_gets_no_second_review_after_a_restart() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(std::iter::once(gh_pull_step(5, true, &[NEEDS_HUMAN_LABEL])))
+                .chain(reuse_issue_steps(
+                    &rig_repo(&dir),
+                    &issue_wt(&dir, 5),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        assert_eq!(rig.job_count(), 1);
+        rig.poll(vec![], vec![pr(5, true, &[NEEDS_HUMAN_LABEL])]);
+        rig.event(turn_finished("borsuk/review-p5", true, "asked"));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
+        let marker = issue_wt(&dir, 5).join(".aif").join("reviewed-sha");
+        assert!(marker.exists());
+        // The completed task stopped its process; the exit frees the slot.
+        rig.event(exited("borsuk/review-p5", true, "stopped"));
+
+        // A restart forgets every gate. The same head, a draft without the
+        // label, must not start a second review.
+        rig.daemon.gates.forget("borsuk", ItemKind::Pr, 5);
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        assert_eq!(rig.job_count(), 1, "the reviewed head fires no gate");
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
+
+        // A push moves the head, and the new head gets its review.
+        let mut pushed = pr(5, true, &[]);
+        pushed.head_sha = "sha5b".to_string();
+        rig.poll(vec![], vec![pushed]);
+        assert_eq!(rig.job_count(), 2, "a new head reviews");
+    }
+
+    /// The answer to a needs-human pull request asks for a fresh review of
+    /// the same head, so the reviewed-sha marker must go with the label.
+    #[test]
+    fn a_needs_human_answer_clears_the_reviewed_marker() {
+        let dir = temp_root();
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 5), 5, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(vec![
+                    gh_pull_step(5, true, &[NEEDS_HUMAN_LABEL]),
+                    gh_step(
+                        &[
+                            "api",
+                            "-X",
+                            "POST",
+                            "repos/acme/borsuk/issues/5/comments",
+                            "-f",
+                            "body=use the fast path",
+                        ],
+                        CmdOut::ok(""),
+                    ),
+                    gh_step(
+                        &[
+                            "api",
+                            "-i",
+                            "-X",
+                            "DELETE",
+                            "repos/acme/borsuk/issues/5/labels/needs-human",
+                        ],
+                        gh_ok(),
+                    ),
+                ])
+                .chain(reuse_issue_steps(
+                    &rig_repo(&dir),
+                    &issue_wt(&dir, 5),
+                    &rig_gitdir(&dir),
+                ))
+                .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        rig.poll(vec![], vec![pr(5, true, &[NEEDS_HUMAN_LABEL])]);
+        rig.event(turn_finished("borsuk/review-p5", true, "asked"));
+        assert_eq!(rig.task("borsuk/review-p5").state, TaskState::Done);
+        let marker = issue_wt(&dir, 5).join(".aif").join("reviewed-sha");
+        assert!(marker.exists());
+        // The completed task stopped its process; the exit frees the slot.
+        rig.event(exited("borsuk/review-p5", true, "stopped"));
+
+        let row = rig
+            .daemon
+            .decisions
+            .open()
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.kind,
+                    DecisionKind::NeedsHuman {
+                        kind: ItemKind::Pr,
+                        number: 5,
+                        ..
+                    }
+                )
+            })
+            .map(|row| row.id.clone())
+            .expect("the label opens a needs-human row");
+        rig.act(Action::Answer {
+            decision_id: row,
+            response: Response::Text {
+                text: "use the fast path".to_string(),
+            },
+        });
+        assert!(!marker.exists(), "the answer forgets the reviewed head");
+
+        rig.poll(vec![], vec![pr(5, true, &[])]);
+        assert_eq!(rig.job_count(), 2, "the same head gets its fresh review");
+    }
+
     #[test]
     fn a_review_without_a_stored_sha_takes_the_polled_head() {
         let dir = temp_root();
@@ -7632,7 +7881,36 @@ mod tests {
             rig.session(0).sends.lock().unwrap().as_slice(),
             &["continue with Postgres".to_string()]
         );
-        assert_eq!(rig.daemon.next_deadline(), None);
+        // The running process has one deadline left: the silence limit.
+        assert_eq!(
+            rig.daemon.next_deadline(),
+            Some(Duration::from_millis(RUN_SILENCE_MS))
+        );
+    }
+
+    /// A process that prints nothing for the silence limit is stalled. The
+    /// daemon stops it and retries the task, so the stage slot frees up.
+    #[test]
+    fn a_silent_run_fails_and_retries() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(started("borsuk/refine-i142", "sid-142"));
+        let session = rig.session(0);
+
+        rig.set_now(T0 + RUN_SILENCE_MS - 1);
+        rig.drive();
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert!(!session.stopped.load(Ordering::SeqCst));
+
+        rig.set_now(T0 + RUN_SILENCE_MS);
+        rig.drive();
+        assert!(
+            session.stopped.load(Ordering::SeqCst),
+            "the stalled process stops"
+        );
+        let task = rig.task("borsuk/refine-i142");
+        assert_eq!(task.state, TaskState::Queued);
+        assert_eq!(task.attempt, 2, "the silence counts as one failed attempt");
     }
 
     #[test]

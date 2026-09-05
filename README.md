@@ -170,6 +170,12 @@ the credentials of the operator home and never store or log a token.
 Claude supports `agent`, permission fields, tool lists, and `strict_mcp`.
 OpenCode supports `agent` and `auto_approve`. Codex supports `profile`, `approval_policy`, and `sandbox`.
 
+Headless codex never asks. A command its sandbox refuses ends as one
+declined item, and that item opens a permission row in the inbox. A grant
+runs the task again with `--sandbox danger-full-access`, because headless
+codex has no finer grant. Codex has no question channel: a codex agent that
+needs a person uses the `needs-human` label, as the prompts describe.
+
 Set `auto_approve = true` on every unattended opencode role. Without it,
 opencode auto-rejects every permission request. Tools that read outside the
 project directory then fail, and the task loses its evidence. The run can
@@ -565,6 +571,15 @@ change would therefore never start again. Each stage has one result:
 A run that ends without its result waits for the next poll. After about a
 minute it fails, and the task retries like any other failure.
 
+A running process that prints nothing for 30 minutes is stalled, not slow:
+every harness prints a step, a tool, or a text line long before that. The
+daemon stops the process and the task retries like any other failure.
+
+A finished review writes the head sha it reviewed into the worktree. A head
+with that mark gets no second review, not even after a daemon restart. An
+answer through the inbox clears the mark, so the fresh review of the same
+head starts. A push moves the head and starts a review as before.
+
 ## Known limits
 
 - An external GitHub label change becomes visible at the next 20-second poll.
@@ -594,6 +609,11 @@ minute it fails, and the task retries like any other failure.
 - A release gate row refreshes at the poll after you stack a pull request.
 - A review push on a draft pull request can restart that review at the next
   poll. A pull request with the `needs-human` label rests instead.
+- A `needs-human` label that a person removes on GitHub, instead of through
+  the inbox, leaves the reviewed-head mark in place. The same head gets no
+  fresh review until a push or an inbox answer.
+- A codex command the sandbox refused opens a permission row. The grant
+  lifts the whole sandbox for the next run of that task, not one command.
 - A review of a pull request from a fork takes the `needs-human` path before a
   repair.
 - A run that ends with a `needs-human` label counts as finished, because the

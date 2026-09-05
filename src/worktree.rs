@@ -440,6 +440,21 @@ impl WorktreeManager {
         write_marker(worktree, REVIEWED_SHA_MARKER, sha)
     }
 
+    /// Forget the last completed review of this worktree.
+    ///
+    /// An operator answer on a `needs-human` pull request calls this, so
+    /// the fresh review of the same head is not skipped as already done.
+    pub fn clear_reviewed_sha(&self, worktree: &Path) -> Result<()> {
+        let path = worktree.join(AIF_DIR).join(REVIEWED_SHA_MARKER);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context(format!("cannot remove {}", path.display())))
+            }
+        }
+    }
+
     /// Whether git lists `worktree` as a registered worktree of the
     /// repository at `repo_path`. The caller ensures the path exists.
     fn registered(&self, exec: &dyn Exec, repo_path: &Path, worktree: &Path) -> Result<bool> {
