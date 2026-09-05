@@ -17,6 +17,9 @@ pub const TO_REFINE: &str = "to-refine";
 /// The label that marks a shaped issue as ready to implement.
 pub const REFINED: &str = "refined";
 
+/// The label that asks a human to decide something on GitHub.
+pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
+
 /// Work that a stage gate reports as ready to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyWork {
@@ -48,9 +51,25 @@ pub fn implement_ready(snap: &RepoSnapshot, issue: &Issue) -> bool {
             .all(|number| !snap.issues.contains_key(number))
 }
 
-/// True when the pull request is open and still a draft.
+/// True when the pull request is open, still a draft, and carries no
+/// `needs-human` label.
+///
+/// The review stage has two outcomes: the agent finds nothing and marks the
+/// pull request ready, or it repairs every finding and marks it ready. The
+/// `needs-human` label names the one explicit rest state between them, and
+/// the label closes this gate for two reasons.
+///
+/// A closed gate keeps the pull request still. The gate trigger carries the
+/// head sha, so without the label test a push would start a second review of
+/// a pull request that waits for a person.
+///
+/// A closed gate also restarts the work exactly once. [`GateTracker::observe`]
+/// rebuilds its memory on every poll, so the label drops the key. When the
+/// operator answers and the daemon removes the label, the gate goes from
+/// false to true and fires one fresh review, which reads the answer in the
+/// comments of the pull request.
 pub fn review_ready(pr: &Pr) -> bool {
-    pr.open && pr.draft
+    pr.open && pr.draft && !has_label(&pr.labels, NEEDS_HUMAN_LABEL)
 }
 
 /// True when the pull request is open and is no longer a draft.
@@ -346,6 +365,52 @@ mod tests {
         closed.open = false;
         assert!(!review_ready(&closed));
         assert!(!release_ready(&closed));
+    }
+
+    /// The `needs-human` label is the one explicit rest state of the review
+    /// stage. It must hold the pull request still, even after a push, and it
+    /// must release exactly one fresh review when the operator answers.
+    #[test]
+    fn a_needs_human_draft_rests_until_the_label_goes_away() {
+        let mut tracker = GateTracker::new();
+        let mut waiting = pr(7, true, "aaa");
+        waiting.labels = vec![NEEDS_HUMAN_LABEL.to_string()];
+        assert!(!review_ready(&waiting), "the label closes the review gate");
+
+        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![waiting.clone()]));
+        assert!(
+            !fired.iter().any(|work| work.stage == Stage::Review),
+            "a labelled draft starts no review"
+        );
+
+        // A push moves the gate trigger. The closed gate must stay closed,
+        // so the agent's own repair commits cannot restart its review.
+        let mut pushed = waiting.clone();
+        pushed.head_sha = "bbb".to_string();
+        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![pushed.clone()]));
+        assert!(
+            !fired.iter().any(|work| work.stage == Stage::Review),
+            "a push on a labelled draft starts no review"
+        );
+
+        // The operator answers, so the daemon removes the label. The gate
+        // goes from false to true and reports the work exactly once.
+        let mut answered = pushed.clone();
+        answered.labels.clear();
+        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![answered.clone()]));
+        let review: Vec<&ReadyWork> = fired
+            .iter()
+            .filter(|work| work.stage == Stage::Review)
+            .collect();
+        assert_eq!(review.len(), 1, "the answer starts one fresh review");
+        assert_eq!(review[0].number, 7);
+        assert_eq!(review[0].head_sha.as_deref(), Some("bbb"));
+
+        let again = tracker.observe("borsuk", &repo(Vec::new(), vec![answered]));
+        assert!(
+            !again.iter().any(|work| work.stage == Stage::Review),
+            "the open gate reports once"
+        );
     }
 
     #[test]
