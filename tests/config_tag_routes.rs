@@ -1,5 +1,6 @@
 use aif::config::{edit_config_text, Config, Harness, RoleOverride, SettingsEdit, SettingsSource};
 use aif::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
+use aif::sock::SettingsView;
 
 const BASE: &str = r#"
 schema_version = 1
@@ -133,6 +134,47 @@ fn repository_route_fields_override_the_effective_global_route() {
     );
     assert_eq!(repository.settings.model, "repo-high");
     assert_eq!(repository.settings.effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn the_settings_view_reports_all_routes_and_each_field_source() {
+    let text = format!(
+        "{BASE}\n\
+         [tag_routes.implement.high]\n\
+         effort = \"max\"\n\n\
+         [repo.demo.tag_routes.implement.high]\n\
+         model = \"repo-high\"\n"
+    );
+    let config = Config::parse(&text).expect("the route overrides must parse");
+    let view =
+        SettingsView::from_config(&config, "revision", &[]).expect("the settings view must build");
+    let key = TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High);
+
+    assert_eq!(view.global_tag_routes.len(), 8);
+    assert_eq!(view.repository_tag_routes.len(), 8);
+    let global = view
+        .global_tag_routes
+        .iter()
+        .find(|route| route.key == key)
+        .unwrap();
+    assert!(global.overridden);
+    assert_eq!(global.sources.harness, SettingsSource::BuiltIn);
+    assert_eq!(global.sources.model, SettingsSource::BuiltIn);
+    assert_eq!(global.sources.effort, SettingsSource::Global);
+    let repository = view
+        .repository_tag_routes
+        .iter()
+        .find(|route| route.repository == "demo" && route.key == key)
+        .unwrap();
+    assert!(repository.overridden);
+    assert_eq!(repository.sources.harness, SettingsSource::BuiltIn);
+    assert_eq!(repository.sources.effort, SettingsSource::Global);
+    assert_eq!(
+        repository.sources.model,
+        SettingsSource::Repository {
+            alias: "demo".to_string()
+        }
+    );
 }
 
 #[test]

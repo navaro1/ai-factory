@@ -45,8 +45,10 @@ use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{self, RESTART_NOTICE};
+#[cfg(test)]
+use crate::routing::ComplexityLevel;
 use crate::routing::{
-    level_from_label, ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteMatch, TagRouteStage,
+    level_from_label, select_level, TagRouteBinding, TagRouteKey, TagRouteMatch, TagRouteStage,
 };
 #[cfg(test)]
 use crate::runner::Runner;
@@ -5152,11 +5154,11 @@ impl Daemon {
                 }
             }
         }
-        let level = matches
+        let labels = matches
             .iter()
-            .filter_map(|matched| level_from_label(stage, &matched.label))
-            .max()
-            .unwrap_or(ComplexityLevel::Medium);
+            .map(|matched| matched.label.clone())
+            .collect::<Vec<_>>();
+        let level = select_level(stage, &labels).level;
         Some(TagRouteBinding {
             key: TagRouteKey::new(stage, level),
             matches,
@@ -10308,6 +10310,48 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_restart_keeps_the_stored_tag_route_binding() {
+        let dir = temp_root();
+        {
+            let steps = fresh_issue_steps(
+                &rig_repo(&dir),
+                &issue_wt(&dir, 142),
+                142,
+                &rig_gitdir(&dir),
+            );
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
+            first.poll(vec![issue(142, &["refined", "complexity:high"])], vec![]);
+            let roles = first.roles.lock().unwrap();
+            assert_eq!(roles[0].settings.model, "m");
+            assert_eq!(
+                roles[0].tag_route.as_ref().unwrap().key,
+                TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High)
+            );
+        }
+
+        let steps = reuse_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 142), &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |config| {
+            config
+                .tag_route_overrides
+                .get_mut(&TagRouteKey::new(
+                    TagRouteStage::Implement,
+                    ComplexityLevel::High,
+                ))
+                .unwrap()
+                .model = Some("changed-after-restart".to_string());
+        });
+        second.poll(vec![issue(142, &["refined", "complexity:high"])], vec![]);
+
+        let roles = second.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].settings.model, "m");
+        assert_eq!(
+            roles[0].tag_route.as_ref().unwrap().key,
+            TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High)
+        );
+    }
+
+    #[test]
     fn a_restart_drops_a_completed_binding_before_a_new_logical_task() {
         let dir = temp_root();
         {
@@ -10461,6 +10505,67 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_task_uses_a_tag_route_saved_before_its_first_dispatch() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let worktree = issue_wt(&dir, 142);
+        let steps: Vec<Step> = vec![git_step(
+            &repo,
+            &["remote", "get-url", "origin"],
+            CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+        )]
+        .into_iter()
+        .chain(fresh_issue_steps(&repo, &worktree, 142, &rig_gitdir(&dir)))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::create_dir_all(rig.repo.join(".git")).unwrap();
+        fs::write(&config_path, &original).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: true,
+        });
+        rig.poll(vec![issue(142, &["refined", "complexity:high"])], vec![]);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert_eq!(rig.job_count(), 0);
+
+        let route_key = TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High);
+        rig.act(Action::SaveSettings {
+            request: "save-route".to_string(),
+            base_revision: config::file_revision(&original),
+            edit: SettingsEdit::GlobalTagRoute {
+                key: route_key,
+                settings: Some(RoleOverride {
+                    model: Some("queued-new-route".to_string()),
+                    ..RoleOverride::default()
+                }),
+            },
+        });
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the route save must push a result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Saved);
+        assert_eq!(rig.job_count(), 0);
+
+        rig.act(Action::Pause {
+            scope: PauseScope::Stage {
+                stage: Stage::Implement,
+            },
+            paused: false,
+        });
+
+        assert_eq!(rig.job(0).model, "queued-new-route");
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles[0].tag_route.as_ref().unwrap().key, route_key);
+    }
+
+    #[test]
     fn a_stale_settings_save_changes_neither_the_file_nor_live_config() {
         let mut rig = Rig::make(vec![]);
         let config_path = rig.repo.parent().unwrap().join("factory.toml");
@@ -10492,6 +10597,47 @@ mod tests {
         assert_eq!(result.revision, crate::config::file_revision(&newer));
         assert_eq!(fs::read_to_string(config_path).unwrap(), newer);
         assert_eq!(rig.daemon.config.roles[&ExecutionRole::Refine].model, "m");
+    }
+
+    #[test]
+    fn an_invalid_tag_route_save_changes_neither_the_file_nor_live_config() {
+        let mut rig = Rig::make(vec![]);
+        let config_path = rig.repo.parent().unwrap().join("factory.toml");
+        let original = settings_config_text(&rig.repo, "m");
+        fs::write(&config_path, &original).unwrap();
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let route_key = TagRouteKey::new(TagRouteStage::Review, ComplexityLevel::High);
+
+        rig.act(Action::SaveSettings {
+            request: "invalid-route".to_string(),
+            base_revision: config::file_revision(&original),
+            edit: SettingsEdit::GlobalTagRoute {
+                key: route_key,
+                settings: Some(RoleOverride {
+                    harness: Some(Harness::Opencode),
+                    model: Some("review-model".to_string()),
+                    sandbox: Some("workspace-write".to_string()),
+                    ..RoleOverride::default()
+                }),
+            },
+        });
+
+        let Push::SettingsResult(result) = rx.try_recv().unwrap() else {
+            panic!("the invalid route must push a result");
+        };
+        assert_eq!(result.status, SettingsResultStatus::Invalid);
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+        assert_eq!(
+            rig.daemon
+                .config
+                .resolved_tag_route(Some("borsuk"), route_key)
+                .unwrap()
+                .settings
+                .model,
+            "m"
+        );
     }
 
     #[test]

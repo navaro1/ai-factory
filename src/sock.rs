@@ -37,6 +37,7 @@ use crate::config::{
 use crate::decisions::{Decision, Decisions};
 use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
+use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 use crate::sched::{Limits, Paused};
 use crate::tasks::{TaskState, TaskTable};
 use crate::trains::Train;
@@ -52,7 +53,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 4;
+pub const WIRE_PROTOCOL_REVISION: u32 = 5;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -131,6 +132,10 @@ pub struct SettingsView {
     pub global: Vec<GlobalRoleSettingsView>,
     /// Every repository role, in repository and role order.
     pub repositories: Vec<RepositoryRoleSettingsView>,
+    /// The eight effective global tag routes, in route order.
+    pub global_tag_routes: Vec<GlobalTagRouteSettingsView>,
+    /// Every effective repository tag route, in repository and route order.
+    pub repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
     /// The effective prompt template of every role that has one, in role
     /// order. The theory roles carry no template, so they are absent.
     pub prompts: Vec<PromptView>,
@@ -167,6 +172,8 @@ struct SettingsViewRef<'a> {
     revision: &'a str,
     global: Vec<&'a GlobalRoleSettingsView>,
     repositories: &'a [RepositoryRoleSettingsView],
+    global_tag_routes: &'a [GlobalTagRouteSettingsView],
+    repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     theory_global: Vec<&'a GlobalRoleSettingsView>,
     prompts: &'a [PromptView],
@@ -177,6 +184,10 @@ struct SettingsViewWire {
     revision: String,
     global: Vec<GlobalRoleSettingsView>,
     repositories: Vec<RepositoryRoleSettingsView>,
+    #[serde(default)]
+    global_tag_routes: Vec<GlobalTagRouteSettingsView>,
+    #[serde(default)]
+    repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
     #[serde(default)]
     theory_global: Vec<GlobalRoleSettingsView>,
     #[serde(default)]
@@ -196,6 +207,8 @@ impl Serialize for SettingsView {
             revision: &self.revision,
             global,
             repositories: &self.repositories,
+            global_tag_routes: &self.global_tag_routes,
+            repository_tag_routes: &self.repository_tag_routes,
             theory_global,
             prompts: &self.prompts,
         }
@@ -214,6 +227,8 @@ impl<'de> Deserialize<'de> for SettingsView {
             revision: wire.revision,
             global: wire.global,
             repositories: wire.repositories,
+            global_tag_routes: wire.global_tag_routes,
+            repository_tag_routes: wire.repository_tag_routes,
             prompts: wire.prompts,
         })
     }
@@ -252,10 +267,45 @@ impl SettingsView {
                 });
             }
         }
+        let mut global_tag_routes = Vec::new();
+        for stage in TagRouteStage::ALL {
+            for level in ComplexityLevel::ALL {
+                let key = TagRouteKey::new(stage, level);
+                let resolved = config.resolved_tag_route(None, key)?;
+                let override_settings = config.tag_route_overrides.get(&key);
+                global_tag_routes.push(GlobalTagRouteSettingsView {
+                    key,
+                    settings: resolved.settings,
+                    sources: RoleFieldSources::for_global_tag_route(override_settings),
+                    overridden: override_settings.is_some(),
+                });
+            }
+        }
+        let mut repository_tag_routes = Vec::new();
+        for (alias, repo) in &config.repos {
+            for global_route in &global_tag_routes {
+                let key = global_route.key;
+                let resolved = config.resolved_tag_route(Some(alias), key)?;
+                let override_settings = repo.tag_route_overrides.get(&key);
+                repository_tag_routes.push(RepositoryTagRouteSettingsView {
+                    repository: alias.clone(),
+                    key,
+                    settings: resolved.settings,
+                    sources: RoleFieldSources::for_repository_tag_route(
+                        alias,
+                        &global_route.sources,
+                        override_settings,
+                    ),
+                    overridden: override_settings.is_some(),
+                });
+            }
+        }
         Ok(Self {
             revision: revision.to_string(),
             global,
             repositories,
+            global_tag_routes,
+            repository_tag_routes,
             prompts: prompts.to_vec(),
         })
     }
@@ -284,6 +334,34 @@ pub struct RepositoryRoleSettingsView {
     /// The source of each effective field.
     pub sources: RoleFieldSources,
     /// True when the repository has a role override table.
+    pub overridden: bool,
+}
+
+/// One complete effective global tag route form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalTagRouteSettingsView {
+    /// The route identity.
+    pub key: TagRouteKey,
+    /// The effective settings after the global override.
+    pub settings: RoleSettings,
+    /// The source of each effective field.
+    pub sources: RoleFieldSources,
+    /// True when the global override table exists.
+    pub overridden: bool,
+}
+
+/// One complete effective repository tag route form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryTagRouteSettingsView {
+    /// The repository alias.
+    pub repository: String,
+    /// The route identity.
+    pub key: TagRouteKey,
+    /// The effective settings after all overrides.
+    pub settings: RoleSettings,
+    /// The source of each effective field.
+    pub sources: RoleFieldSources,
+    /// True when the repository override table exists.
     pub overridden: bool,
 }
 
@@ -325,39 +403,69 @@ pub struct RoleFieldSources {
 impl RoleFieldSources {
     /// Mark fields from a partial override. A harness replacement owns all fields.
     fn for_override(alias: &str, value: Option<&RoleOverride>) -> Self {
-        let global = SettingsSource::Global;
-        let repository = SettingsSource::Repository {
-            alias: alias.to_string(),
-        };
+        Self::overlaid(
+            &Self::all(SettingsSource::Global),
+            SettingsSource::Repository {
+                alias: alias.to_string(),
+            },
+            value,
+        )
+    }
+
+    /// Mark global route fields as built-in or global.
+    fn for_global_tag_route(value: Option<&RoleOverride>) -> Self {
+        Self::overlaid(
+            &Self::all(SettingsSource::BuiltIn),
+            SettingsSource::Global,
+            value,
+        )
+    }
+
+    /// Add one repository route layer over the global route field sources.
+    fn for_repository_tag_route(alias: &str, global: &Self, value: Option<&RoleOverride>) -> Self {
+        Self::overlaid(
+            global,
+            SettingsSource::Repository {
+                alias: alias.to_string(),
+            },
+            value,
+        )
+    }
+
+    /// Apply one partial source layer. A harness replacement owns all fields.
+    fn overlaid(base: &Self, source: SettingsSource, value: Option<&RoleOverride>) -> Self {
         let Some(value) = value else {
-            return Self::all(global);
+            return base.clone();
         };
         if value.harness.is_some() {
-            return Self::all(repository);
+            return Self::all(source);
         }
-        let source = |present: bool| {
+        let selected = |present: bool, inherited: &SettingsSource| {
             if present {
-                repository.clone()
+                source.clone()
             } else {
-                global.clone()
+                inherited.clone()
             }
         };
         Self {
-            harness: global.clone(),
-            program: source(value.program.is_some()),
-            model: source(value.model.is_some()),
-            effort: source(value.effort.is_some()),
-            extra_args: source(value.extra_args.is_some()),
-            agent: source(value.agent.is_some()),
-            profile: source(value.profile.is_some()),
-            permission_mode: source(value.permission_mode.is_some()),
-            permission_handler: source(value.permission_handler.is_some()),
-            tools: source(value.tools.is_some()),
-            disallowed_tools: source(value.disallowed_tools.is_some()),
-            strict_mcp: source(value.strict_mcp.is_some()),
-            auto_approve: source(value.auto_approve.is_some()),
-            approval_policy: source(value.approval_policy.is_some()),
-            sandbox: source(value.sandbox.is_some()),
+            harness: base.harness.clone(),
+            program: selected(value.program.is_some(), &base.program),
+            model: selected(value.model.is_some(), &base.model),
+            effort: selected(value.effort.is_some(), &base.effort),
+            extra_args: selected(value.extra_args.is_some(), &base.extra_args),
+            agent: selected(value.agent.is_some(), &base.agent),
+            profile: selected(value.profile.is_some(), &base.profile),
+            permission_mode: selected(value.permission_mode.is_some(), &base.permission_mode),
+            permission_handler: selected(
+                value.permission_handler.is_some(),
+                &base.permission_handler,
+            ),
+            tools: selected(value.tools.is_some(), &base.tools),
+            disallowed_tools: selected(value.disallowed_tools.is_some(), &base.disallowed_tools),
+            strict_mcp: selected(value.strict_mcp.is_some(), &base.strict_mcp),
+            auto_approve: selected(value.auto_approve.is_some(), &base.auto_approve),
+            approval_policy: selected(value.approval_policy.is_some(), &base.approval_policy),
+            sandbox: selected(value.sandbox.is_some(), &base.sandbox),
         }
     }
 
@@ -539,6 +647,7 @@ impl StateInput<'_> {
                         harness: role.settings.harness,
                         model: role.settings.model.clone(),
                         effort: role.settings.effort.clone(),
+                        tag_route: role.tag_route.clone(),
                     }),
                     queued_messages: 0,
                 })
@@ -1151,6 +1260,9 @@ pub struct RoleBindingView {
     pub model: String,
     /// The variant of the model, when the harness takes one.
     pub effort: Option<String>,
+    /// The selected tag route and its source labels, when this task uses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_route: Option<TagRouteBinding>,
 }
 
 /// One task in the state view.
@@ -2130,6 +2242,12 @@ mod tests {
 
     #[test]
     fn settings_actions_and_results_keep_the_request_identity() {
+        const {
+            assert!(
+                WIRE_PROTOCOL_REVISION >= 5,
+                "tag routes need wire revision 5"
+            )
+        };
         let config = Config::parse(&config_text()).unwrap();
         let settings = config.roles[&crate::config::ExecutionRole::Review].clone();
         let save = Action::SaveSettings {
@@ -2144,7 +2262,27 @@ mod tests {
         let reload = Action::ReloadSettings {
             request: "reload-18".to_string(),
         };
-        for action in [save, reload] {
+        let save_global_route = Action::SaveSettings {
+            request: "save-route-19".to_string(),
+            base_revision: "rev-old".to_string(),
+            edit: SettingsEdit::GlobalTagRoute {
+                key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                settings: Some(RoleOverride {
+                    model: Some("gpt-route".to_string()),
+                    ..RoleOverride::default()
+                }),
+            },
+        };
+        let save_repository_route = Action::SaveSettings {
+            request: "save-repo-route-20".to_string(),
+            base_revision: "rev-old".to_string(),
+            edit: SettingsEdit::RepositoryTagRoute {
+                repository: "borsuk".to_string(),
+                key: TagRouteKey::new(TagRouteStage::Review, ComplexityLevel::VeryHigh),
+                settings: None,
+            },
+        };
+        for action in [save, reload, save_global_route, save_repository_route] {
             let text = serde_json::to_string(&action).unwrap();
             assert_eq!(serde_json::from_str::<Action>(&text).unwrap(), action);
         }
@@ -2261,6 +2399,8 @@ mod tests {
         let json = r#"{"revision":"r","global":[],"repositories":[]}"#;
         let view: SettingsView = serde_json::from_str(json).unwrap();
         assert!(view.prompts.is_empty());
+        assert!(view.global_tag_routes.is_empty());
+        assert!(view.repository_tag_routes.is_empty());
     }
 
     /// The settings view writes the theory roles into their own wire field
@@ -2677,6 +2817,10 @@ mod tests {
                 harness: Harness::Opencode,
                 model: "zai-coding-plan/glm-5.3-flash".to_string(),
                 effort: Some("xhigh".to_string()),
+                tag_route: Some(TagRouteBinding {
+                    key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                    matches: Vec::new(),
+                }),
             }),
         };
 

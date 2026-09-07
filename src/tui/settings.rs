@@ -15,6 +15,7 @@ use crate::config::{
     SettingsSource, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES,
 };
 use crate::prompts;
+use crate::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
 use crate::sock::{
     Action, PromptSource, PromptView, RoleFieldSources, SettingsOperation, SettingsResult,
     SettingsResultStatus, StateView,
@@ -102,6 +103,7 @@ enum DraftValue {
     Global {
         settings: RoleSettings,
         limit: Option<usize>,
+        override_settings: Option<Box<RoleOverride>>,
     },
     Repository {
         settings: RoleSettings,
@@ -109,10 +111,28 @@ enum DraftValue {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTarget {
+    Role(ExecutionRole),
+    TagRoute(TagRouteKey),
+}
+
+impl SettingsTarget {
+    fn execution_role(self) -> ExecutionRole {
+        match self {
+            Self::Role(role) => role,
+            Self::TagRoute(key) => match key.stage {
+                TagRouteStage::Implement => ExecutionRole::Implement,
+                TagRouteStage::Review => ExecutionRole::Review,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Draft {
     scope: usize,
-    role: ExecutionRole,
+    target: SettingsTarget,
     base_revision: String,
     value: DraftValue,
     changed: BTreeSet<Field>,
@@ -132,6 +152,40 @@ impl Draft {
             DraftValue::Global { settings, .. } | DraftValue::Repository { settings, .. } => {
                 settings
             }
+        }
+    }
+
+    fn override_settings_mut(&mut self) -> Option<(&RoleSettings, &mut RoleOverride)> {
+        match &mut self.value {
+            DraftValue::Global {
+                settings,
+                override_settings: Some(override_settings),
+                ..
+            }
+            | DraftValue::Repository {
+                settings,
+                override_settings,
+            } => Some((settings, override_settings)),
+            DraftValue::Global {
+                override_settings: None,
+                ..
+            } => None,
+        }
+    }
+
+    fn override_settings(&self) -> Option<&RoleOverride> {
+        match &self.value {
+            DraftValue::Global {
+                override_settings: Some(override_settings),
+                ..
+            }
+            | DraftValue::Repository {
+                override_settings, ..
+            } => Some(override_settings),
+            DraftValue::Global {
+                override_settings: None,
+                ..
+            } => None,
         }
     }
 }
@@ -498,9 +552,12 @@ impl Settings {
             return "type filter · enter apply · esc close".to_string();
         }
         if self.scope > 0 {
-            return "j k role · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help".to_string();
+            return "j k row · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help".to_string();
         }
-        "j k role · tab field · enter open · s save · r reload · a add repo · ? help".to_string()
+        if matches!(self.selected_target(), SettingsTarget::TagRoute(_)) {
+            return "j k row · tab field · enter open · s save · d use built-in · r reload · a add repo · ? help".to_string();
+        }
+        "j k row · tab field · enter open · s save · r reload · a add repo · ? help".to_string()
     }
 
     /// Store the result of the `opencode models` probe and refresh an
@@ -698,7 +755,7 @@ impl Settings {
                 self.field = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.role = (self.role + 1).min(ExecutionRole::ALL.len() - 1);
+                self.role = (self.role + 1).min(settings_targets().len() - 1);
                 self.field = 0;
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -738,6 +795,12 @@ impl Settings {
                 if self.scope == 0 && self.selected_field_for(Some(state)) == Field::Prompt =>
             {
                 return self.reset_prompt(state, reset_pending)
+            }
+            KeyCode::Char('d')
+                if self.scope == 0
+                    && matches!(self.selected_target(), SettingsTarget::TagRoute(_)) =>
+            {
+                return self.remove_global_tag_route(state)
             }
             KeyCode::Char('d') if self.scope > 0 => return self.remove_override(state),
             KeyCode::Esc if self.draft.is_some() => {
@@ -792,7 +855,9 @@ impl Settings {
 
     /// The pushed prompt view of the selected role.
     fn prompt_view<'a>(&self, state: &'a StateView) -> Option<&'a PromptView> {
-        let role = self.selected_role_for();
+        let SettingsTarget::Role(role) = self.selected_target() else {
+            return None;
+        };
         state.settings.prompts.iter().find(|view| view.role == role)
     }
 
@@ -1009,6 +1074,20 @@ impl Settings {
                     .iter()
                     .map(|value| &value.settings),
             )
+            .chain(
+                state
+                    .settings
+                    .global_tag_routes
+                    .iter()
+                    .map(|value| &value.settings),
+            )
+            .chain(
+                state
+                    .settings
+                    .repository_tag_routes
+                    .iter()
+                    .map(|value| &value.settings),
+            )
             .filter(move |settings| settings.harness == harness)
     }
 
@@ -1123,12 +1202,8 @@ impl Settings {
         if matches!(next, Harness::Opencode | Harness::Codex) {
             settings.auto_approve = Some(false);
         }
-        if let DraftValue::Repository {
-            settings,
-            override_settings,
-        } = &mut draft.value
-        {
-            **override_settings = complete_override(settings);
+        if let Some((settings, override_settings)) = draft.override_settings_mut() {
+            *override_settings = complete_override(settings);
         }
         draft.changed.insert(Field::Harness);
         self.errors.clear();
@@ -1245,19 +1320,48 @@ impl Settings {
         }
         let request = request_code();
         self.pending_request = Some(request.clone());
-        let edit = match draft.value {
-            DraftValue::Global { settings, limit } => SettingsEdit::Global {
-                role: draft.role,
+        let edit = match (draft.target, draft.value) {
+            (
+                SettingsTarget::Role(role),
+                DraftValue::Global {
+                    settings, limit, ..
+                },
+            ) => SettingsEdit::Global {
+                role,
                 settings,
                 limit,
             },
-            DraftValue::Repository {
-                override_settings, ..
-            } => SettingsEdit::Repository {
+            (
+                SettingsTarget::Role(role),
+                DraftValue::Repository {
+                    override_settings, ..
+                },
+            ) => SettingsEdit::Repository {
                 repository: self.repositories(state)[draft.scope - 1].clone(),
-                role: draft.role,
+                role,
                 settings: Some(*override_settings),
             },
+            (
+                SettingsTarget::TagRoute(key),
+                DraftValue::Global {
+                    override_settings: Some(override_settings),
+                    ..
+                },
+            ) => SettingsEdit::GlobalTagRoute {
+                key,
+                settings: Some(*override_settings),
+            },
+            (
+                SettingsTarget::TagRoute(key),
+                DraftValue::Repository {
+                    override_settings, ..
+                },
+            ) => SettingsEdit::RepositoryTagRoute {
+                repository: self.repositories(state)[draft.scope - 1].clone(),
+                key,
+                settings: Some(*override_settings),
+            },
+            _ => unreachable!("each settings target has one draft shape"),
         };
         Some(Action::SaveSettings {
             request,
@@ -1282,12 +1386,40 @@ impl Settings {
         let repository = self.repositories(state).get(self.scope - 1)?.clone();
         let request = request_code();
         self.pending_request = Some(request.clone());
+        let edit = match self.selected_target() {
+            SettingsTarget::Role(role) => SettingsEdit::Repository {
+                repository,
+                role,
+                settings: None,
+            },
+            SettingsTarget::TagRoute(key) => SettingsEdit::RepositoryTagRoute {
+                repository,
+                key,
+                settings: None,
+            },
+        };
         Some(Action::SaveSettings {
             request,
             base_revision: state.settings.revision.clone(),
-            edit: SettingsEdit::Repository {
-                repository,
-                role: self.selected_role_for(),
+            edit,
+        })
+    }
+
+    /// Remove one global tag route and restore its built-in values.
+    fn remove_global_tag_route(&mut self, state: &StateView) -> Option<Action> {
+        if self.request_pending() {
+            return None;
+        }
+        let SettingsTarget::TagRoute(key) = self.selected_target() else {
+            return None;
+        };
+        let request = request_code();
+        self.pending_request = Some(request.clone());
+        Some(Action::SaveSettings {
+            request,
+            base_revision: state.settings.revision.clone(),
+            edit: SettingsEdit::GlobalTagRoute {
+                key,
                 settings: None,
             },
         })
@@ -1467,51 +1599,101 @@ impl Settings {
 
     fn ensure_draft(&mut self, state: &StateView) {
         let scope = self.scope;
-        let role = self.selected_role_for();
+        let target = self.selected_target();
         if self
             .draft
             .as_ref()
-            .is_some_and(|draft| draft.scope == scope && draft.role == role)
+            .is_some_and(|draft| draft.scope == scope && draft.target == target)
         {
             return;
         }
-        let value = if scope == 0 {
-            let Some(source) = state
-                .settings
-                .global
-                .iter()
-                .find(|value| value.role == role)
-            else {
-                return;
-            };
-            DraftValue::Global {
-                settings: source.settings.clone(),
-                limit: source.limit,
+        let value = match (scope, target) {
+            (0, SettingsTarget::Role(role)) => {
+                let Some(source) = state
+                    .settings
+                    .global
+                    .iter()
+                    .find(|value| value.role == role)
+                else {
+                    return;
+                };
+                DraftValue::Global {
+                    settings: source.settings.clone(),
+                    limit: source.limit,
+                    override_settings: None,
+                }
             }
-        } else {
-            let repositories = self.repositories(state);
-            let Some(alias) = repositories.get(scope - 1) else {
-                return;
-            };
-            let Some(source) = state
-                .settings
-                .repositories
-                .iter()
-                .find(|value| value.repository == *alias && value.role == role)
-            else {
-                return;
-            };
-            DraftValue::Repository {
-                settings: source.settings.clone(),
-                override_settings: Box::new(override_from_sources(
-                    &source.settings,
-                    &source.sources,
-                )),
+            (0, SettingsTarget::TagRoute(key)) => {
+                let Some(source) = state
+                    .settings
+                    .global_tag_routes
+                    .iter()
+                    .find(|value| value.key == key)
+                else {
+                    return;
+                };
+                DraftValue::Global {
+                    settings: source.settings.clone(),
+                    limit: None,
+                    override_settings: Some(Box::new(override_from_sources(
+                        &source.settings,
+                        &source.sources,
+                        &SettingsSource::Global,
+                    ))),
+                }
+            }
+            (_, SettingsTarget::Role(role)) => {
+                let repositories = self.repositories(state);
+                let Some(alias) = repositories.get(scope - 1) else {
+                    return;
+                };
+                let Some(source) = state
+                    .settings
+                    .repositories
+                    .iter()
+                    .find(|value| value.repository == *alias && value.role == role)
+                else {
+                    return;
+                };
+                DraftValue::Repository {
+                    settings: source.settings.clone(),
+                    override_settings: Box::new(override_from_sources(
+                        &source.settings,
+                        &source.sources,
+                        &SettingsSource::Repository {
+                            alias: alias.clone(),
+                        },
+                    )),
+                }
+            }
+            (_, SettingsTarget::TagRoute(key)) => {
+                let repositories = self.repositories(state);
+                let Some(alias) = repositories.get(scope - 1) else {
+                    return;
+                };
+                let Some(source) = state
+                    .settings
+                    .repository_tag_routes
+                    .iter()
+                    .find(|value| value.repository == *alias && value.key == key)
+                else {
+                    return;
+                };
+                DraftValue::Repository {
+                    settings: source.settings.clone(),
+                    override_settings: Box::new(override_from_sources(
+                        &source.settings,
+                        &source.sources,
+                        &SettingsSource::Repository {
+                            alias: alias.clone(),
+                        },
+                    )),
+                }
             }
         };
         self.draft = Some(Draft {
             scope,
-            role,
+            target,
             base_revision: state.settings.revision.clone(),
             value,
             changed: BTreeSet::new(),
@@ -1520,30 +1702,47 @@ impl Settings {
     }
 
     fn current_settings_ref<'a>(&'a self, state: &'a StateView) -> Option<&'a RoleSettings> {
-        let role = self.selected_role_for();
+        let target = self.selected_target();
         if let Some(draft) = self
             .draft
             .as_ref()
-            .filter(|draft| draft.scope == self.scope && draft.role == role)
+            .filter(|draft| draft.scope == self.scope && draft.target == target)
         {
             return Some(draft.settings());
         }
-        if self.scope == 0 {
-            state
+        match (self.scope, target) {
+            (0, SettingsTarget::Role(role)) => state
                 .settings
                 .global
                 .iter()
                 .find(|value| value.role == role)
-                .map(|value| &value.settings)
-        } else {
-            let repositories = self.repositories(state);
-            let alias = repositories.get(self.scope - 1)?;
-            state
+                .map(|value| &value.settings),
+            (0, SettingsTarget::TagRoute(key)) => state
                 .settings
-                .repositories
+                .global_tag_routes
                 .iter()
-                .find(|value| value.repository == *alias && value.role == role)
-                .map(|value| &value.settings)
+                .find(|value| value.key == key)
+                .map(|value| &value.settings),
+            (_, SettingsTarget::Role(role)) => {
+                let repositories = self.repositories(state);
+                let alias = repositories.get(self.scope - 1)?;
+                state
+                    .settings
+                    .repositories
+                    .iter()
+                    .find(|value| value.repository == *alias && value.role == role)
+                    .map(|value| &value.settings)
+            }
+            (_, SettingsTarget::TagRoute(key)) => {
+                let repositories = self.repositories(state);
+                let alias = repositories.get(self.scope - 1)?;
+                state
+                    .settings
+                    .repository_tag_routes
+                    .iter()
+                    .find(|value| value.repository == *alias && value.key == key)
+                    .map(|value| &value.settings)
+            }
         }
     }
 
@@ -1575,19 +1774,28 @@ impl Settings {
                 Field::AutoApprove,
             ]),
         }
-        if self.scope == 0 && self.selected_role_for().stage().is_some() {
+        if self.scope == 0
+            && matches!(self.selected_target(), SettingsTarget::Role(role) if role.stage().is_some())
+        {
             fields.push(Field::Limit);
         }
         // Prompts have no repository scope; the file is one per role. The
         // theory roles carry no template, so they get no prompt row.
-        if self.scope == 0 && prompts::file_name(self.selected_role_for()).is_some() {
+        if self.scope == 0
+            && matches!(self.selected_target(), SettingsTarget::Role(role) if prompts::file_name(role).is_some())
+        {
             fields.push(Field::Prompt);
         }
         fields
     }
 
+    fn selected_target(&self) -> SettingsTarget {
+        let targets = settings_targets();
+        targets[self.role.min(targets.len() - 1)]
+    }
+
     fn selected_role_for(&self) -> ExecutionRole {
-        ExecutionRole::ALL[self.role.min(ExecutionRole::ALL.len() - 1)]
+        self.selected_target().execution_role()
     }
 
     fn selected_field_for(&self, state: Option<&StateView>) -> Field {
@@ -1615,7 +1823,7 @@ impl Settings {
 
     fn clamp(&mut self, state: &StateView) {
         self.scope = self.scope.min(self.repositories(state).len());
-        self.role = self.role.min(ExecutionRole::ALL.len() - 1);
+        self.role = self.role.min(settings_targets().len() - 1);
         self.field = self
             .field
             .min(self.visible_fields(state).len().saturating_sub(1));
@@ -1653,7 +1861,7 @@ impl Settings {
             ),
             Field::Limit => {
                 if let Some(draft) = self.draft.as_ref().filter(|draft| {
-                    draft.scope == self.scope && draft.role == self.selected_role_for()
+                    draft.scope == self.scope && draft.target == self.selected_target()
                 }) {
                     match draft.value {
                         DraftValue::Global { limit, .. } => {
@@ -1666,7 +1874,9 @@ impl Settings {
                         .settings
                         .global
                         .iter()
-                        .find(|value| value.role == self.selected_role_for())
+                        .find(|value| {
+                            matches!(self.selected_target(), SettingsTarget::Role(role) if value.role == role)
+                        })
                         .and_then(|value| value.limit)
                         .map(|value| value.to_string())
                         .unwrap_or_default()
@@ -1725,9 +1935,17 @@ impl Settings {
     }
 
     fn draw_roles(&self, frame: &mut Frame<'_>, area: Rect) {
-        let lines = ExecutionRole::ALL
+        let targets = settings_targets();
+        let capacity = usize::from(area.height.saturating_sub(2).max(1));
+        let start = self
+            .role
+            .saturating_sub(capacity.saturating_sub(1))
+            .min(targets.len().saturating_sub(capacity));
+        let lines = targets
             .iter()
             .enumerate()
+            .skip(start)
+            .take(capacity)
             .map(|(index, role)| {
                 let marker = if index == self.role { ">" } else { " " };
                 let style = if index == self.role {
@@ -1738,13 +1956,13 @@ impl Settings {
                     THEME.dim()
                 };
                 Line::from(Span::styled(
-                    format!("{marker} {}", role_label(*role)),
+                    format!("{marker} {}", target_label(*role)),
                     style,
                 ))
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" roles ")),
+            Paragraph::new(lines).block(Block::bordered().title(" roles and tag routes ")),
             area,
         );
     }
@@ -1752,13 +1970,30 @@ impl Settings {
     fn draw_form(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         let fields = self.visible_fields(state);
         let mut lines = Vec::new();
+        if let SettingsTarget::TagRoute(key) = self.selected_target() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("tag {}  ", key.label()), THEME.dim()),
+                Span::raw(self.current_settings_ref(state).map_or_else(
+                    || "unavailable".to_string(),
+                    |settings| {
+                        format!(
+                            "{} · {} · {}",
+                            settings.harness.program(),
+                            settings.model,
+                            settings.effort.as_deref().unwrap_or("default")
+                        )
+                    },
+                )),
+            ]));
+        }
         for (index, field) in fields.iter().enumerate() {
             let cursor = if index == self.field { ">" } else { " " };
             let source = self.field_source(state, *field);
             let (owner, owner_style) = match source {
-                Some(SettingsSource::Global) if self.scope > 0 => ("~", THEME.dim()),
+                Some(SettingsSource::BuiltIn) => ("b", THEME.dim()),
+                Some(SettingsSource::Global) => ("g", THEME.dim()),
                 Some(SettingsSource::Repository { .. }) => (
-                    "+",
+                    "r",
                     Style::default().fg(THEME.repo).add_modifier(Modifier::BOLD),
                 ),
                 _ => (" ", THEME.dim()),
@@ -1782,9 +2017,14 @@ impl Settings {
                 )));
             }
         }
-        if self.scope > 0 {
+        if matches!(self.selected_target(), SettingsTarget::TagRoute(_)) {
             lines.push(Line::from(Span::styled(
-                "~ inherited   + repository value",
+                "b built-in   g global   r repository",
+                THEME.dim(),
+            )));
+        } else if self.scope > 0 {
+            lines.push(Line::from(Span::styled(
+                "g inherited   r repository",
                 THEME.dim(),
             )));
         }
@@ -1825,17 +2065,27 @@ impl Settings {
             )));
         } else if self.selected_field_for(Some(state)) == Field::Prompt {
             lines.push(Line::from(Span::styled(
-                "h/l scope  j/k role  Tab field  Enter edit prompt  d restore built-in",
+                "h/l scope  j/k row  Tab field  Enter edit prompt  d restore built-in",
+                THEME.dim(),
+            )));
+        } else if self.scope == 0 && matches!(self.selected_target(), SettingsTarget::TagRoute(_)) {
+            lines.push(Line::from(Span::styled(
+                "h/l scope  j/k row  Tab field  Enter edit  s save  r reload  d use built-in",
+                THEME.dim(),
+            )));
+        } else if self.scope > 0 {
+            lines.push(Line::from(Span::styled(
+                "h/l scope  j/k row  Tab field  Enter edit  s save  r reload  d remove",
                 THEME.dim(),
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                "h/l scope  j/k role  Tab field  Enter edit  s save  r reload  d remove",
+                "h/l scope  j/k row  Tab field  Enter edit  s save  r reload",
                 THEME.dim(),
             )));
         }
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" role settings ")),
+            Paragraph::new(lines).block(Block::bordered().title(" execution settings ")),
             area,
         );
     }
@@ -2067,41 +2317,55 @@ impl Settings {
     }
 
     fn field_source(&self, state: &StateView, field: Field) -> Option<SettingsSource> {
-        if self.scope == 0 {
-            return Some(SettingsSource::Global);
-        }
+        let target = self.selected_target();
+        let local = if self.scope == 0 {
+            SettingsSource::Global
+        } else {
+            SettingsSource::Repository {
+                alias: self.repositories(state).get(self.scope - 1)?.clone(),
+            }
+        };
         if self.draft.as_ref().is_some_and(|draft| {
             draft.scope == self.scope
-                && draft.role == self.selected_role_for()
-                && matches!(
-                    &draft.value,
-                    DraftValue::Repository {
-                        override_settings,
-                        ..
-                    } if override_settings.harness.is_some()
-                )
+                && draft.target == target
+                && (draft
+                    .override_settings()
+                    .is_some_and(|settings| settings.harness.is_some())
+                    || draft.changed.contains(&field))
         }) {
-            return Some(SettingsSource::Repository {
-                alias: self.repositories(state).get(self.scope - 1)?.clone(),
-            });
+            return Some(local);
         }
-        if self.draft.as_ref().is_some_and(|draft| {
-            draft.scope == self.scope
-                && draft.role == self.selected_role_for()
-                && draft.changed.contains(&field)
-        }) {
-            return Some(SettingsSource::Repository {
-                alias: self.repositories(state).get(self.scope - 1)?.clone(),
-            });
-        }
-        let repositories = self.repositories(state);
-        let alias = repositories.get(self.scope - 1)?;
-        let sources = &state
-            .settings
-            .repositories
-            .iter()
-            .find(|value| value.repository == *alias && value.role == self.selected_role_for())?
-            .sources;
+        let sources = match (self.scope, target) {
+            (0, SettingsTarget::Role(_)) => return Some(SettingsSource::Global),
+            (0, SettingsTarget::TagRoute(key)) => {
+                &state
+                    .settings
+                    .global_tag_routes
+                    .iter()
+                    .find(|value| value.key == key)?
+                    .sources
+            }
+            (_, SettingsTarget::Role(role)) => {
+                let repositories = self.repositories(state);
+                let alias = repositories.get(self.scope - 1)?;
+                &state
+                    .settings
+                    .repositories
+                    .iter()
+                    .find(|value| value.repository == *alias && value.role == role)?
+                    .sources
+            }
+            (_, SettingsTarget::TagRoute(key)) => {
+                let repositories = self.repositories(state);
+                let alias = repositories.get(self.scope - 1)?;
+                &state
+                    .settings
+                    .repository_tag_routes
+                    .iter()
+                    .find(|value| value.repository == *alias && value.key == key)?
+                    .sources
+            }
+        };
         Some(source_for_field(sources, field).clone())
     }
 
@@ -2162,6 +2426,15 @@ impl Settings {
         self.role = ExecutionRole::ALL
             .iter()
             .position(|value| *value == role)
+            .unwrap();
+        self.field = 0;
+    }
+
+    #[cfg(test)]
+    fn set_tag_route(&mut self, key: TagRouteKey) {
+        self.role = settings_targets()
+            .iter()
+            .position(|value| *value == SettingsTarget::TagRoute(key))
             .unwrap();
         self.field = 0;
     }
@@ -2302,6 +2575,26 @@ fn role_label(role: ExecutionRole) -> &'static str {
     }
 }
 
+fn settings_targets() -> Vec<SettingsTarget> {
+    let mut targets = ExecutionRole::ALL
+        .into_iter()
+        .map(SettingsTarget::Role)
+        .collect::<Vec<_>>();
+    for stage in TagRouteStage::ALL {
+        for level in ComplexityLevel::ALL {
+            targets.push(SettingsTarget::TagRoute(TagRouteKey::new(stage, level)));
+        }
+    }
+    targets
+}
+
+fn target_label(target: SettingsTarget) -> String {
+    match target {
+        SettingsTarget::Role(role) => role_label(role).to_string(),
+        SettingsTarget::TagRoute(key) => format!("{} · {}", key.stage, key.level),
+    }
+}
+
 fn clear_harness_fields(settings: &mut RoleSettings) {
     settings.effort = None;
     settings.agent = None;
@@ -2348,58 +2641,59 @@ fn complete_override(settings: &RoleSettings) -> RoleOverride {
     value
 }
 
-fn override_from_sources(settings: &RoleSettings, sources: &RoleFieldSources) -> RoleOverride {
-    if is_repository(&sources.harness) {
+fn override_from_sources(
+    settings: &RoleSettings,
+    sources: &RoleFieldSources,
+    owner: &SettingsSource,
+) -> RoleOverride {
+    let owned = |source: &SettingsSource| source == owner;
+    if owned(&sources.harness) {
         return complete_override(settings);
     }
     RoleOverride {
         harness: None,
-        program: is_repository(&sources.program).then(|| settings.program.clone()),
-        model: is_repository(&sources.model).then(|| settings.model.clone()),
-        effort: is_repository(&sources.effort)
+        program: owned(&sources.program).then(|| settings.program.clone()),
+        model: owned(&sources.model).then(|| settings.model.clone()),
+        effort: owned(&sources.effort)
             .then(|| settings.effort.clone())
             .flatten(),
-        extra_args: is_repository(&sources.extra_args).then(|| settings.extra_args.clone()),
-        agent: is_repository(&sources.agent)
+        extra_args: owned(&sources.extra_args).then(|| settings.extra_args.clone()),
+        agent: owned(&sources.agent)
             .then(|| settings.agent.clone())
             .flatten(),
-        profile: is_repository(&sources.profile)
+        profile: owned(&sources.profile)
             .then(|| settings.profile.clone())
             .flatten(),
-        permission_mode: is_repository(&sources.permission_mode)
+        permission_mode: owned(&sources.permission_mode)
             .then(|| settings.permission_mode.clone())
             .flatten(),
-        permission_handler: is_repository(&sources.permission_handler)
+        permission_handler: owned(&sources.permission_handler)
             .then(|| settings.permission_handler.clone())
             .flatten(),
-        tools: is_repository(&sources.tools).then(|| settings.tools.clone()),
-        disallowed_tools: is_repository(&sources.disallowed_tools)
+        tools: owned(&sources.tools).then(|| settings.tools.clone()),
+        disallowed_tools: owned(&sources.disallowed_tools)
             .then(|| settings.disallowed_tools.clone()),
-        strict_mcp: is_repository(&sources.strict_mcp)
+        strict_mcp: owned(&sources.strict_mcp)
             .then_some(settings.strict_mcp)
             .flatten(),
-        auto_approve: is_repository(&sources.auto_approve)
+        auto_approve: owned(&sources.auto_approve)
             .then_some(settings.auto_approve)
             .flatten(),
-        approval_policy: is_repository(&sources.approval_policy)
+        approval_policy: owned(&sources.approval_policy)
             .then(|| settings.approval_policy.clone())
             .flatten(),
-        sandbox: is_repository(&sources.sandbox)
+        sandbox: owned(&sources.sandbox)
             .then(|| settings.sandbox.clone())
             .flatten(),
     }
 }
 
 fn sync_override(draft: &mut Draft, field: Field) {
-    let DraftValue::Repository {
-        settings,
-        override_settings,
-    } = &mut draft.value
-    else {
+    let Some((settings, override_settings)) = draft.override_settings_mut() else {
         return;
     };
     if override_settings.harness.is_some() {
-        **override_settings = complete_override(settings);
+        *override_settings = complete_override(settings);
         return;
     }
     match field {
@@ -2483,7 +2777,9 @@ fn validate_draft(draft: &Draft) -> BTreeMap<Field, String> {
         }
     }
     if let DraftValue::Global { limit, .. } = draft.value {
-        if draft.role.stage().is_some() && limit.unwrap_or(0) == 0 {
+        if matches!(draft.target, SettingsTarget::Role(role) if role.stage().is_some())
+            && limit.unwrap_or(0) == 0
+        {
             errors.insert(Field::Limit, "must be at least 1".to_string());
         }
     }
@@ -2563,10 +2859,6 @@ fn source_for_field(sources: &RoleFieldSources, field: Field) -> &SettingsSource
     }
 }
 
-fn is_repository(source: &SettingsSource) -> bool {
-    matches!(source, SettingsSource::Repository { .. })
-}
-
 fn field_from_error(message: &str) -> Option<Field> {
     [
         ("extra_args", Field::ExtraArgs),
@@ -2600,9 +2892,10 @@ fn centered(width: u16, height: u16, outer: Rect) -> Rect {
 
 fn settings_panes(area: Rect, narrow: bool) -> [Rect; 2] {
     if narrow {
-        let role_height = u16::try_from(ExecutionRole::ALL.len())
+        let full_height = u16::try_from(settings_targets().len())
             .unwrap_or(u16::MAX)
             .saturating_add(2);
+        let role_height = full_height.min(area.height.saturating_sub(10).max(5));
         let panes =
             Layout::vertical([Constraint::Length(role_height), Constraint::Min(1)]).split(area);
         [panes[0], panes[1]]
@@ -2617,9 +2910,9 @@ mod tests {
     use super::*;
     use crate::config::{ExecutionRole, Harness, RoleSettings, SettingsSource};
     use crate::sock::{
-        Action, GlobalRoleSettingsView, PromptSource, PromptView, RepositoryRoleSettingsView,
-        RoleFieldSources, SettingsOperation, SettingsResult, SettingsResultStatus, SettingsView,
-        StateView,
+        Action, GlobalRoleSettingsView, GlobalTagRouteSettingsView, PromptSource, PromptView,
+        RepositoryRoleSettingsView, RepositoryTagRouteSettingsView, RoleFieldSources,
+        SettingsOperation, SettingsResult, SettingsResultStatus, SettingsView, StateView,
     };
 
     /// The prompt text every test role starts with.
@@ -2690,6 +2983,26 @@ mod tests {
         }
     }
 
+    fn all_sources(source: SettingsSource) -> RoleFieldSources {
+        RoleFieldSources {
+            harness: source.clone(),
+            program: source.clone(),
+            model: source.clone(),
+            effort: source.clone(),
+            extra_args: source.clone(),
+            agent: source.clone(),
+            profile: source.clone(),
+            permission_mode: source.clone(),
+            permission_handler: source.clone(),
+            tools: source.clone(),
+            disallowed_tools: source.clone(),
+            strict_mcp: source.clone(),
+            auto_approve: source.clone(),
+            approval_policy: source.clone(),
+            sandbox: source,
+        }
+    }
+
     fn state() -> StateView {
         let mut state = crate::tui::pipeline::sample_view();
         let harnesses = [
@@ -2719,6 +3032,33 @@ mod tests {
                     settings: role(Harness::Claude),
                     sources: sources("borsuk"),
                     overridden: true,
+                })
+                .collect(),
+            global_tag_routes: TagRouteStage::ALL
+                .into_iter()
+                .flat_map(|stage| {
+                    ComplexityLevel::ALL
+                        .into_iter()
+                        .map(move |level| GlobalTagRouteSettingsView {
+                            key: TagRouteKey::new(stage, level),
+                            settings: role(Harness::Codex),
+                            sources: all_sources(SettingsSource::BuiltIn),
+                            overridden: false,
+                        })
+                })
+                .collect(),
+            repository_tag_routes: TagRouteStage::ALL
+                .into_iter()
+                .flat_map(|stage| {
+                    ComplexityLevel::ALL.into_iter().map(move |level| {
+                        RepositoryTagRouteSettingsView {
+                            repository: "borsuk".to_string(),
+                            key: TagRouteKey::new(stage, level),
+                            settings: role(Harness::Codex),
+                            sources: all_sources(SettingsSource::BuiltIn),
+                            overridden: false,
+                        }
+                    })
                 })
                 .collect(),
             prompts: prompts::ROLES.into_iter().map(prompt).collect(),
@@ -2768,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_and_narrow_layouts_keep_the_stable_role_order() {
+    fn wide_and_narrow_layouts_keep_the_stable_settings_row_order() {
         let settings = Settings::default();
         for output in [
             text(&settings, &state(), 100, 28),
@@ -2786,7 +3126,15 @@ mod tests {
             ]
             .map(|name| output.find(name).expect("the role must be visible"));
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-            assert!(output.contains("role settings"));
+            let implement_low = output
+                .find("implement · low")
+                .expect("the first implementation route must be visible");
+            let review_very_high = output
+                .find("review · very-high")
+                .expect("the last review route must be visible");
+            assert!(positions[7] < implement_low);
+            assert!(implement_low < review_very_high);
+            assert!(output.contains("execution settings"));
         }
     }
 
@@ -3162,7 +3510,7 @@ mod tests {
             Some(SettingsSource::Repository { .. })
         ));
         let output = text(&settings, &state, 100, 28);
-        assert!(output.contains("+ model"), "{output}");
+        assert!(output.contains("r model"), "{output}");
     }
 
     #[test]
@@ -3440,9 +3788,9 @@ mod tests {
         let mut settings = Settings::default();
         settings.handle_key(&state, key(KeyCode::Char('l')));
         let output = text(&settings, &state, 100, 28);
-        assert!(output.contains("~ harness"), "{output}");
-        assert!(output.contains("+ model"), "{output}");
-        assert!(output.contains("~ inherited"), "{output}");
+        assert!(output.contains("g harness"), "{output}");
+        assert!(output.contains("r model"), "{output}");
+        assert!(output.contains("g inherited"), "{output}");
     }
 
     #[test]
@@ -3573,6 +3921,120 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_global_tag_route_save_contains_only_the_changed_override() {
+        let state = state();
+        let route_key = TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High);
+        let mut settings = Settings::default();
+        settings.set_tag_route(route_key);
+        settings.set_field(Field::Model);
+        settings.replace_selected_text(&state, "gpt-custom");
+
+        let action = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("the route save must start");
+
+        assert!(matches!(
+            action,
+            Action::SaveSettings {
+                edit: SettingsEdit::GlobalTagRoute {
+                    key: saved_key,
+                    settings: Some(RoleOverride {
+                        harness: None,
+                        model: Some(ref model),
+                        ..
+                    }),
+                },
+                ..
+            } if saved_key == route_key && model == "gpt-custom"
+        ));
+    }
+
+    #[test]
+    fn repository_tag_route_save_and_remove_use_the_selected_route() {
+        let state = state();
+        let route_key = TagRouteKey::new(TagRouteStage::Review, ComplexityLevel::VeryHigh);
+        let mut settings = Settings::default();
+        settings.set_tag_route(route_key);
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_field(Field::Effort);
+        settings.replace_selected_text(&state, "max");
+
+        let save = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("the repository route save must start");
+        assert!(matches!(
+            save,
+            Action::SaveSettings {
+                edit: SettingsEdit::RepositoryTagRoute {
+                    repository,
+                    key: saved_key,
+                    settings: Some(RoleOverride {
+                        effort: Some(ref effort),
+                        ..
+                    }),
+                },
+                ..
+            } if repository == "borsuk" && saved_key == route_key && effort == "max"
+        ));
+        settings.delivery_failed(None);
+
+        let remove = settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .expect("the repository route removal must start");
+        assert!(matches!(
+            remove,
+            Action::SaveSettings {
+                edit: SettingsEdit::RepositoryTagRoute {
+                    repository,
+                    key: removed_key,
+                    settings: None,
+                },
+                ..
+            } if repository == "borsuk" && removed_key == route_key
+        ));
+    }
+
+    #[test]
+    fn d_restores_a_global_tag_route_to_the_built_in_route() {
+        let state = state();
+        let route_key = TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::Low);
+        let mut settings = Settings::default();
+        settings.set_tag_route(route_key);
+
+        let remove = settings
+            .handle_key(&state, key(KeyCode::Char('d')))
+            .expect("the global route removal must start");
+
+        assert!(matches!(
+            remove,
+            Action::SaveSettings {
+                edit: SettingsEdit::GlobalTagRoute {
+                    key: removed_key,
+                    settings: None,
+                },
+                ..
+            } if removed_key == route_key
+        ));
+    }
+
+    #[test]
+    fn a_tag_route_form_shows_its_tag_preview_and_built_in_sources() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_tag_route(TagRouteKey::new(
+            TagRouteStage::Implement,
+            ComplexityLevel::High,
+        ));
+
+        let output = text(&settings, &state, 100, 28);
+
+        assert!(output.contains("tag complexity:high"), "{output}");
+        assert!(output.contains("codex · model-one · high"), "{output}");
+        assert!(output.contains("b model"), "{output}");
+        assert!(output.contains("b built-in"), "{output}");
     }
 
     #[test]
@@ -3874,8 +4336,8 @@ mod tests {
             ));
         }
         let output = text(&settings, &state, 100, 28);
-        assert!(!output.contains("~ program"), "{output}");
-        assert!(output.contains("+ program"), "{output}");
+        assert!(!output.contains("g program"), "{output}");
+        assert!(output.contains("r program"), "{output}");
     }
 
     #[test]
@@ -4435,14 +4897,14 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(
             settings.footer_hints(),
-            "j k role · tab field · enter open · s save · r reload · a add repo · ? help"
+            "j k row · tab field · enter open · s save · r reload · a add repo · ? help"
         );
 
         settings.handle_key(&state, key(KeyCode::Char('l')));
         assert_eq!(settings.scope, 1);
         assert_eq!(
             settings.footer_hints(),
-            "j k role · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help"
+            "j k row · tab field · enter open · s save · d remove · X remove repo · a add repo · ? help"
         );
 
         settings.scope = 0;

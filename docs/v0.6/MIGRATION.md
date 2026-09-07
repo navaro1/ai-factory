@@ -47,8 +47,8 @@ AI Factory always keeps real Claude questions in the inbox.
 A repository table can override one role field:
 
 ```toml
-[repo.borsuk.stage.review]
-effort = "max"
+[repo.borsuk.stage.refine]
+model = "claude-opus-5[1m]"
 ```
 
 The global role supplies every field that the repository table omits.
@@ -121,8 +121,71 @@ The Settings view uses key `5`. It can save role changes and reload the file.
 
 A stale save does not change the file. Repository topology changes require a daemon restart.
 
+## Complexity tag routes
+
+AI Factory now selects implementation and review settings from GitHub tags.
+
+Implementation uses these tags:
+
+- `complexity:low`
+- `complexity:medium`
+- `complexity:high`
+- `complexity:very-high`
+
+Review uses the matching `review-complexity:*` tags.
+
+Review reads the pull request and all linked issues.
+
+AI Factory selects `medium` when no valid tag exists.
+
+AI Factory selects the highest route when multiple valid tags exist.
+
+The built-in matrix uses Codex and balanced model settings.
+
+| Route | Low | Medium | High | Very high |
+|---|---|---|---|---|
+| Implement | Luna, high | Terra, high | Sol, xhigh | Astra, xhigh |
+| Review | Luna, xhigh | Terra, xhigh | Sol, max | Astra, max |
+
+The model identifiers use the `gpt-5.6-*` and `gpt-6-astra` forms.
+
+You can add a global override:
+
+```toml
+[tag_routes.implement.high]
+model = "gpt-5.6-sol"
+effort = "max"
+```
+
+You can add a repository override:
+
+```toml
+[repo.borsuk.tag_routes.review.high]
+effort = "max"
+```
+
+The Settings view lists the eight routes after the role rows.
+
+Press `s` to save a route. Press `d` to remove its current override.
+
+A global removal restores the built-in route.
+
+A repository removal restores the effective global route.
+
+A queued task uses a new route when it starts.
+
+A started task keeps its stored route after a save, retry, or restart.
+
+The `stage.implement` and `stage.review` tables still supply stage limits.
+
+The tag routes now supply the execution settings for those two stages.
+
 ## Doctor checks
 
 Run `aif doctor` after the migration.
 
-The doctor checks each configured harness executable once. It checks the Claude version floor only for Claude roles.
+The doctor checks each configured harness executable once.
+
+This check includes role programs and tag route programs.
+
+The doctor checks the Claude version floor only for Claude routes and roles.

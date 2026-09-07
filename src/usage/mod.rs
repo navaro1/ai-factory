@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ExecutionRole, Harness};
 use crate::exec::Exec;
+use crate::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
 
 pub mod claude;
 pub mod codex;
@@ -247,11 +248,9 @@ fn harness_rank(harness: Harness) -> u8 {
 
 /// Derive the billed identity set from the resolved execution roles.
 ///
-/// The set covers every configured global role and every repository
-/// override. A theory role that the configuration omits adds nothing, and
-/// a theory role never takes a repository override. The list is sorted
-/// claude first, OpenCode providers second, codex last; within a harness
-/// the identity keys sort alphabetically.
+/// The set covers every role and tag route, including repository overrides.
+/// A theory role that the configuration omits adds nothing. The list is
+/// sorted Claude first, OpenCode providers second, and Codex last.
 pub fn identities(config: &Config) -> Vec<Identity> {
     type IdentityParts = (Harness, BTreeMap<String, ()>, String);
     let mut pairs: BTreeMap<(u8, String), IdentityParts> = BTreeMap::new();
@@ -268,6 +267,14 @@ pub fn identities(config: &Config) -> Vec<Identity> {
         };
         record(settings.harness, &settings.model, &settings.program);
     }
+    for stage in TagRouteStage::ALL {
+        for level in ComplexityLevel::ALL {
+            if let Ok(resolved) = config.resolved_tag_route(None, TagRouteKey::new(stage, level)) {
+                let settings = resolved.settings;
+                record(settings.harness, &settings.model, &settings.program);
+            }
+        }
+    }
     for repo in config.repos.values() {
         for role in ExecutionRole::ALL {
             if !role.overridable() || !repo.role_overrides.contains_key(&role) {
@@ -280,6 +287,18 @@ pub fn identities(config: &Config) -> Vec<Identity> {
                 .resolved_role(Some(&repo.alias), role.table_name())
                 .map_or_else(|_| global.clone(), |resolved| resolved.settings);
             record(settings.harness, &settings.model, &settings.program);
+        }
+        for stage in TagRouteStage::ALL {
+            for level in ComplexityLevel::ALL {
+                let key = TagRouteKey::new(stage, level);
+                if !repo.tag_route_overrides.contains_key(&key) {
+                    continue;
+                }
+                if let Ok(resolved) = config.resolved_tag_route(Some(&repo.alias), key) {
+                    let settings = resolved.settings;
+                    record(settings.harness, &settings.model, &settings.program);
+                }
+            }
         }
     }
     pairs
@@ -547,6 +566,24 @@ model = "zai-coding-plan/glm-5.3"
     }
 
     #[test]
+    fn identities_include_a_provider_used_only_by_a_tag_route() {
+        let config = Config::parse(&format!(
+            "{OVERRIDES_TEXT}\n[tag_routes.implement.low]\nharness = \"opencode\"\n\
+             model = \"grok/grok-code\"\n"
+        ))
+        .unwrap();
+
+        let identities = identities(&config);
+
+        let grok = identities
+            .iter()
+            .find(|identity| identity.id == "grok")
+            .expect("the tag route provider must have a usage identity");
+        assert_eq!(grok.harness, Harness::Opencode);
+        assert_eq!(grok.models, ["grok/grok-code"]);
+    }
+
+    #[test]
     fn the_optional_theory_roles_add_their_identity_only_when_configured() {
         // The two theory roles are optional global tables. A config without
         // them must still derive its identity set.
@@ -746,10 +783,14 @@ minutes = 10
         // The drive polls the due identity and spawns exactly one probe.
         daemon.drive();
         let usage_rx = daemon.take_usage_receiver().unwrap();
-        let (identity, result) = usage_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the drive must spawn the claude probe");
-        assert_eq!(identity, "claude");
+        let (identity, result) = loop {
+            let candidate = usage_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the drive must spawn the claude probe");
+            if candidate.0 == "claude" {
+                break candidate;
+            }
+        };
         let record = result.expect("the scripted probe must succeed");
         assert_eq!(record.mode, UsageMode::Plan);
         assert_eq!(record.plan.as_deref(), Some("max"));
@@ -775,9 +816,12 @@ minutes = 10
             }
         }
         let view = view.expect("a pushed view must carry the usage rows");
-        assert_eq!(view.usage.len(), 1);
-        assert_eq!(view.usage[0].identity, "claude");
-        assert_eq!(view.usage[0].windows[0].used_percent, 42.0);
+        let claude = view
+            .usage
+            .iter()
+            .find(|row| row.identity == "claude")
+            .expect("the pushed view must carry the claude row");
+        assert_eq!(claude.windows[0].used_percent, 42.0);
 
         // The drawn band carries the probed numbers.
         let drawn = crate::tui::pipeline::render_state_board(&view, 120, 40, 5_000_000_000);

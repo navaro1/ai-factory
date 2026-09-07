@@ -342,6 +342,9 @@ fn binding_segment(binding: &RoleBindingView) -> String {
     if let Some(effort) = &binding.effort {
         text.push_str(&format!(" · {effort}"));
     }
+    if let Some(route) = &binding.tag_route {
+        text.push_str(&format!(" · {}", route.key));
+    }
     text
 }
 
@@ -913,6 +916,14 @@ impl SessionView {
             if let Some(model) = &model {
                 summary.push_str(" · ");
                 summary.push_str(model);
+            }
+            if let Some(effort) = &binding.effort {
+                summary.push_str(" · ");
+                summary.push_str(effort);
+            }
+            if let Some(route) = &binding.tag_route {
+                summary.push_str(" · ");
+                summary.push_str(&route.key.to_string());
             }
         } else if let Some(model) = &model {
             summary.push_str(model);
@@ -2016,6 +2027,7 @@ mod tests {
             harness: crate::config::Harness::Opencode,
             model: "zai-coding-plan/glm-5.3-flash".to_string(),
             effort: effort.map(|value| value.to_string()),
+            tag_route: None,
         });
         task
     }
@@ -2051,6 +2063,27 @@ mod tests {
             "header: {screen}"
         );
         assert!(!screen.contains("xhigh"), "header: {screen}");
+    }
+
+    #[test]
+    fn the_header_and_session_panel_show_the_stored_tag_route() {
+        let dir = TempDir::new("tag-route");
+        let log = dir.path().join("task.jsonl");
+        let mut task = bound_task(&log, Some("xhigh"));
+        task.binding.as_mut().unwrap().tag_route = Some(crate::routing::TagRouteBinding {
+            key: crate::routing::TagRouteKey::new(
+                crate::routing::TagRouteStage::Implement,
+                crate::routing::ComplexityLevel::High,
+            ),
+            matches: Vec::new(),
+        });
+        let mut view = SessionView::new();
+        view.show(&task);
+
+        let screen = draw_screen(&view, 160, 20, &[]);
+
+        assert!(screen.contains("implement/high"), "route: {screen}");
+        assert!(screen.contains("opencode · zai-coding-plan/glm-5.3-flash · xhigh"));
     }
 
     #[test]
@@ -2108,6 +2141,7 @@ mod tests {
             harness: crate::config::Harness::Claude,
             model: "opus-5".to_string(),
             effort: None,
+            tag_route: None,
         });
         view.show(&other);
 
@@ -2747,6 +2781,7 @@ mod tests {
             harness: crate::config::Harness::Codex,
             model: "gpt-5.6-sol".to_string(),
             effort: None,
+            tag_route: None,
         });
         view.show(&task);
 

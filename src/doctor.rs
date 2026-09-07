@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use aif::config::{parse_owner_repo, Config, ExecutionRole, Harness, RepoConfig};
 use aif::exec::Exec;
+use aif::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
 use aif::sched::{self, Limits};
 use aif::sock::{Client, PauseScope, PausedView, Push};
 use aif::worktree::{Cleanable, WorktreeKind, WorktreeManager, WORKTREE_KINDS};
@@ -801,6 +802,18 @@ fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
                 .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
                 .or_insert(settings.harness == Harness::Claude);
         }
+        for stage in TagRouteStage::ALL {
+            for level in ComplexityLevel::ALL {
+                let key = TagRouteKey::new(stage, level);
+                if let Ok(resolved) = config.resolved_tag_route(None, key) {
+                    let settings = resolved.settings;
+                    programs
+                        .entry(settings.program)
+                        .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
+                        .or_insert(settings.harness == Harness::Claude);
+                }
+            }
+        }
         for alias in config.repos.keys() {
             for role in ExecutionRole::ALL {
                 let Ok(resolved) = config.resolved_role(Some(alias), role.table_name()) else {
@@ -811,6 +824,19 @@ fn tool_checks(exec: &dyn Exec, config: Option<&Config>) -> Vec<Check> {
                     .entry(settings.program)
                     .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
                     .or_insert(settings.harness == Harness::Claude);
+            }
+            for stage in TagRouteStage::ALL {
+                for level in ComplexityLevel::ALL {
+                    let key = TagRouteKey::new(stage, level);
+                    let Ok(resolved) = config.resolved_tag_route(Some(alias), key) else {
+                        continue;
+                    };
+                    let settings = resolved.settings;
+                    programs
+                        .entry(settings.program)
+                        .and_modify(|claude| *claude |= settings.harness == Harness::Claude)
+                        .or_insert(settings.harness == Harness::Claude);
+                }
             }
         }
     }
@@ -1757,6 +1783,7 @@ mod tests {
                 |call| call.program == "claude",
                 CmdOut::ok("Claude Code 2.1.251\n"),
             )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
             .expect(
                 |call| call.program == "opencode",
                 CmdOut::ok("opencode 1.18.25\n"),
@@ -1776,7 +1803,7 @@ mod tests {
 
         let checks = tool_checks(&exec, Some(&config));
 
-        assert_eq!(checks.len(), 7, "checks: {checks:?}");
+        assert_eq!(checks.len(), 8, "checks: {checks:?}");
         let programs: Vec<_> = exec.calls().into_iter().map(|call| call.program).collect();
         assert_eq!(
             programs,
@@ -1784,11 +1811,48 @@ mod tests {
                 "gh",
                 "git",
                 "claude",
+                "codex",
                 "opencode",
                 "repo-review",
                 "review-agent",
                 "shared-agent"
             ]
+        );
+    }
+
+    #[test]
+    fn tool_checks_include_a_program_from_a_tag_route() {
+        let text = config_text(
+            &[],
+            "[tag_routes.implement.high]\nprogram = \"route-agent\"\n",
+        );
+        let config = Config::parse(&text).expect("the route configuration must parse");
+        let exec = ScriptExec::new()
+            .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
+            .expect(|call| call.program == "git", CmdOut::ok("git 2.43.0\n"))
+            .expect(
+                |call| call.program == "claude",
+                CmdOut::ok("Claude Code 2.1.251\n"),
+            )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
+            .expect(
+                |call| call.program == "opencode",
+                CmdOut::ok("opencode 1.18.25\n"),
+            )
+            .expect(
+                |call| call.program == "route-agent",
+                CmdOut::ok("route-agent 1.0.0\n"),
+            );
+
+        let checks = tool_checks(&exec, Some(&config));
+
+        assert!(checks.iter().any(|check| check.label == "route-agent"));
+        assert_eq!(
+            exec.calls()
+                .iter()
+                .filter(|call| call.program == "route-agent")
+                .count(),
+            1
         );
     }
 
@@ -1809,6 +1873,7 @@ mod tests {
                 |call| call.program == "claude-wrapper",
                 CmdOut::ok("Claude Code 2.1.100\n"),
             )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
             .expect(
                 |call| call.program == "shared",
                 CmdOut::ok("shared 1.0.0\n"),
@@ -1851,6 +1916,7 @@ mod tests {
                 |call| call.program == "claude",
                 CmdOut::ok("Claude Code 2.1.251\n"),
             )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
             .expect(
                 |call| call.program == "opencode",
                 CmdOut::ok("opencode 1.18.25\n"),
@@ -1881,6 +1947,7 @@ mod tests {
                 |call| call.program == "claude",
                 CmdOut::ok("Claude Code 2.1.251\n"),
             )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
             .expect(
                 |call| call.program == "opencode",
                 CmdOut::ok("opencode 1.18.25\n"),
@@ -2216,6 +2283,7 @@ mod tests {
                 |call| call.program == "claude",
                 CmdOut::ok("2.1.223 (Claude Code)\n"),
             )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
             .expect(
                 |call| call.program == "opencode",
                 CmdOut::ok("opencode 1.18.25\n"),
@@ -2341,6 +2409,7 @@ mod tests {
                 |call| call.program == "claude",
                 CmdOut::ok("2.1.251 (Claude Code)\n"),
             )
+            .expect(|call| call.program == "codex", CmdOut::ok("codex 1.0.0\n"))
             .expect(
                 |call| call.program == "opencode",
                 CmdOut::ok("opencode 1.18.25\n"),
@@ -2386,7 +2455,7 @@ mod tests {
             "detail: {}",
             acme.detail
         );
-        for tool in ["gh", "git", "claude", "opencode"] {
+        for tool in ["gh", "git", "claude", "codex", "opencode"] {
             let check = checks
                 .iter()
                 .find(|check| check.label == tool)
@@ -2433,9 +2502,9 @@ mod tests {
             summary.detail
         );
         assert!(!has_failures(&checks));
-        // The nine tool, auth, and repository answers plus the usage curl
+        // The ten tool, auth, and repository answers plus the usage curl
         // version check of the enabled [usage] table.
-        assert_eq!(exec.calls().len(), 10, "calls: {:?}", exec.calls());
+        assert_eq!(exec.calls().len(), 11, "calls: {:?}", exec.calls());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 

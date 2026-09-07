@@ -118,22 +118,18 @@ pub struct TagRouteBinding {
 
 /// Select the highest exact label, or medium when no valid label exists.
 pub fn select_level(stage: TagRouteStage, labels: &[String]) -> TagSelection {
-    let mut level = ComplexityLevel::Medium;
-    let mut found = false;
+    let mut level = None;
     let mut matched_labels = Vec::new();
     for label in labels {
         let candidate = level_from_label(stage, label);
         if let Some(candidate) = candidate {
-            found = true;
-            level = level.max(candidate);
+            level =
+                Some(level.map_or(candidate, |current: ComplexityLevel| current.max(candidate)));
             matched_labels.push(label.clone());
         }
     }
-    if !found {
-        level = ComplexityLevel::Medium;
-    }
     TagSelection {
-        level,
+        level: level.unwrap_or(ComplexityLevel::Medium),
         matched_labels,
     }
 }
@@ -187,5 +183,21 @@ mod tests {
             selection.matched_labels,
             labels(&["complexity:low", "complexity:very-high"])
         );
+    }
+
+    #[test]
+    fn every_exact_label_selects_its_typed_level() {
+        for stage in TagRouteStage::ALL {
+            for level in ComplexityLevel::ALL {
+                let label = format!("{}{}", stage.label_prefix(), level);
+                assert_eq!(
+                    select_level(stage, std::slice::from_ref(&label)),
+                    TagSelection {
+                        level,
+                        matched_labels: vec![label],
+                    }
+                );
+            }
+        }
     }
 }

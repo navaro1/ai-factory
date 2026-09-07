@@ -1579,7 +1579,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("g", "fire the release gate"),
         ("/ n e L c a m", "search and ticket keys"),
         ("h l", "repo / ticket / settings scope"),
-        ("j k", "settings role"),
+        ("j k", "settings role or tag route"),
         ("Tab", "select settings field"),
         ("Enter", "edit settings value"),
         ("s r", "save / reload settings"),
@@ -2152,6 +2152,8 @@ mod tests {
                 })
                 .collect(),
             repositories: Vec::new(),
+            global_tag_routes: Vec::new(),
+            repository_tag_routes: Vec::new(),
             prompts,
         };
         state
@@ -4022,7 +4024,7 @@ mod tests {
         // The hint is longer than the 66 footer columns of an 80-column
         // terminal, so the render shows only its head. The row-cap test
         // holds the full text.
-        assert!(text.contains("j k role · tab field · enter open · s save · r reload"));
+        assert!(text.contains("j k row · tab field · enter open · s save · r reload"));
     }
 
     #[test]
@@ -4194,7 +4196,7 @@ mod tests {
             ),
             (
                 View::Settings,
-                "j k role · tab field · enter open · s save · r reload · a add repo · ? help",
+                "j k row · tab field · enter open · s save · r reload · a add repo · ? help",
             ),
         ];
         for (view, hint) in expected {

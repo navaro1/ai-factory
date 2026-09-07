@@ -847,6 +847,26 @@ mod tests {
     }
 
     #[test]
+    fn an_old_role_binding_without_tag_route_evidence_still_loads() {
+        let dir = temp_dir("old-role-binding");
+        let path = dir.join("state.json");
+        let binding = valid_binding();
+        let mut state = DaemonState::default();
+        state
+            .role_bindings
+            .insert("borsuk/review-p5".to_string(), binding.clone());
+
+        state.save(&path).unwrap();
+
+        assert!(!fs::read_to_string(&path).unwrap().contains("tag_route"));
+        assert_eq!(
+            DaemonState::load(&path).role_bindings["borsuk/review-p5"],
+            binding
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn an_old_state_file_defaults_to_no_role_bindings() {
         let dir = temp_dir("old-role-bindings");
         let path = dir.join("state.json");
