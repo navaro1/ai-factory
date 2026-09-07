@@ -5976,6 +5976,7 @@ mod tests {
                 release: ReleasePolicy::Manual,
                 theory: crate::config::TheoryConfig::default(),
                 role_overrides: BTreeMap::new(),
+                tag_route_overrides: BTreeMap::new(),
             },
         );
         Config {
@@ -5983,6 +5984,7 @@ mod tests {
             roles,
             stages,
             repos,
+            tag_route_overrides: BTreeMap::new(),
             ticket_chat: crate::config::TicketChatConfig {
                 model: Some("m".to_string()),
             },

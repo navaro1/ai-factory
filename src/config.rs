@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exec::{Exec, RealExec};
 use crate::model::Stage;
+use crate::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +132,7 @@ pub struct RoleOverride {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingsSource {
+    BuiltIn,
     Global,
     Repository { alias: String },
 }
@@ -164,6 +166,22 @@ pub enum SettingsEdit {
         /// The role identity.
         role: ExecutionRole,
         /// The partial override. `None` removes the override table.
+        settings: Option<RoleOverride>,
+    },
+    /// Replace or remove one global tag route override.
+    GlobalTagRoute {
+        /// The route cell.
+        key: TagRouteKey,
+        /// The partial override. `None` restores the built-in route.
+        settings: Option<RoleOverride>,
+    },
+    /// Replace or remove one repository tag route override.
+    RepositoryTagRoute {
+        /// The repository alias.
+        repository: String,
+        /// The route cell.
+        key: TagRouteKey,
+        /// The partial override. `None` restores the global route.
         settings: Option<RoleOverride>,
     },
     /// Insert one repository with a single `path` key.
@@ -365,6 +383,7 @@ pub struct RepoConfig {
     pub release: ReleasePolicy,
     pub theory: TheoryConfig,
     pub role_overrides: BTreeMap<ExecutionRole, RoleOverride>,
+    pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
 }
 
 /// Temporary chat data for callers that still use the old ticket interface.
@@ -379,6 +398,7 @@ pub struct Config {
     pub roles: BTreeMap<ExecutionRole, RoleSettings>,
     pub stages: BTreeMap<Stage, StageConfig>,
     pub repos: BTreeMap<String, RepoConfig>,
+    pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
     pub ticket_chat: TicketChatConfig,
     pub usage: UsageConfig,
 }
@@ -419,6 +439,56 @@ impl Config {
         };
         let settings = apply_override(global, override_settings);
         validate_settings(&settings, &format!("repo.{alias}.{role}"))?;
+        Ok(ResolvedRoleSettings {
+            role,
+            source: SettingsSource::Repository {
+                alias: alias.to_string(),
+            },
+            settings,
+        })
+    }
+
+    /// Apply the built-in value, a global override, then one repository override.
+    pub fn resolved_tag_route(
+        &self,
+        repository: Option<&str>,
+        key: TagRouteKey,
+    ) -> Result<ResolvedRoleSettings> {
+        let built_in = built_in_tag_route(key);
+        let global_override = self.tag_route_overrides.get(&key);
+        let global = global_override.map_or_else(
+            || built_in.clone(),
+            |settings| apply_override(&built_in, settings),
+        );
+        let role = tag_route_role(key.stage);
+        let Some(alias) = repository else {
+            return Ok(ResolvedRoleSettings {
+                role,
+                source: if global_override.is_some() {
+                    SettingsSource::Global
+                } else {
+                    SettingsSource::BuiltIn
+                },
+                settings: global,
+            });
+        };
+        let repo = self
+            .repos
+            .get(alias)
+            .ok_or_else(|| anyhow!("repo.{alias}: no configured repository"))?;
+        let Some(override_settings) = repo.tag_route_overrides.get(&key) else {
+            return Ok(ResolvedRoleSettings {
+                role,
+                source: if global_override.is_some() {
+                    SettingsSource::Global
+                } else {
+                    SettingsSource::BuiltIn
+                },
+                settings: global,
+            });
+        };
+        let settings = apply_override(&global, override_settings);
+        validate_settings(&settings, &format!("repo.{alias}.{}", key.table_name()))?;
         Ok(ResolvedRoleSettings {
             role,
             source: SettingsSource::Repository {
@@ -478,6 +548,20 @@ impl Config {
             let settings = raw_role.into_settings(&role.to_string())?;
             roles.insert(role, settings);
         }
+        let mut tag_route_overrides = BTreeMap::new();
+        for (key, raw_override) in raw.tag_routes.entries() {
+            let Some(raw_override) = raw_override else {
+                continue;
+            };
+            let table = key.table_name();
+            let override_settings = raw_override.into_override(&table)?;
+            let base = built_in_tag_route(key);
+            let harness = override_settings.harness.unwrap_or(base.harness);
+            validate_override_for_harness(&override_settings, harness, &table)?;
+            let effective = apply_override(&base, &override_settings);
+            validate_settings(&effective, &table)?;
+            tag_route_overrides.insert(key, override_settings);
+        }
         let mut stages = BTreeMap::new();
         for (index, role) in [
             ExecutionRole::Refine,
@@ -520,6 +604,7 @@ impl Config {
             validate_release(&raw_repo.release, &alias)?;
             let theory = theory_config(&raw_repo, &alias)?;
             let raw_overrides = raw_repo.overrides();
+            let raw_tag_route_overrides = raw_repo.tag_routes.entries();
             let mut lanes = BTreeMap::new();
             for (name, count) in raw_repo.lanes {
                 let stage = Stage::from_str(&name)
@@ -538,6 +623,24 @@ impl Config {
                     role_overrides.insert(role, override_settings);
                 }
             }
+            let mut repository_tag_route_overrides = BTreeMap::new();
+            for (key, raw_override) in raw_tag_route_overrides {
+                let Some(raw_override) = raw_override else {
+                    continue;
+                };
+                let table = format!("repo.{alias}.{}", key.table_name());
+                let override_settings = raw_override.into_override(&table)?;
+                let built_in = built_in_tag_route(key);
+                let global = tag_route_overrides.get(&key).map_or_else(
+                    || built_in.clone(),
+                    |settings| apply_override(&built_in, settings),
+                );
+                let harness = override_settings.harness.unwrap_or(global.harness);
+                validate_override_for_harness(&override_settings, harness, &table)?;
+                let effective = apply_override(&global, &override_settings);
+                validate_settings(&effective, &table)?;
+                repository_tag_route_overrides.insert(key, override_settings);
+            }
             repos.insert(
                 alias.clone(),
                 RepoConfig {
@@ -548,6 +651,7 @@ impl Config {
                     release: raw_repo.release,
                     theory,
                     role_overrides,
+                    tag_route_overrides: repository_tag_route_overrides,
                 },
             );
         }
@@ -556,6 +660,7 @@ impl Config {
             schema_version: 1,
             stages,
             repos,
+            tag_route_overrides,
             ticket_chat: TicketChatConfig {
                 model: Some(roles[&ExecutionRole::TicketChat].model.clone()),
             },
@@ -611,6 +716,44 @@ impl Config {
     }
 }
 
+fn tag_route_role(stage: TagRouteStage) -> ExecutionRole {
+    match stage {
+        TagRouteStage::Implement => ExecutionRole::Implement,
+        TagRouteStage::Review => ExecutionRole::Review,
+    }
+}
+
+/// Return one complete balanced built-in route.
+pub fn built_in_tag_route(key: TagRouteKey) -> RoleSettings {
+    let (model, effort) = match (key.stage, key.level) {
+        (TagRouteStage::Implement, ComplexityLevel::Low) => ("gpt-5.6-luna", "high"),
+        (TagRouteStage::Review, ComplexityLevel::Low) => ("gpt-5.6-luna", "xhigh"),
+        (TagRouteStage::Implement, ComplexityLevel::Medium) => ("gpt-5.6-terra", "high"),
+        (TagRouteStage::Review, ComplexityLevel::Medium) => ("gpt-5.6-terra", "xhigh"),
+        (TagRouteStage::Implement, ComplexityLevel::High) => ("gpt-5.6-sol", "xhigh"),
+        (TagRouteStage::Review, ComplexityLevel::High) => ("gpt-5.6-sol", "max"),
+        (TagRouteStage::Implement, ComplexityLevel::VeryHigh) => ("gpt-6-astra", "xhigh"),
+        (TagRouteStage::Review, ComplexityLevel::VeryHigh) => ("gpt-6-astra", "max"),
+    };
+    RoleSettings {
+        harness: Harness::Codex,
+        program: "codex".to_string(),
+        model: model.to_string(),
+        effort: Some(effort.to_string()),
+        extra_args: Vec::new(),
+        agent: None,
+        profile: None,
+        permission_mode: None,
+        permission_handler: None,
+        tools: Vec::new(),
+        disallowed_tools: Vec::new(),
+        strict_mcp: None,
+        auto_approve: Some(false),
+        approval_policy: Some("never".to_string()),
+        sandbox: Some("workspace-write".to_string()),
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -621,6 +764,8 @@ struct RawConfig {
     ticket: RawTickets,
     #[serde(default)]
     theory: RawTheory,
+    #[serde(default)]
+    tag_routes: RawTagRoutes,
     #[serde(default)]
     repo: BTreeMap<String, RawRepo>,
     #[serde(default)]
@@ -645,6 +790,74 @@ struct RawStages {
 struct RawTickets {
     create: Option<RawRole>,
     chat: Option<RawRole>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTagRoutes {
+    #[serde(default)]
+    implement: RawComplexityRoutes,
+    #[serde(default)]
+    review: RawComplexityRoutes,
+}
+
+impl RawTagRoutes {
+    fn entries(&self) -> [(TagRouteKey, Option<RawRole>); 8] {
+        let route =
+            |stage, level, value: &Option<RawRole>| (TagRouteKey::new(stage, level), value.clone());
+        [
+            route(
+                TagRouteStage::Implement,
+                ComplexityLevel::Low,
+                &self.implement.low,
+            ),
+            route(
+                TagRouteStage::Implement,
+                ComplexityLevel::Medium,
+                &self.implement.medium,
+            ),
+            route(
+                TagRouteStage::Implement,
+                ComplexityLevel::High,
+                &self.implement.high,
+            ),
+            route(
+                TagRouteStage::Implement,
+                ComplexityLevel::VeryHigh,
+                &self.implement.very_high,
+            ),
+            route(
+                TagRouteStage::Review,
+                ComplexityLevel::Low,
+                &self.review.low,
+            ),
+            route(
+                TagRouteStage::Review,
+                ComplexityLevel::Medium,
+                &self.review.medium,
+            ),
+            route(
+                TagRouteStage::Review,
+                ComplexityLevel::High,
+                &self.review.high,
+            ),
+            route(
+                TagRouteStage::Review,
+                ComplexityLevel::VeryHigh,
+                &self.review.very_high,
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComplexityRoutes {
+    low: Option<RawRole>,
+    medium: Option<RawRole>,
+    high: Option<RawRole>,
+    #[serde(rename = "very-high")]
+    very_high: Option<RawRole>,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -757,6 +970,8 @@ struct RawRepo {
     stage: RawStageOverrides,
     #[serde(default)]
     ticket: RawTicketOverrides,
+    #[serde(default)]
+    tag_routes: RawTagRoutes,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1505,6 +1720,29 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
                 table.remove(role_name(*role));
             }
         }
+        SettingsEdit::GlobalTagRoute { key, settings } => {
+            if let Some(settings) = settings {
+                let table = global_tag_route_table_mut(&mut document, *key)?;
+                write_role_override(table, settings);
+            } else {
+                remove_global_tag_route(&mut document, *key);
+            }
+        }
+        SettingsEdit::RepositoryTagRoute {
+            repository,
+            key,
+            settings,
+        } => {
+            if !valid_alias(repository) {
+                bail!("repo.\"{repository}\": alias must match [a-z0-9._-]+");
+            }
+            if let Some(settings) = settings {
+                let table = repository_tag_route_table_mut(&mut document, repository, *key)?;
+                write_role_override(table, settings);
+            } else {
+                remove_repository_tag_route(&mut document, repository, *key)?;
+            }
+        }
         SettingsEdit::AddRepository { alias, path } => {
             if !valid_alias(alias) {
                 bail!("repo.\"{alias}\": alias must match [a-z0-9._-]+");
@@ -1785,6 +2023,84 @@ fn repository_role_table_mut<'a>(
         .get_mut(name)
         .and_then(toml_edit::Item::as_table_mut)
         .ok_or_else(|| anyhow!("repo.{repository}.{section}.{name} must be a table"))
+}
+
+fn ensure_table<'a>(
+    parent: &'a mut toml_edit::Table,
+    name: &str,
+    path: &str,
+) -> Result<&'a mut toml_edit::Table> {
+    if !parent.contains_key(name) {
+        parent.insert(name, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    parent
+        .get_mut(name)
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("{path} must be a table"))
+}
+
+fn global_tag_route_table_mut(
+    document: &mut toml_edit::DocumentMut,
+    key: TagRouteKey,
+) -> Result<&mut toml_edit::Table> {
+    let root = ensure_table(document.as_table_mut(), "tag_routes", "tag_routes")?;
+    let stage_path = format!("tag_routes.{}", key.stage);
+    let stage = ensure_table(root, key.stage.as_str(), &stage_path)?;
+    ensure_table(stage, key.level.as_str(), &key.table_name())
+}
+
+fn repository_tag_route_table_mut<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    repository: &str,
+    key: TagRouteKey,
+) -> Result<&'a mut toml_edit::Table> {
+    let repo = document
+        .get_mut("repo")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|repos| repos.get_mut(repository))
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("repo.{repository}: no configured repository"))?;
+    let root = ensure_table(repo, "tag_routes", &format!("repo.{repository}.tag_routes"))?;
+    let stage_path = format!("repo.{repository}.tag_routes.{}", key.stage);
+    let stage = ensure_table(root, key.stage.as_str(), &stage_path)?;
+    ensure_table(
+        stage,
+        key.level.as_str(),
+        &format!("repo.{repository}.{}", key.table_name()),
+    )
+}
+
+fn remove_global_tag_route(document: &mut toml_edit::DocumentMut, key: TagRouteKey) {
+    if let Some(stage) = document
+        .get_mut("tag_routes")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|routes| routes.get_mut(key.stage.as_str()))
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        stage.remove(key.level.as_str());
+    }
+}
+
+fn remove_repository_tag_route(
+    document: &mut toml_edit::DocumentMut,
+    repository: &str,
+    key: TagRouteKey,
+) -> Result<()> {
+    let repo = document
+        .get_mut("repo")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|repos| repos.get_mut(repository))
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| anyhow!("repo.{repository}: no configured repository"))?;
+    if let Some(stage) = repo
+        .get_mut("tag_routes")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|routes| routes.get_mut(key.stage.as_str()))
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        stage.remove(key.level.as_str());
+    }
+    Ok(())
 }
 
 fn write_role_settings(table: &mut toml_edit::Table, settings: &RoleSettings) {

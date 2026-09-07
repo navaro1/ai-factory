@@ -18,6 +18,7 @@ pub mod model;
 pub mod poll;
 pub mod proc;
 pub mod prompts;
+pub mod routing;
 pub mod runner;
 pub mod sched;
 pub mod sock;

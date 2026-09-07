@@ -701,6 +701,7 @@ mod tests {
             release: ReleasePolicy::Manual,
             theory: crate::config::TheoryConfig::default(),
             role_overrides: BTreeMap::new(),
+            tag_route_overrides: BTreeMap::new(),
         }
     }
 
