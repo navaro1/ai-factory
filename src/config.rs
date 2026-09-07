@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exec::{Exec, RealExec};
 use crate::model::Stage;
-use crate::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
+use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +142,8 @@ pub enum SettingsSource {
 pub struct ResolvedRoleSettings {
     pub role: ExecutionRole,
     pub source: SettingsSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_route: Option<TagRouteBinding>,
     #[serde(flatten)]
     pub settings: RoleSettings,
 }
@@ -423,6 +425,7 @@ impl Config {
             return Ok(ResolvedRoleSettings {
                 role,
                 source: SettingsSource::Global,
+                tag_route: None,
                 settings: global.clone(),
             });
         };
@@ -434,6 +437,7 @@ impl Config {
             return Ok(ResolvedRoleSettings {
                 role,
                 source: SettingsSource::Global,
+                tag_route: None,
                 settings: global.clone(),
             });
         };
@@ -444,6 +448,7 @@ impl Config {
             source: SettingsSource::Repository {
                 alias: alias.to_string(),
             },
+            tag_route: None,
             settings,
         })
     }
@@ -469,6 +474,10 @@ impl Config {
                 } else {
                     SettingsSource::BuiltIn
                 },
+                tag_route: Some(TagRouteBinding {
+                    key,
+                    matches: Vec::new(),
+                }),
                 settings: global,
             });
         };
@@ -484,6 +493,10 @@ impl Config {
                 } else {
                     SettingsSource::BuiltIn
                 },
+                tag_route: Some(TagRouteBinding {
+                    key,
+                    matches: Vec::new(),
+                }),
                 settings: global,
             });
         };
@@ -494,6 +507,10 @@ impl Config {
             source: SettingsSource::Repository {
                 alias: alias.to_string(),
             },
+            tag_route: Some(TagRouteBinding {
+                key,
+                matches: Vec::new(),
+            }),
             settings,
         })
     }

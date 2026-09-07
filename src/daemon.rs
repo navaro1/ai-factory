@@ -33,7 +33,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{
     self, Config, ExecutionRole, Harness, ReleasePolicy, RepoConfig, ResolvedRoleSettings,
-    SettingsEdit,
+    SettingsEdit, SettingsSource,
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
@@ -45,6 +45,9 @@ use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{self, RESTART_NOTICE};
+use crate::routing::{
+    level_from_label, ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteMatch, TagRouteStage,
+};
 #[cfg(test)]
 use crate::runner::Runner;
 use crate::runner::{
@@ -5079,13 +5082,85 @@ impl Daemon {
 
     /// Resolve the current typed settings for one task.
     fn resolved_task_role(&self, task: &Task) -> Result<ResolvedRoleSettings> {
-        self.role_bindings.get(&task.id).cloned().map_or_else(
-            || {
-                self.config
-                    .resolved_role(Some(&task.repo), Self::execution_role(task).table_name())
-            },
-            Ok,
-        )
+        self.role_bindings
+            .get(&task.id)
+            .cloned()
+            .map_or_else(|| self.current_task_role(task), Ok)
+    }
+
+    /// Resolve the current settings before the task gets an immutable binding.
+    fn current_task_role(&self, task: &Task) -> Result<ResolvedRoleSettings> {
+        let Some(route) = self.task_tag_route(task) else {
+            return self
+                .config
+                .resolved_role(Some(&task.repo), Self::execution_role(task).table_name());
+        };
+        let mut settings = self
+            .config
+            .resolved_tag_route(Some(&task.repo), route.key)?;
+        settings.tag_route = Some(route);
+        Ok(settings)
+    }
+
+    /// Select the tag route and retain all exact labels as evidence.
+    fn task_tag_route(&self, task: &Task) -> Option<TagRouteBinding> {
+        if task.purpose != TaskPurpose::Pipeline {
+            return None;
+        }
+        let stage = match task.stage {
+            Stage::Implement => TagRouteStage::Implement,
+            Stage::Review => TagRouteStage::Review,
+            Stage::Refine | Stage::Release => return None,
+        };
+        let repo = self.snapshot.repos.get(&task.repo);
+        let mut matches = Vec::new();
+        let mut add_labels = |kind: ItemKind, number: u64, labels: &[String]| {
+            for label in labels {
+                if level_from_label(stage, label).is_some() {
+                    matches.push(TagRouteMatch {
+                        kind,
+                        number,
+                        label: label.clone(),
+                    });
+                }
+            }
+        };
+        match stage {
+            TagRouteStage::Implement => {
+                if let Some(issue) = repo.and_then(|repo| repo.issues.get(&task.number)) {
+                    add_labels(ItemKind::Issue, issue.number, &issue.labels);
+                }
+            }
+            TagRouteStage::Review => {
+                if let Some(pull) = repo.and_then(|repo| repo.prs.get(&task.number)) {
+                    add_labels(ItemKind::Pr, pull.number, &pull.labels);
+                }
+                let linked = self
+                    .review_tickets
+                    .get(&task.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.links
+                            .get(&task.repo)
+                            .map(|links| links.tickets_of(task.number).into_iter().collect())
+                            .unwrap_or_default()
+                    });
+                for number in linked {
+                    if let Some(issue) = repo.and_then(|repo| repo.issues.get(&number)) {
+                        add_labels(ItemKind::Issue, issue.number, &issue.labels);
+                    }
+                }
+            }
+        }
+        let level = matches
+            .iter()
+            .filter_map(|matched| level_from_label(stage, &matched.label))
+            .max()
+            .unwrap_or(ComplexityLevel::Medium);
+        Some(TagRouteBinding {
+            key: TagRouteKey::new(stage, level),
+            matches,
+        })
     }
 
     /// Resolve and persist the immutable settings before one first run.
@@ -5093,9 +5168,7 @@ impl Daemon {
         if let Some(binding) = self.role_bindings.get(&task.id) {
             return Ok(binding.clone());
         }
-        let binding = self
-            .config
-            .resolved_role(Some(&task.repo), Self::execution_role(task).table_name())?;
+        let binding = self.current_task_role(task)?;
         self.role_bindings.insert(task.id.clone(), binding.clone());
         let state = self.collect_state();
         let text = state.to_json()?;
@@ -5105,7 +5178,48 @@ impl Daemon {
         }
         self.saved = Some(text);
         self.changed = true;
+        if binding.tag_route.is_some() {
+            self.append_task_log(task, &Self::tag_route_log_line(&binding));
+        }
         Ok(binding)
+    }
+
+    /// Render one stable route record before the runner writes its output.
+    fn tag_route_log_line(binding: &ResolvedRoleSettings) -> String {
+        let route = binding
+            .tag_route
+            .as_ref()
+            .expect("a route log requires route evidence");
+        let tags = if route.matches.is_empty() {
+            "default:medium".to_string()
+        } else {
+            route
+                .matches
+                .iter()
+                .map(|matched| {
+                    let kind = match matched.kind {
+                        ItemKind::Issue => "issue",
+                        ItemKind::Pr => "pr",
+                    };
+                    format!("{}#{}:{}", kind, matched.number, matched.label)
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let source = match &binding.source {
+            SettingsSource::BuiltIn => "built-in".to_string(),
+            SettingsSource::Global => "global".to_string(),
+            SettingsSource::Repository { alias } => format!("repository:{alias}"),
+        };
+        format!(
+            "aif: route {} tags={} source={} harness={} model={} effort={}\n",
+            route.key,
+            tags,
+            source,
+            binding.settings.harness.program(),
+            binding.settings.model,
+            binding.settings.effort.as_deref().unwrap_or("default")
+        )
     }
 
     /// Return the runtime actions of the task's resolved harness.
@@ -5544,7 +5658,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExecutionRole, Harness, RoleSettings, StageConfig};
+    use crate::config::{ExecutionRole, Harness, RoleOverride, RoleSettings, StageConfig};
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use crate::prompts::{
@@ -5979,16 +6093,46 @@ mod tests {
                 tag_route_overrides: BTreeMap::new(),
             },
         );
+        let route_override = complete_role_override(&role_settings);
+        let tag_route_overrides = TagRouteStage::ALL
+            .into_iter()
+            .flat_map(|stage| {
+                let route_override = route_override.clone();
+                ComplexityLevel::ALL
+                    .into_iter()
+                    .map(move |level| (TagRouteKey::new(stage, level), route_override.clone()))
+            })
+            .collect();
         Config {
             schema_version: 1,
             roles,
             stages,
             repos,
-            tag_route_overrides: BTreeMap::new(),
+            tag_route_overrides,
             ticket_chat: crate::config::TicketChatConfig {
                 model: Some("m".to_string()),
             },
             usage: crate::config::UsageConfig::default(),
+        }
+    }
+
+    fn complete_role_override(settings: &RoleSettings) -> RoleOverride {
+        RoleOverride {
+            harness: Some(settings.harness),
+            program: Some(settings.program.clone()),
+            model: Some(settings.model.clone()),
+            effort: settings.effort.clone(),
+            extra_args: Some(settings.extra_args.clone()),
+            agent: settings.agent.clone(),
+            profile: settings.profile.clone(),
+            permission_mode: settings.permission_mode.clone(),
+            permission_handler: settings.permission_handler.clone(),
+            tools: Some(settings.tools.clone()),
+            disallowed_tools: Some(settings.disallowed_tools.clone()),
+            strict_mcp: settings.strict_mcp,
+            auto_approve: settings.auto_approve,
+            approval_policy: settings.approval_policy.clone(),
+            sandbox: settings.sandbox.clone(),
         }
     }
 
@@ -6021,6 +6165,19 @@ mod tests {
         settings.auto_approve = (harness == Harness::Opencode).then_some(true);
         settings.approval_policy = None;
         settings.sandbox = None;
+        let route_stage = match role {
+            ExecutionRole::Implement => Some(TagRouteStage::Implement),
+            ExecutionRole::Review => Some(TagRouteStage::Review),
+            _ => None,
+        };
+        if let Some(stage) = route_stage {
+            let settings = complete_role_override(settings);
+            for level in ComplexityLevel::ALL {
+                config
+                    .tag_route_overrides
+                    .insert(TagRouteKey::new(stage, level), settings.clone());
+            }
+        }
     }
 
     /// One open issue.
@@ -7557,7 +7714,7 @@ mod tests {
         );
         assert!(rig.decision(&row_id).is_none());
         assert_eq!(
-            logged_lines(&rig.task("borsuk/implement-i142").log_path),
+            logged_user_lines(&rig.task("borsuk/implement-i142").log_path),
             vec![
                 r#"{"type":"user","message":{"role":"user","content":"use the vendored sources"}}"#
             ],
@@ -7682,7 +7839,7 @@ mod tests {
         );
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
         assert!(
-            logged_lines(&rig.task("borsuk/implement-i142").log_path).is_empty(),
+            logged_user_lines(&rig.task("borsuk/implement-i142").log_path).is_empty(),
             "a refused answer writes no user line"
         );
     }
@@ -8804,7 +8961,7 @@ mod tests {
                 .pending_chats
                 .contains_key("borsuk/implement-i142"));
             assert_eq!(
-                logged_lines(&first.task("borsuk/implement-i142").log_path),
+                logged_user_lines(&first.task("borsuk/implement-i142").log_path),
                 vec![
                     r#"{"type":"user","message":{"role":"user","content":"add a regression test"}}"#
                 ],
@@ -9891,7 +10048,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_role_override_selects_the_runner_and_all_settings() {
+    fn repository_tag_route_override_selects_the_runner_and_all_settings() {
         let dir = temp_root();
         let steps = fresh_issue_steps(
             &rig_repo(&dir),
@@ -9904,9 +10061,9 @@ mod tests {
                 .repos
                 .get_mut("borsuk")
                 .unwrap()
-                .role_overrides
+                .tag_route_overrides
                 .insert(
-                    ExecutionRole::Implement,
+                    TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::Medium),
                     crate::config::RoleOverride {
                         harness: Some(Harness::Codex),
                         program: Some("codex-local".to_string()),
@@ -9927,6 +10084,13 @@ mod tests {
         assert_eq!(roles.len(), 1);
         assert_eq!(roles[0].role, ExecutionRole::Implement);
         assert_eq!(
+            roles[0].tag_route.as_ref().map(|route| route.key),
+            Some(TagRouteKey::new(
+                TagRouteStage::Implement,
+                ComplexityLevel::Medium
+            ))
+        );
+        assert_eq!(
             roles[0].source,
             crate::config::SettingsSource::Repository {
                 alias: "borsuk".to_string(),
@@ -9943,6 +10107,140 @@ mod tests {
             roles[0].settings.sandbox.as_deref(),
             Some("workspace-write")
         );
+    }
+
+    #[test]
+    fn an_implementation_uses_its_issue_complexity_route() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            let mut settings = config.roles[&ExecutionRole::Implement].clone();
+            settings.model = "implement-high".to_string();
+            config.tag_route_overrides.insert(
+                TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                complete_role_override(&settings),
+            );
+        });
+
+        rig.poll(vec![issue(142, &["refined", "complexity:high"])], vec![]);
+
+        assert_eq!(rig.job(0).model, "implement-high");
+        let roles = rig.roles.lock().unwrap();
+        let route = roles[0].tag_route.as_ref().unwrap();
+        assert_eq!(
+            route.key,
+            TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High)
+        );
+        assert_eq!(
+            route.matches,
+            [TagRouteMatch {
+                kind: ItemKind::Issue,
+                number: 142,
+                label: "complexity:high".to_string(),
+            }]
+        );
+        drop(roles);
+        let log = fs::read_to_string(rig.task("borsuk/implement-i142").log_path).unwrap();
+        assert!(log.contains("aif: route implement/high"), "{log}");
+        assert!(log.contains("issue#142:complexity:high"), "{log}");
+    }
+
+    #[test]
+    fn a_review_uses_the_highest_pr_and_linked_issue_route() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            let mut settings = config.roles[&ExecutionRole::Review].clone();
+            settings.model = "review-very-high".to_string();
+            config.tag_route_overrides.insert(
+                TagRouteKey::new(TagRouteStage::Review, ComplexityLevel::VeryHigh),
+                complete_role_override(&settings),
+            );
+        });
+        let mut pull = linked_pr(5, 142);
+        pull.draft = true;
+        pull.labels = vec!["review-complexity:low".to_string()];
+
+        rig.poll(
+            vec![issue(142, &["review-complexity:very-high"])],
+            vec![pull],
+        );
+
+        assert_eq!(rig.job(0).model, "review-very-high");
+        let roles = rig.roles.lock().unwrap();
+        let route = roles[0].tag_route.as_ref().unwrap();
+        assert_eq!(
+            route.key,
+            TagRouteKey::new(TagRouteStage::Review, ComplexityLevel::VeryHigh)
+        );
+        assert_eq!(
+            route.matches,
+            [
+                TagRouteMatch {
+                    kind: ItemKind::Pr,
+                    number: 5,
+                    label: "review-complexity:low".to_string(),
+                },
+                TagRouteMatch {
+                    kind: ItemKind::Issue,
+                    number: 142,
+                    label: "review-complexity:very-high".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_implementation_retry_keeps_its_first_tag_route_binding() {
+        let dir = temp_root();
+        let steps: Vec<Step> = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        )
+        .into_iter()
+        .chain(reuse_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            &rig_gitdir(&dir),
+        ))
+        .collect();
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            let mut settings = config.roles[&ExecutionRole::Implement].clone();
+            settings.model = "first-route".to_string();
+            config.tag_route_overrides.insert(
+                TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                complete_role_override(&settings),
+            );
+        });
+        rig.poll(vec![issue(142, &["refined", "complexity:high"])], vec![]);
+        rig.daemon
+            .config
+            .tag_route_overrides
+            .get_mut(&TagRouteKey::new(
+                TagRouteStage::Implement,
+                ComplexityLevel::High,
+            ))
+            .unwrap()
+            .model = Some("changed-route".to_string());
+
+        rig.event(exited("borsuk/implement-i142", false, "failed"));
+
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 2);
+        assert_eq!(roles[0], roles[1]);
+        assert_eq!(roles[1].settings.model, "first-route");
     }
 
     #[test]
@@ -13637,6 +13935,14 @@ mod tests {
         }
     }
 
+    /// The accepted chat records in one task log.
+    fn logged_user_lines(log: &Path) -> Vec<String> {
+        logged_lines(log)
+            .into_iter()
+            .filter(|line| line.starts_with(r#"{"type":"user""#))
+            .collect()
+    }
+
     #[test]
     fn a_live_chat_writes_one_user_line_into_the_task_log() {
         let mut rig = Rig::make(vec![]);
@@ -13656,7 +13962,7 @@ mod tests {
         let logged = fs::read_to_string(&log).unwrap();
         assert!(logged.ends_with('\n'), "the line ends with a newline");
         assert_eq!(
-            logged_lines(&log),
+            logged_user_lines(&log),
             vec![r#"{"type":"user","message":{"role":"user","content":"continue with Postgres"}}"#],
             "the live success appends exactly one user line"
         );
@@ -13711,7 +14017,7 @@ mod tests {
         );
         let log = rig.task("borsuk/implement-i142").log_path;
         assert_eq!(
-            logged_lines(&log),
+            logged_user_lines(&log),
             vec![r#"{"type":"user","message":{"role":"user","content":"add a regression test"}}"#],
             "the queue path appends exactly one user line"
         );
@@ -13763,7 +14069,7 @@ mod tests {
             "a task without a session takes no message"
         );
         assert!(
-            logged_lines(&task.log_path).is_empty(),
+            logged_user_lines(&task.log_path).is_empty(),
             "a refused message leaves the log empty"
         );
     }
@@ -13791,7 +14097,7 @@ mod tests {
         );
 
         assert!(
-            logged_lines(&task.log_path).is_empty(),
+            logged_user_lines(&task.log_path).is_empty(),
             "the worktree hold leaves the log empty"
         );
     }
@@ -13818,7 +14124,11 @@ mod tests {
             text: "extend the change".to_string(),
         });
         let log = rig.task("borsuk/implement-i142").log_path;
-        assert_eq!(logged_lines(&log).len(), 1, "the first chat wrote its line");
+        assert_eq!(
+            logged_user_lines(&log).len(),
+            1,
+            "the first chat wrote its line"
+        );
 
         // The reopen queued the task. A queued task takes no message.
         let queued = rig.task("borsuk/implement-i142");
@@ -13834,7 +14144,7 @@ mod tests {
         );
 
         assert_eq!(
-            logged_lines(&log),
+            logged_user_lines(&log),
             vec![r#"{"type":"user","message":{"role":"user","content":"extend the change"}}"#],
             "the closed input appends nothing to the earlier line"
         );

@@ -356,6 +356,9 @@ mod tests {
         ExecutionRole, Harness, ResolvedRoleSettings, RoleSettings, SettingsSource,
     };
     use crate::model::ItemKind;
+    use crate::routing::{
+        ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteMatch, TagRouteStage,
+    };
     use std::path::PathBuf;
 
     /// A unique directory for one test's files.
@@ -801,6 +804,14 @@ mod tests {
             source: SettingsSource::Repository {
                 alias: "borsuk".to_string(),
             },
+            tag_route: Some(TagRouteBinding {
+                key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                matches: vec![TagRouteMatch {
+                    kind: ItemKind::Issue,
+                    number: 142,
+                    label: "complexity:high".to_string(),
+                }],
+            }),
             settings: RoleSettings {
                 harness: Harness::Codex,
                 program: "codex-custom".to_string(),
@@ -880,6 +891,7 @@ mod tests {
         ResolvedRoleSettings {
             role: ExecutionRole::Review,
             source: SettingsSource::Global,
+            tag_route: None,
             settings: RoleSettings {
                 harness: Harness::Codex,
                 program: "codex".to_string(),

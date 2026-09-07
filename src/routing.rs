@@ -4,6 +4,8 @@ use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::ItemKind;
+
 /// The two pipeline stages that use tag routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,15 +101,28 @@ pub struct TagSelection {
     pub matched_labels: Vec<String>,
 }
 
+/// One item and label that contributed to a stored route selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagRouteMatch {
+    pub kind: ItemKind,
+    pub number: u64,
+    pub label: String,
+}
+
+/// The tag evidence stored with one task role binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagRouteBinding {
+    pub key: TagRouteKey,
+    pub matches: Vec<TagRouteMatch>,
+}
+
 /// Select the highest exact label, or medium when no valid label exists.
 pub fn select_level(stage: TagRouteStage, labels: &[String]) -> TagSelection {
     let mut level = ComplexityLevel::Medium;
     let mut found = false;
     let mut matched_labels = Vec::new();
     for label in labels {
-        let candidate = ComplexityLevel::ALL
-            .into_iter()
-            .find(|candidate| label == &format!("{}{}", stage.label_prefix(), candidate.as_str()));
+        let candidate = level_from_label(stage, label);
         if let Some(candidate) = candidate {
             found = true;
             level = level.max(candidate);
@@ -121,6 +136,13 @@ pub fn select_level(stage: TagRouteStage, labels: &[String]) -> TagSelection {
         level,
         matched_labels,
     }
+}
+
+/// Parse one exact label for the selected stage.
+pub fn level_from_label(stage: TagRouteStage, label: &str) -> Option<ComplexityLevel> {
+    ComplexityLevel::ALL
+        .into_iter()
+        .find(|candidate| label == format!("{}{}", stage.label_prefix(), candidate.as_str()))
 }
 
 #[cfg(test)]

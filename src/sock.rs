@@ -2724,6 +2724,7 @@ mod tests {
         let binding = ResolvedRoleSettings {
             role: ExecutionRole::Implement,
             source: SettingsSource::Global,
+            tag_route: None,
             settings: RoleSettings {
                 harness: Harness::Opencode,
                 program: "opencode".to_string(),
