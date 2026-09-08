@@ -1542,7 +1542,7 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 /// The number of key rows in the help overlay.
 ///
 /// Two columns split the rows, so an odd count would drop the middle one.
-const HELP_ROWS: usize = 36;
+const HELP_ROWS: usize = 38;
 
 /// Draw the help overlay over the whole frame.
 fn draw_help(f: &mut Frame, area: Rect) {
