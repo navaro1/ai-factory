@@ -38,8 +38,7 @@ use crate::config::{
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{
-    self, implement_labelled, review_ready, unmet_blockers, GateTracker, ReadyWork,
-    NEEDS_HUMAN_LABEL,
+    self, implement_ready, review_ready, unmet_blockers, GateTracker, ReadyWork, NEEDS_HUMAN_LABEL,
 };
 use crate::gh::GhClient;
 use crate::links::Links;
@@ -1444,7 +1443,7 @@ impl Daemon {
                     fresh
                         .issues
                         .get(&task.number)
-                        .is_none_or(|issue| !implement_labelled(issue))
+                        .is_none_or(|issue| !implement_ready(issue))
                         && !(task.state == TaskState::Running
                             && implementation_transitioned(fresh, &links, task.number))
                 }
@@ -2131,7 +2130,7 @@ impl Daemon {
         }
         let snapshot = self.snapshot.repos.get(&task.repo)?;
         let issue = snapshot.issues.get(&task.number)?;
-        unmet_blockers(snapshot, &issue.body).first().copied()
+        unmet_blockers(snapshot, issue).first().copied()
     }
 
     /// Move every queued task with an unmet dependency behind the queued
@@ -6706,6 +6705,89 @@ mod tests {
         let before = rig.daemon.table.order.clone();
         rig.drive();
         assert_eq!(rig.daemon.table.order, before);
+    }
+
+    /// The dispatch guard alone holds a blocked ticket. This test leaves
+    /// the implement stage empty and the queue length at one, so no
+    /// capacity rule, no ordering rule, and no worktree rule can explain
+    /// the wait. The worktree steps of 143 are scripted, so a start would
+    /// succeed if the guard let it through.
+    #[test]
+    fn the_only_queued_ticket_does_not_start_while_its_blocker_is_open() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir);
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 143), 143, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let blocked = || issue_with_body(143, &["refined"], "depends on #9");
+
+        // 142 takes the only implement slot. 143 queues behind it, blocked.
+        rig.poll(
+            vec![issue(142, &["refined"]), blocked(), issue(9, &[])],
+            vec![],
+        );
+        rig.event(started("borsuk/implement-i142", "sid-142"));
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Queued);
+
+        // 142 leaves. The stage is empty, 143 is the only queued task, and
+        // its blocker #9 is the one thing left that can hold it.
+        rig.poll(vec![blocked(), issue(9, &[])], vec![]);
+        rig.event(exited("borsuk/implement-i142", false, "cancelled"));
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "the departed ticket frees the stage"
+        );
+        assert_eq!(
+            queued_order(&rig),
+            vec!["borsuk/implement-i143"],
+            "one queued task, so no ordering rule applies"
+        );
+        assert_eq!(
+            rig.task("borsuk/implement-i143").state,
+            TaskState::Queued,
+            "the open blocker is the only thing that holds it"
+        );
+
+        // The blocker closes and the same task starts, which proves the
+        // wait above was the blocker and not a broken dispatch.
+        rig.poll(vec![blocked()], vec![]);
+
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Running);
+    }
+
+    /// A ticket that is already blocked when it gets `refined` still gets
+    /// its task and its board row. The gate reads the label alone.
+    #[test]
+    fn a_ticket_refined_while_blocked_gets_a_queued_task() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 143),
+            143,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(
+            vec![
+                issue_with_body(143, &["refined"], "depends on #9"),
+                issue(9, &[]),
+            ],
+            vec![],
+        );
+
+        let task = rig.task("borsuk/implement-i143");
+        assert_eq!(
+            task.state,
+            TaskState::Queued,
+            "the gate opened on the label"
+        );
+        assert_eq!(rig.daemon.dependency_blocker(&task), Some(9));
+        assert_eq!(rig.job_count(), 0, "no agent starts for a blocked ticket");
+        let reason = rig.daemon.closed_reason(&task, false);
+        assert!(reason.contains("#9"), "reason: {reason}");
     }
 
     /// A blocked ticket starts as soon as its blocker closes.

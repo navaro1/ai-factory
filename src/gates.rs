@@ -6,6 +6,13 @@
 //! across polls reports once. The tracker only reports. It never creates
 //! tasks and never touches a release queue; the daemon decides what to do
 //! with the report, including the report of the release stage.
+//!
+//! A gate answers one question: did this item enter the stage? It does not
+//! answer whether the work can start now. The blockers of a ticket are the
+//! second question, and [`unmet_blockers`] answers it. The daemon asks the
+//! gate once, on the edge, and asks the blockers on every pass. So a ticket
+//! with an open blocker gets its queued task and its board row, and the
+//! dispatch holds that task until the blocker closes.
 
 use std::collections::BTreeSet;
 
@@ -40,22 +47,24 @@ pub fn refine_ready(issue: &Issue) -> bool {
     issue.open && has_label(&issue.labels, TO_REFINE)
 }
 
-/// True when the issue is open, carries `refined`, does not carry
-/// `to-refine`, and every blocker named in the body is settled.
-pub fn implement_ready(snap: &RepoSnapshot, issue: &Issue) -> bool {
-    implement_labelled(issue) && unmet_blockers(snap, &issue.body).is_empty()
-}
-
 /// True when the issue is open, carries `refined`, and does not carry
 /// `to-refine`.
 ///
-/// This is the implement gate without its blocker test. The two parts ask
-/// for different answers, so the daemon reads them apart. A ticket that
-/// lost the label, closed, or vanished left the stage, and its task goes
-/// away with it. A ticket that only waits for a blocker is still implement
-/// work, so its task waits in the queue and yields its place to the
-/// tickets that can run.
-pub fn implement_labelled(issue: &Issue) -> bool {
+/// This is the whole implement gate. The blockers of the ticket are not
+/// part of it, and [`unmet_blockers`] carries them instead.
+///
+/// The gate held the blocker test until v0.6. The test then decided two
+/// things at once, and each answer was wrong for the other. A blocked
+/// ticket got no task, so the board showed nothing and the operator saw no
+/// cause. And `Daemon::reconcile_unready` cancels an active task whose gate
+/// closed, so a blocker that reopened turned a healthy ticket into a failed
+/// row.
+///
+/// The gate now answers one question: did the ticket enter the implement
+/// stage? A ticket that lost the label, closed, or vanished left the stage,
+/// and its task goes away with it. A ticket that waits for a blocker is
+/// still implement work. It keeps its task, and the dispatch defers it.
+pub fn implement_ready(issue: &Issue) -> bool {
     issue.open && has_label(&issue.labels, REFINED) && !has_label(&issue.labels, TO_REFINE)
 }
 
@@ -70,15 +79,19 @@ pub fn blocker_open(snap: &RepoSnapshot, number: u64) -> bool {
     snap.issues.contains_key(&number) || snap.prs.contains_key(&number)
 }
 
-/// The blockers of one body that are still open, in ascending order.
+/// The blockers of one issue that are still open, in ascending order.
 ///
 /// The result is empty when the body names no blocker, or when every
 /// blocker it names is settled. A caller that only needs a yes or no asks
 /// `is_empty`. A caller that must name the cause takes the first entry.
-pub fn unmet_blockers(snap: &RepoSnapshot, body: &str) -> Vec<u64> {
-    parse_blocked_by(body)
+///
+/// The issue never blocks itself. A body that names its own number is a
+/// mistake, and a ticket that waits for itself waits for ever, so the
+/// parser drops that number.
+pub fn unmet_blockers(snap: &RepoSnapshot, issue: &Issue) -> Vec<u64> {
+    parse_blocked_by(&issue.body)
         .into_iter()
-        .filter(|number| blocker_open(snap, *number))
+        .filter(|number| *number != issue.number && blocker_open(snap, *number))
         .collect()
 }
 
@@ -248,7 +261,7 @@ impl GateTracker {
         for issue in snap.issues.values() {
             for (stage, open) in [
                 (Stage::Refine, refine_ready(issue)),
-                (Stage::Implement, implement_ready(snap, issue)),
+                (Stage::Implement, implement_ready(issue)),
             ] {
                 if open {
                     now_ready.insert(GateKey {
@@ -370,26 +383,30 @@ mod tests {
 
     #[test]
     fn implement_takes_refined_issues_without_to_refine() {
-        let snap = repo(vec![issue(2, &[])], vec![]);
-        assert!(implement_ready(&snap, &issue(1, &["refined"])));
-        assert!(!implement_ready(
-            &snap,
-            &issue(1, &["refined", "to-refine"])
-        ));
-        assert!(!implement_ready(&snap, &issue(1, &[])));
+        assert!(implement_ready(&issue(1, &["refined"])));
+        assert!(!implement_ready(&issue(1, &["refined", "to-refine"])));
+        assert!(!implement_ready(&issue(1, &[])));
+        let mut closed = issue(1, &["refined"]);
+        closed.open = false;
+        assert!(!implement_ready(&closed));
     }
 
+    /// The gate answers one question: did the ticket enter the stage? An
+    /// open blocker is the second question, so it leaves the gate open and
+    /// shows up in the unmet list instead. The daemon defers the task.
     #[test]
-    fn implement_waits_for_open_dependencies() {
+    fn an_open_dependency_leaves_the_implement_gate_open() {
         let blocked = issue_with_body(1, &["refined"], "blocked by #2");
         let held = repo(vec![blocked, issue(2, &[])], vec![]);
-        assert!(!implement_ready(&held, &held.issues[&1]));
+        assert!(implement_ready(&held.issues[&1]));
+        assert_eq!(unmet_blockers(&held, &held.issues[&1]), vec![2]);
 
         let free = repo(
             vec![issue_with_body(1, &["refined"], "blocked by #2")],
             vec![],
         );
-        assert!(implement_ready(&free, &free.issues[&1]));
+        assert!(implement_ready(&free.issues[&1]));
+        assert!(unmet_blockers(&free, &free.issues[&1]).is_empty());
     }
 
     #[test]
@@ -451,44 +468,58 @@ mod tests {
     }
 
     /// GitHub gives issues and pull requests one number space, so an open
-    /// pull request blocks the ticket that names it.
+    /// pull request is a blocker of the ticket that names it.
     #[test]
-    fn an_open_pull_request_blocker_holds_the_implement_gate() {
+    fn an_open_pull_request_counts_as_a_blocker() {
         let held = repo(
             vec![issue_with_body(1, &["refined"], "blocked by #4")],
             vec![pr(4, true, "aaa")],
         );
-        assert!(!implement_ready(&held, &held.issues[&1]));
-        assert_eq!(unmet_blockers(&held, "blocked by #4"), vec![4]);
+        assert_eq!(unmet_blockers(&held, &held.issues[&1]), vec![4]);
 
         let merged = repo(
             vec![issue_with_body(1, &["refined"], "blocked by #4")],
             vec![],
         );
-        assert!(implement_ready(&merged, &merged.issues[&1]));
-        assert!(unmet_blockers(&merged, "blocked by #4").is_empty());
+        assert!(unmet_blockers(&merged, &merged.issues[&1]).is_empty());
     }
 
     /// The unmet list names every open blocker and drops the settled ones.
     #[test]
     fn unmet_blockers_reports_only_the_open_ones_in_order() {
+        let ticket = |body: &str| issue_with_body(1, &["refined"], body);
         let snap = repo(
-            vec![issue(2, &[]), issue(9, &[])],
+            vec![issue(2, &[]), issue(9, &[]), ticket("")],
             vec![pr(5, false, "aaa")],
         );
 
         assert_eq!(
-            unmet_blockers(&snap, "blocked by #9, #2 and #7"),
+            unmet_blockers(&snap, &ticket("blocked by #9, #2 and #7")),
             vec![2, 9],
             "#7 is settled, so it does not appear"
         );
-        assert_eq!(unmet_blockers(&snap, "depends on #5"), vec![5]);
-        assert!(unmet_blockers(&snap, "depends on #7").is_empty());
-        assert!(unmet_blockers(&snap, "no phrasing here #2").is_empty());
+        assert_eq!(unmet_blockers(&snap, &ticket("depends on #5")), vec![5]);
+        assert!(unmet_blockers(&snap, &ticket("depends on #7")).is_empty());
+        assert!(unmet_blockers(&snap, &ticket("no phrasing here #2")).is_empty());
 
         assert!(blocker_open(&snap, 2));
         assert!(blocker_open(&snap, 5));
         assert!(!blocker_open(&snap, 7));
+    }
+
+    /// A ticket that names its own number would wait for ever, so the
+    /// parser drops that number and keeps the rest of the list.
+    #[test]
+    fn a_ticket_never_blocks_itself() {
+        let itself = issue_with_body(1, &["refined"], "depends on #1 and #2");
+        let snap = repo(vec![itself.clone(), issue(2, &[])], vec![]);
+
+        assert_eq!(unmet_blockers(&snap, &itself), vec![2]);
+        assert!(blocker_open(&snap, 1), "the ticket itself is still open");
+
+        let alone = issue_with_body(1, &["refined"], "depends on #1");
+        let solo = repo(vec![alone.clone()], vec![]);
+        assert!(unmet_blockers(&solo, &alone).is_empty());
     }
 
     #[test]
@@ -610,8 +641,10 @@ mod tests {
         );
     }
 
+    /// The blocker no longer holds the gate. The ticket gets its task at
+    /// once, so the board shows the wait, and the tracker reports it once.
     #[test]
-    fn an_implement_gate_stays_shut_while_a_dependency_is_open() {
+    fn an_implement_gate_opens_once_even_while_a_dependency_is_open() {
         let mut tracker = GateTracker::new();
         let held = repo(
             vec![
@@ -625,13 +658,14 @@ mod tests {
             vec![],
         );
 
-        assert!(tracker.observe("borsuk", &held).is_empty());
-        assert!(tracker.observe("borsuk", &held).is_empty());
-
-        let fired = tracker.observe("borsuk", &free);
+        let fired = tracker.observe("borsuk", &held);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Implement);
         assert_eq!(fired[0].number, 7);
+
+        // The blocker closing is not a gate edge, so no second task fires.
+        assert!(tracker.observe("borsuk", &held).is_empty());
+        assert!(tracker.observe("borsuk", &free).is_empty());
     }
 
     #[test]
@@ -719,17 +753,14 @@ mod tests {
             ],
             vec![],
         );
-        let unblocked = repo(
-            vec![issue_with_body(1, &["refined"], "depends on #9")],
-            vec![],
-        );
 
         assert_eq!(tracker.observe("borsuk", &to_refine).len(), 1);
-        // Issue 9 is still open, so the implement gate stays shut.
-        assert!(tracker.observe("borsuk", &refined).is_empty());
 
-        let fired = tracker.observe("borsuk", &unblocked);
+        // The label moved, so the implement gate opens. Issue 9 is still
+        // open, and the daemon defers the task it gets from this report.
+        let fired = tracker.observe("borsuk", &refined);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Implement);
+        assert_eq!(unmet_blockers(&refined, &refined.issues[&1]), vec![9]);
     }
 }

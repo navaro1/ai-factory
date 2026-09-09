@@ -54,20 +54,30 @@ list, so `Depends on #4, #5 and #6` names three blockers. A blocker is open
 while GitHub shows it as an open ticket or an open pull request. Every other
 blocker is settled.
 
-The factory never implements a ticket that has an open blocker:
+The `refined` label alone opens the implement gate. A blocked ticket
+therefore gets its task and its row on the board, and the factory then holds
+that task:
 
 | Condition | What the factory does |
 |---|---|
-| The ticket has an open blocker at the gate. | The factory starts no task. |
+| A ticket gets `refined` while a blocker is open. | The factory creates the task. The task waits in the queue. |
 | A blocker of a queued task reopens. | The factory holds the task in the queue. |
-| A ready ticket waits behind a blocked ticket. | The factory moves the blocked ticket down. The ready ticket starts first. |
-| The last blocker of a ticket closes. | The blocked ticket starts in its turn. |
+| The last blocker of a ticket closes. | The task starts in its turn. |
 
-A blocked ticket keeps its task row and its `refined` label. It does not fail.
-The session view of the task names the open blocker.
+The factory checks the blockers before every start, not once. So a blocker
+that reopens holds the task again, and a restart cannot lose the wait.
 
-A blocker stops a start. It never stops a run. An agent that already works on
-the ticket finishes its run.
+The dispatch steps over a blocked task, so a ready ticket behind it takes the
+slot. The factory also moves the blocked task down the queue. The board then
+shows the order that the dispatch follows: ready tickets first, blocked
+tickets behind them.
+
+A blocked ticket keeps its task row, its `refined` label, and its attempt
+count. It does not fail. The session view of the task names the open blocker.
+
+A blocker stops a start, not a run. An agent that already works on the ticket
+finishes its run. A daemon restart is different: the restart queues every
+task again, so a blocked ticket waits for its blocker before it resumes.
 
 ## Install
 
