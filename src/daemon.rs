@@ -1863,9 +1863,10 @@ impl Daemon {
     /// remain. A task in `Queued` or `AwaitingUser` gets one run: the first
     /// message is the prompt, and the session id continues the old
     /// conversation. The pipeline order and the scheduler decide whether the
-    /// run may start, so prior stages, stage limits, lane reservations, and
-    /// pauses all apply to a follow-up turn. A full live-process limit stops
-    /// one yielding parked session first, and the limit check retries once.
+    /// run may start, so prior stages, open blockers, stage limits, lane
+    /// reservations, and pauses all apply to a follow-up turn. A full
+    /// live-process limit stops one yielding parked session first, and the
+    /// limit check retries once.
     fn resume_pending_chats(&mut self) {
         let ids: Vec<String> = self.pending_chats.keys().cloned().collect();
         for id in ids {
@@ -1891,6 +1892,14 @@ impl Daemon {
                 continue;
             }
             if self.prior_stage_active(&task) {
+                continue;
+            }
+            // The blocker rule holds both launchers. A queued message is not
+            // a decision to override it: the operator wrote that message
+            // before the blocker opened, and the message waits with the
+            // task until the blocker closes. An `AwaitingUser` task is not
+            // parked, so a live session still takes its answer.
+            if self.parked(&task) {
                 continue;
             }
             if !matches!(
@@ -14142,6 +14151,54 @@ mod tests {
         Rig::make_in(dir.to_path_buf(), steps, |config| {
             set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
         })
+    }
+
+    /// `resume_pending_chats` is the second launcher. A queued chat message
+    /// must not carry a blocked ticket past the blocker rule.
+    #[test]
+    fn a_queued_chat_does_not_start_a_blocked_ticket() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        let blocked = || issue_with_body(142, &["refined"], "depends on #9");
+
+        rig.poll(vec![blocked()], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.daemon
+            .chat("borsuk/implement-i142", "add a regression test");
+        assert_eq!(rig.job_count(), 1, "the message waits for the turn to end");
+
+        // #9 opens while the agent still runs, so the run finishes.
+        rig.poll(vec![blocked(), issue(9, &[])], vec![]);
+        // The run fails, so the task goes back to the queue. It now holds a
+        // session id, a queued message, and an open blocker.
+        rig.event(exited("borsuk/implement-i142", false, "boom"));
+
+        let task = rig.task("borsuk/implement-i142");
+        assert_eq!(task.state, TaskState::Queued);
+        assert!(task.session_id.is_some(), "the requeue keeps the session");
+        assert_eq!(rig.daemon.dependency_blocker(&task), Some(9));
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the queued message starts no run while #9 is open"
+        );
+        assert!(
+            rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the message waits for the blocker"
+        );
+
+        // #9 closes, and the same queued message resumes the task.
+        rig.poll(vec![blocked()], vec![]);
+
+        assert_eq!(
+            rig.job_count(),
+            2,
+            "the closed blocker releases the message"
+        );
+        assert_eq!(rig.job(1).prompt, "add a regression test");
+        assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
     }
 
     #[test]

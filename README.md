@@ -84,6 +84,9 @@ A blocked task holds nothing else back. The factory reviews a draft pull
 request that already exists for the ticket, and it accepts a chat message on
 that review.
 
+A chat message for a blocked ticket waits with the ticket. The factory keeps
+the message and sends it when the ticket starts.
+
 A blocker prevents the factory from starting a task. It does not stop a task
 that already runs. An agent that already implements the ticket completes its
 work. A daemon restart is different: the restart queues every task again, so
