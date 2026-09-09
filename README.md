@@ -46,6 +46,29 @@ Each implementation issue gets one git worktree (a second repository
 checkout). The implementation and review agents use this worktree. The
 factory creates the worktree. The agents never create it.
 
+### Ticket dependencies
+
+A ticket can name the work that it waits for. Write `Blocked by #12`,
+`Blocked-by #12`, or `Depends on #12` in the ticket body. Each phrase takes a
+list, so `Depends on #4, #5 and #6` names three blockers. A blocker is open
+while GitHub shows it as an open ticket or an open pull request. Every other
+blocker is settled.
+
+The factory never implements a ticket that has an open blocker:
+
+| Condition | What the factory does |
+|---|---|
+| The ticket has an open blocker at the gate. | The factory starts no task. |
+| A blocker of a queued task reopens. | The factory holds the task in the queue. |
+| A ready ticket waits behind a blocked ticket. | The factory moves the blocked ticket down. The ready ticket starts first. |
+| The last blocker of a ticket closes. | The blocked ticket starts in its turn. |
+
+A blocked ticket keeps its task row and its `refined` label. It does not fail.
+The session view of the task names the open blocker.
+
+A blocker stops a start. It never stops a run. An agent that already works on
+the ticket finishes its run.
+
 ## Install
 
 You need:

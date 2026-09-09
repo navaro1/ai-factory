@@ -300,6 +300,24 @@ impl TaskTable {
         self.insert_task(id.clone(), task)
     }
 
+    /// Move one task to the back of the insertion order.
+    ///
+    /// The dispatch walk follows this order, so the moved task yields its
+    /// place to every task behind it. The call reports whether the order
+    /// changed: an unknown id and a task that already sits last both report
+    /// `false`, so a caller can repeat the call without churn.
+    pub fn bump_to_back(&mut self, id: &str) -> bool {
+        let Some(position) = self.order.iter().position(|existing| existing == id) else {
+            return false;
+        };
+        if position + 1 == self.order.len() {
+            return false;
+        }
+        let moved = self.order.remove(position);
+        self.order.push(moved);
+        true
+    }
+
     /// Remove one task and its insertion-order entry.
     pub fn remove(&mut self, id: &str) -> Option<Task> {
         self.order.retain(|existing| existing != id);
@@ -494,6 +512,28 @@ mod tests {
         }
         assert_eq!(table.by_id[&id].state, state);
         (table, id)
+    }
+
+    /// A bump moves one task behind every other task and reports the move.
+    /// A repeat of the same bump changes nothing, so a caller may run it on
+    /// every pass.
+    #[test]
+    fn a_bump_moves_one_task_last_and_then_reports_no_change() {
+        let mut table = TaskTable::new();
+        let first = queued(&mut table, "borsuk", Stage::Implement, ItemKind::Issue, 1);
+        let second = queued(&mut table, "borsuk", Stage::Implement, ItemKind::Issue, 2);
+        let third = queued(&mut table, "borsuk", Stage::Implement, ItemKind::Issue, 3);
+
+        assert!(table.bump_to_back(&first));
+        assert_eq!(
+            table.order,
+            vec![second.clone(), third.clone(), first.clone()]
+        );
+
+        assert!(!table.bump_to_back(&first), "the last task cannot move");
+        assert_eq!(table.order, vec![second, third, first]);
+
+        assert!(!table.bump_to_back("borsuk/implement-i9"), "no such task");
     }
 
     #[test]

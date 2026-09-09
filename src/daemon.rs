@@ -38,7 +38,8 @@ use crate::config::{
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
 use crate::gates::{
-    self, implement_ready, review_ready, GateTracker, ReadyWork, NEEDS_HUMAN_LABEL,
+    self, implement_labelled, review_ready, unmet_blockers, GateTracker, ReadyWork,
+    NEEDS_HUMAN_LABEL,
 };
 use crate::gh::GhClient;
 use crate::links::Links;
@@ -785,6 +786,7 @@ impl Daemon {
         self.fail_silent_runs();
         self.poll_usage();
         self.resume_pending_chats();
+        self.bump_blocked_tasks();
         self.dispatch_queued();
         self.save_state();
         self.push_state();
@@ -1420,6 +1422,12 @@ impl Daemon {
     }
 
     /// Cancel active implement and review tasks whose gates closed.
+    ///
+    /// A closed gate here means the item left the stage: the ticket lost
+    /// `refined`, the pull request left the draft state, or the item
+    /// closed. An implement ticket that only waits for an open blocker did
+    /// not leave the stage, so it keeps its task; the dispatch defers it
+    /// instead.
     fn reconcile_unready(&mut self, repo: &str, fresh: &RepoSnapshot) {
         let links = self.links.get(repo).cloned().unwrap_or_default();
         let ids: Vec<String> = self
@@ -1428,11 +1436,15 @@ impl Daemon {
             .into_iter()
             .filter(|task| task.repo == repo)
             .filter(|task| match task.stage {
+                // A blocker that reopens does not cancel the task. The
+                // ticket is still implement work, so `bump_blocked_tasks`
+                // moves it down the queue and `next_eligible` holds it
+                // there until the blocker closes.
                 Stage::Implement => {
                     fresh
                         .issues
                         .get(&task.number)
-                        .is_none_or(|issue| !implement_ready(fresh, issue))
+                        .is_none_or(|issue| !implement_labelled(issue))
                         && !(task.state == TaskState::Running
                             && implementation_transitioned(fresh, &links, task.number))
                 }
@@ -1989,7 +2001,9 @@ impl Daemon {
     /// other stages until `dispatch_one` stops a yielding parked session,
     /// the reaper stops one, or an exit frees a slot. A task that
     /// holds queued chat messages is not eligible either;
-    /// `resume_pending_chats` owns it.
+    /// `resume_pending_chats` owns it. A task whose ticket names an open
+    /// blocker is not eligible while that blocker stays open, so the slot
+    /// goes to a ticket that can run.
     fn next_eligible(
         &self,
         saturated: &BTreeSet<Stage>,
@@ -2009,6 +2023,7 @@ impl Daemon {
                 || (self.restored_ids.contains(&task.id) && self.restore_repos.contains(&task.repo))
                 || self.prior_stage_active(task)
                 || self.worktree_holder(task).is_some()
+                || self.dependency_blocker(task).is_some()
             {
                 continue;
             }
@@ -2089,6 +2104,74 @@ impl Daemon {
             active.get_or_insert(prior.id.as_str());
         }
         active.map(str::to_string)
+    }
+
+    /// The first blocker of `task` that is still open, if one exists.
+    ///
+    /// Only an implement task of a pipeline ticket carries blockers. The
+    /// body of the ticket names them, and the live snapshot of the same
+    /// repository says which of them are still open.
+    ///
+    /// The implement gate reads the same blockers, but it reads them once,
+    /// on the edge that queues the task. Between that edge and the dispatch
+    /// the truth can move: a blocker reopens, the refine stage writes a new
+    /// `depends on` line, or the daemon restarts and restores a task that
+    /// GitHub has since blocked. This check runs on every pass, so an
+    /// unmet dependency stops the start each time it is true.
+    ///
+    /// A repository with no snapshot yet reports no blocker. The first poll
+    /// of that repository decides, and until then the daemon knows nothing
+    /// that contradicts the gate.
+    fn dependency_blocker(&self, task: &Task) -> Option<u64> {
+        if task.stage != Stage::Implement
+            || task.kind != ItemKind::Issue
+            || task.purpose != TaskPurpose::Pipeline
+        {
+            return None;
+        }
+        let snapshot = self.snapshot.repos.get(&task.repo)?;
+        let issue = snapshot.issues.get(&task.number)?;
+        unmet_blockers(snapshot, &issue.body).first().copied()
+    }
+
+    /// Move every queued task with an unmet dependency behind the queued
+    /// tasks that can run.
+    ///
+    /// A blocked task keeps its place in the insertion order for as long as
+    /// nothing moves it, so it sits in front of tickets that are ready. The
+    /// dispatch walk already steps over it, but the board then shows a head
+    /// of queue that never starts, and a later free ticket that waits for
+    /// no stated reason. This pass states the order the dispatch already
+    /// follows: ready tickets first, blocked tickets behind them.
+    ///
+    /// The pass moves a blocked task only when a free queued task sits
+    /// behind it, so the move always buys a place for work that can run.
+    /// One pass reaches the fixed point, and a second pass on the same
+    /// table moves nothing. `drive` is therefore still idempotent.
+    fn bump_blocked_tasks(&mut self) {
+        let queued: Vec<(String, bool)> = self
+            .table
+            .order
+            .iter()
+            .filter_map(|id| self.table.by_id.get(id))
+            .filter(|task| task.state == TaskState::Queued)
+            .map(|task| (task.id.clone(), self.dependency_blocker(task).is_some()))
+            .collect();
+        let free_behind = queued.iter().rposition(|(_, blocked)| !blocked);
+        let Some(last_free) = free_behind else {
+            return;
+        };
+        let bump: Vec<String> = queued
+            .into_iter()
+            .take(last_free)
+            .filter(|(_, blocked)| *blocked)
+            .map(|(id, _)| id)
+            .collect();
+        for id in bump {
+            if self.table.bump_to_back(&id) {
+                self.changed = true;
+            }
+        }
     }
 
     /// Start one queued task: ensure the worktree, render the prompt, start
@@ -4178,9 +4261,11 @@ impl Daemon {
     /// A task with no session id and no marker needs a new session. A task
     /// with a spent session needs an action that fits its current state.
     ///
-    /// A queued task that a prior stage holds names that blocker. Without
-    /// the name the human sees a task that never starts and no cause. This
-    /// is the one place the session view can carry the cause, so it does.
+    /// A queued task that a prior stage holds names that blocker. A queued
+    /// task that an open ticket or pull request holds names that number.
+    /// Without the name the human sees a task that never starts and no
+    /// cause. This is the one place the session view can carry the cause,
+    /// so it does.
     ///
     /// A failed blocker never finishes on its own. It holds the queued task
     /// forever. Only that case names an action, because only a failed task
@@ -4211,6 +4296,11 @@ impl Daemon {
                     ""
                 };
                 return format!("This task waits for \"{blocker}\" to finish.{action}");
+            }
+            if let Some(number) = self.dependency_blocker(task) {
+                return format!(
+                    "This task waits for #{number} to close. Ready tickets start first."
+                );
             }
         }
         if !has_session {
@@ -6198,6 +6288,13 @@ mod tests {
         }
     }
 
+    /// One open issue with an explicit body.
+    fn issue_with_body(number: u64, labels: &[&str], body: &str) -> Issue {
+        let mut one = issue(number, labels);
+        one.body = body.to_string();
+        one
+    }
+
     /// One open pull request.
     fn pr(number: u64, draft: bool, labels: &[&str]) -> Pr {
         Pr {
@@ -6395,6 +6492,23 @@ mod tests {
         }
     }
 
+    /// The ids of the queued tasks, in dispatch order.
+    fn queued_order(rig: &Rig) -> Vec<String> {
+        rig.daemon
+            .table
+            .order
+            .iter()
+            .filter(|id| {
+                rig.daemon
+                    .table
+                    .by_id
+                    .get(*id)
+                    .is_some_and(|task| task.state == TaskState::Queued)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn started(task: &str, session_id: &str) -> RunEvent {
         RunEvent::Started {
             task: task.to_string(),
@@ -6512,6 +6626,173 @@ mod tests {
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(rig.job_count(), 1);
         assert!(rig.daemon.table.by_id.contains_key("borsuk/refine-i142"));
+    }
+
+    /// The implement limit is 1, so 142 holds the only slot. Ticket 143
+    /// queues while its blocker is closed, then #9 reopens. The blocked
+    /// ticket must move behind the ready ticket 144 and stay put.
+    #[test]
+    fn a_blocked_ticket_moves_behind_the_ready_ones() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir);
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 144), 144, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let blocked = || issue_with_body(143, &["refined"], "depends on #9");
+
+        // 142 takes the only implement slot; 143 queues behind it.
+        rig.poll(vec![issue(142, &["refined"]), blocked()], vec![]);
+        rig.event(started("borsuk/implement-i142", "sid-142"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Queued);
+        assert_eq!(
+            rig.daemon
+                .dependency_blocker(&rig.task("borsuk/implement-i143")),
+            None
+        );
+
+        // #9 reopens. Nothing waits behind 143 yet, so nothing moves.
+        rig.poll(
+            vec![issue(142, &["refined"]), blocked(), issue(9, &[])],
+            vec![],
+        );
+        assert_eq!(
+            rig.daemon
+                .dependency_blocker(&rig.task("borsuk/implement-i143")),
+            Some(9)
+        );
+        assert_eq!(
+            queued_order(&rig),
+            vec!["borsuk/implement-i143"],
+            "a blocked ticket with nothing behind it keeps its place"
+        );
+
+        // Ticket 144 is ready and queues behind 143, so 143 gives up its
+        // place. The slot is still busy, so neither one starts yet.
+        rig.poll(
+            vec![
+                issue(142, &["refined"]),
+                blocked(),
+                issue(9, &[]),
+                issue(144, &["refined"]),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            queued_order(&rig),
+            vec!["borsuk/implement-i144", "borsuk/implement-i143"]
+        );
+
+        // Ticket 142 closes and frees the only slot. Ticket 144 arrives
+        // ready. The blocked 143 must give up its place and the freed slot
+        // must go to 144.
+        rig.poll(
+            vec![blocked(), issue(9, &[]), issue(144, &["refined"])],
+            vec![],
+        );
+        // The cancelled session still holds its live slot until it exits.
+        rig.event(exited("borsuk/implement-i142", false, "cancelled"));
+
+        assert_eq!(rig.task("borsuk/implement-i144").state, TaskState::Running);
+        assert_eq!(
+            rig.task("borsuk/implement-i143").state,
+            TaskState::Queued,
+            "the blocked ticket still waits for #9"
+        );
+        assert_eq!(queued_order(&rig), vec!["borsuk/implement-i143"]);
+
+        // A second pass moves nothing: the order is already a fixed point.
+        let before = rig.daemon.table.order.clone();
+        rig.drive();
+        assert_eq!(rig.daemon.table.order, before);
+    }
+
+    /// A blocked ticket starts as soon as its blocker closes.
+    #[test]
+    fn a_blocked_ticket_starts_when_its_blocker_closes() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir);
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 143), 143, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let blocked = || issue_with_body(143, &["refined"], "depends on #9");
+
+        rig.poll(vec![issue(142, &["refined"]), blocked()], vec![]);
+        rig.event(started("borsuk/implement-i142", "sid-142"));
+        rig.poll(
+            vec![issue(142, &["refined"]), blocked(), issue(9, &[])],
+            vec![],
+        );
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Queued);
+
+        // #9 closes and 142 finishes in the same poll, so the slot and the
+        // dependency both clear.
+        rig.poll(vec![issue(142, &[]), blocked()], vec![linked_pr(5, 142)]);
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(
+            rig.daemon
+                .dependency_blocker(&rig.task("borsuk/implement-i143")),
+            None
+        );
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Running);
+    }
+
+    /// The wait reason names the open blocker, so the operator sees why a
+    /// queued ticket never starts.
+    #[test]
+    fn the_wait_reason_names_the_open_blocker() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let blocked = || issue_with_body(143, &["refined"], "depends on #9");
+
+        rig.poll(vec![issue(142, &["refined"]), blocked()], vec![]);
+        rig.event(started("borsuk/implement-i142", "sid-142"));
+        rig.poll(
+            vec![issue(142, &["refined"]), blocked(), issue(9, &[])],
+            vec![],
+        );
+
+        let reason = rig
+            .daemon
+            .closed_reason(&rig.task("borsuk/implement-i143"), false);
+        assert!(reason.contains("#9"), "reason: {reason}");
+    }
+
+    /// An open pull request blocks a ticket that names it. GitHub gives
+    /// issues and pull requests one number space.
+    #[test]
+    fn an_open_pull_request_blocks_the_ticket_that_names_it() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let blocked = || issue_with_body(143, &["refined"], "depends on #4");
+
+        rig.poll(vec![issue(142, &["refined"]), blocked()], vec![]);
+        rig.event(started("borsuk/implement-i142", "sid-142"));
+        rig.poll(
+            vec![issue(142, &["refined"]), blocked()],
+            vec![pr(4, true, &[])],
+        );
+
+        assert_eq!(
+            rig.daemon
+                .dependency_blocker(&rig.task("borsuk/implement-i143")),
+            Some(4)
+        );
     }
 
     #[test]

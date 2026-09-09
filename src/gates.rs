@@ -41,14 +41,45 @@ pub fn refine_ready(issue: &Issue) -> bool {
 }
 
 /// True when the issue is open, carries `refined`, does not carry
-/// `to-refine`, and every blocker named in the body is closed.
+/// `to-refine`, and every blocker named in the body is settled.
 pub fn implement_ready(snap: &RepoSnapshot, issue: &Issue) -> bool {
-    issue.open
-        && has_label(&issue.labels, REFINED)
-        && !has_label(&issue.labels, TO_REFINE)
-        && parse_blocked_by(&issue.body)
-            .iter()
-            .all(|number| !snap.issues.contains_key(number))
+    implement_labelled(issue) && unmet_blockers(snap, &issue.body).is_empty()
+}
+
+/// True when the issue is open, carries `refined`, and does not carry
+/// `to-refine`.
+///
+/// This is the implement gate without its blocker test. The two parts ask
+/// for different answers, so the daemon reads them apart. A ticket that
+/// lost the label, closed, or vanished left the stage, and its task goes
+/// away with it. A ticket that only waits for a blocker is still implement
+/// work, so its task waits in the queue and yields its place to the
+/// tickets that can run.
+pub fn implement_labelled(issue: &Issue) -> bool {
+    issue.open && has_label(&issue.labels, REFINED) && !has_label(&issue.labels, TO_REFINE)
+}
+
+/// True when `number` still blocks work in this repository.
+///
+/// GitHub gives issues and pull requests one number space, so a blocker
+/// names either kind. The snapshot holds the open items alone, so a
+/// blocker that appears in it is open, and every other blocker is
+/// settled. A settled blocker is a closed ticket, a merged or closed pull
+/// request, or an item this repository never had.
+pub fn blocker_open(snap: &RepoSnapshot, number: u64) -> bool {
+    snap.issues.contains_key(&number) || snap.prs.contains_key(&number)
+}
+
+/// The blockers of one body that are still open, in ascending order.
+///
+/// The result is empty when the body names no blocker, or when every
+/// blocker it names is settled. A caller that only needs a yes or no asks
+/// `is_empty`. A caller that must name the cause takes the first entry.
+pub fn unmet_blockers(snap: &RepoSnapshot, body: &str) -> Vec<u64> {
+    parse_blocked_by(body)
+        .into_iter()
+        .filter(|number| blocker_open(snap, *number))
+        .collect()
 }
 
 /// True when the pull request is open, still a draft, and carries no
@@ -417,6 +448,47 @@ mod tests {
             !again.iter().any(|work| work.stage == Stage::Review),
             "the open gate reports once"
         );
+    }
+
+    /// GitHub gives issues and pull requests one number space, so an open
+    /// pull request blocks the ticket that names it.
+    #[test]
+    fn an_open_pull_request_blocker_holds_the_implement_gate() {
+        let held = repo(
+            vec![issue_with_body(1, &["refined"], "blocked by #4")],
+            vec![pr(4, true, "aaa")],
+        );
+        assert!(!implement_ready(&held, &held.issues[&1]));
+        assert_eq!(unmet_blockers(&held, "blocked by #4"), vec![4]);
+
+        let merged = repo(
+            vec![issue_with_body(1, &["refined"], "blocked by #4")],
+            vec![],
+        );
+        assert!(implement_ready(&merged, &merged.issues[&1]));
+        assert!(unmet_blockers(&merged, "blocked by #4").is_empty());
+    }
+
+    /// The unmet list names every open blocker and drops the settled ones.
+    #[test]
+    fn unmet_blockers_reports_only_the_open_ones_in_order() {
+        let snap = repo(
+            vec![issue(2, &[]), issue(9, &[])],
+            vec![pr(5, false, "aaa")],
+        );
+
+        assert_eq!(
+            unmet_blockers(&snap, "blocked by #9, #2 and #7"),
+            vec![2, 9],
+            "#7 is settled, so it does not appear"
+        );
+        assert_eq!(unmet_blockers(&snap, "depends on #5"), vec![5]);
+        assert!(unmet_blockers(&snap, "depends on #7").is_empty());
+        assert!(unmet_blockers(&snap, "no phrasing here #2").is_empty());
+
+        assert!(blocker_open(&snap, 2));
+        assert!(blocker_open(&snap, 5));
+        assert!(!blocker_open(&snap, 7));
     }
 
     #[test]
