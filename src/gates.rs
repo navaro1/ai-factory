@@ -61,9 +61,10 @@ pub fn refine_ready(issue: &Issue) -> bool {
 /// row.
 ///
 /// The gate now answers one question: did the ticket enter the implement
-/// stage? A ticket that lost the label, closed, or vanished left the stage,
-/// and its task goes away with it. A ticket that waits for a blocker is
-/// still implement work. It keeps its task, and the dispatch defers it.
+/// stage? The daemon cancels the task of a ticket that lost the label,
+/// closed, or is absent, because that ticket left the stage. A ticket that
+/// waits for a blocker is still implement work. It keeps its task, and the
+/// dispatch defers that task.
 pub fn implement_ready(issue: &Issue) -> bool {
     issue.open && has_label(&issue.labels, REFINED) && !has_label(&issue.labels, TO_REFINE)
 }

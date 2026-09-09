@@ -49,8 +49,8 @@ factory creates the worktree. The agents never create it.
 ### Ticket dependencies
 
 A ticket can name the work that it waits for. Write `Blocked by #12`,
-`Blocked-by #12`, or `Depends on #12` in the ticket body. Each phrase takes a
-list, so `Depends on #4, #5 and #6` names three blockers. A blocker is open
+`Blocked-by #12`, or `Depends on #12` in the ticket body. Each phrase accepts
+a list, so `Depends on #4, #5 and #6` names three blockers. A blocker is open
 while GitHub shows it as an open ticket or an open pull request. Every other
 blocker is settled. A ticket never blocks itself, so its own number in the
 list does nothing.
@@ -80,9 +80,14 @@ tickets behind them.
 A blocked ticket keeps its task row, its `refined` label, and its attempt
 count. It does not fail. The session view of the task names the open blocker.
 
-A blocker stops a start, not a run. An agent that already works on the ticket
-finishes its run. A daemon restart is different: the restart queues every
-task again, so a blocked ticket waits for its blocker before it resumes.
+A blocked task holds nothing else back. The factory reviews a draft pull
+request that already exists for the ticket, and it accepts a chat message on
+that review.
+
+A blocker prevents the factory from starting a task. It does not stop a task
+that already runs. An agent that already implements the ticket completes its
+work. A daemon restart is different: the restart queues every task again, so
+a blocked ticket waits for its blocker before it continues.
 
 ## Install
 

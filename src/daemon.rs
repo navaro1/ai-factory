@@ -2056,7 +2056,8 @@ impl Daemon {
     /// gate can therefore open first. This guard keeps two stages off one
     /// issue at the same time. It also keeps a release behind its review.
     /// A failed prior task holds the gate too, because its stage never
-    /// finished the work.
+    /// finished the work. A parked task does not: it runs no agent, and it
+    /// cannot update GitHub, so there is no race for this guard to stop.
     fn holds_prior_stage(&self, task: &Task, prior: &Task) -> bool {
         prior.state != TaskState::Done
             && match task.stage {
@@ -2084,6 +2085,25 @@ impl Daemon {
                             .is_some_and(|prs| prs.contains(&prior.number))
                 }
             }
+            // The parked test comes last. The stage match above is a few
+            // field reads, and this one parses a ticket body, so the cheap
+            // test decides for every prior that cannot match anyway.
+            && !self.parked(prior)
+    }
+
+    /// True when the blocker rule holds this task still.
+    ///
+    /// A parked task is queued and waits for an open blocker. It has no
+    /// agent, no session, and no worktree, and the dispatch will not start
+    /// it. So it holds nothing: not the next stage of its own item, and not
+    /// a chat follow-up that shares its worktree.
+    ///
+    /// Before v0.6 a blocked ticket produced no task at all, and nothing
+    /// could be held by a task that did not exist. The task exists now, so
+    /// that the operator can see the wait. This rule keeps the rest of the
+    /// factory as it was.
+    fn parked(&self, task: &Task) -> bool {
+        task.state == TaskState::Queued && self.dependency_blocker(task).is_some()
     }
 
     /// The id of the task before this one that still owns the same work.
@@ -2115,7 +2135,7 @@ impl Daemon {
     ///
     /// The implement gate reads the same blockers, but it reads them once,
     /// on the edge that queues the task. Between that edge and the dispatch
-    /// the truth can move: a blocker reopens, the refine stage writes a new
+    /// the facts can change: a blocker reopens, the refine stage writes a new
     /// `depends on` line, or the daemon restarts and restores a task that
     /// GitHub has since blocked. This check runs on every pass, so an
     /// unmet dependency stops the start each time it is true.
@@ -2171,7 +2191,7 @@ impl Daemon {
     /// tasks that can run.
     ///
     /// A blocked task keeps its place in the insertion order for as long as
-    /// nothing moves it, so it sits in front of tickets that are ready. The
+    /// nothing moves it, so the queue places it before tickets that are ready. The
     /// dispatch walk already steps over it, but the board then shows a head
     /// of queue that never starts, and a later free ticket that waits for
     /// no stated reason. This pass states the order the dispatch already
@@ -4202,7 +4222,8 @@ impl Daemon {
     ///
     /// Two agents must never run in one worktree. A follow-up waits while
     /// another task of the same repository and exclusive worktree is active.
-    /// A `Shared` task never blocks and is never blocked.
+    /// A `Shared` task never blocks and is never blocked. A parked task runs
+    /// no agent, so it blocks nothing either.
     fn sibling_blocker(&self, task: &Task) -> Option<String> {
         let workspace = self.workspace(task);
         if !matches!(workspace, Workspace::Exclusive(_)) {
@@ -4216,6 +4237,7 @@ impl Daemon {
                     && other.repo == task.repo
                     && !other.state.is_terminal()
                     && self.workspace(other) == workspace
+                    && !self.parked(other)
             })
             .map(|other| other.id.clone())
     }
@@ -6829,6 +6851,53 @@ mod tests {
         assert_eq!(rig.job_count(), 0, "no agent starts for a blocked ticket");
         let reason = rig.daemon.closed_reason(&task, false);
         assert!(reason.contains("#9"), "reason: {reason}");
+    }
+
+    /// A parked ticket must hold nothing. Its implement task has no agent
+    /// and cannot start, so the review of a draft pull request that already
+    /// exists for the ticket must still run, and a chat follow-up on that
+    /// review must not be refused.
+    #[test]
+    fn a_blocked_ticket_does_not_freeze_the_review_of_its_pull_request() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 143),
+            143,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let mut pull = linked_pr(150, 143);
+        pull.draft = true;
+
+        rig.poll(
+            vec![
+                issue_with_body(143, &["refined"], "depends on #9"),
+                issue(9, &[]),
+            ],
+            vec![pull],
+        );
+
+        let implement = rig.task("borsuk/implement-i143");
+        assert_eq!(implement.state, TaskState::Queued, "the ticket is blocked");
+        assert_eq!(rig.daemon.dependency_blocker(&implement), Some(9));
+
+        let review = rig.task("borsuk/review-p150");
+        assert_eq!(
+            rig.daemon.prior_stage_blocker(&review),
+            None,
+            "a parked implement task holds no follow-up stage"
+        );
+        assert_eq!(
+            review.state,
+            TaskState::Running,
+            "the draft pull request is reviewed while the ticket waits"
+        );
+        assert_eq!(
+            rig.daemon.sibling_blocker(&review),
+            None,
+            "a parked task blocks no chat follow-up on its worktree"
+        );
     }
 
     /// A blocked ticket starts as soon as its blocker closes.
