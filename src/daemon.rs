@@ -785,8 +785,9 @@ impl Daemon {
         self.fail_silent_runs();
         self.poll_usage();
         self.resume_pending_chats();
-        self.bump_blocked_tasks();
-        self.dispatch_queued();
+        let blocked = self.blocked_now();
+        self.bump_blocked_tasks(&blocked);
+        self.dispatch_queued(&blocked);
         self.save_state();
         self.push_state();
     }
@@ -1971,11 +1972,11 @@ impl Daemon {
     }
 
     /// Dispatch queued tasks while the scheduler yields one.
-    fn dispatch_queued(&mut self) {
+    fn dispatch_queued(&mut self, blocked: &BTreeMap<String, Option<u64>>) {
         let mut saturated: BTreeSet<Stage> = BTreeSet::new();
         let mut failed: BTreeSet<String> = BTreeSet::new();
         loop {
-            let Some(id) = self.next_eligible(&saturated, &failed) else {
+            let Some(id) = self.next_eligible(&saturated, &failed, blocked) else {
                 break;
             };
             match self.dispatch_one(&id) {
@@ -2007,6 +2008,7 @@ impl Daemon {
         &self,
         saturated: &BTreeSet<Stage>,
         failed: &BTreeSet<String>,
+        blocked: &BTreeMap<String, Option<u64>>,
     ) -> Option<String> {
         for id in &self.table.order {
             let Some(task) = self.table.by_id.get(id) else {
@@ -2022,7 +2024,7 @@ impl Daemon {
                 || (self.restored_ids.contains(&task.id) && self.restore_repos.contains(&task.repo))
                 || self.prior_stage_active(task)
                 || self.worktree_holder(task).is_some()
-                || self.dependency_blocker(task).is_some()
+                || self.blocker_of(task, blocked).is_some()
             {
                 continue;
             }
@@ -2133,6 +2135,38 @@ impl Daemon {
         unmet_blockers(snapshot, issue).first().copied()
     }
 
+    /// The open blocker of every queued task now, by task id.
+    ///
+    /// `drive` runs on every run event, which includes every text chunk and
+    /// every tool call of every agent. The bump pass and the dispatch walk
+    /// then ask the same question about the same tasks, and the body parse
+    /// is the expensive part of the answer. So `drive` pays for it once per
+    /// pass and hands the answer to both readers.
+    ///
+    /// A `None` value means the task has no open blocker. An absent key
+    /// means the task was not queued when the pass started.
+    fn blocked_now(&self) -> BTreeMap<String, Option<u64>> {
+        self.table
+            .by_id
+            .values()
+            .filter(|task| task.state == TaskState::Queued)
+            .map(|task| (task.id.clone(), self.dependency_blocker(task)))
+            .collect()
+    }
+
+    /// The open blocker of one task, from the pass answer or fresh.
+    ///
+    /// A dispatch can requeue a task, so the walk can meet a task that was
+    /// not queued when [`Daemon::blocked_now`] ran. That task is absent
+    /// from the map, and the lookup then reads it directly. So no task
+    /// escapes the blocker check by arriving late.
+    fn blocker_of(&self, task: &Task, blocked: &BTreeMap<String, Option<u64>>) -> Option<u64> {
+        match blocked.get(&task.id) {
+            Some(found) => *found,
+            None => self.dependency_blocker(task),
+        }
+    }
+
     /// Move every queued task with an unmet dependency behind the queued
     /// tasks that can run.
     ///
@@ -2143,18 +2177,25 @@ impl Daemon {
     /// no stated reason. This pass states the order the dispatch already
     /// follows: ready tickets first, blocked tickets behind them.
     ///
-    /// The pass moves a blocked task only when a free queued task sits
-    /// behind it, so the move always buys a place for work that can run.
+    /// The pass moves a blocked task only when another queued task sits
+    /// behind it. That task is any task the blocker rule does not hold: an
+    /// unblocked ticket of this stage, or a queued task of another stage.
+    /// The second kind competes for no implement slot, so the move buys
+    /// nothing there. It still costs nothing, and it keeps one rule instead
+    /// of two. What the pass guarantees is the weaker, useful thing: no
+    /// blocked ticket stays in front of a queued task that it cannot be
+    /// waiting for.
+    ///
     /// One pass reaches the fixed point, and a second pass on the same
     /// table moves nothing. `drive` is therefore still idempotent.
-    fn bump_blocked_tasks(&mut self) {
+    fn bump_blocked_tasks(&mut self, blocked: &BTreeMap<String, Option<u64>>) {
         let queued: Vec<(String, bool)> = self
             .table
             .order
             .iter()
             .filter_map(|id| self.table.by_id.get(id))
             .filter(|task| task.state == TaskState::Queued)
-            .map(|task| (task.id.clone(), self.dependency_blocker(task).is_some()))
+            .map(|task| (task.id.clone(), self.blocker_of(task, blocked).is_some()))
             .collect();
         let free_behind = queued.iter().rposition(|(_, blocked)| !blocked);
         let Some(last_free) = free_behind else {
@@ -14216,7 +14257,8 @@ mod tests {
 
         // The dispatcher must leave the task to resume_pending_chats,
         // whatever the order of the drive steps is.
-        rig.daemon.dispatch_queued();
+        let blocked = rig.daemon.blocked_now();
+        rig.daemon.dispatch_queued(&blocked);
         assert_eq!(rig.job_count(), 3, "the dispatcher does not own the task");
 
         rig.drive();

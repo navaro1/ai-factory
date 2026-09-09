@@ -52,7 +52,12 @@ A ticket can name the work that it waits for. Write `Blocked by #12`,
 `Blocked-by #12`, or `Depends on #12` in the ticket body. Each phrase takes a
 list, so `Depends on #4, #5 and #6` names three blockers. A blocker is open
 while GitHub shows it as an open ticket or an open pull request. Every other
-blocker is settled.
+blocker is settled. A ticket never blocks itself, so its own number in the
+list does nothing.
+
+GitHub counts tickets and pull requests together, so `#42` names one item of
+either kind. Write only a number that exists. A number above the last one is
+free today, and the next pull request can take it and block your ticket.
 
 The `refined` label alone opens the implement gate. A blocked ticket
 therefore gets its task and its row on the board, and the factory then holds
