@@ -1898,8 +1898,8 @@ impl Daemon {
             // a decision to override it: the operator wrote that message
             // before the blocker opened, and the message waits with the
             // task until the blocker closes. An `AwaitingUser` task is not
-            // parked, so a live session still takes its answer.
-            if self.parked(&task) {
+            // deferred, so a live session still takes its answer.
+            if self.deferred(&task) {
                 continue;
             }
             if !matches!(
@@ -2065,7 +2065,7 @@ impl Daemon {
     /// gate can therefore open first. This guard keeps two stages off one
     /// issue at the same time. It also keeps a release behind its review.
     /// A failed prior task holds the gate too, because its stage never
-    /// finished the work. A parked task does not: it runs no agent, and it
+    /// finished the work. A deferred task does not: it runs no agent, and it
     /// cannot update GitHub, so there is no race for this guard to stop.
     fn holds_prior_stage(&self, task: &Task, prior: &Task) -> bool {
         prior.state != TaskState::Done
@@ -2094,15 +2094,15 @@ impl Daemon {
                             .is_some_and(|prs| prs.contains(&prior.number))
                 }
             }
-            // The parked test comes last. The stage match above is a few
+            // The deferred test comes last. The stage match above is a few
             // field reads, and this one parses a ticket body, so the cheap
             // test decides for every prior that cannot match anyway.
-            && !self.parked(prior)
+            && !self.deferred(prior)
     }
 
     /// True when the blocker rule holds this task still.
     ///
-    /// A parked task is queued and waits for an open blocker. It has no
+    /// A deferred task is queued and waits for an open blocker. It has no
     /// agent, no session, and no worktree, and the dispatch will not start
     /// it. So it holds nothing: not the next stage of its own item, and not
     /// a chat follow-up that shares its worktree.
@@ -2111,7 +2111,16 @@ impl Daemon {
     /// could be held by a task that did not exist. The task exists now, so
     /// that the operator can see the wait. This rule keeps the rest of the
     /// factory as it was.
-    fn parked(&self, task: &Task) -> bool {
+    ///
+    /// The name is not `parked`. The daemon already calls an idle
+    /// `AwaitingUser` session parked, and that session runs a live process.
+    /// A deferred task runs nothing.
+    ///
+    /// This reads the blockers fresh instead of the map of the current pass,
+    /// because [`Daemon::closed_reason`] reaches this path with no map to
+    /// hand. The stage match of each caller runs first, so the read happens
+    /// only for a task that can be deferred.
+    fn deferred(&self, task: &Task) -> bool {
         task.state == TaskState::Queued && self.dependency_blocker(task).is_some()
     }
 
@@ -2452,8 +2461,10 @@ impl Daemon {
     /// restart.
     ///
     /// A queued chat message names that same session, and
-    /// [`Daemon::resume_pending_chats`] discards every queued message of a
-    /// task it cannot resume. The drop therefore waits while a chat waits,
+    /// [`Daemon::resume_pending_chats`] discards the queued messages of a
+    /// task that vanished, went terminal, or lost its session. A task that
+    /// an open blocker holds keeps its messages instead. The drop therefore
+    /// waits while a chat waits,
     /// like the `Done` path and the cancel path that both keep the marker
     /// for a pending chat. The retry resumes the saved session instead, and
     /// the operator sees a stuck row when that resume fails again.
@@ -4231,8 +4242,8 @@ impl Daemon {
     ///
     /// Two agents must never run in one worktree. A follow-up waits while
     /// another task of the same repository and exclusive worktree is active.
-    /// A `Shared` task never blocks and is never blocked. A parked task runs
-    /// no agent, so it blocks nothing either.
+    /// A `Shared` task never blocks and is never blocked. A deferred task
+    /// runs no agent, so it blocks nothing either.
     fn sibling_blocker(&self, task: &Task) -> Option<String> {
         let workspace = self.workspace(task);
         if !matches!(workspace, Workspace::Exclusive(_)) {
@@ -4246,7 +4257,7 @@ impl Daemon {
                     && other.repo == task.repo
                     && !other.state.is_terminal()
                     && self.workspace(other) == workspace
-                    && !self.parked(other)
+                    && !self.deferred(other)
             })
             .map(|other| other.id.clone())
     }
