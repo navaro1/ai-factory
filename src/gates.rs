@@ -391,7 +391,10 @@ mod tests {
     #[test]
     fn implement_takes_refined_issues_without_to_refine() {
         assert!(implement_ready(&issue(1, &["refined"]), &names()));
-        assert!(!implement_ready(&issue(1, &["refined", "to-refine"]), &names()));
+        assert!(!implement_ready(
+            &issue(1, &["refined", "to-refine"]),
+            &names()
+        ));
         assert!(!implement_ready(&issue(1, &[]), &names()));
         let mut closed = issue(1, &["refined"]);
         closed.open = false;
@@ -455,7 +458,10 @@ mod tests {
         let mut tracker = GateTracker::new();
         let mut waiting = pr(7, true, "aaa");
         waiting.labels = vec!["needs-human".to_string()];
-        assert!(!review_ready(&waiting, &names()), "the label closes the review gate");
+        assert!(
+            !review_ready(&waiting, &names()),
+            "the label closes the review gate"
+        );
 
         let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![waiting.clone()]), &names());
         assert!(
@@ -477,7 +483,11 @@ mod tests {
         // goes from false to true and reports the work exactly once.
         let mut answered = pushed.clone();
         answered.labels.clear();
-        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![answered.clone()]), &names());
+        let fired = tracker.observe(
+            "borsuk",
+            &repo(Vec::new(), vec![answered.clone()]),
+            &names(),
+        );
         let review: Vec<&ReadyWork> = fired
             .iter()
             .filter(|work| work.stage == Stage::Review)
@@ -640,7 +650,9 @@ mod tests {
         let draft = |sha: &str| repo(vec![], vec![pr(5, true, sha)]);
 
         assert_eq!(tracker.observe("borsuk", &draft("aaa"), &names()).len(), 1);
-        assert!(tracker.observe("borsuk", &draft("aaa"), &names()).is_empty());
+        assert!(tracker
+            .observe("borsuk", &draft("aaa"), &names())
+            .is_empty());
 
         let again = tracker.observe("borsuk", &draft("bbb"), &names());
         assert_eq!(again.len(), 1);
@@ -656,7 +668,9 @@ mod tests {
         renamed.head_ref = "aif/borsuk/issue-142".to_string();
 
         assert_eq!(
-            tracker.observe("borsuk", &repo(vec![], vec![first]), &names()).len(),
+            tracker
+                .observe("borsuk", &repo(vec![], vec![first]), &names())
+                .len(),
             1
         );
         assert_eq!(

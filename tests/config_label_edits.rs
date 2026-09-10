@@ -47,8 +47,11 @@ fn label_edit(repository: Option<&str>, pairs: &[(LabelKey, Option<&str>)]) -> S
 
 #[test]
 fn a_global_label_edit_creates_the_table_and_parses_back() {
-    let text = edit_config_text(BASE, &label_edit(None, &[(LabelKey::Epic, Some("type:epic"))]))
-        .expect("the edit must apply");
+    let text = edit_config_text(
+        BASE,
+        &label_edit(None, &[(LabelKey::Epic, Some("type:epic"))]),
+    )
+    .expect("the edit must apply");
     assert!(text.contains("[labels]"), "{text}");
     let config = Config::parse(&text).expect("the result must parse");
     assert_eq!(config.resolved_labels(None).epic, "type:epic");
@@ -113,7 +116,9 @@ fn a_repository_label_table_goes_away_when_its_last_key_goes() {
         "the empty table must go away: {cleared}"
     );
     assert_eq!(
-        Config::parse(&cleared).unwrap().resolved_labels(Some("demo")),
+        Config::parse(&cleared)
+            .unwrap()
+            .resolved_labels(Some("demo")),
         LabelNames::default()
     );
 }
@@ -137,8 +142,11 @@ fn a_label_edit_for_an_absent_repository_fails() {
 fn a_label_edit_that_creates_a_collision_is_refused_by_the_writer() {
     let error = format!(
         "{:#}",
-        edit_config_text(BASE, &label_edit(None, &[(LabelKey::Epic, Some("refined"))]))
-            .expect_err("a collision must fail the edit")
+        edit_config_text(
+            BASE,
+            &label_edit(None, &[(LabelKey::Epic, Some("refined"))])
+        )
+        .expect_err("a collision must fail the edit")
     );
     assert!(error.contains("refined"), "{error}");
     assert!(error.contains("epic"), "{error}");
@@ -148,8 +156,11 @@ fn a_label_edit_that_creates_a_collision_is_refused_by_the_writer() {
 fn every_key_survives_a_write_and_a_read() {
     let mut text = BASE.to_string();
     for key in LabelKey::ALL {
-        text = edit_config_text(&text, &label_edit(None, &[(key, Some(&format!("n-{key}")))]))
-            .unwrap_or_else(|error| panic!("{key}: {error:#}"));
+        text = edit_config_text(
+            &text,
+            &label_edit(None, &[(key, Some(&format!("n-{key}")))]),
+        )
+        .unwrap_or_else(|error| panic!("{key}: {error:#}"));
     }
     let config = Config::parse(&text).expect("every key together must parse");
     for key in LabelKey::ALL {

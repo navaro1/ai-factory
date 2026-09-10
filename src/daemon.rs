@@ -37,9 +37,7 @@ use crate::config::{
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
-use crate::gates::{
-    implement_ready, review_ready, unmet_blockers, GateTracker, ReadyWork,
-};
+use crate::gates::{implement_ready, review_ready, unmet_blockers, GateTracker, ReadyWork};
 use crate::gh::GhClient;
 use crate::labels::{LabelKey, LabelNames};
 use crate::links::Links;
@@ -2666,17 +2664,13 @@ impl Daemon {
             return;
         }
         if task.stage == Stage::Refine {
-            let transitioned = self
-                .snapshot
-                .repos
-                .get(&task.repo)
-                .is_some_and(|fresh| {
-                    refine_transitioned(
-                        fresh,
-                        task.number,
-                        &self.config.resolved_labels(Some(&task.repo)),
-                    )
-                });
+            let transitioned = self.snapshot.repos.get(&task.repo).is_some_and(|fresh| {
+                refine_transitioned(
+                    fresh,
+                    task.number,
+                    &self.config.resolved_labels(Some(&task.repo)),
+                )
+            });
             if ok && transitioned {
                 self.stop_session(id, "cannot stop the completed refine session");
                 self.complete_task(&task);
@@ -5597,7 +5591,10 @@ impl Daemon {
             ("label_needs_human", names.needs_human.clone()),
             ("label_release_stacked", names.release_stacked.clone()),
             ("label_complexity", names.complexity_prefix.clone()),
-            ("label_review_complexity", names.review_complexity_prefix.clone()),
+            (
+                "label_review_complexity",
+                names.review_complexity_prefix.clone(),
+            ),
         ])
     }
 
@@ -5890,11 +5887,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::config::{ExecutionRole, Harness, RoleOverride, RoleSettings, StageConfig};
-    use crate::labels::{
-        DEFAULT_EPIC as EPIC, DEFAULT_NEEDS_HUMAN as NEEDS_HUMAN_LABEL,
-        DEFAULT_REFINED as REFINED, DEFAULT_TO_REFINE as TO_REFINE,
-    };
     use crate::exec::{Call, CmdOut, ScriptExec};
+    use crate::labels::{DEFAULT_EPIC as EPIC, DEFAULT_NEEDS_HUMAN as NEEDS_HUMAN_LABEL};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use crate::prompts::{
         scan_placeholders, IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT,
@@ -14207,10 +14201,7 @@ mod tests {
 
         // The run created the sub-tickets and marked the parent an epic.
         rig.poll(
-            vec![
-                issue(142, &[EPIC]),
-                issue(143, &["refined", "chunk"]),
-            ],
+            vec![issue(142, &[EPIC]), issue(143, &["refined", "chunk"])],
             vec![],
         );
 

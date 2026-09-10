@@ -11,8 +11,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::exec::{Exec, RealExec};
-use crate::model::Stage;
 use crate::labels::{LabelKey, LabelNames};
+use crate::model::Stage;
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -663,11 +663,7 @@ impl Config {
             let raw_overrides = raw_repo.overrides();
             let raw_tag_route_overrides = raw_repo.tag_routes.entries();
             let label_overrides = raw_repo.labels.overrides(&format!("repo.{alias}.labels"))?;
-            apply_label_overrides(
-                &labels,
-                &label_overrides,
-                &format!("repo.{alias}.labels"),
-            )?;
+            apply_label_overrides(&labels, &label_overrides, &format!("repo.{alias}.labels"))?;
             let mut lanes = BTreeMap::new();
             for (name, count) in raw_repo.lanes {
                 let stage = Stage::from_str(&name)
