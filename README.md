@@ -5,6 +5,7 @@ repositories. A daemon (a background program that runs without a terminal)
 does the work. A terminal user interface (UI) shows the work and takes your
 decisions.
 GitHub is the source of truth. AI Factory keeps no journal and no database.
+The stance of the factory lives in [docs/STANCE.md](docs/STANCE.md).
 
 ## The four stages
 
