@@ -3214,6 +3214,7 @@ mod tests {
             input: InputMode::Live,
             queued_messages: 0,
             binding: None,
+            hold: None,
         }
     }
 

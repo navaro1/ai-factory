@@ -166,6 +166,11 @@ pub struct TheoryView {
     /// request number.
     #[serde(default)]
     pub deltas: Vec<DeltaView>,
+    /// The open record count and the window cap of the repository. A
+    /// cap of zero means the view carries no window, so the strip draws
+    /// no gauge.
+    #[serde(default)]
+    pub window: (usize, usize),
 }
 
 /// Whether one delta still waits for the operator.
@@ -823,6 +828,7 @@ impl StateInput<'_> {
                         tag_route: binding.role.tag_route.clone(),
                     }),
                     queued_messages: 0,
+                    hold: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1517,6 +1523,11 @@ pub struct TaskView {
     /// wire when empty, so an older daemon push still parses.
     #[serde(default)]
     pub binding: Option<RoleBindingView>,
+    /// Why the dispatch holds this queued task back, when one does. The
+    /// daemon sets `window full` on an implement task the theory window
+    /// refuses, and clears it when the window opens again.
+    #[serde(default)]
+    pub hold: Option<String>,
 }
 
 /// One release train in the state view.
@@ -2843,6 +2854,7 @@ mod tests {
                         lint: vec!["features/x.md: area nope unknown".to_string()],
                     },
                 )]),
+                window: (2, 3),
             },
         );
         let view = StateView {
@@ -3133,6 +3145,7 @@ mod tests {
             input: InputMode::NextTurn,
             queued_messages: 2,
             binding: None,
+            hold: None,
         });
         let text = serde_json::to_string(&Push::State(view.clone())).unwrap();
         assert!(
@@ -3166,15 +3179,17 @@ mod tests {
                     matches: Vec::new(),
                 }),
             }),
+            hold: None,
         };
 
         let text = serde_json::to_string(&task).unwrap();
         assert_eq!(serde_json::from_str::<TaskView>(&text).unwrap(), task);
 
-        // An old daemon ships no binding field; the parse falls back to
-        // none and the header keeps today's line.
+        // An old daemon ships no binding and no hold field; the parse
+        // falls back to none and the header keeps today's line.
         let mut old = serde_json::to_value(&task).unwrap();
         old.as_object_mut().unwrap().remove("binding");
+        old.as_object_mut().unwrap().remove("hold");
         let parsed = serde_json::from_value::<TaskView>(old).unwrap();
         let mut expected = task;
         expected.binding = None;
@@ -3482,6 +3497,7 @@ mod tests {
             input: InputMode::NextTurn,
             queued_messages: 1,
             binding: None,
+            hold: None,
         });
         server.publish(second.clone());
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(second.clone()));

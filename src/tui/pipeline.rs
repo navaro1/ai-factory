@@ -2165,7 +2165,8 @@ fn release_pr_title(state: &StateView, repo: &str, pr: u64) -> Option<String> {
 /// state, because it cannot start. A task in any other state keeps its true
 /// state: a pause blocks starts, it does not stop running tasks. A count
 /// above zero of queued messages adds a badge, so a waiting message stays
-/// visible from the board.
+/// visible from the board. A queued task the dispatch holds names the hold
+/// at the end of the row, so the cause of the wait stays visible.
 fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if matches!(task.state, TaskState::Queued) && task_pause_override(state, task) == Some(false) {
@@ -2201,6 +2202,9 @@ fn ticket_spans(state: &StateView, task: &TaskView) -> Vec<Span<'static>> {
     }
     if let Some(badge) = link_badge(state, task) {
         spans.push(Span::styled(format!(" · {badge}"), THEME.dim()));
+    }
+    if let Some(hold) = &task.hold {
+        spans.push(Span::styled(format!(" · {hold}"), THEME.dim()));
     }
     spans
 }
@@ -2344,6 +2348,7 @@ fn task(
         input: crate::sock::InputMode::Live,
         queued_messages: 0,
         binding: None,
+        hold: None,
     }
 }
 
@@ -3765,6 +3770,28 @@ mod tests {
 
         // A ticket without queued messages shows no badge.
         assert!(text.contains("queued · i142"));
+    }
+
+    /// A held implement task names the hold on its board row.
+    #[test]
+    fn a_held_implement_task_shows_the_hold_on_the_board() {
+        let mut state = sample_view();
+        state.tasks[3].hold = Some(crate::daemon::WINDOW_FULL_HOLD.to_string());
+        let mut app = App {
+            state: Some(state),
+            connected: true,
+            ..App::default()
+        };
+        let text = render_to_size(&mut app, 200, 24);
+        assert!(text.contains("queued · i7 · window full"), "board: {text}");
+
+        // A task without a hold names no hold.
+        let mut app = App {
+            state: Some(sample_view()),
+            connected: true,
+            ..App::default()
+        };
+        assert!(!render_to_string(&mut app).contains("window full"));
     }
 
     #[test]

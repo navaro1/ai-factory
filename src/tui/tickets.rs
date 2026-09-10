@@ -1767,6 +1767,7 @@ mod tests {
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
             binding: None,
+            hold: None,
         }
     }
 
