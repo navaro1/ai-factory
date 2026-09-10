@@ -104,6 +104,73 @@ impl Entry {
     }
 }
 
+impl Model {
+    /// The slice of this model over `areas`, in file order.
+    ///
+    /// Every name is the id of a boundary entry. The slice holds those
+    /// boundaries, the states their sides name, every transition that
+    /// touches one of those states, and every invariant and failure that
+    /// names one of them. It then takes one hop: every boundary those
+    /// invariants and failures touch. A transition out of the area keeps
+    /// its own entry, and the state it leads to stays out. A boundary
+    /// that only shares a side name stays out, because a shared region
+    /// name is not a relation.
+    pub fn slice(&self, areas: &[&str]) -> Model {
+        let mut names: BTreeSet<&str> = areas.iter().copied().collect();
+        for entry in &self.entries {
+            if let Entry::Boundary { id, sides, .. } = entry {
+                if areas.contains(&id.as_str()) {
+                    names.extend(sides.iter().map(String::as_str));
+                }
+            }
+        }
+        let mut kept: BTreeSet<&str> = BTreeSet::new();
+        for entry in &self.entries {
+            let take = match entry {
+                Entry::Boundary { id, .. } | Entry::State { id, .. } => names.contains(id.as_str()),
+                Entry::Transition { from, to, .. } => {
+                    names.contains(from.as_str()) || names.contains(to.as_str())
+                }
+                Entry::Invariant { constrains, .. } => {
+                    constrains.iter().any(|name| names.contains(name.as_str()))
+                }
+                Entry::Failure { crosses, .. } => names.contains(crosses.as_str()),
+            };
+            if take {
+                kept.insert(entry.id());
+            }
+        }
+        let mut touched: BTreeSet<&str> = BTreeSet::new();
+        for entry in &self.entries {
+            if !kept.contains(entry.id()) {
+                continue;
+            }
+            match entry {
+                Entry::Invariant { constrains, .. } => {
+                    touched.extend(constrains.iter().map(String::as_str));
+                }
+                Entry::Failure { crosses, .. } => {
+                    touched.insert(crosses.as_str());
+                }
+                _ => {}
+            }
+        }
+        for entry in &self.entries {
+            if matches!(entry, Entry::Boundary { .. }) && touched.contains(entry.id()) {
+                kept.insert(entry.id());
+            }
+        }
+        Model {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| kept.contains(entry.id()))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 /// One theory error. `entry` names the offending entry when one exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelError {
@@ -541,6 +608,123 @@ mod tests {
         let parsed = parse("not toml [").expect_err("the broken file must fail");
         assert_eq!(parsed.entry, None);
         assert!(parsed.message.starts_with("invalid TOML: "));
+    }
+
+    /// A model with two areas, their states, and one invariant that
+    /// crosses both.
+    fn two_area_model() -> Model {
+        let text = format!(
+            "{}{}{}{}{}{}",
+            entry("state", "S-in", ""),
+            entry("state", "S-out", ""),
+            entry("state", "S-far", ""),
+            entry(
+                "boundary",
+                "B-1",
+                "sides = [\"S-in\", \"S-out\"]\npaths = [\"src/one/**\"]"
+            ),
+            entry(
+                "boundary",
+                "B-2",
+                "sides = [\"S-far\", \"S-in\"]\npaths = [\"src/two/**\"]"
+            ),
+            entry("invariant", "I-1", "constrains = [\"B-1\", \"B-2\"]"),
+        );
+        parse(&text).expect("the two-area model must parse")
+    }
+
+    /// The entry ids of one slice, in file order.
+    fn slice_ids(model: &Model, areas: &[&str]) -> Vec<String> {
+        model
+            .slice(areas)
+            .entries
+            .iter()
+            .map(|entry| entry.id().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn slice_takes_one_area_its_states_and_one_hop_to_the_crossed_boundary() {
+        let model = two_area_model();
+
+        assert_eq!(
+            slice_ids(&model, &["B-1"]),
+            ["S-in", "S-out", "B-1", "B-2", "I-1"]
+        );
+    }
+
+    #[test]
+    fn slice_leaves_out_the_other_areas_states_and_takes_no_second_hop() {
+        let model = two_area_model();
+
+        let near = slice_ids(&model, &["B-1"]);
+        assert!(
+            !near.iter().any(|id| id == "S-far"),
+            "the other area's state stays out"
+        );
+
+        let far = slice_ids(&model, &["B-2"]);
+        assert_eq!(far, ["S-in", "S-far", "B-1", "B-2", "I-1"]);
+        assert!(
+            !far.iter().any(|id| id == "S-out"),
+            "the hop takes the boundary, not its states"
+        );
+    }
+
+    #[test]
+    fn slice_keeps_an_outbound_transition_and_leaves_the_state_it_leads_to_out() {
+        let text = format!(
+            "{}{}{}{}{}",
+            entry("state", "S-in", ""),
+            entry("state", "S-out", ""),
+            entry("state", "S-far", ""),
+            entry(
+                "boundary",
+                "B-1",
+                "sides = [\"S-in\", \"S-out\"]\npaths = [\"src/one/**\"]"
+            ),
+            entry("transition", "T-1", "from = \"S-out\"\nto = \"S-far\""),
+        );
+        let model = parse(&text).expect("the outbound model must parse");
+
+        let ids = slice_ids(&model, &["B-1"]);
+
+        assert_eq!(ids, ["S-in", "S-out", "B-1", "T-1"]);
+        assert!(
+            !ids.iter().any(|id| id == "S-far"),
+            "the state the transition leads to stays out"
+        );
+    }
+
+    #[test]
+    fn slice_over_no_area_is_empty_and_a_failure_carries_its_boundary() {
+        let model = two_area_model();
+        assert!(slice_ids(&model, &[]).is_empty());
+        assert!(slice_ids(&model, &["B-9"]).is_empty());
+
+        let text = format!(
+            "{}{}{}{}",
+            entry("state", "S-in", ""),
+            entry(
+                "boundary",
+                "B-1",
+                "sides = [\"S-in\", \"S-in\"]\npaths = [\"src/one/**\"]"
+            ),
+            entry(
+                "boundary",
+                "B-2",
+                "sides = [\"S-far\", \"S-far\"]\npaths = [\"src/two/**\"]"
+            ),
+            entry("failure", "F-1", "crosses = \"B-1\""),
+        );
+        let other = parse(&text).expect("the failure model must parse");
+
+        assert_eq!(
+            slice_ids(&other, &["B-2"]),
+            ["B-2"],
+            "the failure of the other boundary stays out"
+        );
+        assert_eq!(slice_ids(&other, &["B-1"]), ["S-in", "B-1", "F-1"]);
     }
 
     #[test]

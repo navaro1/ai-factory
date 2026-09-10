@@ -43,7 +43,7 @@ use crate::gates::{
 };
 use crate::gh::{self, GhClient};
 use crate::links::Links;
-use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
+use crate::model::{Issue, ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{self, RESTART_NOTICE, SETUP_BODY};
 #[cfg(test)]
@@ -6151,9 +6151,8 @@ impl Daemon {
     /// the criteria and the plan the contract traces to. Every other pull
     /// request keeps the behaviour it had before the governor.
     ///
-    /// The context comes from the first linked ticket. C11 widens the
-    /// check to the rest of its rules and to a pull request that closes
-    /// several tickets.
+    /// The context unions every linked ticket, because one pull request
+    /// can close several and each carries its own criteria and plan.
     fn body_finding(&self, alias: &str, number: u64) -> Option<contract::Finding> {
         let repo_cfg = self.config.repos.get(alias)?.clone();
         if !repo_cfg.theory.governor.is_on() {
@@ -6161,13 +6160,14 @@ impl Daemon {
         }
         let snapshot = self.snapshot.repos.get(alias)?;
         let pull = snapshot.prs.get(&number)?;
-        let ticket = self
-            .links
-            .get(alias)
-            .map(|links| links.tickets_of(number))
-            .unwrap_or_default()
-            .first()
-            .and_then(|ticket| snapshot.issues.get(ticket))?;
+        let tickets: Vec<&Issue> = self
+            .linked_tickets(alias, number)
+            .iter()
+            .filter_map(|ticket| snapshot.issues.get(ticket))
+            .collect();
+        if tickets.is_empty() {
+            return None;
+        }
         let cache = self.theory_models.get(alias)?;
         let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
             return None;
@@ -6202,15 +6202,29 @@ impl Daemon {
                 }
             }
         }
-        let (criteria, _findings) = contract::parse_criteria(&ticket.body);
+        let mut criteria: Vec<contract::Criterion> = Vec::new();
+        let mut owned_paths: Vec<String> = Vec::new();
+        let mut names_dependency = false;
+        for ticket in &tickets {
+            let (parsed, _findings) = contract::parse_criteria(&ticket.body);
+            for criterion in parsed {
+                if !criteria.iter().any(|seen| seen.id == criterion.id) {
+                    criteria.push(criterion);
+                }
+            }
+            for path in contract::owned_paths(&ticket.body) {
+                push_once(&mut owned_paths, path);
+            }
+            names_dependency |= contract::names_dependency(&ticket.body);
+        }
         let ctx = contract::ContractContext {
             criteria,
             features,
             areas,
-            owned_paths: contract::owned_paths(&ticket.body),
+            owned_paths,
             changed_paths,
             manifests: &contract::MANIFESTS,
-            ticket_names_dependency: contract::names_dependency(&ticket.body),
+            ticket_names_dependency: names_dependency,
         };
         records::check_pr(&pull.body, &pull.head_ref, &ctx).err()
     }
@@ -8062,11 +8076,19 @@ impl Daemon {
             return Ok(binding.role.clone());
         }
         let binding = self.current_task_role(task)?;
+        // The model commit is the theory checkout commit the cache was
+        // read at. An ungoverned repository holds no cache, so the
+        // binding keeps `None` and v0.6 behaviour holds.
+        let model_commit = self
+            .theory_models
+            .get(&task.repo)
+            .map(|cache| cache.commit.clone())
+            .filter(|commit| !commit.is_empty());
         self.role_bindings.insert(
             task.id.clone(),
             TaskBinding {
                 role: binding.clone(),
-                model_commit: None,
+                model_commit,
             },
         );
         let state = self.collect_state();
@@ -8293,20 +8315,16 @@ impl Daemon {
         };
         // The theory placeholders render only for a governed repository;
         // with the governor off v0.6 behaviour holds and no git call runs.
-        // Only a shadow-mode repository fills `{why_rule}`, because only
-        // there does the code pull request hide the model.
-        let (model_text, skills_text, why_rule) = if repo_cfg.theory.governor.is_on() {
-            let why_rule = match repo_cfg.theory_repo() {
-                Some(_) => WHY_RULE_SHADOW.to_string(),
-                None => String::new(),
-            };
-            (
-                self.model_entries(&task.repo),
-                self.skills_slice(task, &repo_cfg.path, worktree),
-                why_rule,
-            )
+        let (model_text, prediction_text, skills_text) = if repo_cfg.theory.governor.is_on() {
+            self.theory_values(task, &repo_cfg.path, worktree)
         } else {
             (String::new(), String::new(), String::new())
+        };
+        // Only a shadow-mode repository fills `{why_rule}`, because only
+        // there does the code pull request hide the model.
+        let why_rule = match repo_cfg.theory_repo() {
+            Some(_) if repo_cfg.theory.governor.is_on() => WHY_RULE_SHADOW.to_string(),
+            _ => String::new(),
         };
         Ok(vec![
             ("repo", task.repo.clone()),
@@ -8320,8 +8338,8 @@ impl Daemon {
             ("pr_numbers", pr_numbers),
             ("pr_count", pr_count),
             ("model", model_text),
-            // Predictions do not exist yet; the later chunks fill these.
-            ("prediction", String::new()),
+            ("prediction", prediction_text),
+            // The comparison arrives with the delta of C12.
             ("comparison", String::new()),
             ("skills", skills_text),
             ("rules", String::new()),
@@ -8335,36 +8353,193 @@ impl Daemon {
         self.theory_models
             .get(repo)
             .and_then(|cache| cache.model.as_ref().ok())
-            .map(|model| {
-                model
-                    .entries
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "- {} ({}): {}",
-                            entry.id(),
-                            entry.kind_name(),
-                            entry.statement()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
+            .map(entry_lines)
             .unwrap_or_default()
+    }
+
+    /// The `{model}`, `{prediction}`, and `{skills}` values of one task.
+    ///
+    /// One area set feeds the model slice and the skills slice, so both
+    /// blocks of one prompt describe the same areas. A record with no
+    /// prediction keeps the whole model and every area, so a `verify-skill`
+    /// ticket still gets a slice.
+    fn theory_values(
+        &self,
+        task: &Task,
+        repo_path: &Path,
+        worktree: &Path,
+    ) -> (String, String, String) {
+        let names = self.slice_areas(task, repo_path, worktree);
+        let verify = self
+            .theory_models
+            .get(&task.repo)
+            .and_then(|cache| cache.verify.as_ref().ok());
+        let boundaries = names
+            .model
+            .as_ref()
+            .zip(verify)
+            .map(|(names, verify)| resolve_areas(names, verify).1);
+        let areas = names
+            .skills
+            .as_ref()
+            .zip(verify)
+            .map(|(names, verify)| resolve_areas(names, verify).0);
+        (
+            self.model_slice(&task.repo, boundaries.as_deref()),
+            self.prediction_text(task),
+            self.skills_slice(task, areas.as_deref()),
+        )
+    }
+
+    /// The area names the two slices of one stage prompt take.
+    ///
+    /// Refine takes the short prediction's areas for both. Implement
+    /// takes the full prediction's areas for both. Review parts the two:
+    /// the skills slice takes the areas of
+    /// `git diff --name-only <base>...<head>` alone, because requirement
+    /// R9 of v0.8 binds the run skills to what the diff touched, and the
+    /// model slice adds the areas every linked ticket predicted. A review
+    /// whose diff matches no boundary and whose tickets predicted nothing
+    /// leaves the model whole, the way v0.8 rendered it. A name is an
+    /// area of `theory/verify.toml` or a boundary of the model, as a
+    /// prediction writes it.
+    fn slice_areas(&self, task: &Task, repo_path: &Path, worktree: &Path) -> SliceAreas {
+        let Some(cache) = self.theory_models.get(&task.repo) else {
+            return SliceAreas::whole();
+        };
+        let (Ok(model), Ok(verify)) = (&cache.model, &cache.verify) else {
+            return SliceAreas::whole();
+        };
+        match task.stage {
+            Stage::Refine => match self
+                .record_view(&task.repo, task.number)
+                .and_then(|view| view.short.as_ref())
+            {
+                Some(short) => SliceAreas::shared(short.areas.clone()),
+                None => SliceAreas::whole(),
+            },
+            Stage::Implement => match self.record_view(&task.repo, task.number) {
+                Some(view) if view.short.is_some() || view.full.is_some() => {
+                    SliceAreas::shared(predicted_areas(view))
+                }
+                _ => SliceAreas::whole(),
+            },
+            Stage::Review => {
+                let mut union: Vec<String> = Vec::new();
+                for ticket in self.linked_tickets(&task.repo, task.number) {
+                    if let Some(view) = self.record_view(&task.repo, ticket) {
+                        for name in predicted_areas(view) {
+                            push_once(&mut union, name);
+                        }
+                    }
+                }
+                let paths = self.diff_paths(repo_path, worktree);
+                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                let touched: Vec<String> = verify
+                    .areas_for_paths(model, &refs)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                for area in &touched {
+                    push_once(&mut union, area.clone());
+                }
+                SliceAreas {
+                    model: (!union.is_empty()).then_some(union),
+                    skills: Some(touched),
+                }
+            }
+            Stage::Release => SliceAreas::whole(),
+        }
+    }
+
+    /// The theory record blocks of one ticket, when the daemon read them.
+    fn record_view(&self, alias: &str, ticket: u64) -> Option<&RecordView> {
+        self.theory_blocks
+            .get(&(alias.to_string(), RecordKey::Issue(ticket).key_text()))
+    }
+
+    /// The tickets one pull request closes.
+    fn linked_tickets(&self, alias: &str, number: u64) -> Vec<u64> {
+        self.links
+            .get(alias)
+            .map(|links| links.tickets_of(number))
+            .unwrap_or_default()
+    }
+
+    /// The `{model}` value of one task: the cached entries as prompt
+    /// lines, cut to the slice of `boundaries` when the record predicted
+    /// some.
+    fn model_slice(&self, repo: &str, boundaries: Option<&[String]>) -> String {
+        let Some(model) = self
+            .theory_models
+            .get(repo)
+            .and_then(|cache| cache.model.as_ref().ok())
+        else {
+            return String::new();
+        };
+        match boundaries {
+            None => entry_lines(model),
+            Some(names) => {
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                entry_lines(&model.slice(&refs))
+            }
+        }
+    }
+
+    /// The `{prediction}` value of one review task.
+    ///
+    /// Each ticket the pull request closes contributes one block: the
+    /// short claim with its areas, then the five slots of the full
+    /// prediction with their tags. A run with no prediction at all reads
+    /// `none`, and every other stage renders empty.
+    fn prediction_text(&self, task: &Task) -> String {
+        if task.stage != Stage::Review {
+            return String::new();
+        }
+        let mut blocks: Vec<String> = Vec::new();
+        for ticket in self.linked_tickets(&task.repo, task.number) {
+            let Some(view) = self.record_view(&task.repo, ticket) else {
+                continue;
+            };
+            let mut lines = vec![format!("ticket #{ticket}")];
+            if let Some(short) = &view.short {
+                lines.push(format!("short: {}", short.text));
+                lines.push(format!("areas: {}", name_list(&short.areas)));
+            }
+            if let Some(full) = &view.full {
+                for slot in &full.slots {
+                    lines.push(format!(
+                        "{} ({}): {}",
+                        slot.name,
+                        slot.tag.name(),
+                        name_list(&slot.entries)
+                    ));
+                }
+            }
+            if lines.len() > 1 {
+                blocks.push(lines.join("\n"));
+            }
+        }
+        if blocks.is_empty() {
+            return "none".to_string();
+        }
+        blocks.join("\n\n")
     }
 
     /// The `{skills}` value of one task: the slice of requirement R9 over
     /// the areas the stage names.
     ///
-    /// Refine and implement slice over every area of `verify.toml`,
-    /// because predictions do not exist yet. Review slices over the areas
-    /// of the PR diff. A repository whose theory did not read renders an
-    /// empty block.
-    fn skills_slice(&self, task: &Task, repo_path: &Path, worktree: &Path) -> String {
+    /// The areas come from [`Daemon::slice_areas`]. A record with no
+    /// prediction slices over every area of `verify.toml`, and a
+    /// repository whose theory did not read renders an empty block.
+    fn skills_slice(&self, task: &Task, areas: Option<&[String]>) -> String {
         let Some(cache) = self.theory_models.get(&task.repo) else {
             return String::new();
         };
-        let (Ok(model), Ok(verify)) = (&cache.model, &cache.verify) else {
+        if cache.model.is_err() {
+            return String::new();
+        }
+        let Ok(verify) = &cache.verify else {
             return String::new();
         };
         let Some(skills) = self.theory_skills.get(&task.repo) else {
@@ -8373,13 +8548,9 @@ impl Daemon {
         let Ok(set) = &skills.skills else {
             return String::new();
         };
-        let areas: Vec<&str> = match task.stage {
-            Stage::Review => {
-                let paths = self.diff_paths(repo_path, worktree);
-                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-                verify.areas_for_paths(model, &refs)
-            }
-            _ => verify.areas.iter().map(|area| area.id.as_str()).collect(),
+        let areas: Vec<&str> = match areas {
+            Some(names) => names.iter().map(String::as_str).collect(),
+            None => verify.areas.iter().map(|area| area.id.as_str()).collect(),
         };
         let stage = match task.stage {
             Stage::Refine => skills::SliceStage::Refine {
@@ -8805,6 +8976,116 @@ impl Daemon {
     }
 }
 
+/// The area names the model slice and the skills slice of one prompt take.
+///
+/// A `None` field is the v0.8 fallback: the whole model for `model`, and
+/// every area of the verification map for `skills`.
+struct SliceAreas {
+    /// The names the `{model}` slice takes.
+    model: Option<Vec<String>>,
+    /// The names the `{skills}` slice takes.
+    skills: Option<Vec<String>>,
+}
+
+impl SliceAreas {
+    /// The whole model and every area, for a record with no prediction.
+    fn whole() -> Self {
+        Self {
+            model: None,
+            skills: None,
+        }
+    }
+
+    /// One name list for both slices.
+    fn shared(names: Vec<String>) -> Self {
+        Self {
+            model: Some(names.clone()),
+            skills: Some(names),
+        }
+    }
+}
+
+/// The entries of one model as prompt lines.
+fn entry_lines(model: &Model) -> String {
+    model
+        .entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "- {} ({}): {}",
+                entry.id(),
+                entry.kind_name(),
+                entry.statement()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The area names one record predicts.
+///
+/// The short prediction names the areas the change touches, and the
+/// `other-areas` slot of the full prediction names the areas it can also
+/// reach. Their union is the full prediction's areas, and a record with
+/// no full prediction leaves the short prediction's areas alone.
+fn predicted_areas(view: &RecordView) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for short in view.short.iter() {
+        for area in &short.areas {
+            push_once(&mut names, area.clone());
+        }
+    }
+    for slot in view.full.iter().flat_map(|full| full.slots.iter()) {
+        if slot.name == PREDICTION_OTHER_AREAS {
+            for area in &slot.entries {
+                push_once(&mut names, area.clone());
+            }
+        }
+    }
+    names
+}
+
+/// The verification areas and the model boundaries a set of predicted
+/// names covers, each list in first-sight order and without a repeat.
+///
+/// A name is an area of `theory/verify.toml` or a boundary of the model.
+/// An area name carries its boundary, and a boundary name carries every
+/// area that guards it.
+fn resolve_areas(names: &[String], verify: &VerifyMap) -> (Vec<String>, Vec<String>) {
+    let mut areas: Vec<String> = Vec::new();
+    let mut boundaries: Vec<String> = Vec::new();
+    for name in names {
+        match verify.areas.iter().find(|area| &area.id == name) {
+            Some(area) => {
+                push_once(&mut areas, area.id.clone());
+                push_once(&mut boundaries, area.boundary.clone());
+            }
+            None => {
+                push_once(&mut boundaries, name.clone());
+                for area in verify.areas.iter().filter(|area| &area.boundary == name) {
+                    push_once(&mut areas, area.id.clone());
+                }
+            }
+        }
+    }
+    (areas, boundaries)
+}
+
+/// Append one value when the list does not carry it yet.
+fn push_once(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// One comma list, or `none` for an empty one.
+fn name_list(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names.join(", ")
+}
+
 /// The task id of one run event.
 fn event_task(event: &RunEvent) -> &str {
     match event {
@@ -8972,12 +9253,14 @@ mod tests {
         ExecutionRole, Governor, Harness, RoleOverride, RoleSettings, StageConfig,
     };
     use crate::exec::{Call, CmdOut, ScriptExec};
-    use crate::model::{Issue, Pr, RepoSnapshot};
+    use crate::model::{Pr, RepoSnapshot};
     use crate::prompts::{
         scan_placeholders, IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT,
     };
     use crate::tasks::MAX_ATTEMPTS;
-    use crate::theory::records::{parse_event_blocks, THEORY_FULL_LABEL, THEORY_SHORT_LABEL};
+    use crate::theory::records::{
+        parse_event_blocks, PredictionSlot, PredictionTag, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
+    };
     use crate::theory::verify::Tier;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22174,6 +22457,117 @@ mod tests {
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
     }
 
+    /// The second refined ticket of the widening tests. It carries `AC-2`
+    /// and its plan owns the api paths.
+    fn second_ticket() -> Issue {
+        let mut ticket = issue(143, &[]);
+        ticket.body = contract_ticket()
+            .body
+            .replace(
+                "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive",
+                "- AC-2 \u{b7} An empty card field shows a message \u{b7} check: checkout drive",
+            )
+            .replace("| web/** |", "| api/** |");
+        ticket
+    }
+
+    /// One draft pull request that closes both tickets.
+    fn two_ticket_pr(body: &str) -> Pr {
+        let mut pull = linked_draft(7);
+        pull.body = format!("Closes #142\nCloses #143\n\n{body}");
+        pull
+    }
+
+    /// A body whose two lines answer one criterion of each ticket.
+    const TWO_TICKET_BODY: &str = concat!(
+        "## Why\n",
+        "The checkout accepts an empty card field.\n",
+        "\n",
+        "## Before / After\n",
+        "- AC-1 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the submit blocks\n",
+        "- AC-2 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the field shows a message\n",
+    );
+
+    #[test]
+    fn the_body_check_unions_the_criteria_and_the_paths_of_every_linked_ticket() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts\napi/orders/new.rs",
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // The paused lane keeps the review queued, so the admission runs
+        // the body check and no dispatch follows it.
+        rig.daemon
+            .paused
+            .lanes
+            .insert((Stage::Review, "borsuk".to_string()), true);
+
+        rig.poll(
+            vec![contract_ticket(), second_ticket()],
+            vec![two_ticket_pr(TWO_TICKET_BODY)],
+        );
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "AC-2 of the second ticket and its owned paths both count"
+        );
+        assert_eq!(findings(&rig, "PR: "), 0, "a clean body posts no finding");
+    }
+
+    #[test]
+    fn a_body_without_the_why_section_stops_the_review_and_requeues_every_ticket() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let finding = "section Why missing";
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts\napi/orders/new.rs",
+        ));
+        steps.push(record_comment_step(&format!("PR: {finding}")));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![contract_ticket(), second_ticket()],
+            vec![two_ticket_pr(&TWO_TICKET_BODY.replace("## Why\n", ""))],
+        );
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed(format!("PR: {finding}")),
+            "the missing section cancels the review"
+        );
+        assert_eq!(findings(&rig, &format!("PR: {finding}")), 1);
+        // The check queues one implement per linked ticket. The lane
+        // limit of the rig dispatches the first one and holds the second.
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Queued);
+        assert!(
+            !rig.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.task == "borsuk/review-p7"),
+            "a failed body check dispatches no review"
+        );
+    }
+
     #[test]
     fn an_ungoverned_review_runs_no_body_check() {
         let dir = temp_root();
@@ -24453,14 +24847,377 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "the untouched area stays out:\n{}",
             placeholder_of(&values, "skills")
         );
+        // C10 cuts the model block to the slice of the touched area, so
+        // the untouched boundary leaves the block with the untouched
+        // feature file.
         assert_eq!(
             placeholder_of(&values, "model"),
-            "- B-checkout (boundary): the cart pays\n- B-orders (boundary): the order lands"
+            "- B-orders (boundary): the order lands"
         );
-        assert_eq!(placeholder_of(&values, "prediction"), "");
+        assert_eq!(
+            git_calls(&rig, "diff"),
+            1,
+            "the review slice reads the head diff once"
+        );
+        assert_eq!(placeholder_of(&values, "prediction"), "none");
         assert_eq!(placeholder_of(&values, "comparison"), "");
         assert_eq!(placeholder_of(&values, "rules"), "");
         assert_eq!(placeholder_of(&values, "why_rule"), "");
+        let filled = prompts::fill_template(prompts::REVIEW_PROMPT, &values)
+            .expect("the review prompt must accept every value");
+        assert!(
+            filled.contains("- B-orders (boundary): the order lands"),
+            "the prompt carries the sliced entry"
+        );
+    }
+
+    /// One short prediction over `areas`.
+    fn short_view(text: &str, areas: &[&str]) -> ShortPrediction {
+        ShortPrediction {
+            kind: records::PREDICTION_SHORT.to_string(),
+            text: text.to_string(),
+            areas: areas.iter().map(|area| area.to_string()).collect(),
+        }
+    }
+
+    /// One full prediction over the named slots, in the given order.
+    fn full_view(slots: &[(&str, Vec<&str>, PredictionTag)]) -> FullPrediction {
+        FullPrediction {
+            kind: records::PREDICTION_FULL.to_string(),
+            slots: slots
+                .iter()
+                .map(|(name, entries, tag)| PredictionSlot {
+                    name: (*name).to_string(),
+                    entries: entries.iter().map(|id| id.to_string()).collect(),
+                    tag: *tag,
+                })
+                .collect(),
+        }
+    }
+
+    /// Store one record view under the issue key of `ticket`.
+    fn store_view(rig: &mut Rig, ticket: u64, view: RecordView) {
+        rig.daemon.theory_blocks.insert(
+            ("borsuk".to_string(), RecordKey::Issue(ticket).key_text()),
+            view,
+        );
+    }
+
+    /// The placeholder values of one pipeline task of the rig repository.
+    fn values_of(
+        rig: &Rig,
+        stage: Stage,
+        kind: ItemKind,
+        number: u64,
+    ) -> Vec<(&'static str, String)> {
+        let task = Task::new("borsuk", stage, kind, number, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        rig.daemon
+            .placeholder_values(&task, &repo_cfg, &PathBuf::new())
+            .expect("the values must render")
+    }
+
+    /// Both model boundaries as the model block writes them.
+    const BOTH_ENTRIES: &str =
+        "- B-checkout (boundary): the cart pays\n- B-orders (boundary): the order lands";
+
+    #[test]
+    fn the_refine_and_implement_slices_follow_the_prediction_areas() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut rig = Rig::make_in(dir, slice_steps(&repo, "aaa111"), governed);
+        rig.poll(Vec::new(), Vec::new());
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: None,
+                ..RecordView::default()
+            },
+        );
+
+        let refine = values_of(&rig, Stage::Refine, ItemKind::Issue, 142);
+        assert_eq!(
+            placeholder_of(&refine, "model"),
+            "- B-checkout (boundary): the cart pays",
+            "refine slices over the short prediction's areas"
+        );
+        assert!(placeholder_of(&refine, "skills").contains("run-web"));
+        assert!(
+            !placeholder_of(&refine, "skills").contains("run-api"),
+            "the unpredicted area stays out of the skills slice"
+        );
+
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: Some(full_view(&[(
+                    PREDICTION_OTHER_AREAS,
+                    vec!["api-orders"],
+                    PredictionTag::Sure,
+                )])),
+                ..RecordView::default()
+            },
+        );
+
+        let implement = values_of(&rig, Stage::Implement, ItemKind::Issue, 142);
+        assert_eq!(
+            placeholder_of(&implement, "model"),
+            BOTH_ENTRIES,
+            "implement adds the areas the full prediction reaches"
+        );
+        assert!(placeholder_of(&implement, "skills").contains("# Orders"));
+    }
+
+    #[test]
+    fn a_record_with_no_prediction_keeps_the_whole_model_and_every_area() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut rig = Rig::make_in(dir, slice_steps(&repo, "aaa111"), governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        for (stage, template) in [
+            (Stage::Refine, prompts::REFINE_PROMPT),
+            (Stage::Implement, prompts::IMPLEMENT_PROMPT),
+        ] {
+            let values = values_of(&rig, stage, ItemKind::Issue, 142);
+            assert_eq!(placeholder_of(&values, "model"), BOTH_ENTRIES, "{stage}");
+            let skills = placeholder_of(&values, "skills");
+            assert!(
+                skills.contains("run-web") && skills.contains("run-api"),
+                "{stage}"
+            );
+            assert_eq!(placeholder_of(&values, "prediction"), "", "{stage}");
+            prompts::fill_template(template, &values)
+                .unwrap_or_else(|error| panic!("{stage}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn the_review_prediction_block_renders_the_short_claim_and_the_slots() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(git_step(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &pr_worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        let mut snapshot = RepoSnapshot::default();
+        snapshot.prs.insert(7, contract_pr("## Why\n"));
+        rig.daemon
+            .links
+            .insert("borsuk".to_string(), Links::derive("borsuk", &snapshot));
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: Some(full_view(&[
+                    ("behaviours", vec!["T-1"], PredictionTag::Sure),
+                    ("states", Vec::new(), PredictionTag::Unsure),
+                    ("invariants", vec!["I-1"], PredictionTag::Sure),
+                    ("failure-modes", vec!["F-1"], PredictionTag::Unsure),
+                    (PREDICTION_OTHER_AREAS, Vec::new(), PredictionTag::Unsure),
+                ])),
+                ..RecordView::default()
+            },
+        );
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        assert_eq!(
+            placeholder_of(&values, "prediction"),
+            concat!(
+                "ticket #142\n",
+                "short: the submit blocks\n",
+                "areas: web-checkout\n",
+                "behaviours (sure): T-1\n",
+                "states (unsure): none\n",
+                "invariants (sure): I-1\n",
+                "failure-modes (unsure): F-1\n",
+                "other-areas (unsure): none",
+            ),
+            "the block keeps the five slots in their template order"
+        );
+        assert_eq!(
+            placeholder_of(&values, "model"),
+            "- B-checkout (boundary): the cart pays",
+            "the review slice unions the implement areas with the diff areas"
+        );
+        prompts::fill_template(prompts::REVIEW_PROMPT, &values)
+            .expect("the review prompt must accept every value");
+    }
+
+    /// The rig steps of one review slice test: the theory read, then the
+    /// head diff of pull request 7.
+    fn review_slice_steps(dir: &Path, repo: &Path, diff: &str) -> Vec<Step> {
+        let mut steps = slice_steps(repo, "aaa111");
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &pr_wt(dir, 7),
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps
+    }
+
+    /// Link pull request 7 to ticket 142 in the rig.
+    fn link_pr_seven(rig: &mut Rig) {
+        let mut snapshot = RepoSnapshot::default();
+        snapshot.prs.insert(7, contract_pr("## Why\n"));
+        rig.daemon
+            .links
+            .insert("borsuk".to_string(), Links::derive("borsuk", &snapshot));
+    }
+
+    /// Requirement R9 of v0.8 binds the run skills to what the diff
+    /// touched. A predicted area the diff never reached widens the model
+    /// block and must leave the skills block alone.
+    #[test]
+    fn the_review_skills_slice_ignores_a_predicted_area_the_diff_never_touched() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = review_slice_steps(&dir, &repo, "api/orders/new.rs");
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        link_pr_seven(&mut rig);
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: None,
+                ..RecordView::default()
+            },
+        );
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        let skills = placeholder_of(&values, "skills");
+        assert!(
+            skills.contains("# Orders"),
+            "the diff area's file:\n{skills}"
+        );
+        assert!(
+            !skills.contains("# Checkout"),
+            "the predicted area the diff never touched stays out:\n{skills}"
+        );
+        assert!(
+            !skills.contains("index only"),
+            "the diff area's files stay inline:\n{skills}"
+        );
+        assert_eq!(
+            placeholder_of(&values, "model"),
+            BOTH_ENTRIES,
+            "the model block still unions the predicted area with the diff area"
+        );
+    }
+
+    /// A `verify-skill` pull request changes no area. The model block
+    /// keeps every entry, the way v0.8 rendered it.
+    #[test]
+    fn a_review_with_no_prediction_and_no_touched_area_keeps_the_whole_model() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = review_slice_steps(&dir, &repo, "docs/readme.md");
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        link_pr_seven(&mut rig);
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        assert_eq!(placeholder_of(&values, "model"), BOTH_ENTRIES);
+        assert_eq!(
+            placeholder_of(&values, "skills"),
+            "",
+            "no touched area leaves the skills block empty"
+        );
+        assert_eq!(placeholder_of(&values, "prediction"), "none");
+    }
+
+    #[test]
+    fn a_governed_dispatch_binds_the_model_commit_and_the_task_end_drops_it() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &["to-refine", THEORY_SHORT_LABEL])], vec![]);
+
+        let id = "borsuk/refine-i142";
+        assert_eq!(
+            rig.daemon.role_bindings[id].model_commit.as_deref(),
+            Some("aaa111"),
+            "the dispatch pins the cached model commit"
+        );
+
+        rig.event(turn_finished(id, true, "refined"));
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        assert_eq!(rig.task(id).state, TaskState::Done);
+
+        // The ticket leaves GitHub, so the row retires and takes the
+        // binding with it.
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.role_bindings.contains_key(id),
+            "the task end drops the binding and its model commit"
+        );
+    }
+
+    #[test]
+    fn an_ungoverned_dispatch_binds_no_model_commit() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        assert_eq!(
+            rig.daemon.role_bindings["borsuk/refine-i142"].model_commit,
+            None
+        );
     }
 
     #[test]
