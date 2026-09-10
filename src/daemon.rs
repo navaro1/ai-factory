@@ -14570,6 +14570,15 @@ mod tests {
         r#""statement":"No other module runs gh.","constrains":["B-gh"]}]"#
     );
 
+    /// One state entry and one failure entry, as a second turn proposes
+    /// them.
+    const TWO_MORE_ENTRIES: &str = concat!(
+        r#"[{"kind":"state","id":"S-open","title":"Open","#,
+        r#""statement":"The client holds one token."},"#,
+        r#"{"kind":"failure","id":"F-timeout","title":"Timeout","#,
+        r#""statement":"The call never answers.","crosses":"B-gh"}]"#
+    );
+
     /// One model proposal block that carries `entries`.
     fn model_proposal(entries: &str) -> String {
         format!(
@@ -14675,6 +14684,112 @@ mod tests {
         };
         assert_eq!(result.kind, TicketResultKind::Success);
         assert_eq!(result.message, "opened the model pull request 12 of borsuk");
+    }
+
+    #[test]
+    fn a_second_bootstrap_proposal_adds_its_entries_to_the_open_model_branch() {
+        let dir = temp_root();
+        let worktree = model_wt(&dir);
+        // The second turn finds the worktree of the first on the open
+        // model branch, so it reuses it and pushes to the same request.
+        let second_turn: Vec<Step> = vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":12,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(
+                &rig_repo(&dir),
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(format!("worktree {}\n", worktree.display())),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(&dir)),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(&worktree, &["add", "theory/model.toml"], CmdOut::ok("")),
+            git_step(&worktree, &["diff", "--cached", "--quiet"], refused()),
+            git_step(
+                &worktree,
+                &["commit", "-m", "Update the model"],
+                CmdOut::ok(""),
+            ),
+            git_step(
+                &worktree,
+                &["push", "-u", "origin", RIG_MODEL_BRANCH],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    "acme/borsuk",
+                    "--head",
+                    RIG_MODEL_BRANCH,
+                    "--json",
+                    "number",
+                ],
+                CmdOut::ok("[{\"number\":12}]"),
+            ),
+        ];
+        let steps: Vec<Step> = vec![model_derive_step("acme/borsuk", "[]")]
+            .into_iter()
+            .chain(fresh_model_steps(&dir, &rig_repo(&dir)))
+            .chain(model_commit_steps(&dir, "acme/borsuk", "[]"))
+            .chain(second_turn)
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        start_bootstrap(&mut rig);
+        rig.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+        assert_eq!(model_ids(&dir), vec!["B-gh", "I-one-client"]);
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_MORE_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+
+        assert_eq!(
+            model_ids(&dir),
+            vec!["B-gh", "I-one-client", "S-open", "F-timeout"],
+            "the second turn adds to the first, it does not replace it"
+        );
+        let creates = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh" && call.args.get(1).is_some_and(|a| a == "create"))
+            .count();
+        assert_eq!(creates, 1, "the open model pull request takes both turns");
+        let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|push| match push {
+                Push::TicketResult(result) => Some(result.message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "opened the model pull request 12 of borsuk".to_string(),
+                "pushed the model of borsuk to the model pull request 12".to_string(),
+            ]
+        );
     }
 
     #[test]

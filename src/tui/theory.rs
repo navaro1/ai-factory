@@ -847,10 +847,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn b_shows_the_running_bootstrap_task_and_esc_returns_to_the_panels() {
-        let mut state = state_with_empty_area_hold();
-        state.tasks = vec![crate::sock::TaskView {
+    /// The running bootstrap task of the `gh` area, as the daemon pushes
+    /// it.
+    fn bootstrap_task() -> crate::sock::TaskView {
+        crate::sock::TaskView {
             id: "borsuk/bootstrap-gh".to_string(),
             repo: "borsuk".to_string(),
             stage: crate::model::Stage::Refine,
@@ -862,7 +862,13 @@ mod tests {
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
             binding: None,
-        }];
+        }
+    }
+
+    #[test]
+    fn b_shows_the_running_bootstrap_task_and_esc_returns_to_the_panels() {
+        let mut state = state_with_empty_area_hold();
+        state.tasks = vec![bootstrap_task()];
         let mut pane = Theory::default();
         mark_the_hold(&mut pane, &state);
 
@@ -880,6 +886,35 @@ mod tests {
         );
         assert!(!pane.typing());
         assert!(render_with(&state, &mut pane).contains("HOLDS"));
+    }
+
+    #[test]
+    fn a_letter_and_enter_in_the_bootstrap_chat_send_the_typed_message() {
+        let mut state = state_with_empty_area_hold();
+        state.tasks = vec![bootstrap_task()];
+        let mut pane = Theory::default();
+        mark_the_hold(&mut pane, &state);
+        assert!(matches!(
+            pane.handle_key(&state, press(KeyCode::Char('b'))),
+            Outcome::Send(_, _)
+        ));
+
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('h'))),
+            Outcome::None,
+            "a letter types into the bar and sends nothing"
+        );
+        let outcome = pane.handle_key(&state, press(KeyCode::Enter));
+
+        let Outcome::Send(action, toast) = outcome else {
+            panic!("enter sends the typed message, got {outcome:?}");
+        };
+        let Action::Chat { task, text } = *action else {
+            panic!("the chat bar sends one Action::Chat");
+        };
+        assert_eq!(task, "borsuk/bootstrap-gh");
+        assert_eq!(text, "h");
+        assert_eq!(toast, "sent chat borsuk/bootstrap-gh");
     }
 
     #[test]

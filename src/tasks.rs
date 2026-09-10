@@ -355,18 +355,7 @@ impl TaskTable {
         now_ms: u64,
     ) -> Result<&mut Task> {
         let id = ticket_chat_id(repo, number);
-        if self
-            .by_id
-            .get(&id)
-            .is_some_and(|task| !task.state.is_terminal())
-        {
-            return self
-                .by_id
-                .get_mut(&id)
-                .ok_or_else(|| anyhow!("task \"{id}\" vanished before reuse"));
-        }
-        let task = Task::ticket_chat(repo, number, log_path, now_ms);
-        self.insert_task(id.clone(), task)
+        self.upsert_chat(id, || Task::ticket_chat(repo, number, log_path, now_ms))
     }
 
     /// Queue one bootstrap conversation or reuse its active task.
@@ -378,6 +367,17 @@ impl TaskTable {
         now_ms: u64,
     ) -> Result<&mut Task> {
         let id = bootstrap_id(repo, area);
+        self.upsert_chat(id, || Task::bootstrap_chat(repo, area, log_path, now_ms))
+    }
+
+    /// Return the live conversation under `id`, or insert what `build`
+    /// makes.
+    ///
+    /// A conversation outlives one turn, so a task that is still open
+    /// returns as it stands. Only a terminal task is replaced, which is
+    /// how a closed chat starts again under the same id. `build` runs
+    /// only for that second case.
+    fn upsert_chat(&mut self, id: String, build: impl FnOnce() -> Task) -> Result<&mut Task> {
         if self
             .by_id
             .get(&id)
@@ -388,8 +388,7 @@ impl TaskTable {
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("task \"{id}\" vanished before reuse"));
         }
-        let task = Task::bootstrap_chat(repo, area, log_path, now_ms);
-        self.insert_task(id.clone(), task)
+        self.insert_task(id, build())
     }
 
     /// Move one task to the back of the insertion order.

@@ -725,11 +725,17 @@ Ask short questions. Ask one question per turn. Ask only what an entry needs.
 An entry needs an id, a kind, a title, and a statement. Say back what you
 understood in one short sentence.
 
-An entry takes one of five kinds. A state names one region of the system. A
-boundary names the line between two regions and the path globs that cross it.
-A transition names a move from one state to another state. An invariant names
-a claim that always holds, and the states or the boundaries it constrains. A
-failure names one way the system breaks through one boundary.
+An entry takes one of five kinds. Each kind takes its own keys.
+
+- state names one region of the system. It takes no other key.
+- boundary names the two regions it separates in sides, and the path globs
+  that cross it in paths.
+- transition names the state it leaves in from, and the state it reaches
+  in to.
+- invariant names a claim that always holds, and the states or the
+  boundaries it holds over in constrains.
+- failure names one way the system breaks, and the boundary it breaks
+  through in crosses.
 
 Give each entry a short id the operator recognises. Reuse no id the model so
 far already holds.
@@ -1178,6 +1184,13 @@ mod tests {
             filled.contains(crate::theory::records::MODEL_PROPOSAL_BLOCK),
             "the prompt names the block tag the daemon parses:\n{filled}"
         );
+        for key in ["sides", "paths", "constrains", "from", "to", "crosses"] {
+            assert!(
+                filled.contains(&format!(" in {key}"))
+                    || filled.contains(&format!(" in {key}.")),
+                "the prompt names the required key {key}:\n{filled}"
+            );
+        }
     }
 
     #[test]
