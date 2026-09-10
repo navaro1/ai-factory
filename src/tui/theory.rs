@@ -301,21 +301,33 @@ impl Theory {
         )
     }
 
-    /// Send the teach action of the marked area row.
+    /// Send the teach action of the marked area or delta row.
     ///
-    /// A repository row names no area, so it sends nothing.
+    /// A repository or hold row names neither, so it sends nothing.
     fn send_teach(&self, state: &StateView) -> Outcome {
-        let Some(Stop::Area(repo, id)) = self.at(state) else {
-            return Outcome::None;
-        };
-        let toast = format!("asked to teach {repo}/{id}");
-        Outcome::Send(
-            Box::new(Action::Theory(TheoryAction::Teach {
-                repo,
-                key: TeachKey::Area(id),
-            })),
-            toast,
-        )
+        match self.at(state) {
+            Some(Stop::Area(repo, id)) => {
+                let toast = format!("asked to teach {repo}/{id}");
+                Outcome::Send(
+                    Box::new(Action::Theory(TheoryAction::Teach {
+                        repo,
+                        key: TeachKey::Area(id),
+                    })),
+                    toast,
+                )
+            }
+            Some(Stop::Delta(repo, number)) => {
+                let toast = format!("asked to teach {repo}/#{number}");
+                Outcome::Send(
+                    Box::new(Action::Theory(TheoryAction::Teach {
+                        repo,
+                        key: TeachKey::Delta(number),
+                    })),
+                    toast,
+                )
+            }
+            _ => Outcome::None,
+        }
     }
 
     /// Start or resume the bootstrap chat of the marked hold row.
@@ -1346,6 +1358,37 @@ mod tests {
             pane.handle_key(&state, press(KeyCode::Enter)),
             Outcome::Send(_, _)
         ));
+    }
+
+    /// `t` on a DELTAS row teaches the pull request the delta belongs to.
+    #[test]
+    fn t_on_a_delta_row_teaches_the_pull_request_of_the_delta() {
+        let mut state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        );
+        state.theory.get_mut("borsuk").unwrap().deltas =
+            vec![delta(142, &[("sure-miss", "INV-3")], 4, 0)];
+        let mut pane = Theory::default();
+
+        // Two steps walk past the repository and area rows.
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Delta("borsuk".to_string(), 142))
+        );
+
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('t'))),
+            Outcome::Send(
+                Box::new(Action::Theory(TheoryAction::Teach {
+                    repo: "borsuk".to_string(),
+                    key: TeachKey::Delta(142),
+                })),
+                "asked to teach borsuk/#142".to_string()
+            )
+        );
     }
 
     // --- The edit-model flow. ---

@@ -8744,7 +8744,7 @@ impl Daemon {
     /// model slice of that area's boundary holds the entry.
     fn card_teaches(&self, repo: &str, card: &CardView, key: &TeachKey) -> bool {
         match key {
-            TeachKey::Pr(number) => card.number == Some(*number),
+            TeachKey::Pr(number) | TeachKey::Delta(number) => card.number == Some(*number),
             TeachKey::Area(id) => {
                 let Some(entry) = card.entry.as_deref() else {
                     return false;
@@ -9033,7 +9033,7 @@ impl Daemon {
             return;
         };
         let record = match key {
-            TeachKey::Pr(number) => RecordKey::Pr(*number),
+            TeachKey::Pr(number) | TeachKey::Delta(number) => RecordKey::Pr(*number),
             TeachKey::Area(_) => RecordKey::Repo,
         };
         for event in parse_event_blocks(&turn.all) {
@@ -10219,6 +10219,10 @@ impl Daemon {
     ) -> Result<Vec<(&'static str, String)>> {
         let (subject, paths) = match key {
             TeachKey::Pr(number) => self.teach_pr_subject(repo_cfg, *number, worktree)?,
+            TeachKey::Delta(number) => {
+                let (diff, paths) = self.teach_pr_subject(repo_cfg, *number, worktree)?;
+                (self.teach_delta_subject(task, *number, diff), paths)
+            }
             TeachKey::Area(id) => (self.teach_area_subject(task, id), self.area_paths(task, id)),
         };
         Ok(vec![
@@ -10255,6 +10259,49 @@ impl Daemon {
             .map(str::to_string)
             .collect();
         Ok((cap_diff(&diff), paths))
+    }
+
+    /// The diff of one delta teach: the pull request diff plus the delta
+    /// lines.
+    ///
+    /// Every missed slot and every violation becomes one line, so the
+    /// agent explains the contradiction the delta found. A missed slot
+    /// names the entries the operator predicted, else the slot alone. The
+    /// question joins the lines when the review asked one. A record that
+    /// holds no delta leaves the diff alone.
+    fn teach_delta_subject(&self, task: &Task, number: u64, diff: String) -> String {
+        let Some(delta) = self
+            .theory_blocks
+            .get(&(task.repo.clone(), RecordKey::Pr(number).key_text()))
+            .and_then(|view| view.delta.as_ref())
+        else {
+            return diff;
+        };
+        let predicted = self.predicted_slots(&task.repo, number);
+        let mut out = diff;
+        for slot in &delta.slots {
+            if slot.outcome != DeltaOutcome::Miss {
+                continue;
+            }
+            match predicted.get(&slot.id).filter(|list| !list.is_empty()) {
+                Some(entries) => {
+                    for entry in entries {
+                        out.push_str(&format!("\nmiss {} {}", slot.id, entry));
+                    }
+                }
+                None => out.push_str(&format!("\nmiss {}", slot.id)),
+            }
+        }
+        for violation in &delta.violations {
+            out.push_str(&format!(
+                "\nviolation {}: {}",
+                violation.entry, violation.finding
+            ));
+        }
+        if !delta.question.is_empty() {
+            out.push_str(&format!("\nquestion {}", delta.question));
+        }
+        out
     }
 
     /// Run one git command of a teach subject, or report why it failed.
@@ -10421,7 +10468,7 @@ impl Daemon {
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         let areas: Vec<&str> = match key {
             TeachKey::Area(id) => vec![id.as_str()],
-            TeachKey::Pr(_) => verify.areas_for_paths(model, &refs),
+            TeachKey::Pr(_) | TeachKey::Delta(_) => verify.areas_for_paths(model, &refs),
         };
         skills::slice(skills::SliceStage::Teach, &areas, verify, set)
     }
@@ -29014,6 +29061,152 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             prompt.contains("### .claude/skills/run-web/features/checkout.md"),
             "the feature file of the area the diff touches:\n{prompt}"
         );
+    }
+
+    /// A teach on a DELTAS row diffs the pull request and renders the
+    /// delta lines, so the agent explains the contradiction the review
+    /// found.
+    #[test]
+    fn a_delta_teach_diffs_the_pull_request_and_renders_the_delta_lines() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(delta_prediction()))),
+        ));
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Delta(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-delta-7");
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the pull request:\n{prompt}"
+        );
+        assert_eq!(
+            prompt
+                .lines()
+                .filter(|line| line.starts_with("miss "))
+                .count(),
+            1,
+            "one miss line:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("miss invariants INV-3"),
+            "the missed slot with the predicted entry:\n{prompt}"
+        );
+        assert_eq!(
+            prompt
+                .lines()
+                .filter(|line| line.starts_with("violation "))
+                .count(),
+            1,
+            "one violation line:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("violation INV-3: the retry crosses the boundary"),
+            "the violation the review found:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("question Does the cart keep the token?"),
+            "the question of the review:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("### .claude/skills/run-web/features/checkout.md"),
+            "the feature file of the area the diff touches:\n{prompt}"
+        );
+    }
+
+    /// A delta teach whose linked ticket predicted nothing names each
+    /// missed slot alone, with no predicted entry on the line.
+    #[test]
+    fn a_delta_teach_without_a_full_prediction_names_the_missed_slot_alone() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Delta(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let prompt = rig.job(0).prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the pull request:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("\nmiss invariants\nviolation INV-3: the retry crosses the boundary"),
+            "the bare miss line before the violation:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("miss invariants INV"),
+            "no predicted entry joins the miss line:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("\nquestion Does the cart keep the token?"),
+            "the question of the review:\n{prompt}"
+        );
+    }
+
+    /// A delta teach whose record holds no cached delta teaches the
+    /// plain diff, with no delta line at all.
+    #[test]
+    fn a_delta_teach_without_a_cached_delta_teaches_the_plain_diff() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Delta(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-delta-7");
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the pull request:\n{prompt}"
+        );
+        for prefix in ["miss ", "violation ", "question "] {
+            assert_eq!(
+                prompt
+                    .lines()
+                    .filter(|line| line.starts_with(prefix))
+                    .count(),
+                0,
+                "no {prefix}line without a delta:\n{prompt}"
+            );
+        }
     }
 
     #[test]
