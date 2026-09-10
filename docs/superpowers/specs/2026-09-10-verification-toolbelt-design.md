@@ -1,8 +1,8 @@
 # The Verification Toolbelt
 
-Date: 2026-09-10 · Status: Design record, brainstorm complete, no code · Scope: The verification skill per surface, the verifier and the lever inside a run, refine grounding, review re-drive, setup and maintenance, teach, steering · Sibling: docs/superpowers/specs/2026-09-03-theory-governor-design.md and docs/v0.7/SPEC.md
+Date: 2026-09-10 · Status: Design record, brainstorm complete, no code · Revision: 2, after the simplification pass · Scope: The run skill per surface, the driver ladder, the Before / After contract, deterministic fast checks, refine grounding, review re-drive, setup, teach, steering · Sibling: docs/superpowers/specs/2026-09-03-theory-governor-design.md and docs/v0.7/SPEC.md
 
-Sources: Lauren Tan, *How I Use Cursor* (2026-05-25), *Loops You Can Trust* (2026-06-24), *The Complete Guide to pstack, Part 1* (2026-08-31), *The Complete Guide to pstack, Part 2* (2026-09-09). The pstack plugin, version 0.15.1, in particular `create-verification-skill`, `maintain-verification-skill`, the feature-map example, the principle skills, and the feature, bug-fix, prototype, and opening-a-pr playbooks. Piotr's notes of 2026-09-10. Andy Grove, *High Output Management*, through Lauren's reading of it.
+Sources: Lauren Tan, *How I Use Cursor* (2026-05-25), *Loops You Can Trust* (2026-06-24), *The Complete Guide to pstack, Part 1* (2026-08-31), *The Complete Guide to pstack, Part 2* (2026-09-09). The pstack plugin 0.15.1 and the `cursor-team-kit` skills `control-ui`, `control-cli`, and `verify-this`. Claude Code's bundled `run`, `verify`, and `run-skill-generator` skills and its hooks and subagent docs. The Codex docs on skills, subagents, hooks, and MCP. Anthropic, *Effective harnesses for long-running agents* and the `cwc-long-running-agents` repository. Pulumi's token measurements of `agent-browser` against the Playwright MCP. Piotr's notes of 2026-09-10.
 
 ---
 
@@ -12,18 +12,20 @@ ai-factory is an opinionated way to deliver software with agents, from the seat 
 
 > Verification is the limiting step. An agent that can verify its own work closes the loop. An agent that cannot makes the human the bottleneck at the diff level.
 
-The governor's trust loop measures numbers. A measurer is a script that emits values. Behaviour that needs a running application, a driven UI, a command with a transcript, or a log line has no path in the governor today. `verify.toml` names a skill and the daemon passes a name. Nothing creates the skill, nothing resolves it, nothing maintains it, and nothing checks that the review used it.
+The governor's trust loop measures numbers. Behaviour that needs a running application, a driven UI, a command with a transcript, or a log line has no path in the governor today. `verify.toml` names a skill and the daemon passes a name. Nothing creates the skill, nothing resolves it, and nothing checks that the review used it.
 
-The toolbelt fills that gap with four things:
+The toolbelt fills that gap with four things, and it borrows every tool it can instead of building one:
 
 | Thing | One sentence |
 |---|---|
-| The verification skill | One directory per surface of the application, with a control CLI, a skill document, and a feature map. Agent-owned code. |
-| The verifier | One subagent in every implement run that did not write the code, drives the skill, and writes the evidence. |
-| The lever | A rule: a check done by hand twice becomes a tool in the skill, in the same PR. |
-| Teach | One chat purpose that explains a change or an area to the operator, from code and history, so the operator can predict again. |
+| The run skill | One markdown file per surface that says how to launch, drive, check, and read the logs of that surface, with the generic driver it uses. Agent-owned. |
+| The Before / After contract | Every agent PR states, per feature, the observed behaviour before and after, with the command that observed it. The daemon checks the shape. |
+| Fast checks | The daemon runs each touched feature's fast command before review, through the measure machinery. A fail costs zero reviewer tokens. |
+| Teach | One chat purpose that explains a change or an area to the operator, so the operator can predict again. |
 
-The toolbelt is orthogonal to the governor. It changes no label of the governor's state machine. It touches the governor at five seams: the `{skills}` placeholder, the `## Evidence` section and its body check, the `theory.chat` machinery, the cadence list, and the `create_issue` path of the ladder.
+The design follows one rule from the research: simpler with the same result means fewer tokens and faster delivery. The first revision had a control CLI per surface, an eight-section skill, a verifier subagent in every run, a maintenance cadence, and twelve principles named in every PR. Each of those had a cheaper equivalent that already exists. This revision uses the equivalents.
+
+The toolbelt is orthogonal to the governor. It changes no label of the governor's state machine. It touches the governor at five seams: the `{skills}` placeholder, the PR body check, the measure task, the `theory.chat` machinery, and the `create_issue` path of the ladder.
 
 Three refusals hold, from the governor:
 
@@ -31,9 +33,10 @@ Three refusals hold, from the governor:
 2. An agent never edits `theory/model.toml`, `theory/verify.toml`, or `theory/rules.md` off a model branch.
 3. The factory keeps no journal. GitHub holds every record.
 
-One refusal joins them:
+Two refusals join them:
 
-4. A test alone is not verification. An evidence item that rests on "it compiles", "tests pass", or an author's own summary is inconclusive, and inconclusive is not a pass.
+4. A test alone is not verification. A Before / After line that rests on "it compiles", "tests pass", or an author's summary is `inconclusive`, and inconclusive is not a pass.
+5. No browser-profile integration, ever. Claude in Chrome and the Codex `@Chrome` act inside a signed-in browser. Headless Playwright through a CLI is the web driver.
 
 ---
 
@@ -42,22 +45,21 @@ One refusal joins them:
 | Term | Meaning |
 |---|---|
 | Surface | One thing a user touches: a web UI, an admin panel, an HTTP API, a CLI, a TUI, a library. A repository has one or more. |
-| Verification skill | The directory `skills/verify/<surface>/` with `SKILL.md`, `bin/`, and `features/`. Agent-owned code, reviewed like any code. |
-| Control CLI | The executable `skills/verify/<surface>/bin/control-<surface>`. It launches, checks, drives, snapshots, reads logs, tests, and tears down the surface. |
+| Run skill | The file `.claude/skills/run-<surface>/SKILL.md` plus its `features/` directory and optional helper scripts. Agent-owned code, reviewed like any code. |
+| Driver | The generic tool that drives a surface. One of five tiers, section 4.3. |
+| Tier | The driver's level: `browser`, `dom`, `http`, `terminal`, or `none`. |
+| Floor | The lowest tier the operator accepts for an area, set in `verify.toml`. |
 | Feature | One user-facing behaviour of one surface, described in `features/<feature>.md`. It binds to one area of `verify.toml`. |
-| Feature map | The `features/README.md` index plus the feature files of one surface. pstack calls it materialized memory. |
-| Fast path | The one command per feature that is the quickest proof it still works. Seconds, not minutes. |
-| Skills checkout | The git checkout that holds `skills/verify/`. The theory checkout by default. |
-| Evidence item | One line in `## Evidence`: feature ID, command, head SHA, observed result, state. |
-| State | `pass`, `fail`, or `inconclusive`. |
-| Verifier | The subagent of an implement run that writes every evidence item. It never edits product code. |
-| Re-drive | The review agent runs every evidence item again on the head, and for a bug also on the base. |
-| Lever | A tool under `bin/` that proves one fact and exits non-zero on failure. A reviewer can rerun it. |
+| Fast command | The one command per feature that is the quickest proof it still works. Seconds, not minutes. Exit code is the verdict. |
+| Fast check | The daemon's run of a fast command as a measure task, with an exit-code record. |
+| Skills checkout | The git checkout that holds the run skills. The theory checkout by default. |
+| Before / After line | One line in `## Before / After`: feature, tier, command, before, after. |
+| State | `pass`, `fail`, or `inconclusive`. Derived from the line and the fast check. |
+| Re-drive | The review agent runs every Before / After command again on the head, and for a bug also on the base. |
+| Lever | A helper script under the skill that proves one fact and exits non-zero on failure. A reviewer can rerun it. |
 | Restate | The first section of a refined ticket: the request in the agent's own words. |
-| Grounding | The `## Grounding` section of a refined ticket: how the code works and why it is shaped so, from code and history. |
 | Teach | The `theory.chat` purpose that explains a merged PR, a delta, or an area to the operator. |
-| Setup ticket | The ticket `Create the verification skill for <alias>/<surface>`, labels `to-refine` and `verify-skill`. |
-| Maintain ticket | The ticket `Maintain the verification skill for <alias>/<surface>`, same labels, opened by a cadence. |
+| Setup ticket | The ticket `Create the run skill for <alias>/<surface>`, labels `to-refine` and `verify-skill`. |
 
 ---
 
@@ -65,133 +67,112 @@ One refusal joins them:
 
 The twelve rules of the governor hold. These join them.
 
-13. An agent verifies on the real surface. A test alone is not verification. An evidence item states the command, the head SHA, and the observed result, or it is inconclusive.
+13. An agent verifies on the real surface. A Before / After line states the command and the observed result, or it is inconclusive.
 14. A question an experiment can answer is not the operator's. An agent runs the experiment and records the result. Only a product or preference call earns `needs-human`.
-15. The agent that judges a change never wrote it. Inside a run, the verifier writes the evidence and the authors do not. Across stages, the review agent re-drives every item.
+15. The agent that judges a change never wrote it. The review agent re-drives every line on a fresh context and another model. The daemon runs the fast checks, and no agent grades its own fast check.
 16. A check done by hand twice becomes a lever in the same PR. A lever the reviewer cannot rerun is not a lever.
-17. No confirmed reproduction, no authored fix. A bug ticket reproduces twice through the control CLI before any plan.
-18. The skills checkout is the theory checkout, unless a path override says otherwise. A repository that many people share stays clean of experiments through shadow mode or the override.
-19. Evidence is text. Transcripts, ARIA snapshots, exit codes, and log excerpts travel in the PR body and in comments. A screenshot without the command that produced it is not evidence.
-20. The daemon inlines skill content into the prompt. It never relies on a harness skill loader, a harness browser integration, or a plugin.
+17. No confirmed reproduction, no authored fix. A bug ticket reproduces twice through the driver before any plan.
+18. The skills checkout is the theory checkout, unless a path override says otherwise. A repository that many people share stays clean through shadow mode or the override.
+19. Evidence is text. Transcripts, ARIA snapshots, exit codes, and log excerpts travel in the PR body and in comments.
+20. An agent probes for drivers and never installs one. A new driver is a ticket the operator opens.
+21. The daemon inlines skill content into the prompt. It never relies on a harness skill loader, a harness browser integration, or a plugin.
 
 ---
 
-## 4. The verification skill
+## 4. The run skill
 
 ### 4.1 Layout
 
-One directory per surface. A repository with an admin panel, an API, and a web application has three.
+One directory per surface, in the shape Claude Code's `run-skill-generator` writes, so that generator can seed it and a human can `/run` it. A repository with an admin panel, an API, and a web application has three.
 
 ```
-skills/verify/
-  README.md                    index of surfaces, one line each
-  admin/
-    SKILL.md                   the surface skill, sections in 4.2
-    bin/control-admin          the control CLI, contract in 4.4
-    features/README.md         feature index and baseline preconditions
-    features/user-roles.md     one file per feature, contract in 4.3
-    features/audit-log.md
-  api/
+.claude/skills/
+  run-admin/
+    SKILL.md                  the surface skill, section 4.2
+    features/README.md        the feature index
+    features/user-roles.md    one file per feature that needs a drive recipe
+    wait_for.sh               a helper, only when a step needs one
+  run-api/
     SKILL.md
-    bin/control-api
     features/README.md
-    features/auth-tokens.md
-  web/
+  run-web/
     SKILL.md
-    bin/control-web
     features/README.md
     features/checkout.md
-    features/search.md
 ```
 
-A feature file binds to one `[[area]].id` of `verify.toml` through its front matter. The daemon resolves the skills of an area in this order: the `skills` list on the area, then every feature file whose `area` equals the area ID. The operator's list wins on conflict. A feature file whose `area` is not in `verify.toml` is a lint failure of the skills checkout, reported by the doctor, never a model error.
+The path carries a vendor name. That is the price of a free generator and a free `/run`. The daemon inlines the content, so Codex and OpenCode read the same file. A human on Codex can symlink `.agents/skills/run-<surface>` to it.
 
-### 4.2 The surface skill
+### 4.2 The skill file
 
-`SKILL.md` has eight sections in this fixed order. Each is grounded in the repository. A placeholder left in any section fails the setup ticket.
+The front matter names the surface, the driver, and the tier. The body has the four project-specific items of Claude Code's `run` skill plus two lines. Everything generic stays out, because the driver's own help text carries it.
 
-| Section | Must contain | Why |
-|---|---|---|
-| Fast | The priority test command for this surface and the fastest partial spin-up, with the expected wall time and what the partial spin-up does not run. | The agent needs a proof in under a minute before it pays for a full launch. |
-| Launch | The exact start command, the ready signal, and the teardown. For a CLI or TUI: build once, then one PTY session per drive. | Wrong launch steps teach every later agent the wrong thing. |
-| Doctor | One read-only check: process up, right build hash, port owned by this run, auth valid. Its JSON shape and exit codes. | Doctor runs before every drive and after every failed drive. |
-| Drive | The recipe with real handles from this repository: ARIA roles and names, routes, prompt strings, subcommands. Never coordinates. | Stable handles survive UI churn. |
-| Logs | Where logs go, the grep that finds one request or one command, one excerpt of a healthy log, the lines that mean failure. | Logs are the only view into why. They are text, so they travel. |
-| Evidence | What to capture and the proof standard: the real user path, the action and the resulting state, side effects checked, no test-only endpoints. Text first. | Adapted from pstack for rule 19. |
-| Cleanup | How to stop what this run started, by handle from the session file. Evidence survives. | A stranded port breaks the next run. |
-| Helpers | Each script in `bin/`, its invocation, one example. | A script the reader must reverse-engineer is not a helper. |
+```
+---
+name: run-web
+description: Launch and drive the web app for verification.
+surface: web
+driver: playwright-cli
+tier: browser
+blind: pixels below 320 px width, native file dialogs
+---
+```
 
-### 4.3 The feature file
+| Section | Must contain |
+|---|---|
+| Run | The dev command, the port, the ready signal, and the stop command. Background launch, poll the port, kill by port, never `pkill -f`. For a TUI: the `tmux new-session` line and the ready marker. |
+| Fast | The priority test command for this surface and its expected wall time. |
+| Auth or seed | Whatever gets a usable session: a cookie line, a login sequence, a seed script. |
+| Drive | One representative interaction through the driver, ending in an observable state. Stable handles: ARIA roles and names, routes, prompt strings, key names. |
+| Logs | Where logs go and the grep that finds one request or one command. |
+| Gotchas | Only the ones the author hit. |
 
-Front matter, one H1, one paragraph, then the four H2s of the pstack feature-map example: `Sub-features`, `How to get to it (user POV)`, `Driving it with <control CLI>`, `Gotchas`.
+A placeholder left in any section fails the setup ticket.
+
+### 4.3 The driver ladder
+
+The setup ticket probes the toolchain and the machine, picks the highest tier it finds, and records it in the front matter. An agent never installs a driver.
+
+| Tier | Driver | Proves | Needs |
+|---|---|---|---|
+| `browser` | `playwright-cli`, `agent-browser`, or `chromium-cli`, headless | Rendered UI, clicks, ARIA snapshots | Playwright in the toolchain. No extension, no browser profile. |
+| `dom` | The repo's `jsdom` or `happy-dom` runner, or fetch plus an HTML parser | Rendered markup and component behaviour | Node or Python already present. |
+| `http` | `curl`, an HTTP or GraphQL client | Status, headers, body, side effects in logs and data | Nothing new. |
+| `terminal` | `tmux`, `agent-tty`, direct invocation | A CLI or TUI end to end | `tmux`. |
+| `none` | No driver reaches the feature | Nothing. Every line is `inconclusive` with the reason. | Nothing. |
+
+A CLI driver costs a few characters per action. The Playwright MCP costs the full accessibility tree per action. The ladder names CLIs only.
+
+The operator sets a floor per area in `verify.toml`: `min_tier = "browser"`. A line below the floor is `inconclusive`. The body check holds the PR and opens a theory event through `open_event`. The operator accepts the lower tier or stops the line. No silent downgrade.
+
+### 4.4 The feature file
+
+Front matter, one H1, one paragraph, then the four H2s of the pstack feature-map example: `Sub-features`, `How to get to it (user POV)`, `Driving it`, `Gotchas`. The index lists every feature in one line each. A feature gets its own file only when its drive needs more than one command.
 
 ```
 ---
 area: web-checkout
-surface: web
-fast: control-web test --tag checkout
+fast: npx playwright test checkout --reporter=line
 ---
 ```
 
-`fast` is one command. It finishes in seconds and exits non-zero on failure. The agent runs it first and pastes the result. The `Driving it` section opens with `Preconditions:` and pairs each user action with one exact command and one observable result. The file names user paths, stable handles, required state, commands, and observable proof. It names no function and no file of the implementation. That rule mirrors rule 5 of the governor for the model, for the same reason: the map must survive a refactor.
-
-### 4.4 The control CLI
-
-The contract, adapted from pstack and the benny control adapter:
-
-| Property | Meaning |
-|---|---|
-| Composable subcommands | `up`, `doctor`, `drive`, `snapshot`, `logs`, `test`, `down`. Each does one thing. Output pipes. |
-| `--dry-run` on destructive commands | `down`, `reset`, and `seed` print what they would do and exit 0. |
-| JSON output | `--json` on every command. Agents assert on JSON. Humans read the default text. |
-| Rich `--help` | Every subcommand shows one example. The help text is the second copy of the skill. |
-| Error text says what to do instead | `port 4173 owned by pid 812 (not ours). Run: control-web down --session <id>` |
-| Doctor before drive | `drive` refuses when no doctor passed in this session. `--force` exists and is logged. |
-| Kill only what you started | `up` writes a session file with pids and ports. `down` reads it. Never `pkill`. |
-| Evidence survives cleanup | Evidence goes to `$AIF_EVIDENCE_DIR`, default `.aif/evidence/<session>/` in the worktree. `down` never touches it. |
-| No harness features | Browser driving uses CDP or Playwright inside the CLI. Never the Chrome integration of one harness. |
-
-A minimal command set for a web surface:
-
-| Command | Example |
-|---|---|
-| up | `control-web up --only checkout --seed minimal --json` |
-| doctor | `control-web doctor --session s1 --json` |
-| drive | `control-web drive click --role button --name "Place order"` |
-| snapshot | `control-web snapshot --aria --path $AIF_EVIDENCE_DIR/checkout/confirm.aria.txt` |
-| logs | `control-web logs --since up --grep "order_id=" --tail 40` |
-| test | `control-web test --tag checkout` |
-| down | `control-web down --session s1 --dry-run` |
-
-A minimal command set for a CLI or TUI surface:
-
-| Command | Example |
-|---|---|
-| build | `control-cli build` |
-| doctor | `control-cli doctor --json` |
-| run | `control-cli run -- app search "quarterly" --format json` |
-| tui | `control-cli tui start --cols 120 --rows 40`, `tui send "/"`, `tui expect "Search"`, `tui transcript --path $AIF_EVIDENCE_DIR/search/tui.txt` |
-| logs | `control-cli logs --session t1 --grep ERROR` |
-| test | `control-cli test --tag search` |
-| down | `control-cli tui stop --session t1` |
+`fast` finishes in seconds and exits non-zero on failure. The file names user paths, stable handles, required state, commands, and observable proof. It names no function and no file of the implementation, for the same reason rule 5 of the governor gives for the model.
 
 ### 4.5 Location and override
 
-The skills checkout is the theory checkout: `TheoryConfig::checkout(repo_path)`. In in-repository mode that is the code repository, and `skills/verify/` ships with the code. In shadow mode that is the private theory repository, and the code repository never sees a skill file, a label, or a comment. A per-repository override `skills = { path = "..." }` points anywhere. A path without a remote keeps commits local. This is how the operator experiments against a repository that hundreds of people share.
+The skills checkout is the theory checkout: `TheoryConfig::checkout(repo_path)`. In in-repository mode that is the code repository. In shadow mode that is the private theory repository, and the code repository never sees a skill file, a label, or a comment. A per-repository override `skills = { path = "..." }` points anywhere. A path without a remote keeps commits local. This is how the operator experiments against a repository that hundreds of people share.
 
-The daemon renders absolute paths into every prompt and sets `AIF_SKILLS_DIR` in the environment of every task. The control CLI runs inside the code worktree and finds the application there. It finds itself through `AIF_SKILLS_DIR`.
-
-A setup or maintain PR lands in the checkout that holds the path. In shadow mode that is the theory repository, through the model-branch path of C7. In in-repository mode that is a normal PR.
+The daemon renders absolute paths into every prompt. Helper scripts run inside the code worktree and find the application there.
 
 ### 4.6 Slicing
 
-The daemon inlines files, not directories. The cap is two surfaces and six feature files per prompt. Past the cap it inlines the feature index only and names the paths.
+The daemon inlines files, not directories. The cap is two surfaces and six feature files per prompt. Past the cap it inlines the index only and names the paths.
 
 | Stage | Areas | Inlined into `{skills}` |
 |---|---|---|
-| Refine | Short prediction's areas | The feature index of each surface and the Fast section. For a bug ticket, the Drive and Logs sections too. |
-| Implement | Full prediction's areas | The feature files that bind to those areas. The Fast, Doctor, Drive, Logs, and Evidence sections of each named surface. Launch and Cleanup once per surface. Helpers dropped, `--help` replaces it. |
-| Review | Implement slice plus areas of `git diff --name-only <base>...<head>` | The same rule over the wider set, plus `features/README.md` of each surface for the proof standard. |
+| Refine | Short prediction's areas | The index and the Run and Fast sections of each surface. For a bug ticket, the Drive and Logs sections too. |
+| Implement | Full prediction's areas | The whole skill file of each named surface, and the feature files that bind to those areas. |
+| Review | Implement slice plus areas of `git diff --name-only <base>...<head>` | The same rule over the wider set. |
 | Teach | The areas of the PR, delta, or area | The feature files of those areas, index only past the cap. |
 
 This changes design record §5.1 and spec C28, which pass a name. Section 9 lists the edit.
@@ -200,72 +181,82 @@ This changes design record §5.1 and spec C28, which pass a name. Section 9 list
 
 ## 5. The run
 
-### 5.1 Refine
+### 5.1 The Before / After contract
 
-Four steps come before the plan table. Refine moves from the repository checkout to the issue worktree, so an experiment never touches the operator's checkout.
+Every agent PR has this body and nothing else. It is a briefing, not a lab notebook, in Lauren Tan's opening-a-pr shape.
+
+```
+## Why
+One or two short paragraphs. The behaviour that changes and for whom.
+
+## Before / After
+- checkout-submit · browser · `npx playwright test checkout` · before: an empty card is accepted and the API returns 500 · after: the field shows "Card is required" and no request is sent
+- api-orders · http · `curl -s -X POST :4000/orders -d @empty.json` · before: 500, log `NullPointer at Orders.create` · after: 422 `{"error":"card_required"}`
+- poll_p95 · measure · `aif measure` · 12 → 11 ms
+
+## Blast radius
+One to three sentences. What else the change touches and why it is safe.
+```
+
+One line per feature. Each line names the feature, the tier, the command, and the observed state before and after. A `measure` line comes from the daemon's own Before and After comment of C28, so the number is a factory number. For a bug, before is the repro on base and after is the same command on head. A transcript longer than the cap goes under its line in a fenced block, cut to the cap, and the full file stays at `.aif/evidence/` in the author's worktree. Screenshots wait for `gh --attach` to reach stable.
+
+Writing rules, from `technical-writing` and `unslop`, as one paragraph in the prompt: short declarative sentences, one thought per sentence, active voice, no long dash, no curly quote, no mid-sentence colon, no `## Summary`, no `## Test plan`, no narration of the work, body under 40 lines before the fenced blocks.
+
+### 5.2 The body check
+
+The deterministic check of C11 gains these lines. It costs zero agent tokens and covers every harness.
+
+| Line | Rule |
+|---|---|
+| Sections | `## Why` and `## Before / After` present. `## How`, a heading that starts with `Implementation`, `## Summary`, and `## Test plan` absent. |
+| Coverage | Every touched area with a run skill has at least one Before / After line. Every line names a feature in the index or a measurer in `verify.toml`. |
+| Tier | Every line's tier is at or above the area's floor. |
+| State | No line is `inconclusive`. |
+| Prose | No long dash, no curly quote, no mid-sentence colon outside code, body under the line cap. pstack's `check-plan.mjs` holds the same three lint rules. |
+
+A failure posts one finding comment and re-queues implement, as C11 does today. A floor failure also opens a theory event.
+
+### 5.3 Fast checks
+
+At review admission, next to the base and head measurements of C28, the daemon queues one measure task per touched feature that names a `fast` command. The task runs the command in the head worktree through the script runner and records `{ id: <feature>, value: <exit code>, unit: "exit", direction: "lower" }`. A non-zero exit is a `fail`, and the review does not dispatch. The daemon posts the finding and re-queues implement. No reviewer tokens are spent on work whose own fast path fails.
+
+This is Build the Lever at its cheapest. The agent names the lever in the feature file. The factory pulls it.
+
+### 5.4 Refine
+
+Refine moves from the repository checkout to the issue worktree, so an experiment never touches the operator's checkout. Four steps come before the plan table. The refine agent does them itself. Subagents stay allowed for sizeable research, as today, and are not required.
 
 | Step | The agent | Writes into the ticket |
 |---|---|---|
-| Restate | Rewrites the request in its own words before it reads code. This is the indirect prompt of pstack Part 2. It exposes a wrong fixation early. | `## Problem` opens with the restatement, one paragraph. |
-| Ground | Sends at most three read-only subagents. One traces how the affected code works. One reads `git log`, `gh pr list`, and linked issues for why it is shaped so. No subagent writes. | `## Grounding`: the mechanism, the history, the paths it touches, with citations. |
-| Prototype before ask | Classifies each open question. A question an experiment can answer is not the operator's. The agent runs the experiment in a scratch directory under the worktree, never committed, and records the result. Only a product or preference call goes to `needs-human`. | `## Decisions`: one line per question, the answer, the command that answered it. |
-| Repro twice, bug tickets only | Drives the control CLI to reproduce the defect twice on the base. A defect that does not reproduce twice is not planned. The agent tightens conditions or instruments until it fires. A third miss goes to `needs-human` with the attempts. | `## Repro`: the exact command, two observed outputs, the exit code. |
+| Restate | Rewrites the request in its own words before it reads code. This is the indirect prompt of pstack Part 2. | `## Problem` opens with the restatement, one paragraph. |
+| Ground | Reads the affected code and `git log` and `gh pr list` for the paths it touches. | `## Grounding`: the mechanism, the history, the paths, with citations. |
+| Prototype before ask | Classifies each open question. A question an experiment can answer is not the operator's. The agent runs the experiment in a scratch directory under the worktree, never committed, and records the result. Only a product or preference call goes to `needs-human`. | `## Decisions`: one line per question, the answer, the command. |
+| Repro twice, bug tickets only | Drives the surface to reproduce the defect twice on the base. A third miss goes to `needs-human` with the attempts. | `## Repro`: the exact command, two observed outputs, the exit code. |
 
-The plan table gains one column, `Lever`, next to `Validation`. A chunk names the `bin/` command that proves it, or `new: <name>` when the chunk must add one.
+The plan table gains one column, `Fast`, next to `Validation`. A chunk names the fast command that proves it, or `new: <feature>` when the chunk must add a feature file.
 
-### 5.2 Implement
+### 5.5 Implement
 
-One run has one coordinator, at most three author subagents per wave, and one verifier after the last wave.
+The coordinator and its author subagents work as today. Two rules join the prompt.
 
-| Role | May | May not | Receives |
-|---|---|---|---|
-| Coordinator | Plan waves, own shared files, integrate, commit, run `gh`, repair, open the draft PR, write `## Why`. | Write an evidence item from its own run. Skip the verifier. | Ticket, `{model}`, `{rules}`, `{skills}`, the worktree. |
-| Author, at most three per wave, disjoint owned paths | Edit owned paths, run focused validation, add a lever under `bin/` when its owned paths include it. | Git or `gh` writes. Start a subagent. Edit another chunk's paths. Write evidence. | Chunk goal, owned paths, acceptance criteria, validation command, lever column. |
-| Verifier, one per run | Read the skill, drive the control CLI, run every fast path and every claimed lever, call `aif measure`, write `## Evidence`. | Edit product code or tests. Git or `gh` writes. Accept an author's summary as proof. | Acceptance criteria, the skill slice, the head SHA, the list of claimed levers. |
+The coordinator drives every touched feature once through the driver before it opens the PR and writes the Before / After line from what it observed. It runs every fast command and pastes the exit code. It writes no line it did not observe.
 
-The verifier writes one evidence item per acceptance criterion. Each item names the feature ID, the command, the head SHA, the observed result, and the state. Inconclusive means the verifier could not reach the surface, the control CLI errored, or the result rested on a proxy.
+The lever rule. When an agent checks the same fact by hand twice, or writes a throwaway script to check it, it adds the script to the run skill in the same PR, with one invocation line in `SKILL.md`. A one-off `grep`, a shell history line, or a test that passes when every dependency returns nothing is not a lever.
 
-A run with any `fail` or `inconclusive` item does not open the PR. The coordinator reads the item, repairs, and dispatches a fresh verifier on the new head. After two repair loops the coordinator takes the human path with `needs-human` and the last item in the comment.
+No verifier subagent runs by default. The fast checks of 5.3 and the re-drive of 5.6 give the same separation at lower cost. A `very-high` tag route may add a verifier subagent through the harness's own mechanism: `--agents` JSON for Claude Code, a role file for Codex, on the review route's model. That is a route setting, not a prompt rule.
 
-The verifier runs on the review route's model where the harness allows a model per subagent. Where it does not, it runs on the same model in a fresh context. Either way the review agent re-drives every item, so verifier drift is caught one stage later.
+### 5.6 Review
 
-### 5.3 The lever rule
+The review agent runs on another model in a fresh context. It trusts no Before / After line until it re-drives it.
 
-When an agent checks the same fact by hand twice, or writes a throwaway script to check it, it adds the tool to `skills/verify/<surface>/bin/` in the same PR, with one invocation line in `SKILL.md` and one line in the `## Evidence` items that uses it.
+1. Run every line's command on the head. Compare the observed state to the stated after.
+2. For a `bug` ticket, run the `## Repro` command in the base worktree of C28 and expect the stated before. Then run it on the head and expect the after. Red on base, green on head.
+3. Run every lever the PR adds and get the stated exit code.
+4. Post the reviewer's own Before / After lines as a PR comment, in the same shape.
 
-| Counts as a lever | Does not count |
-|---|---|
-| A `bin/` command that drives the surface and exits non-zero on failure. | A one-off `grep` over the tree. |
-| A measurer command that `aif measure` can run and that emits one JSON record. | A shell history line pasted into the PR. |
-| A fixture generator or seed script a check depends on. | A test that still passes when every dependency returns nothing. |
-| A repro command for a bug, with its expected exit code. | A screenshot with no command that produced it. |
+A mismatch is a finding. The reviewer repairs the code, or repairs the check when the check was the defect, then re-drives the full list. A bug that does not fail on base is a wrong root cause, and that finding goes to `needs-human` with both outputs. The two outcomes of the review contract stay: `gh pr ready` when every line passes on the reviewer's run, `needs-human` otherwise.
 
-The reviewer checks a claimed lever three ways. It exists at the named path in the diff. `SKILL.md` names its invocation. The reviewer runs it on the head and gets the stated exit code. A lever that fails any of the three is a finding.
-
-Relation to the ladder. Rung 2 turns a human intervention into a measurer or a test. The lever rule reaches the same place from the other side: the agent builds the check while it works, before any human sees a defect. A lever that proves useful across PRs is a candidate measurer. The operator promotes it through the area chat of C31. The agent never edits `verify.toml`.
-
-### 5.4 The evidence contract
-
-`## Evidence` holds one item per line, in a details block when it grows:
-
-```
-- <feature-id> · <command> · <head-sha8> · <observed result> · pass|fail|inconclusive
-```
-
-Long outputs go under the item in a fenced block, cut to a per-item cap the skill names. The full file stays at `$AIF_EVIDENCE_DIR` in the author's worktree, and the reviewer regenerates it by re-driving, never by copying.
-
-The deterministic check, in the C11 slot, gains three lines. Every touched area with a skill has at least one item. Every item names a feature ID that exists in the map. No item reads `inconclusive`. A failure re-queues implement with the finding, as C11 does today.
-
-### 5.5 Review
-
-The review agent trusts no evidence item until it re-drives it.
-
-1. Run every evidence item on the head. Compare the observed result to the stated one.
-2. For a `bug` ticket, run the `## Repro` command in the base worktree of C28 and expect the stated failure. Then run it on the head and expect the pass. Red on base, green on head.
-3. Run every claimed lever per section 5.3.
-4. Post the reviewer's own items as a PR comment, in the same shape, with the reviewer's SHA and outputs.
-
-A mismatch is a finding. A stated pass that turns to fail or inconclusive means the author's evidence was wrong. The reviewer repairs the code, or repairs the check when the check was the defect, then re-drives the full list. A bug that does not fail on base is a wrong root cause, and that finding goes to `needs-human` with both outputs. The two outcomes of the review contract stay: `gh pr ready` when every item passes on the reviewer's run, `needs-human` otherwise.
+The reviewer also repairs run-skill drift it meets, as it repairs any finding. That is the daily maintenance Lauren describes, done by the agent that is already there.
 
 ---
 
@@ -273,47 +264,38 @@ A mismatch is a finding. A stated pass that turns to fail or inconclusive means 
 
 ### 6.1 The doctor
 
-`aif doctor` prints one line per configured repository and surface: `verify skill <alias>/<surface>: ok`, `missing`, or `lint: <feature file>: area <id> unknown`. It warns when the implement route and the review route of one complexity level resolve to the same model family. That warning is Lauren's rule that a verdict comes from a different family than the work.
+`aif doctor` prints one line per configured repository and surface: `run skill <alias>/<surface>: <tier>`, `missing`, or `lint: <feature file>: area <id> unknown`. It warns when an area's floor is above the tier its surface reaches, and when the implement route and the review route of one complexity level resolve to the same model family.
 
 ### 6.2 The setup ticket
 
-Key `v` on a repository row of the Theory view creates the ticket `Create the verification skill for <alias>/<surface>` with labels `to-refine` and `verify-skill`. The daemon asks for the surface name inline. The body tells the agent to:
+Key `v` on a repository row of the Theory view creates the ticket `Create the run skill for <alias>/<surface>` with labels `to-refine` and `verify-skill`. The daemon asks for the surface name inline. The body tells the agent to:
 
-1. Interview the repository, not the operator: surface, run command, drive method, evidence, isolation.
-2. Fix a checkout that does not start, or report it precisely, before any generation.
-3. Write `bin/control-<surface>` to the contract of 4.4. Check `--help` and `--dry-run` on every subcommand.
-4. Write `SKILL.md` with the eight sections of 4.2. Measure the Fast path and record its time.
-5. Seed `features/` from `verify.toml`: one file per area that maps to this surface, the top three to five features.
-6. Prove it once end to end: up, doctor, fast, drive one feature, snapshot, logs, down. Confirm the evidence still exists.
-7. Paste the transcript, the ARIA snapshot, and the log excerpt into `## Evidence`. Write `## Why`. No `## How`.
-8. Propose the `skills` entries for `verify.toml` as text in the PR. Never edit `verify.toml`.
+1. Interview the repository, not the operator: the surface, the run command, the drivers present, the evidence, the isolation.
+2. Probe the driver ladder. Pick the highest tier present. Install nothing.
+3. Fix a checkout that does not start, or report it precisely, before any generation.
+4. Write `SKILL.md` to section 4.2. Measure the Fast path and record its time. Under Claude Code, `run-skill-generator` writes the first draft.
+5. Seed `features/` from `verify.toml`: the index, and one file per area that maps to this surface and needs a drive recipe, the top three to five.
+6. Prove it once end to end: run, fast, drive one feature, read the logs, stop. Confirm the evidence file still exists.
+7. Write the PR to the contract of 5.1. The Before / After line of a setup PR states `before: no run skill` and the after is the proof of step 6.
+8. Propose the `skills` entry for `verify.toml` as text in the PR. Never edit `verify.toml`.
 
-A `verify-skill` ticket and its PR skip both prediction gates, like `model-pr`. They change no behaviour of the application. The PR check of C11 still runs, and the review still re-drives. The first proof of step 6 is Lauren's first unit by hand, done by the agent and checked by the review.
+A `verify-skill` ticket and its PR skip both prediction gates, like `model-pr`. They change no behaviour of the application. The body check and the review still run.
 
-### 6.3 The maintain cadence
+### 6.3 Maintenance
 
-`ScheduleKind::Maintain` fires on `maintain.days`, default 7, and after each release train when `maintain.after_train` is on, default on. It creates `Maintain the verification skill for <alias>/<surface>` with `to-refine` and `verify-skill`, one per surface, and skips a surface that already has an open maintain ticket. The body tells the agent to:
+No new cadence. Two existing paths carry it.
 
-1. Index hygiene: every feature file is in the README and binds to a live area ID.
-2. Source wave: one read-only subagent per feature file reads the source and flags drift with citations. No driving yet.
-3. Live pass: doctor, then drive every feature once. Doctor again after any failed drive.
-4. Triage. A wrong description is doc drift, fix it. Working behaviour the harness cannot drive is a harness gap, fix it in `bin/`. Broken application behaviour is a product gap. Never fix product code.
-5. Report each product gap as one new ticket labelled `bug`, with the drive transcript and the log excerpt. Keep it out of this PR.
-6. Re-drive every harness fix before it ships.
-7. End in exactly one outcome. `changed`: one PR under `skills/verify/<surface>/` only. `clean` or `blocked`: no PR, one comment with the coverage and the block, and the ticket closes.
-8. Final `down`. Confirm the evidence path still exists.
-
-A `bug` ticket that a maintain run files enters the governed path of C19.
+The reviewer repairs run-skill drift it meets during a re-drive, per 5.6. The weekly audit sweep of C24 gains one paragraph: check each run skill's Run and Fast sections and each feature file's handles against the code, report dead paths and dead handles. When the sweep finds drift, the daemon opens one ticket `Maintain the run skill for <alias>/<surface>` with `to-refine` and `verify-skill` through the `create_issue` path of C32, and skips a surface that already has one open. Its body is the pstack maintain recipe in eight lines: index hygiene, source pass, live pass, triage into doc drift or harness gap or product gap, a `bug` ticket per product gap, re-drive every fix, one PR or one comment, final stop.
 
 ---
 
 ## 7. Understanding: teach
 
-The governor makes the operator explain to the agent, in the bootstrap and the area chat, and tests the operator, with cards and the interview. Lauren's Part 2 goes the other way: the agent explains, and the human then predicts. Teach is that path.
+The governor makes the operator explain to the agent and tests the operator. Lauren's Part 2 goes the other way: the agent explains, and the human then predicts. Teach is that path.
 
-`TaskPurpose::Teach` runs under `theory.chat`. Key `t` on a merged PR row, a DELTAS row, or an AREAS row starts it. The prompt tells the agent to explain what changed and why, from the diff, the git and PR history, the feature map slice, and the model slice. It gives the smallest complete answer first, then adds layers on request. It builds a picture in steps, one part at a time. It keeps the confidence language of what it found in history: a hedge is a finding, not style. It names no framing labels and prints no quiz.
+`TaskPurpose::Teach` runs under `theory.chat`. Key `t` on a merged PR row, a DELTAS row, or an AREAS row starts it. The prompt tells the agent to explain what changed and why, from the diff, the git and PR history, the feature index, and the model slice. It gives the smallest complete answer first, then adds layers on request. It builds a picture in steps, one part at a time. It keeps the confidence language of what it found in history. It prints no framing labels and no quiz.
 
-Teach ends with one `<aif-event-v1>` block per contradiction it finds between the model and the code, else with no block. A contradiction opens a theory event through `open_event`, on the record of the PR or the repository record. The inbox offers `t` after a card miss with cause `recall`, because a recall miss is the moment to teach.
+Teach ends with one `<aif-event-v1>` block per contradiction it finds between the model and the code, else with no block. A contradiction opens a theory event through `open_event`. The inbox offers `t` after a card miss with cause `recall`.
 
 Teach adds no claim to the model. The operator predicts again on the next ticket, and the delta measures whether the teaching held.
 
@@ -321,47 +303,39 @@ Teach adds no claim to the model. The operator predicts again on the next ticket
 
 ## 8. Steering and principles
 
-The operator steers without a diff. These are the handles, in the order a new operator meets them.
+The operator steers without a diff.
 
 | Handle | Changes | Where |
 |---|---|---|
 | Ticket text | Scope, acceptance criteria, the restatement the agent must match. | The GitHub issue. |
-| Complexity labels | The model of implement and review per ticket. | `complexity:*`, `review-complexity:*`. |
-| The model | The theory every agent reads as its slice. | `theory/model.toml`, edit-model flow. |
-| `verify.toml` policies | Which properties gate, ratchet, or observe. Which skills an area names. | The area chat. |
-| The verification skill | How agents launch, drive, and prove each surface. | Setup and maintain tickets, or a direct PR. |
+| Complexity labels | The model of implement and review per ticket, and the optional verifier route. | `complexity:*`, `review-complexity:*`. |
+| The model | The theory every agent reads as its slice. | `theory/model.toml`. |
+| `verify.toml` | Policies, floors, skills per area. | The area chat. |
+| The run skill | How agents launch, drive, and prove each surface. | Setup tickets, or a direct PR. |
 | `rules.md` | One rule every prompt carries. | A theory event answer with rung 3. |
 | Prompt edits | The stage wording. | The Settings view. |
-| Principle names | Which decisions the stance rewards. | The index below, in `docs/STANCE.md`. |
 
-The stance carries a principle index of twelve. An agent that lets a principle change a decision names it in `## Why`, with the decision it changed. A name with no changed decision is a finding. Every entry adapts a pstack principle by Lauren Tan.
+The stance carries four principles as vocabulary, each adapted from pstack by Lauren Tan, and each backed by a structural check rather than a naming rule. An agent names none of them in a PR.
 
-| Principle | The decision it changes here |
+| Principle | The structure that enforces it |
 |---|---|
-| Prove It Works | No evidence item from a proxy or a self-report. |
-| Build the Lever | A second hand check becomes a `bin/` tool in the PR. |
-| Sequence Verifiable Units | The repro commit lands before the fix commit. Each chunk is verified before the next wave. |
-| Fix Root Causes | No fix ships without a base repro that fails. |
-| Test Behavior, Not Implementation | A test asserts a literal result through the public path. |
-| Never Block on the Human | Reversible work proceeds. Only a product call earns `needs-human`. |
-| Encode Lessons in Structure | A repeated finding becomes a lever or a rung, never more prose. |
-| Laziness Protocol | The smallest script that proves the job. Never a framework. |
-| Model the Domain | Name the data shape before the first edit. |
-| Subtract Before You Add | Delete dead weight in its own commit before the feature. |
-| Separate Before Serializing Shared State | Chunks split by owned path. Shared files go to the coordinator. |
-| Guard the Context Window | Bulk reads go to read-only subagents. Summaries stay in the coordinator. |
+| Prove It Works | The Before / After lines and the body check. |
+| Build the Lever | The fast command per feature and the daemon's fast check. |
+| Never Block on the Human | Prototype before ask in refine. |
+| Fix Root Causes | Red on base, green on head in review. |
 
 ---
 
 ## 9. Changes to the governor documents
 
-The toolbelt asks for three edits to the sibling documents. Each is one sentence.
-
 | Document | Today | Change |
 |---|---|---|
 | Design record §5.1, spec C28 | The map names a skill by name. The factory passes only the name. | The factory inlines the skill slice of 4.6 into `{skills}`. |
-| Spec C11, R27 | The check requires `## Why` and forbids `## How`. | The check also applies the three evidence lines of 5.4. |
-| Spec §2 and the refine cwd in `dispatch_one` | Refine runs in the repository checkout. | Refine runs in the issue worktree. |
+| Spec C11, R27 | The check requires `## Why` and forbids `## How`. | The check applies the table of 5.2. |
+| Spec C28 | Base and head measurements at review admission. | Fast checks of 5.3 join them. |
+| Spec R23 | The area schema. | `min_tier` joins it. |
+| Spec §2 and the refine cwd | Refine runs in the repository checkout. | Refine runs in the issue worktree. |
+| Spec C24 | The sweep checks entries against the code. | One paragraph on run-skill drift, and the maintain ticket. |
 
 Nothing else in C0 to C32 changes.
 
@@ -371,17 +345,18 @@ Nothing else in C0 to C32 changes.
 
 | Stage or task | Change |
 |---|---|
-| refine | Runs in the issue worktree. Restate, Ground, Decisions, and Repro sections. The Lever column. Reads the refine slice of `{skills}`. |
-| implement | The verifier subagent writes `## Evidence`. The lever rule. No PR opens on a fail or inconclusive item. |
-| body check | Three evidence lines join the C11 check. |
-| review | Re-drives every item. Red on base, green on head for a bug. Runs every claimed lever. Posts its own items. |
+| refine | Issue worktree. Restate, Ground, Decisions, Repro. The Fast column. Reads the refine slice. |
+| implement | Drives once, writes Before / After, runs the fast commands, adds levers. The body contract and the writing paragraph. |
+| body check | The table of 5.2. |
+| fast checks | Measure tasks per touched feature at review admission. A fail re-queues implement. |
+| review | Re-drives every line. Red on base, green on head for a bug. Runs levers. Posts its own lines. Repairs drift. |
 | release | Unchanged. |
-| `verify-skill` tickets | Skip both prediction gates. Take the normal pipeline otherwise. |
-| `maintain` cadence | New `ScheduleKind`. Creates one maintain ticket per surface. |
+| `verify-skill` tickets | Skip both prediction gates. |
+| audit sweep | One paragraph, one ticket on drift. |
 | `teach` | New `TaskPurpose` under `theory.chat`. |
-| doctor | Skill lines per surface. Family warning. |
+| doctor | Tier per surface, lint, floor warning, family warning. |
 
-New labels: `verify-skill`. New marker blocks: none. Teach reuses `<aif-event-v1>`. New environment: `AIF_SKILLS_DIR`, `AIF_EVIDENCE_DIR`.
+New labels: `verify-skill`. New marker blocks: none. New measurement unit: `exit`.
 
 ---
 
@@ -392,7 +367,15 @@ New labels: `verify-skill`. New marker blocks: none. Teach reuses `<aif-event-v1
 path = "/home/you/Workplace/borsuk"
 theory = { repo = "navaro1/borsuk-theory", path = "/home/you/Workplace/borsuk-theory" }
 skills = { path = "/home/you/Workplace/borsuk-verify" }   # optional, default: the theory checkout
-maintain = { days = 7, after_train = true }
+```
+
+```toml
+# theory/verify.toml
+[[area]]
+id = "web-checkout"
+boundary = "B-checkout"
+min_tier = "browser"          # optional, default: none
+skills = ["run-web"]
 ```
 
 The exact field names belong to the spec.
@@ -403,11 +386,11 @@ The exact field names belong to the spec.
 
 | Surface | Addition |
 |---|---|
-| Theory view, AREAS panel | A skill mark per area: `✓` resolved, `-` none, `!` lint. Key `v` creates a setup ticket. Key `t` teaches an area. |
+| Theory view, AREAS panel | The tier per area: `browser`, `http`, `-` none, `!` lint or below floor. Key `v` creates a setup ticket. Key `t` teaches an area. |
 | Theory view, DELTAS panel | Key `t` teaches the PR of a delta. |
-| Pipeline view | A merged PR row takes `t`. A held implement row shows `awaits evidence` while the verifier loops. |
-| Inbox | A card miss with cause `recall` offers `t`. |
-| Settings | The `skills.path` and `maintain` fields per repository. |
+| Pipeline view | A held implement row shows `fast check failed` with the feature. |
+| Inbox | A card miss with cause `recall` offers `t`. A floor failure appears as a theory event. |
+| Settings | The `skills.path` field per repository. |
 | Doctor | The lines of 6.1. |
 
 ---
@@ -416,35 +399,32 @@ The exact field names belong to the spec.
 
 | Chunk | Content | Depends on |
 |---|---|---|
-| V0 The stance addendum | Rules 13 to 20, refusal 4, the vocabulary, the principle index of section 8, the steering table. Sources cited. | C3 |
-| V1 Skill resolution and the doctor | `skills/verify/` layout parser, feature front matter, the resolution order of 4.1, the lint, `TheoryConfig.skills`, `AIF_SKILLS_DIR`, the doctor lines and the family warning, the AREAS mark. | C25 |
+| V0 The stance addendum | Rules 13 to 21, refusals 4 and 5, the vocabulary, the four principles, the steering table, the driver ladder. | C3 |
+| V1 Skill resolution and the doctor | The `run-<surface>` parser, the feature front matter, the resolution order of 4.1, the lint, `TheoryConfig.skills`, `min_tier` in the area schema, the doctor lines, the AREAS tier mark. | C25 |
 | V2 The setup ticket | Key `v`, the surface prompt, `create_issue` with `to-refine` and `verify-skill`, the body of 6.2, the gate skip for `verify-skill`. | C16, C32, V1 |
-| V3 `{skills}` slicing | The slice rule of 4.6 for refine, implement, review, teach. The cap. Replaces the name fill of C28. | C10, C28, V1 |
-| V4 The evidence contract and the check | The item grammar, `AIF_EVIDENCE_DIR`, the three lines in `check_pr`. | C11, V3 |
-| V5 Refine grounding | The issue worktree for refine. The Restate, Ground, Decisions, Repro sections. The Lever column. The refine prompt rewritten and pinned. | C10, V3 |
-| V6 The verifier and the lever | The implement prompt rewritten and pinned: roles, the verifier, the lever rule, no PR on fail or inconclusive, two repair loops then `needs-human`. | V4 |
-| V7 Review re-drive | The review prompt rewritten and pinned: re-drive, red on base for a bug, lever checks, the reviewer's own items. | C28, V4 |
-| V8 The maintain cadence | `ScheduleKind::Maintain`, `maintain` config, the body of 6.3, one open ticket per surface. | C21, V2 |
-| V9 Teach | `TaskPurpose::Teach`, the prompt, keys `t`, the recall offer, events through `open_event`. | C17, V3 |
+| V3 Slicing and fast checks | The slice rule of 4.6 for the four stages. The cap. Fast checks as measure tasks at review admission, the `exit` unit, the re-queue on fail. Replaces the name fill of C28. | C10, C28, V1 |
+| V4 The contract and the prompts | The body check table of 5.2 in `check_pr`. The refine cwd. The refine, implement, and review prompts rewritten once and pinned. The audit sweep paragraph and the maintain ticket. | C11, C24, V3 |
+| V5 Teach | `TaskPurpose::Teach`, the prompt, keys `t`, the recall offer, events through `open_event`. | C17, V3 |
 
-V0 can start now. V1 to V4 wait for the trust-loop parsers. V5 to V7 rewrite the three prompts once each and can land in one train. V8 and V9 come last.
+V0 can start now. V1 to V3 wait for the trust-loop parsers. V4 rewrites the three prompts once. V5 comes last.
 
 ---
 
 ## 14. Follow-ups outside this design
 
-- Media evidence: screenshots and video, once a home exists that `gh` can link.
-- A multi-model review panel with an agreement map, if the single reviewer plus re-drive proves too weak.
+- Screenshots and video in the PR, when `gh --attach` reaches stable.
+- A browser only in CI: run the repo's end-to-end workflow on the PR branch and read the run log through `gh run view`. One more GitHub call per review.
+- A verifier subagent in every run, if the fast checks plus re-drive prove too weak.
+- A multi-model review panel with an agreement map.
 - A blinded eval of a prompt change, in the style of the pstack eval playbook.
-- Cloud agents, when the worktree count becomes the limit, as the governor already notes.
-- A decision-log comment per PR, if overnight orchestrations appear and the marker blocks stop being enough.
+- Harness Stop hooks as a second gate, if the body check is ever bypassed.
 
 ---
 
 ## 15. Open items for the spec
 
-- The exact TOML fields of `skills` and `maintain`, and the front-matter keys of a feature file.
-- The per-item output cap of an evidence item, and the details-block form.
+- The exact TOML fields of `skills` and `min_tier`, and the front-matter keys of the skill and feature files.
+- The line cap of the body and the per-line transcript cap.
 - The surface prompt of key `v`: inline text, or a pick from `verify.toml` boundaries.
-- Whether a `verify-skill` PR in shadow mode rides the model branch of C7 or its own `aif/<alias>/skills-<n>` branch.
-- The harness capability table for a per-subagent model, so the verifier binding of 5.2 is precise.
+- Whether a `verify-skill` PR in shadow mode rides the model branch of C7 or its own branch.
+- The `very-high` verifier route: the exact `--agents` JSON for Claude Code and the role file for Codex, and the OpenCode fallback.
