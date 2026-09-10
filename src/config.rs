@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exec::{Exec, RealExec};
 use crate::model::Stage;
+use crate::labels::{LabelKey, LabelNames};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -386,6 +387,8 @@ pub struct RepoConfig {
     pub theory: TheoryConfig,
     pub role_overrides: BTreeMap<ExecutionRole, RoleOverride>,
     pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
+    /// The `[repo.<alias>.labels]` values, over the global set.
+    pub label_overrides: BTreeMap<LabelKey, String>,
 }
 
 /// Temporary chat data for callers that still use the old ticket interface.
@@ -401,6 +404,8 @@ pub struct Config {
     pub stages: BTreeMap<Stage, StageConfig>,
     pub repos: BTreeMap<String, RepoConfig>,
     pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
+    /// The global label set: the defaults under the `[labels]` table.
+    pub labels: LabelNames,
     pub ticket_chat: TicketChatConfig,
     pub usage: UsageConfig,
 }
@@ -451,6 +456,25 @@ impl Config {
             tag_route: None,
             settings,
         })
+    }
+
+    /// Return the label set one repository uses.
+    ///
+    /// The result layers the built-in defaults, the global `[labels]` table,
+    /// and the `[repo.<alias>.labels]` table. An unknown alias returns the
+    /// global set, which is what a caller without a repository wants.
+    pub fn resolved_labels(&self, repository: Option<&str>) -> LabelNames {
+        let mut names = self.labels.clone();
+        let Some(alias) = repository else {
+            return names;
+        };
+        let Some(repo) = self.repos.get(alias) else {
+            return names;
+        };
+        for (key, value) in &repo.label_overrides {
+            names.set(*key, value.clone());
+        }
+        names
     }
 
     /// Apply the built-in value, a global override, then one repository override.
@@ -606,6 +630,11 @@ impl Config {
                 },
             );
         }
+        let labels = apply_label_overrides(
+            &LabelNames::default(),
+            &raw.labels.overrides("labels")?,
+            "labels",
+        )?;
         let mut repos = BTreeMap::new();
         for (alias, raw_repo) in raw.repo {
             if !valid_alias(&alias) {
@@ -622,6 +651,12 @@ impl Config {
             let theory = theory_config(&raw_repo, &alias)?;
             let raw_overrides = raw_repo.overrides();
             let raw_tag_route_overrides = raw_repo.tag_routes.entries();
+            let label_overrides = raw_repo.labels.overrides(&format!("repo.{alias}.labels"))?;
+            apply_label_overrides(
+                &labels,
+                &label_overrides,
+                &format!("repo.{alias}.labels"),
+            )?;
             let mut lanes = BTreeMap::new();
             for (name, count) in raw_repo.lanes {
                 let stage = Stage::from_str(&name)
@@ -669,6 +704,7 @@ impl Config {
                     theory,
                     role_overrides,
                     tag_route_overrides: repository_tag_route_overrides,
+                    label_overrides,
                 },
             );
         }
@@ -678,6 +714,7 @@ impl Config {
             stages,
             repos,
             tag_route_overrides,
+            labels,
             ticket_chat: TicketChatConfig {
                 model: Some(roles[&ExecutionRole::TicketChat].model.clone()),
             },
@@ -784,9 +821,94 @@ struct RawConfig {
     #[serde(default)]
     tag_routes: RawTagRoutes,
     #[serde(default)]
+    labels: RawLabels,
+    #[serde(default)]
     repo: BTreeMap<String, RawRepo>,
     #[serde(default)]
     usage: UsageConfig,
+}
+
+/// One optional `[labels]` or `[repo.<alias>.labels]` table.
+///
+/// Every field is optional. An absent field keeps the value of the layer
+/// below: the repository table falls back to the global table, and the
+/// global table falls back to [`LabelNames::default`].
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLabels {
+    to_refine: Option<String>,
+    refined: Option<String>,
+    epic: Option<String>,
+    chunk: Option<String>,
+    needs_human: Option<String>,
+    release_stacked: Option<String>,
+    complexity_prefix: Option<String>,
+    review_complexity_prefix: Option<String>,
+}
+
+impl RawLabels {
+    /// Pair every key with its optional raw value.
+    fn entries(&self) -> [(LabelKey, Option<String>); 8] {
+        [
+            (LabelKey::ToRefine, self.to_refine.clone()),
+            (LabelKey::Refined, self.refined.clone()),
+            (LabelKey::Epic, self.epic.clone()),
+            (LabelKey::Chunk, self.chunk.clone()),
+            (LabelKey::NeedsHuman, self.needs_human.clone()),
+            (LabelKey::ReleaseStacked, self.release_stacked.clone()),
+            (LabelKey::ComplexityPrefix, self.complexity_prefix.clone()),
+            (
+                LabelKey::ReviewComplexityPrefix,
+                self.review_complexity_prefix.clone(),
+            ),
+        ]
+    }
+
+    /// Validate every present value and collect it under its key.
+    fn overrides(&self, table: &str) -> Result<BTreeMap<LabelKey, String>> {
+        let mut out = BTreeMap::new();
+        for (key, value) in self.entries() {
+            let Some(value) = value else {
+                continue;
+            };
+            let full = format!("{table}.{key}");
+            nonempty(&value, &full)?;
+            if value.trim() != value {
+                bail!("{full} must not start or end with a space");
+            }
+            out.insert(key, value);
+        }
+        Ok(out)
+    }
+}
+
+/// Apply one override map over a base set and reject a name collision.
+fn apply_label_overrides(
+    base: &LabelNames,
+    overrides: &BTreeMap<LabelKey, String>,
+    table: &str,
+) -> Result<LabelNames> {
+    let mut names = base.clone();
+    for (key, value) in overrides {
+        names.set(*key, value.clone());
+    }
+    validate_label_names(&names, table)?;
+    Ok(names)
+}
+
+/// Reject two keys that resolve to the same name.
+///
+/// One name that drives two gates makes the pipeline ambiguous, so the
+/// parser refuses the file instead of guessing.
+fn validate_label_names(names: &LabelNames, table: &str) -> Result<()> {
+    let mut seen: BTreeMap<&str, LabelKey> = BTreeMap::new();
+    for key in LabelKey::ALL {
+        let value = names.get(key);
+        if let Some(other) = seen.insert(value, key) {
+            bail!("{table}: {other} and {key} both use the name \"{value}\"");
+        }
+    }
+    Ok(())
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -989,6 +1111,8 @@ struct RawRepo {
     ticket: RawTicketOverrides,
     #[serde(default)]
     tag_routes: RawTagRoutes,
+    #[serde(default)]
+    labels: RawLabels,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

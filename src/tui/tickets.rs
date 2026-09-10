@@ -9,6 +9,7 @@ use ratatui::Frame;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+use crate::labels::LabelNames;
 use crate::sock::{
     Action, StateView, TicketAction, TicketConflict, TicketContent, TicketContentSource,
     TicketDetails, TicketGroup, TicketLabels, TicketMentions, TicketResult, TicketResultKind,
@@ -1096,7 +1097,7 @@ impl Tickets {
                 if !lines.is_empty() {
                     lines.push(Line::from(""));
                 }
-                lines.push(group_line(ticket.group));
+                lines.push(group_line(ticket.group, &state.settings.labels));
                 previous = Some(ticket.group);
             }
             let selected = ticket_index == self.selected;
@@ -1585,11 +1586,14 @@ fn ticket_chat_harness<'a>(state: &'a StateView, repo: &str) -> &'a str {
 }
 
 /// The word and symbol for one workflow group.
-fn group_line(group: TicketGroup) -> Line<'static> {
+///
+/// The group spans every repository, so the header shows the global label
+/// name. A repository that renamed the label still sorts into this group.
+fn group_line(group: TicketGroup, names: &LabelNames) -> Line<'static> {
     let (symbol, word, color) = match group {
-        TicketGroup::Untouched => ("○", "untouched", THEME.text),
-        TicketGroup::ToRefine => ("◇", "to-refine", THEME.warn),
-        TicketGroup::Refined => ("◆", "refined", THEME.ok),
+        TicketGroup::Untouched => ("○", "untouched".to_string(), THEME.text),
+        TicketGroup::ToRefine => ("◇", names.to_refine.clone(), THEME.warn),
+        TicketGroup::Refined => ("◆", names.refined.clone(), THEME.ok),
     };
     Line::from(vec![
         Span::styled(format!(" {symbol} "), Style::default().fg(color)),

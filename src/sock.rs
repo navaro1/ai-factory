@@ -35,6 +35,7 @@ use crate::config::{
     RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
+use crate::labels::{LabelKey, LabelNames};
 use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
@@ -136,6 +137,10 @@ pub struct SettingsView {
     pub global_tag_routes: Vec<GlobalTagRouteSettingsView>,
     /// Every effective repository tag route, in repository and route order.
     pub repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
+    /// The global label names, from the defaults and the `[labels]` table.
+    pub labels: LabelNames,
+    /// The effective label names of every repository, by alias.
+    pub repository_labels: BTreeMap<String, LabelNames>,
     /// The effective prompt template of every role that has one, in role
     /// order. The theory roles carry no template, so they are absent.
     pub prompts: Vec<PromptView>,
@@ -174,6 +179,8 @@ struct SettingsViewRef<'a> {
     repositories: &'a [RepositoryRoleSettingsView],
     global_tag_routes: &'a [GlobalTagRouteSettingsView],
     repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
+    labels: &'a LabelNames,
+    repository_labels: &'a BTreeMap<String, LabelNames>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     theory_global: Vec<&'a GlobalRoleSettingsView>,
     prompts: &'a [PromptView],
@@ -188,6 +195,10 @@ struct SettingsViewWire {
     global_tag_routes: Vec<GlobalTagRouteSettingsView>,
     #[serde(default)]
     repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
+    #[serde(default)]
+    labels: LabelNames,
+    #[serde(default)]
+    repository_labels: BTreeMap<String, LabelNames>,
     #[serde(default)]
     theory_global: Vec<GlobalRoleSettingsView>,
     #[serde(default)]
@@ -209,6 +220,8 @@ impl Serialize for SettingsView {
             repositories: &self.repositories,
             global_tag_routes: &self.global_tag_routes,
             repository_tag_routes: &self.repository_tag_routes,
+            labels: &self.labels,
+            repository_labels: &self.repository_labels,
             theory_global,
             prompts: &self.prompts,
         }
@@ -229,6 +242,8 @@ impl<'de> Deserialize<'de> for SettingsView {
             repositories: wire.repositories,
             global_tag_routes: wire.global_tag_routes,
             repository_tag_routes: wire.repository_tag_routes,
+            labels: wire.labels,
+            repository_labels: wire.repository_labels,
             prompts: wire.prompts,
         })
     }
@@ -300,12 +315,19 @@ impl SettingsView {
                 });
             }
         }
+        let repository_labels = config
+            .repos
+            .keys()
+            .map(|alias| (alias.clone(), config.resolved_labels(Some(alias))))
+            .collect();
         Ok(Self {
             revision: revision.to_string(),
             global,
             repositories,
             global_tag_routes,
             repository_tag_routes,
+            labels: config.resolved_labels(None),
+            repository_labels,
             prompts: prompts.to_vec(),
         })
     }
@@ -686,17 +708,18 @@ impl StateInput<'_> {
             .keys()
             .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
             .flat_map(|(repo, items)| {
+                let names = config.resolved_labels(Some(repo));
                 items
                     .issues
                     .values()
                     .filter(|issue| issue.open)
-                    .map(|issue| TicketSummary {
+                    .map(move |issue| TicketSummary {
                         repo: repo.clone(),
                         number: issue.number,
                         title: issue.title.clone(),
                         labels: issue.labels.clone(),
                         updated_at: issue.updated_at.clone(),
-                        group: TicketGroup::from_labels(&issue.labels),
+                        group: TicketGroup::from_labels(&issue.labels, &names),
                     })
             })
             .collect();
@@ -907,10 +930,10 @@ pub enum TicketGroup {
 
 impl TicketGroup {
     /// Classify one label set.
-    fn from_labels(labels: &[String]) -> Self {
-        if labels.iter().any(|label| label == "to-refine") {
+    fn from_labels(labels: &[String], names: &LabelNames) -> Self {
+        if names.has(LabelKey::ToRefine, labels) {
             TicketGroup::ToRefine
-        } else if labels.iter().any(|label| label == "refined") {
+        } else if names.has(LabelKey::Refined, labels) {
             TicketGroup::Refined
         } else {
             TicketGroup::Untouched
