@@ -65,43 +65,47 @@ The toolbelt adds rules 13 to 23.
 
 13. An agent verifies on the real surface. A Before / After line states the command and the observed result, or it is `inconclusive`.
 14. A question an experiment can answer is not the operator's. An agent runs the experiment and records the result. Only a product or preference call earns `needs-human`.
-15. The agent that judges a change never wrote it. The review agent re-drives every line on a fresh context and another model.
+15. The agent that judges a change never wrote it. The review agent re-drives every line on a fresh context and another model. The daemon runs the fast checks, and no agent grades its own fast check.
 16. A check done by hand twice becomes a lever in the same PR. A lever the reviewer cannot rerun is not a lever.
 17. No confirmed reproduction, no authored fix. A bug ticket reproduces twice through the driver before any plan.
-18. The skills checkout is the theory checkout, unless a path override says otherwise.
+18. The skills checkout is the theory checkout, unless a path override says otherwise. A repository that many people share stays clean through shadow mode or the override.
 19. Evidence is text. Transcripts, ARIA snapshots, exit codes, and log excerpts travel in the PR body and in comments.
 20. An agent probes for drivers and never installs one. A new driver is a ticket the operator opens.
-21. The daemon inlines skill content into the prompt. It never relies on a harness skill loader or a plugin.
-22. The ticket defines done. Every acceptance criterion is falsifiable and names its check. Every Before / After line names the criterion it proves.
-23. The simplest change that meets every criterion ships, in the style the repository already has. A test that still passes with the change reverted is not a test.
+21. The daemon inlines skill content into the prompt. It never relies on a harness skill loader, a harness browser integration, or a plugin.
+22. The ticket defines done. Every acceptance criterion is falsifiable and names its check. Every Before / After line names the criterion it proves. A change that no criterion asks for does not ship.
+23. The simplest change that meets every criterion ships, in the style the repository already has. No new abstraction, layer, or dependency without a criterion that needs it. A test that still passes with the change reverted is not a test.
 
 ## The refusals
 
 1. An agent never writes a prediction. An agent can challenge a vague one.
 2. An agent never edits the model, the verification map, or the rules. An agent can propose an entry.
 3. No human reads code to catch a defect.
-4. A test alone is not verification. A Before / After line that rests on "it compiles" or "tests pass" is `inconclusive`, and `inconclusive` is not a pass.
-5. No browser-profile integration. Headless Playwright through a CLI is the web driver.
+4. A test alone is not verification. A Before / After line that rests on "it compiles", "tests pass", or an author's summary is `inconclusive`, and `inconclusive` is not a pass.
+5. No browser-profile integration, ever. Claude in Chrome and the Codex `@Chrome` act inside a signed-in browser. Headless Playwright through a CLI is the web driver.
 
 ## The driver ladder
 
-The setup ticket probes the toolchain and picks the highest tier it finds. An
-agent never installs a driver. The operator sets a floor per area in
-`verify.toml`. A line below the floor is `inconclusive`, and the operator
-accepts the lower tier or stops the line.
+The setup ticket probes the toolchain and the machine, picks the highest tier
+it finds, and records it in the front matter. An agent never installs a driver.
+The operator sets a floor per area in `verify.toml`. A line below the floor is
+`inconclusive`, and the operator accepts the lower tier or stops the line.
 
 | Tier | Driver | Proves | Needs |
 |---|---|---|---|
-| `browser` | `playwright-cli`, `agent-browser`, or `chromium-cli`, headless | Rendered UI, clicks, ARIA snapshots | Playwright in the toolchain |
+| `browser` | `playwright-cli`, `agent-browser`, or `chromium-cli`, headless | Rendered UI, clicks, ARIA snapshots | Playwright in the toolchain. No extension, no browser profile. |
 | `dom` | The repository's `jsdom` or `happy-dom` runner, or fetch plus an HTML parser | Rendered markup and component behaviour | Node or Python already present |
 | `http` | `curl` or an HTTP or GraphQL client | Status, headers, body, side effects in logs and data | Nothing new |
 | `terminal` | `tmux`, `agent-tty`, or direct invocation | A CLI or TUI end to end | `tmux` |
-| `none` | No driver reaches the feature | Nothing. Every line is `inconclusive` | Nothing |
+| `none` | No driver reaches the feature | Nothing. Every line is `inconclusive` with the reason | Nothing |
+
+A CLI driver costs a few characters per action. The Playwright MCP costs the
+full accessibility tree per action. The ladder names CLIs only.
 
 ## The principles
 
-The stance carries six principles as vocabulary. Each one is backed by a
-structural check, not by a naming rule. An agent names none of them in a PR.
+The stance carries six principles as vocabulary, each adapted from pstack by
+Lauren Tan. Each one is backed by a structural check, not by a naming rule. An
+agent names none of them in a PR.
 
 | Principle | The structure that enforces it |
 |---|---|
