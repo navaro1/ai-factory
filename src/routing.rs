@@ -125,11 +125,7 @@ pub struct TagRouteBinding {
 }
 
 /// Select the highest exact label, or medium when no valid label exists.
-pub fn select_level(
-    stage: TagRouteStage,
-    labels: &[String],
-    names: &LabelNames,
-) -> TagSelection {
+pub fn select_level(stage: TagRouteStage, labels: &[String], names: &LabelNames) -> TagSelection {
     let mut level = None;
     let mut matched_labels = Vec::new();
     for label in labels {

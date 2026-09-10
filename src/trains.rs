@@ -640,7 +640,9 @@ mod tests {
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
         let mut t = Train::new("borsuk");
-        let err = t.stack(9, true, "acme/borsuk", &client, STACKED).unwrap_err();
+        let err = t
+            .stack(9, true, "acme/borsuk", &client, STACKED)
+            .unwrap_err();
         assert!(err.to_string().contains("not in the release queue"));
         assert_eq!(exec.calls().len(), 0, "no label call happens");
     }
@@ -672,7 +674,10 @@ mod tests {
         t.rebuild_stacked(&[2]);
 
         assert_eq!(t.stacked, vec![2]);
-        assert_eq!(t.finish(true, "acme/borsuk", &client, STACKED).unwrap(), vec![2]);
+        assert_eq!(
+            t.finish(true, "acme/borsuk", &client, STACKED).unwrap(),
+            vec![2]
+        );
         assert_eq!(exec.calls().len(), 1);
     }
 

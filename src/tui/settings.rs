@@ -1644,13 +1644,14 @@ impl Settings {
             }
             names.set(key, trimmed);
             let clash = LabelKey::ALL.into_iter().any(|other| {
-                other != key && draft.label_names().is_some_and(|(n, _)| n.get(other) == n.get(key))
+                other != key
+                    && draft
+                        .label_names()
+                        .is_some_and(|(n, _)| n.get(other) == n.get(key))
             });
             if clash {
-                self.errors.insert(
-                    field,
-                    "another label already uses this name".to_string(),
-                );
+                self.errors
+                    .insert(field, "another label already uses this name".to_string());
             } else {
                 self.errors.remove(&field);
             }
@@ -2055,9 +2056,7 @@ impl Settings {
                         DraftValue::Global { limit, .. } => {
                             limit.map(|value| value.to_string()).unwrap_or_default()
                         }
-                        DraftValue::Repository { .. } | DraftValue::Labels { .. } => {
-                            String::new()
-                        }
+                        DraftValue::Repository { .. } | DraftValue::Labels { .. } => String::new(),
                     }
                 } else {
                     state
@@ -2171,9 +2170,7 @@ impl Settings {
             };
             lines.push(Line::from(vec![
                 Span::styled("labels  ", THEME.dim()),
-                Span::raw(format!(
-                    "{scope} · the names this scope matches on GitHub"
-                )),
+                Span::raw(format!("{scope} · the names this scope matches on GitHub")),
             ]));
             lines.push(Line::from(""));
         }
@@ -4205,7 +4202,9 @@ mod tests {
         settings.set_field(Field::Label(LabelKey::Chunk));
         settings.replace_selected_text(&state, "   ");
 
-        assert!(settings.field_error(Field::Label(LabelKey::Chunk)).is_some());
+        assert!(settings
+            .field_error(Field::Label(LabelKey::Chunk))
+            .is_some());
         assert_eq!(
             settings.field_value(&state, Field::Label(LabelKey::Chunk)),
             "chunk",
