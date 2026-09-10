@@ -4686,6 +4686,7 @@ mod tests {
                 }),
                 full: None,
                 delta: None,
+                ..crate::sock::RecordView::default()
             },
         );
         App {

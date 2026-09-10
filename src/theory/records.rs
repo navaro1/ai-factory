@@ -340,7 +340,7 @@ fn parse_prediction(body: &str) -> Option<Prediction> {
 }
 
 /// The bodies of every complete block of one tag, in text order.
-fn scan_block_bodies<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
+pub(super) fn scan_block_bodies<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
     let close = close_tag(tag);
     let mut bodies = Vec::new();
     let mut rest = text;
