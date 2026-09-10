@@ -530,6 +530,76 @@ what step 6 proved.
 Never edit `theory/verify.toml`.
 "#;
 
+/// The built-in prompt of one audit sweep task.
+///
+/// The theory roles carry no prompt file, so a sweep task fills this
+/// template directly. The placeholders are `{repo}`, `{worktree}`,
+/// `{model}`, and `{skills}`.
+pub const AUDIT_SWEEP_PROMPT: &str = r#"You audit the repository {repo}
+against the model. You work in {worktree}, the repository checkout. Read
+the files you need. Change no file.
+
+The model
+
+{model}
+
+The skills
+
+{skills}
+
+Check every entry of the model against the code. An entry that no code
+supports is dead. End the turn with one event block per dead entry.
+
+Then check each run skill against the code. Read the Run and Fast sections
+of every SKILL.md file. Read the handles of every feature file. A command
+that names a path that the code no longer holds is a dead path. A handle
+that no code answers is a dead handle. End the turn with one skill-drift
+block per surface with drift. Name the dead paths and the dead handles in
+the text of the block.
+
+A model event block takes this form.
+
+<aif-event-v1>
+{"kind":"sweep","text":"One sentence on the dead entry.","area":"area id"}
+</aif-event-v1>
+
+A drift block names its surface and takes this form.
+
+<aif-event-v1>
+{"kind":"skill-drift","text":"The dead paths and the dead handles.","surface":"surface id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a
+block in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The body of one run skill maintain ticket, before the daemon fills it.
+///
+/// The eight steps are section 6.3 of the verification toolbelt design
+/// record. The daemon fills `{alias}`, `{surface}`, `{skills_dir}`, and
+/// `{app_path}` when it creates the ticket, so the refine agent and the
+/// implement agent read one complete recipe.
+pub const MAINTAIN_BODY: &str = r#"Maintain the run skill of the {surface} surface of {alias}.
+
+The audit sweep found drift between the skill and the code. The application
+lives at {app_path}. Every skill file lives under {skills_dir}. Never edit
+`theory/verify.toml`.
+
+1. Clean the feature index. Remove an entry that no file or area supports.
+2. Read every source path that the Run and Fast sections name. Fix a path
+that the code moved.
+3. Run the Run section and the Fast section once each. Fix a command that
+fails against the live application.
+4. Triage every finding. A finding is doc drift, or a harness gap, or a
+product gap.
+5. Open one `bug` ticket per product gap. Fix no product code in this
+ticket.
+6. Re-drive every fix against the live application.
+7. Ship the repair as one PR. Post a comment instead when the skill needs
+no change.
+8. Stop when the skill matches the code again.
+"#;
+
 /// The placeholders the daemon fills in a stage prompt.
 const STAGE_PLACEHOLDERS: &[&str] = &[
     "repo",
@@ -902,6 +972,64 @@ mod tests {
             ),
             "the event block stays literal:\n{filled}"
         );
+    }
+
+    #[test]
+    fn the_audit_sweep_prompt_names_exactly_its_four_placeholders() {
+        assert_eq!(
+            scan_placeholders(AUDIT_SWEEP_PROMPT),
+            vec!["repo", "worktree", "model", "skills"]
+        );
+        assert!(
+            AUDIT_SWEEP_PROMPT.contains("dead handles"),
+            "the drift paragraph names the dead handles"
+        );
+        assert!(
+            AUDIT_SWEEP_PROMPT.contains("skill-drift"),
+            "the drift block carries the skill-drift kind"
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(AUDIT_SWEEP_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(AUDIT_SWEEP_PROMPT, &values).expect("the sweep prompt fills");
+        assert!(filled.contains("<model>"));
+        assert!(filled.contains(
+            r#"{"kind":"skill-drift","text":"The dead paths and the dead handles.","surface":"surface id"}"#
+        ), "the drift block stays literal:\n{filled}");
+    }
+
+    #[test]
+    fn the_maintain_body_fills_like_the_setup_body() {
+        assert_eq!(
+            scan_placeholders(MAINTAIN_BODY),
+            vec!["surface", "alias", "app_path", "skills_dir"]
+        );
+        let filled = fill_template(
+            MAINTAIN_BODY,
+            &[
+                ("alias", "borsuk".to_string()),
+                ("surface", "web".to_string()),
+                ("skills_dir", "/tmp/skills/run-web/".to_string()),
+                ("app_path", "/srv/app".to_string()),
+            ],
+        )
+        .expect("the maintain body fills");
+        assert!(filled.contains("Maintain the run skill of the web surface of borsuk."));
+        assert!(filled.contains("/tmp/skills/run-web/"));
+        assert!(filled.contains("/srv/app"));
+        for step in [
+            "1. Clean the feature index",
+            "2. Read every source path",
+            "3. Run the Run section",
+            "4. Triage every finding",
+            "5. Open one `bug` ticket",
+            "6. Re-drive every fix",
+            "7. Ship the repair as one PR",
+            "8. Stop when the skill matches",
+        ] {
+            assert!(filled.contains(step), "the eight steps stay:\n{filled}");
+        }
     }
 
     /// The theory roles carry no template yet. Every prompt entry point
