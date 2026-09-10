@@ -313,6 +313,12 @@ The parser rejects an empty name, a padded name, and two keys that resolve
 to the same name. The refine, implement, and review prompts carry the
 configured names, so the agent writes the name the factory reads.
 
+The Settings view edits the names. Pick the `labels` target under the eight
+tag routes. The global scope writes `[labels]`. A repository scope writes
+`[repo.<alias>.labels]`, and `d` there clears every override. Type the name
+the scope inherits to remove one key. A save applies without a restart, and
+the panel refuses an empty name or a name another key already uses.
+
 Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` for migration steps.
 
 ## Commands

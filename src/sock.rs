@@ -141,6 +141,10 @@ pub struct SettingsView {
     pub labels: LabelNames,
     /// The effective label names of every repository, by alias.
     pub repository_labels: BTreeMap<String, LabelNames>,
+    /// The label keys the global `[labels]` table sets, in key order.
+    pub global_label_overrides: Vec<LabelKey>,
+    /// The label keys each `[repo.<alias>.labels]` table sets, by alias.
+    pub repository_label_overrides: BTreeMap<String, Vec<LabelKey>>,
     /// The effective prompt template of every role that has one, in role
     /// order. The theory roles carry no template, so they are absent.
     pub prompts: Vec<PromptView>,
@@ -181,6 +185,8 @@ struct SettingsViewRef<'a> {
     repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
     labels: &'a LabelNames,
     repository_labels: &'a BTreeMap<String, LabelNames>,
+    global_label_overrides: &'a [LabelKey],
+    repository_label_overrides: &'a BTreeMap<String, Vec<LabelKey>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     theory_global: Vec<&'a GlobalRoleSettingsView>,
     prompts: &'a [PromptView],
@@ -199,6 +205,10 @@ struct SettingsViewWire {
     labels: LabelNames,
     #[serde(default)]
     repository_labels: BTreeMap<String, LabelNames>,
+    #[serde(default)]
+    global_label_overrides: Vec<LabelKey>,
+    #[serde(default)]
+    repository_label_overrides: BTreeMap<String, Vec<LabelKey>>,
     #[serde(default)]
     theory_global: Vec<GlobalRoleSettingsView>,
     #[serde(default)]
@@ -222,6 +232,8 @@ impl Serialize for SettingsView {
             repository_tag_routes: &self.repository_tag_routes,
             labels: &self.labels,
             repository_labels: &self.repository_labels,
+            global_label_overrides: &self.global_label_overrides,
+            repository_label_overrides: &self.repository_label_overrides,
             theory_global,
             prompts: &self.prompts,
         }
@@ -244,6 +256,8 @@ impl<'de> Deserialize<'de> for SettingsView {
             repository_tag_routes: wire.repository_tag_routes,
             labels: wire.labels,
             repository_labels: wire.repository_labels,
+            global_label_overrides: wire.global_label_overrides,
+            repository_label_overrides: wire.repository_label_overrides,
             prompts: wire.prompts,
         })
     }
@@ -320,6 +334,20 @@ impl SettingsView {
             .keys()
             .map(|alias| (alias.clone(), config.resolved_labels(Some(alias))))
             .collect();
+        let repository_label_overrides = config
+            .repos
+            .iter()
+            .map(|(alias, repo)| {
+                (
+                    alias.clone(),
+                    repo.label_overrides.keys().copied().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let global_label_overrides = LabelKey::ALL
+            .into_iter()
+            .filter(|key| config.labels.get(*key) != key.default_value())
+            .collect::<Vec<_>>();
         Ok(Self {
             revision: revision.to_string(),
             global,
@@ -328,6 +356,8 @@ impl SettingsView {
             repository_tag_routes,
             labels: config.resolved_labels(None),
             repository_labels,
+            global_label_overrides,
+            repository_label_overrides,
             prompts: prompts.to_vec(),
         })
     }

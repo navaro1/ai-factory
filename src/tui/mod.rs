@@ -2143,6 +2143,8 @@ mod tests {
             revision: "rev-one".to_string(),
             labels: crate::labels::LabelNames::default(),
             repository_labels: std::collections::BTreeMap::new(),
+            global_label_overrides: Vec::new(),
+            repository_label_overrides: std::collections::BTreeMap::new(),
             global: crate::config::ExecutionRole::ALL
                 .into_iter()
                 .map(|role| crate::sock::GlobalRoleSettingsView {
