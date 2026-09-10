@@ -276,6 +276,25 @@ impl<'a> GhClient<'a> {
         Ok(comments)
     }
 
+    /// Post one comment on an issue or pull request.
+    ///
+    /// The call is the plain `gh api` form post the daemon used before
+    /// [`GhClient`] owned it, so a comment needs no response head.
+    pub fn post_comment(&self, owner_repo: &str, number: u64, text: &str) -> Result<()> {
+        let url = format!("repos/{owner_repo}/issues/{number}/comments");
+        let field = format!("body={text}");
+        let args = ["api", "-X", "POST", url.as_str(), "-f", field.as_str()];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        if out.status != 0 {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            bail!("gh api exited with status {}: {detail}", out.status);
+        }
+        Ok(())
+    }
+
     /// Create one repository label and return GitHub's label.
     pub fn create_label(&self, owner_repo: &str, name: &str, color: &str) -> Result<RepoLabel> {
         let url = format!("repos/{owner_repo}/labels");
@@ -303,6 +322,41 @@ impl<'a> GhClient<'a> {
             name: str_field(&value, "name")?.to_string(),
             color: str_field(&value, "color")?.to_string(),
         })
+    }
+
+    /// Create one repository label, or find the existing one.
+    ///
+    /// GitHub answers HTTP 422 when the label exists; the method then
+    /// fetches the catalog and returns the existing label together with
+    /// the refreshed catalog, so the caller can refresh its cache. A
+    /// fresh creation carries no catalog. Every error carries the
+    /// operator message of the ticket controller as its text.
+    pub fn create_label_if_missing(
+        &self,
+        owner_repo: &str,
+        name: &str,
+        color: &str,
+    ) -> Result<(RepoLabel, Option<Vec<RepoLabel>>)> {
+        match self.create_label(owner_repo, name, color) {
+            Ok(label) => Ok((label, None)),
+            Err(error) if error.to_string().contains("HTTP 422") => {
+                let labels = self.fetch_labels(owner_repo).map_err(|refresh_error| {
+                    anyhow!(
+                        "GitHub reported an existing label, but the catalog refresh failed: {refresh_error:#}"
+                    )
+                })?;
+                match labels
+                    .iter()
+                    .find(|label| label.name.eq_ignore_ascii_case(name))
+                {
+                    Some(label) => Ok((label.clone(), Some(labels))),
+                    None => Err(anyhow!(
+                        "GitHub rejected label creation, and the refreshed catalog has no matching label"
+                    )),
+                }
+            }
+            Err(error) => Err(anyhow!("GitHub rejected label creation: {error:#}")),
+        }
     }
 
     /// Update one issue title and description and return GitHub's issue.
@@ -511,11 +565,24 @@ impl<'a> GhClient<'a> {
     }
 
     /// Create an issue and return the issue GitHub answered with.
-    pub fn create_issue(&self, owner_repo: &str, title: &str, body: &str) -> Result<Issue> {
+    ///
+    /// Each label name becomes one `labels[]` form field on the creation
+    /// call, so GitHub attaches the labels at once.
+    pub fn create_issue(
+        &self,
+        owner_repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[&str],
+    ) -> Result<Issue> {
         let url = format!("repos/{owner_repo}/issues");
         let title_field = format!("title={title}");
         let body_field = format!("body={body}");
-        let args = [
+        let label_fields: Vec<String> = labels
+            .iter()
+            .map(|label| format!("labels[]={label}"))
+            .collect();
+        let mut args: Vec<&str> = vec![
             "api",
             "-i",
             "-X",
@@ -526,6 +593,10 @@ impl<'a> GhClient<'a> {
             "-f",
             body_field.as_str(),
         ];
+        for field in &label_fields {
+            args.push("-f");
+            args.push(field.as_str());
+        }
         let out = self
             .exec
             .run("gh", &args, None)
@@ -1760,7 +1831,7 @@ mod tests {
         );
         let client = GhClient::new(&exec);
         let issue = client
-            .create_issue("acme/borsuk", "decision", "why")
+            .create_issue("acme/borsuk", "decision", "why", &[])
             .unwrap();
 
         assert_eq!(issue.number, 42);
@@ -1898,5 +1969,222 @@ mod tests {
                 "repos/acme/borsuk/issues/9/comments?per_page=100&page=2"
             ]
         );
+    }
+
+    #[test]
+    fn post_comment_runs_the_exact_gh_call() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/9/comments",
+                "-f",
+                "body=done",
+            ]),
+            CmdOut::ok(""),
+        );
+        let client = GhClient::new(&exec);
+        client.post_comment("acme/borsuk", 9, "done").unwrap();
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn post_comment_reports_a_failed_call() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/9/comments",
+                "-f",
+                "body=nope",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "validation failed".to_string(),
+            },
+        );
+        let client = GhClient::new(&exec);
+        let error = client.post_comment("acme/borsuk", 9, "nope").unwrap_err();
+        assert!(error.to_string().contains("status 1"));
+        assert!(error.to_string().contains("validation failed"));
+    }
+
+    #[test]
+    fn create_label_if_missing_returns_a_fresh_label_with_no_catalog() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/labels",
+                "-f",
+                "name=event-open",
+                "-f",
+                "color=d4c5f9",
+            ]),
+            CmdOut::ok(response(
+                "HTTP/2 201",
+                &[],
+                r#"{"name":"event-open","color":"d4c5f9"}"#,
+            )),
+        );
+        let client = GhClient::new(&exec);
+        let (label, refreshed) = client
+            .create_label_if_missing("acme/borsuk", "event-open", "d4c5f9")
+            .unwrap();
+        assert_eq!(label.name, "event-open");
+        assert_eq!(refreshed, None);
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn create_label_if_missing_finds_the_existing_label_and_the_catalog() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=triage",
+                    "-f",
+                    "color=55e6ff",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: "HTTP/2 422\r\n\r\n{}".to_string(),
+                    stderr: "already_exists".to_string(),
+                },
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/labels?per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &[],
+                    r#"[{"name":"ui","color":"000000"},{"name":"Triage","color":"ff0000"}]"#,
+                )),
+            );
+        let client = GhClient::new(&exec);
+        let (label, refreshed) = client
+            .create_label_if_missing("acme/borsuk", "triage", "55e6ff")
+            .unwrap();
+        assert_eq!(label.name, "Triage");
+        assert_eq!(label.color, "ff0000");
+        let refreshed = refreshed.expect("the refreshed catalog rides along");
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn create_label_if_missing_fails_when_the_catalog_has_no_match() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=triage",
+                    "-f",
+                    "color=55e6ff",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: "HTTP/2 422\r\n\r\n{}".to_string(),
+                    stderr: "already_exists".to_string(),
+                },
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/labels?per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &[],
+                    r#"[{"name":"ui","color":"000000"}]"#,
+                )),
+            );
+        let client = GhClient::new(&exec);
+        let error = client
+            .create_label_if_missing("acme/borsuk", "triage", "55e6ff")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "GitHub rejected label creation, and the refreshed catalog has no matching label"
+        );
+    }
+
+    #[test]
+    fn create_issue_passes_one_label_field_per_label() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Eliminate: INV-3",
+                "-f",
+                "body=why",
+                "-f",
+                "labels[]=to-refine",
+                "-f",
+                "labels[]=ladder-1",
+            ]),
+            CmdOut::ok(response("HTTP/2 201", &[], &issue_json(12))),
+        );
+        let client = GhClient::new(&exec);
+        let issue = client
+            .create_issue(
+                "acme/borsuk",
+                "Eliminate: INV-3",
+                "why",
+                &["to-refine", "ladder-1"],
+            )
+            .unwrap();
+        assert_eq!(issue.number, 12);
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn create_issue_with_no_labels_sends_no_label_field() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Direct title",
+                "-f",
+                "body=Direct body",
+            ]),
+            CmdOut::ok(response("HTTP/2 201", &[], &issue_json(12))),
+        );
+        let client = GhClient::new(&exec);
+        let issue = client
+            .create_issue("acme/borsuk", "Direct title", "Direct body", &[])
+            .unwrap();
+        assert_eq!(issue.number, 12);
     }
 }
