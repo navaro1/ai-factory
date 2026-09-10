@@ -261,6 +261,8 @@ struct App {
     view: View,
     /// The row the operator marked.
     selection: Selection,
+    /// The AREAS row the operator marked in the Theory view.
+    theory_row: usize,
     /// The toast text and the instant it expires at.
     toast: Option<(String, Instant)>,
     /// True while the help overlay covers the view.
@@ -732,8 +734,19 @@ impl App {
                 KeyCode::Char('4') => self.view = View::Tickets,
                 KeyCode::Char('5') => self.view = View::Settings,
                 KeyCode::Char('?') => self.help = true,
+                KeyCode::Char('j') | KeyCode::Down => theory::move_selection(self, 1),
+                KeyCode::Char('k') | KeyCode::Up => theory::move_selection(self, -1),
                 KeyCode::Esc => self.view = View::Pipeline,
-                _ => {}
+                _ => {
+                    let row = self.theory_row;
+                    if let Some(action) = self
+                        .state
+                        .as_ref()
+                        .and_then(|state| theory::handle_key(state, row, key))
+                    {
+                        emit(self, sink, action, "sent teach".to_string());
+                    }
+                }
             },
         }
         true
@@ -1385,7 +1398,7 @@ fn render_with_clock(
         }
         View::Theory => {
             if let Some(state) = app.state.as_ref() {
-                theory::draw(f, body, state);
+                theory::draw(f, body, state, app.theory_row);
             }
         }
     }
@@ -1500,7 +1513,7 @@ fn footer_hints(app: &App) -> String {
         View::Inbox => inbox::footer_text(state, &app.inbox),
         View::Tickets => app.tickets.footer_hints(),
         View::Settings => app.settings.footer_hints(),
-        View::Theory => "1-6 view · esc home".to_string(),
+        View::Theory => "1-6 view · j/k move · t teach · esc home".to_string(),
     }
 }
 
@@ -2990,6 +3003,47 @@ mod tests {
             &mut sink,
         );
         assert_eq!(app.view, View::Pipeline);
+    }
+
+    #[test]
+    fn t_on_an_areas_row_sends_one_teach_request_for_that_area() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        let area = |id: &str| crate::sock::AreaView {
+            id: id.to_string(),
+            tier: crate::theory::verify::Tier::Browser,
+            ..crate::sock::AreaView::default()
+        };
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                areas: vec![area("api-orders"), area("web-checkout")],
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('j'), key('t')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.theory_row, 1);
+        assert_eq!(
+            sink.0,
+            vec![Action::Theory(crate::sock::TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Area("web-checkout".to_string()),
+            })]
+        );
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("t teach"), "{screen}");
+        assert!(screen.contains("\u{25b8} web-checkout"), "{screen}");
     }
 
     #[test]

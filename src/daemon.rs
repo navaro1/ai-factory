@@ -60,18 +60,24 @@ use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
     Action, AreaView, AskView, EntryView, InputMode, PauseScope, PromptSource, PromptView, Push,
     SettingsOperation, SettingsResult, SettingsResultStatus, StateInput, StateView, SurfaceView,
-    TheoryView, TicketAction, TicketDetails, TicketProposal,
+    TheoryAction, TheoryView, TicketAction, TicketDetails, TicketProposal,
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
-use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
-use crate::theory::model::{self, Model};
-use crate::theory::records::{event_block, Event, RecordKey, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL};
+use crate::tasks::{self, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::theory::model::{self, Entry, Model};
+use crate::theory::records::{
+    event_block, parse_event_blocks, Event, RecordKey, EVENT_BLOCK, EVENT_OPEN_COLOR,
+    EVENT_OPEN_LABEL,
+};
 use crate::theory::skills::{self, SkillSet, SKILLS_DIR};
 use crate::theory::verify::VerifyMap;
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
 use crate::worktree::{self, WorktreeKind, WorktreeManager, TRAIN_DIR};
+
+/// How many diff lines one teach subject carries at most.
+const TEACH_DIFF_LINES: usize = 400;
 
 /// How long a parked session stays alive without activity before the reaper
 /// stops its process.
@@ -2892,7 +2898,7 @@ impl Daemon {
                     .table
                     .by_id
                     .get(&task_id)
-                    .is_some_and(Self::is_ticket_chat)
+                    .is_some_and(|task| Self::wants_final_block(task).is_some())
                 {
                     let turn = self.ticket_turn_text.entry(task_id).or_default();
                     if proposal_marker_text(&turn.last) {
@@ -2916,7 +2922,7 @@ impl Daemon {
                     self.add_turn_cost(&task_id, cost_usd);
                 }
                 if ok {
-                    self.finish_ticket_proposal_turn(&task_id);
+                    self.finish_final_block_turn(&task_id);
                 } else {
                     self.ticket_turn_text.remove(&task_id);
                 }
@@ -2942,7 +2948,9 @@ impl Daemon {
         if task.state != TaskState::Running || !self.task_capabilities(&task).live_input {
             return;
         }
-        if task.stage == Stage::Refine {
+        // A teach task runs one turn. It shares the refine stage with the
+        // parked sessions, so it must not park with them.
+        if task.stage == Stage::Refine && !Self::is_teach(&task) {
             let transitioned = self
                 .snapshot
                 .repos
@@ -3248,7 +3256,9 @@ impl Daemon {
         // `Done`. The process would still hold a live slot of the stage,
         // and a release task keeps one id across batches, so the next batch
         // could never start. The refine path stops its session the same way.
-        if task.purpose == TaskPurpose::Pipeline && self.task_capabilities(task).live_input {
+        if (task.purpose == TaskPurpose::Pipeline || Self::is_teach(task))
+            && self.task_capabilities(task).live_input
+        {
             self.stop_session(&task.id, "cannot stop the completed session");
         }
         // A live-input task without a saved message loses its restart data
@@ -3692,6 +3702,7 @@ impl Daemon {
                 role,
                 base_revision,
             } => self.reset_prompt(request, role, base_revision),
+            Action::Theory(TheoryAction::Teach { repo, key }) => self.teach(&repo, key),
             Action::Reconcile { repo } => self.reconcile(repo.as_deref()),
             Action::Stop => self.shutdown = true,
         }
@@ -4498,7 +4509,8 @@ impl Daemon {
             Stage::Refine
                 if task.kind == ItemKind::Issue
                     && !Self::is_ticket_creation(task)
-                    && !Self::is_ticket_chat(task) =>
+                    && !Self::is_ticket_chat(task)
+                    && !Self::is_teach(task) =>
             {
                 Workspace::Exclusive(WorktreeKey::Issue(task.number))
             }
@@ -5361,6 +5373,42 @@ impl Daemon {
         }
     }
 
+    /// Queue one teach task for one subject.
+    ///
+    /// The task runs one turn in the repository checkout. Its item is the
+    /// ticket-session item, so no worktree and no pipeline sweep claims
+    /// it, and the key alone names the subject.
+    fn teach(&mut self, repo: &str, key: TeachKey) {
+        if !self.config.repos.contains_key(repo) {
+            eprintln!("the teach request for {repo}: no such repository");
+            return;
+        }
+        let id = tasks::teach_id(repo, &key);
+        let log = self
+            .state_dir
+            .join("logs")
+            .join(format!("{repo}__teach-{}.jsonl", key.slug()));
+        let queued = self.table.upsert_with_id(
+            ScopedTask {
+                id: &id,
+                repo,
+                stage: Stage::Refine,
+                kind: ItemKind::Issue,
+                number: TICKET_NUMBER,
+            },
+            log,
+            self.now_ms,
+        );
+        match queued {
+            Ok(task) => {
+                task.purpose = TaskPurpose::Teach(key);
+                self.role_bindings.remove(&id);
+                self.changed = true;
+            }
+            Err(error) => eprintln!("the teach task {id}: {error:#}"),
+        }
+    }
+
     /// Queue or reuse one issue conversation.
     fn ticket_chat(&mut self, repo: &str, number: u64) {
         let handoff_active = self
@@ -5473,6 +5521,51 @@ impl Daemon {
         self.role_bindings.remove(&id);
         if self.ticket_conversations.remove(key).is_some() {
             self.changed = true;
+        }
+    }
+
+    /// Apply the final block of one finished turn, per the task purpose.
+    ///
+    /// A ticket chat proposes a rewritten ticket. A teach task opens one
+    /// theory event per contradiction it found. Every other purpose drops
+    /// the buffered text.
+    fn finish_final_block_turn(&mut self, id: &str) {
+        match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
+            Some(TaskPurpose::TicketChat) => self.finish_ticket_proposal_turn(id),
+            Some(TaskPurpose::Teach(_)) => self.finish_teach_events(id),
+            _ => {
+                self.ticket_turn_text.remove(id);
+            }
+        }
+    }
+
+    /// Open one theory event per block of one finished teach turn.
+    ///
+    /// The record is the pull request for a pull request subject, and the
+    /// repository for an area subject. A turn with no block opens nothing,
+    /// and a failed post goes to standard error only, because the teach
+    /// task itself succeeded.
+    fn finish_teach_events(&mut self, id: &str) {
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        if turn.earlier_marker {
+            return;
+        }
+        let Some(task) = self.table.by_id.get(id).cloned() else {
+            return;
+        };
+        let TaskPurpose::Teach(key) = &task.purpose else {
+            return;
+        };
+        let record = match key {
+            TeachKey::Pr(number) => RecordKey::Pr(*number),
+            TeachKey::Area(_) => RecordKey::Repo,
+        };
+        for event in parse_event_blocks(&turn.last) {
+            if let Err(error) = self.open_event(&task.repo, &record, &event) {
+                eprintln!("task {id}: cannot open the theory event: {error:#}");
+            }
         }
     }
 
@@ -5659,9 +5752,14 @@ impl Daemon {
     }
 
     /// True when the task is an issue-creation session.
+    ///
+    /// A state file written before the purpose field restores its tasks as
+    /// `Pipeline`, so the shape of the item still names the session. Every
+    /// other purpose carries its own identity and stays out.
     fn is_ticket_creation(task: &Task) -> bool {
         task.purpose == TaskPurpose::TicketCreate
-            || (task.stage == Stage::Refine
+            || (task.purpose == TaskPurpose::Pipeline
+                && task.stage == Stage::Refine
                 && task.kind == ItemKind::Issue
                 && task.number == TICKET_NUMBER)
     }
@@ -5671,12 +5769,31 @@ impl Daemon {
         task.purpose == TaskPurpose::TicketChat
     }
 
+    /// True when the task explains one subject to the operator.
+    fn is_teach(task: &Task) -> bool {
+        matches!(task.purpose, TaskPurpose::Teach(_))
+    }
+
+    /// The block tag one task must end its turn with, or `None`.
+    ///
+    /// A task with a tag buffers its assistant text, so the daemon reads
+    /// the last complete event of the turn and nothing earlier.
+    fn wants_final_block(task: &Task) -> Option<&'static str> {
+        match task.purpose {
+            TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
+            TaskPurpose::Teach(_) => Some(EVENT_BLOCK),
+            TaskPurpose::Pipeline | TaskPurpose::TicketCreate => None,
+        }
+    }
+
     /// Select the execution role for one task purpose.
     fn execution_role(task: &Task) -> ExecutionRole {
         if Self::is_ticket_creation(task) {
             ExecutionRole::TicketCreate
         } else if Self::is_ticket_chat(task) {
             ExecutionRole::TicketChat
+        } else if Self::is_teach(task) {
+            ExecutionRole::TheoryChat
         } else {
             match task.stage {
                 Stage::Refine => ExecutionRole::Refine,
@@ -5874,6 +5991,10 @@ impl Daemon {
         repo_cfg: &RepoConfig,
         worktree: &Path,
     ) -> Result<String> {
+        if let TaskPurpose::Teach(key) = &task.purpose {
+            let values = self.teach_values(task, key, repo_cfg, worktree);
+            return prompts::fill_template(prompts::TEACH_PROMPT, &values);
+        }
         let role = Self::execution_role(task);
         let template = self.prompt_template(role)?;
         // A crash between the write and the rename can leave a blank file.
@@ -6072,6 +6193,234 @@ impl Daemon {
         skills::slice(stage, &areas, verify, set)
     }
 
+    /// The placeholder values of one teach task.
+    ///
+    /// A repository whose theory did not read, and a subject the daemon
+    /// cannot resolve, render their blocks empty. The teach turn still
+    /// starts, because an explanation of the code alone still helps.
+    fn teach_values(
+        &self,
+        task: &Task,
+        key: &TeachKey,
+        repo_cfg: &RepoConfig,
+        worktree: &Path,
+    ) -> Vec<(&'static str, String)> {
+        let (subject, paths) = match key {
+            TeachKey::Pr(number) => self.teach_pr_subject(task, repo_cfg, *number, worktree),
+            TeachKey::Area(id) => (self.teach_area_subject(task, id), self.area_paths(task, id)),
+        };
+        vec![
+            ("repo", task.repo.clone()),
+            ("worktree", worktree.display().to_string()),
+            ("subject", subject),
+            ("history", self.teach_history(repo_cfg, worktree, &paths)),
+            ("model", self.model_entries(&task.repo)),
+            ("skills", self.teach_skills(task, key, &paths)),
+        ]
+    }
+
+    /// The diff of one merged pull request and the paths it changed.
+    ///
+    /// The range is `<merge base>...<head>`, so git picks the merge base
+    /// itself. A diff past [`TEACH_DIFF_LINES`] ends with one marker line
+    /// that counts what stayed out.
+    fn teach_pr_subject(
+        &self,
+        task: &Task,
+        repo_cfg: &RepoConfig,
+        number: u64,
+        worktree: &Path,
+    ) -> (String, Vec<String>) {
+        let empty = (String::new(), Vec::new());
+        let Some(head) = self.teach_pr_head(task, repo_cfg, number) else {
+            return empty;
+        };
+        let Ok(base) = self
+            .worktrees
+            .default_base(self.exec.as_ref(), worktree)
+            .map_err(|error| eprintln!("the teach subject of {}: {error:#}", task.id))
+        else {
+            return empty;
+        };
+        let range = format!("{base}...{head}");
+        let paths = match worktree::git(
+            self.exec.as_ref(),
+            worktree,
+            &["diff", "--name-only", &range],
+        ) {
+            Ok(out) if out.status == 0 => out.stdout.lines().map(str::to_string).collect(),
+            _ => Vec::new(),
+        };
+        let diff = match worktree::git(self.exec.as_ref(), worktree, &["diff", &range]) {
+            Ok(out) if out.status == 0 => cap_diff(&out.stdout),
+            _ => String::new(),
+        };
+        (diff, paths)
+    }
+
+    /// The head commit of one pull request, from the snapshot or GitHub.
+    ///
+    /// A merged pull request left the snapshot, so the daemon asks GitHub
+    /// for the head it merged.
+    fn teach_pr_head(&self, task: &Task, repo_cfg: &RepoConfig, number: u64) -> Option<String> {
+        let cached = self
+            .snapshot
+            .repos
+            .get(&task.repo)
+            .and_then(|snapshot| snapshot.prs.get(&number))
+            .map(|pull| pull.head_sha.clone())
+            .filter(|sha| !sha.is_empty());
+        if let Some(head) = cached {
+            return Some(head);
+        }
+        let number = number.to_string();
+        let args = [
+            "pr",
+            "view",
+            number.as_str(),
+            "--repo",
+            repo_cfg.owner_repo.as_str(),
+            "--json",
+            "headRefOid",
+        ];
+        let out = self.exec.run("gh", &args, None).ok()?;
+        if out.status != 0 {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(&out.stdout)
+            .ok()?
+            .get("headRefOid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// The statement of one area and the model entries of its boundary.
+    fn teach_area_subject(&self, task: &Task, id: &str) -> String {
+        let Some((model, verify)) = self.theory_pair(&task.repo) else {
+            return String::new();
+        };
+        let Some(area) = verify.areas.iter().find(|area| area.id == id) else {
+            return String::new();
+        };
+        let mut out = format!("area {}: {}", area.id, area.statement);
+        for entry in &model.entries {
+            let names = match entry {
+                Entry::Boundary { id, .. } => *id == area.boundary,
+                Entry::Failure { crosses, .. } => *crosses == area.boundary,
+                _ => false,
+            };
+            if names {
+                out.push_str(&format!(
+                    "\n- {} ({}): {}",
+                    entry.id(),
+                    entry.kind_name(),
+                    entry.statement()
+                ));
+            }
+        }
+        out
+    }
+
+    /// The path globs of the boundary one area guards.
+    fn area_paths(&self, task: &Task, id: &str) -> Vec<String> {
+        let Some((model, verify)) = self.theory_pair(&task.repo) else {
+            return Vec::new();
+        };
+        let Some(area) = verify.areas.iter().find(|area| area.id == id) else {
+            return Vec::new();
+        };
+        model
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Boundary { id, paths, .. } if *id == area.boundary => Some(paths.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `{history}` value of one teach task.
+    ///
+    /// The block holds the recent commits of the subject's paths and the
+    /// merged pull requests that name them. A failed call contributes no
+    /// line, so the teach turn still starts.
+    fn teach_history(&self, repo_cfg: &RepoConfig, worktree: &Path, paths: &[String]) -> String {
+        if paths.is_empty() {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut args: Vec<&str> = vec!["log", "--oneline", "-20", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        if let Ok(out) = worktree::git(self.exec.as_ref(), worktree, &args) {
+            if out.status == 0 {
+                lines.extend(
+                    out.stdout
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| format!("- {line}")),
+                );
+            }
+        }
+        let search = paths.join(" ");
+        let args = [
+            "pr",
+            "list",
+            "--repo",
+            repo_cfg.owner_repo.as_str(),
+            "--state",
+            "merged",
+            "--search",
+            search.as_str(),
+            "--limit",
+            "10",
+            "--json",
+            "number,title",
+        ];
+        if let Ok(out) = self.exec.run("gh", &args, None) {
+            if out.status == 0 {
+                let found: Vec<serde_json::Value> =
+                    serde_json::from_str(&out.stdout).unwrap_or_default();
+                for hit in found {
+                    let number = hit.get("number").and_then(serde_json::Value::as_u64);
+                    let title = hit.get("title").and_then(serde_json::Value::as_str);
+                    if let (Some(number), Some(title)) = (number, title) {
+                        lines.push(format!("- #{number} {title}"));
+                    }
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The `{skills}` value of one teach task: the feature files of the
+    /// areas the subject touches.
+    fn teach_skills(&self, task: &Task, key: &TeachKey, paths: &[String]) -> String {
+        let Some((model, verify)) = self.theory_pair(&task.repo) else {
+            return String::new();
+        };
+        let Some(cache) = self.theory_skills.get(&task.repo) else {
+            return String::new();
+        };
+        let Ok(set) = &cache.skills else {
+            return String::new();
+        };
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let areas: Vec<&str> = match key {
+            TeachKey::Area(id) => vec![id.as_str()],
+            TeachKey::Pr(_) => verify.areas_for_paths(model, &refs),
+        };
+        skills::slice(skills::SliceStage::Teach, &areas, verify, set)
+    }
+
+    /// The parsed model and verification map of one repository.
+    fn theory_pair(&self, repo: &str) -> Option<(&Model, &VerifyMap)> {
+        let cache = self.theory_models.get(repo)?;
+        match (&cache.model, &cache.verify) {
+            (Ok(model), Ok(verify)) => Some((model, verify)),
+            _ => None,
+        }
+    }
+
     /// The changed paths of one PR worktree against the default base.
     ///
     /// A base or a diff git cannot resolve yields no paths, so the review
@@ -6242,6 +6591,23 @@ fn event_task(event: &RunEvent) -> &str {
         | RunEvent::TurnEnd { task, .. }
         | RunEvent::Exit { task, .. } => task,
     }
+}
+
+/// Cap one diff at [`TEACH_DIFF_LINES`] lines.
+///
+/// A longer diff ends with one marker line that counts what stayed out, so
+/// the agent knows the text is partial.
+fn cap_diff(text: &str) -> String {
+    let total = text.lines().count();
+    if total <= TEACH_DIFF_LINES {
+        return text.to_string();
+    }
+    let head: Vec<&str> = text.lines().take(TEACH_DIFF_LINES).collect();
+    format!(
+        "{}\n... {} more diff lines stay out.",
+        head.join("\n"),
+        total - TEACH_DIFF_LINES
+    )
 }
 
 /// True when assistant text contains a full or partial proposal marker.
@@ -16946,7 +17312,7 @@ mod tests {
                 TaskPurpose::TicketChat,
             ] {
                 let mut task = Task::new("borsuk", stage, ItemKind::Issue, 1, PathBuf::new(), T0);
-                task.purpose = purpose;
+                task.purpose = purpose.clone();
                 let role = Daemon::execution_role(&task);
                 assert!(
                     prompts::file_name(role).is_some(),
@@ -18565,6 +18931,215 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "the plain slice still carries Run:\n{}",
             rig.job(1).prompt
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Teach
+    // ------------------------------------------------------------------
+
+    /// The scripted history calls of one teach task over `web/**`.
+    fn teach_history_steps(repo: &Path) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["log", "--oneline", "-20", "--", "web/**"],
+                CmdOut::ok("aaa1111 add the pay button\nbbb2222 move the cart\n"),
+            ),
+            gh_step(
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    "acme/borsuk",
+                    "--state",
+                    "merged",
+                    "--search",
+                    "web/**",
+                    "--limit",
+                    "10",
+                    "--json",
+                    "number,title",
+                ],
+                CmdOut::ok(r#"[{"number":7,"title":"checkout rework"}]"#),
+            ),
+        ]
+    }
+
+    /// One teach action for the `web-checkout` area of the rig repository.
+    fn teach_area(id: &str) -> Action {
+        Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Area(id.to_string()),
+        })
+    }
+
+    #[test]
+    fn a_teach_dispatch_renders_the_history_and_the_area_slice() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_history_steps(&repo));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(teach_area("web-checkout"));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-area-web-checkout");
+        assert_eq!(job.cwd, repo);
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains(
+                "- aaa1111 add the pay button\n- bbb2222 move the cart\n- #7 checkout rework"
+            ),
+            "two commit lines and one pull request line:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("### .claude/skills/run-web/features/checkout.md"),
+            "the area feature file:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("# Orders"),
+            "another area stays out:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("area web-checkout: the cart pays"),
+            "the area statement:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- B-checkout (boundary): the cart pays"),
+            "the boundary entry:\n{prompt}"
+        );
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles[0].role, ExecutionRole::TheoryChat);
+    }
+
+    /// The scripted `open_event` calls of one block on the repository
+    /// record, which is issue 90 of the rig repository.
+    fn open_event_steps(event: &Event) -> Vec<Step> {
+        let body = format!("body={}", event_block(event));
+        vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/90/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=event-open",
+                    "-f",
+                    "color=d4c5f9",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"event-open\",\"color\":\"d4c5f9\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/90/labels",
+                    "-f",
+                    "labels[]=event-open",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// One teach event of the `web-checkout` area.
+    fn teach_event(text: &str) -> Event {
+        Event {
+            kind: "teach".to_string(),
+            text: text.to_string(),
+            area: Some("web-checkout".to_string()),
+            number: None,
+        }
+    }
+
+    /// The open issue that holds the repository theory record.
+    fn theory_issue() -> Issue {
+        let mut one = issue(90, &[]);
+        one.title = "borsuk/theory".to_string();
+        one
+    }
+
+    #[test]
+    fn a_teach_turn_opens_one_event_per_block() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let first = teach_event("The code retries, and the model forbids a retry.");
+        let second = teach_event("The boundary lists no cart path.");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_history_steps(&repo));
+        steps.extend(open_event_steps(&first));
+        steps.extend(open_event_steps(&second));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(teach_area("web-checkout"));
+        let id = "borsuk/teach-area-web-checkout";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The checkout posts the cart, then the api charges it.".to_string(),
+        });
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: format!("{}\n{}", event_block(&first), event_block(&second)),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        let bodies: Vec<Event> = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .filter_map(|call| call.args.iter().find(|arg| arg.starts_with("body=")))
+            .flat_map(|field| parse_event_blocks(field.strip_prefix("body=").unwrap_or(field)))
+            .collect();
+        assert_eq!(bodies, vec![first, second], "one event per block");
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_teach_turn_with_no_block_opens_nothing_and_ends_done() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_history_steps(&repo));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(teach_area("web-checkout"));
+        let id = "borsuk/teach-area-web-checkout";
+        let before = rig.exec.calls().len();
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The checkout matches the model in every step.".to_string(),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a turn with no block posts nothing"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
     }
 
     #[test]

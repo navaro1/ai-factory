@@ -4,22 +4,86 @@
 //! strip with the governor state and the counts, then the AREAS panel with
 //! the tier each area reaches.
 
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::sock::{AreaView, StateView, TheoryView};
+use crate::sock::{Action, AreaView, StateView, TheoryAction, TheoryView};
+use crate::tasks::TeachKey;
 use crate::theory::verify::Tier;
 
 use super::theme::THEME;
+use super::App;
 
 /// The separator of the header strip and the area rows.
 const DOT: &str = " · ";
 
-/// Draw the Theory view.
-pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView) {
+/// One selectable row of the Theory view: one area of one repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AreaRow {
+    /// The repository alias.
+    pub(super) repo: String,
+    /// The area id.
+    pub(super) id: String,
+}
+
+/// The selectable rows of the view, in draw order.
+///
+/// An ungoverned repository draws no AREAS panel, so it offers no row.
+pub(super) fn rows(state: &StateView) -> Vec<AreaRow> {
+    let mut all = Vec::new();
+    for (alias, view) in &state.theory {
+        if !view.governor {
+            continue;
+        }
+        for area in &view.areas {
+            all.push(AreaRow {
+                repo: alias.clone(),
+                id: area.id.clone(),
+            });
+        }
+    }
+    all
+}
+
+/// Move the selection by `delta`, clamped to the rows of the view.
+pub(super) fn move_selection(app: &mut App, delta: isize) {
+    let count = app
+        .state
+        .as_ref()
+        .map(|state| rows(state).len())
+        .unwrap_or_default();
+    if count == 0 {
+        app.theory_row = 0;
+        return;
+    }
+    let next = if delta < 0 {
+        app.theory_row.saturating_sub(delta.unsigned_abs())
+    } else {
+        app.theory_row.saturating_add(delta.unsigned_abs())
+    };
+    app.theory_row = next.min(count - 1);
+}
+
+/// The action of one key press in the Theory view, or `None`.
+///
+/// `t` starts one teach task for the selected area.
+pub(super) fn handle_key(state: &StateView, selected: usize, key: KeyEvent) -> Option<Action> {
+    if key.code != KeyCode::Char('t') || !key.modifiers.is_empty() {
+        return None;
+    }
+    let row = rows(state).into_iter().nth(selected)?;
+    Some(Action::Theory(TheoryAction::Teach {
+        repo: row.repo,
+        key: TeachKey::Area(row.id),
+    }))
+}
+
+/// Draw the Theory view with `selected` marking one area row.
+pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, selected: usize) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(THEME.dim())
@@ -30,6 +94,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView) {
                 .add_modifier(Modifier::BOLD),
         ));
     let mut lines: Vec<Line> = Vec::new();
+    let mut index = 0usize;
     for (alias, view) in &state.theory {
         if !lines.is_empty() {
             lines.push(Line::from(""));
@@ -46,7 +111,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView) {
         if view.areas.is_empty() {
             lines.push(Line::from(Span::styled("no area", THEME.dim())));
         }
-        lines.extend(view.areas.iter().map(area_row));
+        for row in &view.areas {
+            lines.push(area_row(row, index == selected));
+            index += 1;
+        }
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no repository", THEME.dim())));
@@ -86,18 +154,34 @@ fn strip(view: &TheoryView) -> Line<'static> {
 }
 
 /// One row of the AREAS panel: the area id and its tier mark.
-fn area_row(row: &AreaView) -> Line<'static> {
+fn area_row(row: &AreaView, is_selected: bool) -> Line<'static> {
     let mark = mark(row);
     let color = match mark.as_str() {
         "!" => THEME.error,
         "-" => THEME.dim,
         _ => THEME.accent,
     };
-    Line::from(vec![
+    let marker = if is_selected {
+        Span::styled(
+            "\u{25b8} ",
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+    let line = Line::from(vec![
+        marker,
         Span::styled(row.id.clone(), Style::default().fg(THEME.text)),
         Span::styled(DOT, THEME.dim()),
         Span::styled(mark, Style::default().fg(color)),
-    ])
+    ]);
+    if is_selected {
+        line.style(THEME.selected())
+    } else {
+        line
+    }
 }
 
 /// The tier mark of one area: the tier name, `-` when no surface maps to
@@ -165,7 +249,7 @@ mod tests {
     fn render(state: &StateView) -> String {
         let backend = TestBackend::new(70, 16);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, f.area(), state)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), state, 0)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
         for y in 0..buffer.area.height {

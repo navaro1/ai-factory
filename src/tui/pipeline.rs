@@ -447,6 +447,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
         KeyCode::Char(' ') => stack_selected_pr(app, sink),
         KeyCode::Char('g') => ask_release(app),
         KeyCode::Char('s') => cycle_policy(app, sink),
+        KeyCode::Char('t') => teach_selected_pr(app, sink),
         KeyCode::Enter => open_selected_task(app),
         _ => {}
     }
@@ -803,6 +804,25 @@ fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
 }
 
 /// Stack or unstack the selected pull request in a waiting release queue.
+/// Send one teach request for the selected release pull request.
+///
+/// The board holds no merged pull request of its own, so the train rows
+/// are the pull requests a release merges. Every other row sends nothing.
+fn teach_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
+    let Some(Row::ReleasePr { repo, pr }) = selected_row(app) else {
+        return;
+    };
+    emit(
+        app,
+        sink,
+        Action::Theory(crate::sock::TheoryAction::Teach {
+            repo: repo.clone(),
+            key: crate::tasks::TeachKey::Pr(pr),
+        }),
+        format!("sent teach #{pr} {repo}"),
+    );
+}
+
 fn stack_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
     let found = {
         let Some(state) = app.state.as_ref() else {

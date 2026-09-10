@@ -854,9 +854,12 @@ pub fn normalize_label_color(color: &str) -> Result<String, String> {
     Ok(color.to_ascii_lowercase())
 }
 
+/// The opening tag of one ticket proposal block.
+pub const TICKET_PROPOSAL_BLOCK: &str = "<aif-ticket-proposal-v1>";
+
 /// Parse the final strict proposal block from one assistant text event.
 pub fn parse_ticket_proposal(text: &str) -> Option<TicketContent> {
-    const OPEN: &str = "<aif-ticket-proposal-v1>";
+    const OPEN: &str = TICKET_PROPOSAL_BLOCK;
     const CLOSE: &str = "</aif-ticket-proposal-v1>";
 
     let text = text.trim_end();

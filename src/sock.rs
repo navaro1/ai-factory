@@ -1482,6 +1482,19 @@ pub enum Push {
     SettingsResult(SettingsResult),
 }
 
+/// One theory command inside [`Action::Theory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "theory_action", rename_all = "snake_case")]
+pub enum TheoryAction {
+    /// Explain one subject against the model and the skills.
+    Teach {
+        /// The repository alias.
+        repo: String,
+        /// The subject of the explanation.
+        key: crate::tasks::TeachKey,
+    },
+}
+
 /// One command from a UI or from `aif stop` to the daemon.
 ///
 /// Every variant names its target explicitly. The daemon resolves each
@@ -1587,6 +1600,8 @@ pub enum Action {
     },
     /// Perform one ticket review or mutation action.
     Ticket(TicketAction),
+    /// Perform one theory action.
+    Theory(TheoryAction),
     /// Save one role edit against an exact file revision.
     SaveSettings {
         /// The request identity from the UI.
@@ -2304,6 +2319,14 @@ mod tests {
                 repo: "qubitsok".to_string(),
             },
             Action::Reconcile { repo: None },
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Area("web-checkout".to_string()),
+            }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Pr(7),
+            }),
             Action::Stop,
         ]
     }
