@@ -42,6 +42,8 @@ use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
 use crate::theory::model::Model;
 use crate::theory::records::{DeltaBlock, FullPrediction, ShortPrediction};
+#[cfg(test)]
+use crate::theory::records::{DeltaOutcome, DeltaSlot, DeltaViolation, PredictionTag};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
@@ -2898,7 +2900,26 @@ mod tests {
                     reason: "awaits full prediction".to_string(),
                     stage: Stage::Implement,
                 }],
-                records: BTreeMap::new(),
+                records: BTreeMap::from([(
+                    "pr-7".to_string(),
+                    RecordView {
+                        short: None,
+                        full: None,
+                        delta: Some(DeltaBlock {
+                            slots: vec![DeltaSlot {
+                                id: "invariants".to_string(),
+                                outcome: DeltaOutcome::Miss,
+                                tag: PredictionTag::Sure,
+                            }],
+                            touched: vec!["INV-3".to_string()],
+                            violations: vec![DeltaViolation {
+                                entry: "INV-3".to_string(),
+                                finding: "the retry crosses the boundary".to_string(),
+                            }],
+                            question: "Does the cart keep the token?".to_string(),
+                        }),
+                    },
+                )]),
                 areas: vec![AreaView {
                     id: "web-checkout".to_string(),
                     tier: Tier::Browser,
@@ -2946,6 +2967,8 @@ mod tests {
         assert!(text.contains("\"tier\":\"browser\""), "line: {text}");
         assert!(text.contains("\"sure-miss\""), "line: {text}");
         assert!(text.contains("\"state\":\"open\""), "line: {text}");
+        assert!(text.contains("\"outcome\":\"miss\""), "line: {text}");
+        assert!(text.contains("\"tag\":\"sure\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 

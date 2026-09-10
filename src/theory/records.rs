@@ -625,11 +625,15 @@ pub fn delta_block(delta: &DeltaBlock) -> String {
 
 /// Parse one block body into a delta; `None` for any other body.
 ///
-/// A slot id that names no slot of [`PREDICTION_SLOT_NAMES`] refuses the
-/// whole body, because the daemon cannot map an unknown slot to a
+/// A body with no slot at all reports nothing, so it is refused. A slot
+/// id that names no slot of [`PREDICTION_SLOT_NAMES`] refuses the whole
+/// body too, because the daemon cannot map an unknown slot to a
 /// prediction tag.
 pub fn parse_delta(body: &str) -> Option<DeltaBlock> {
     let delta = serde_json::from_str::<DeltaBlock>(body).ok()?;
+    if delta.slots.is_empty() {
+        return None;
+    }
     delta
         .slots
         .iter()
@@ -1615,14 +1619,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_delta_refuses_an_unknown_slot_id() {
-        let body = r#"{"slots":[{"id":"bananas","outcome":"hit"}]}"#;
-
-        assert_eq!(parse_delta(body), None);
-        assert_eq!(
-            parse_delta_blocks(&format!("{DELTA_BLOCK}\n{body}\n</aif-delta-v1>")),
-            Vec::new()
-        );
+    fn parse_delta_refuses_an_unknown_slot_id_and_an_empty_slot_list() {
+        for body in [
+            r#"{"slots":[{"id":"bananas","outcome":"hit"}]}"#,
+            r#"{"slots":[]}"#,
+        ] {
+            assert_eq!(parse_delta(body), None, "body: {body}");
+            assert_eq!(
+                parse_delta_blocks(&format!("{DELTA_BLOCK}\n{body}\n</aif-delta-v1>")),
+                Vec::new(),
+                "body: {body}"
+            );
+        }
     }
 
     #[test]

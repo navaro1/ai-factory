@@ -7708,16 +7708,15 @@ impl Daemon {
     /// ticket-proposal strictness, so one complete block must end the
     /// report. A governed review that ends without a readable block fails
     /// the attempt with the finding `no delta block`, and the task
-    /// re-queues while attempts remain. Every other pipeline task drops
-    /// its text. A failed post goes to standard error only, because the
-    /// review itself succeeded.
+    /// re-queues while attempts remain. A turn that wrote no assistant
+    /// text at all fails the same way, because it carried no block
+    /// either. Every other pipeline task drops its text. A failed post
+    /// goes to standard error only, because the review itself succeeded.
     fn finish_review_delta(&mut self, id: &str) {
-        let Some(turn) = self.ticket_turn_text.remove(id) else {
-            return;
-        };
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
+        let turn = self.ticket_turn_text.remove(id).unwrap_or_default();
         if !self.wants_delta(&task) {
             return;
         }
@@ -7737,9 +7736,10 @@ impl Daemon {
 
     /// Copy the confidence tag of each slot in from the full prediction.
     ///
-    /// The review writes the outcome of a slot, never its tag, so the
-    /// posted block carries the tag the operator committed to. A slot no
-    /// linked ticket predicted keeps the `unsure` the parse gave it.
+    /// The review reports the outcome of a slot, and the prediction owns
+    /// the tag, so a slot a linked ticket predicted takes the tag the
+    /// operator committed to. Every other slot keeps the tag its own
+    /// block body carried, which is `unsure` when the body named none.
     fn tagged_delta(&self, task: &Task, mut delta: DeltaBlock) -> DeltaBlock {
         let mut tags: BTreeMap<String, PredictionTag> = BTreeMap::new();
         for ticket in self.linked_tickets(&task.repo, task.number) {
@@ -23198,6 +23198,79 @@ mod tests {
         );
     }
 
+    /// One delta whose only slot missed.
+    fn missed_slot_delta(id: &str, tag: PredictionTag) -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![DeltaSlot {
+                id: id.to_string(),
+                outcome: DeltaOutcome::Miss,
+                tag,
+            }],
+            touched: Vec::new(),
+            violations: Vec::new(),
+            question: String::new(),
+        }
+    }
+
+    /// The DELTAS rows of one poll that shows `prediction` on ticket 142
+    /// and `delta` on the record of the merged pull request 7.
+    ///
+    /// A closed pull request admits no review, so the poll reads the two
+    /// records and nothing else.
+    fn delta_rows_of(prediction: FullPrediction, delta: &DeltaBlock) -> Vec<DeltaView> {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(prediction))),
+        ));
+        steps.push(comment_page_step(7, &block_page(&delta_block(delta))));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let mut merged = contract_pr(&delta_pr_body());
+        merged.open = false;
+        merged.draft = false;
+        merged.labels = vec![DELTA_OPEN_LABEL.to_string()];
+
+        rig.poll(vec![delta_ticket()], vec![merged]);
+
+        theory_of(&rig).deltas
+    }
+
+    /// A missed slot the prediction left empty names itself, so the row
+    /// still reaches the panel.
+    #[test]
+    fn a_missed_slot_without_predicted_entries_names_the_slot() {
+        let rows = delta_rows_of(
+            full_view(&[("invariants", Vec::new(), PredictionTag::Sure)]),
+            &missed_slot_delta("invariants", PredictionTag::Sure),
+        );
+
+        assert_eq!(
+            rows[0].misses,
+            vec![("sure-miss".to_string(), "invariants".to_string())]
+        );
+        assert_eq!(rows[0].hits, 0);
+        assert_eq!(rows[0].unsure, 0);
+    }
+
+    /// A missed slot draws one row per entry the prediction named.
+    #[test]
+    fn a_missed_slot_draws_one_row_per_predicted_entry() {
+        let rows = delta_rows_of(
+            full_view(&[("invariants", vec!["INV-3", "INV-4"], PredictionTag::Unsure)]),
+            &missed_slot_delta("invariants", PredictionTag::Unsure),
+        );
+
+        assert_eq!(
+            rows[0].misses,
+            vec![
+                ("unsure-miss".to_string(), "INV-3".to_string()),
+                ("unsure-miss".to_string(), "INV-4".to_string()),
+            ]
+        );
+    }
+
     /// A review of a pull request with no linked ticket expects no block.
     /// The turn ends without one, the task keeps running towards its
     /// transition, and no label call goes out.
@@ -23280,6 +23353,28 @@ mod tests {
         );
     }
 
+    /// A governed review whose turn wrote no assistant text at all fails
+    /// the same way. An empty buffer is a report with no block in it.
+    #[test]
+    fn a_governed_review_turn_without_any_text_fails_the_attempt() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+        let before = rig.exec.calls().len();
+
+        rig.event(turn_ended(id));
+
+        assert_eq!(rig.task(id).state, TaskState::Queued);
+        assert_eq!(rig.task(id).attempt, 2);
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a silent turn posts nothing"
+        );
+    }
+
     /// The finding of the missing block reaches the operator: the last
     /// attempt fails with it and the stuck row names the task.
     #[test]
@@ -23300,7 +23395,7 @@ mod tests {
 
         assert_eq!(
             rig.task(id).state,
-            TaskState::Failed(NO_DELTA_BLOCK.to_string())
+            TaskState::Failed("no delta block".to_string())
         );
         assert!(rig
             .decision(&format!("stuck:{id}:{MAX_ATTEMPTS}"))
