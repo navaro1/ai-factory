@@ -2099,13 +2099,6 @@ impl Daemon {
         if !config.theory.governor.is_on() {
             return Ok(());
         }
-        if self
-            .links
-            .get(alias)
-            .is_some_and(|links| !links.prs_of(number).is_empty())
-        {
-            return Ok(());
-        }
         let Some(issue) = self
             .snapshot
             .repos
@@ -2114,6 +2107,13 @@ impl Daemon {
         else {
             return Ok(());
         };
+        if self
+            .links
+            .get(alias)
+            .is_some_and(|links| !links.prs_of(number).is_empty())
+        {
+            return Ok(());
+        }
         if issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL) {
             return Ok(());
         }
@@ -21721,6 +21721,37 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             rig.job_count(),
             1,
             "the label skips only the check, not the admission"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert!(
+            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            "the check posts no comment and no label"
+        );
+    }
+
+    /// A refined ticket whose pull request is already open skips the
+    /// check through the existing-PR guard: no finding comment and no
+    /// label, and the admission proceeds.
+    #[test]
+    fn a_ticket_with_an_open_pull_request_is_never_checked() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue_with_body(142, &["refined"], &body)],
+            vec![linked_pr(7, 142)],
+        );
+
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the guard skips only the check, not the admission"
         );
         assert_eq!(rig.job(0).task, "borsuk/implement-i142");
         assert!(
