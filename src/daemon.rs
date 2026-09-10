@@ -149,9 +149,12 @@ struct TicketTurnText {
 
 /// The working directory identity of one task.
 ///
-/// `Shared` is the repository checkout. The refine stage, the ticket
-/// session, and the ticket chat all work there, and none of them owns it.
-/// `Exclusive` is a private git worktree. One task at a time may run in it.
+/// `Shared` is the repository checkout. The ticket session and the ticket
+/// chat work there, and neither owns it. `Exclusive` is a private git
+/// worktree. One task at a time may run in it. Every pipeline stage is
+/// exclusive: the refine stage and the implement stage share the issue
+/// worktree of their ticket, so the guard holds one of them while the
+/// other runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Workspace {
     Shared,
@@ -4199,12 +4202,21 @@ impl Daemon {
 
     /// The working directory identity of one task.
     ///
-    /// The refine stage, the ticket session, and the ticket chat share the
-    /// repository checkout, so a `Shared` task owns no worktree. Every other
-    /// stage runs in one private git worktree and owns it. The guard and the
-    /// directory readers both read this helper, so they cannot disagree.
+    /// A refine run of one issue works in the issue worktree of that issue,
+    /// like the implement run that follows it. The ticket session and the
+    /// ticket chat stay in the repository checkout, so a `Shared` task owns
+    /// no worktree. Every exclusive stage owns one private git worktree.
+    /// The guard and the directory readers both read this helper, so they
+    /// cannot disagree.
     fn workspace(&self, task: &Task) -> Workspace {
         match task.stage {
+            Stage::Refine
+                if task.kind == ItemKind::Issue
+                    && !Self::is_ticket_creation(task)
+                    && !Self::is_ticket_chat(task) =>
+            {
+                Workspace::Exclusive(WorktreeKey::Issue(task.number))
+            }
             Stage::Refine => Workspace::Shared,
             Stage::Implement => Workspace::Exclusive(WorktreeKey::Issue(task.number)),
             Stage::Review => {
@@ -5978,6 +5990,45 @@ mod tests {
         ]
     }
 
+    /// The worktree steps of every dispatch into a fresh issue worktree.
+    ///
+    /// The rig never materialises a worktree directory, so a test scripts
+    /// one group per dispatch: refine and implement replay the create path
+    /// each time. `numbers` lists the issues in dispatch order; `times` is
+    /// the number of dispatches per issue. The steps sit before any other
+    /// steps only while no other git call interleaves.
+    fn refine_worktree_steps(dir: &Path, numbers: &[u64], times: usize) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let gitdir = rig_gitdir(dir);
+        let mut steps = Vec::new();
+        for number in numbers {
+            for _ in 0..times {
+                steps.extend(fresh_issue_steps(
+                    &repo,
+                    &issue_wt(dir, *number),
+                    *number,
+                    &gitdir,
+                ));
+            }
+        }
+        steps
+    }
+
+    /// The worktree steps of a dispatch sequence whose first dispatch
+    /// creates the issue worktree and whose later dispatches reuse it: the
+    /// `started` event of a run writes the session marker into the
+    /// worktree, so the directory exists and the manager reuses it.
+    fn fresh_then_reuse_steps(dir: &Path, number: u64, dispatches: usize) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let gitdir = rig_gitdir(dir);
+        let worktree = issue_wt(dir, number);
+        let mut steps = fresh_issue_steps(&repo, &worktree, number, &gitdir);
+        for _ in 1..dispatches {
+            steps.extend(reuse_issue_steps(&repo, &worktree, &gitdir));
+        }
+        steps
+    }
+
     /// The git calls of a first dispatch into a PR worktree: prune broken
     /// registrations, cut the branch from `HEAD`, prepare the markers, then
     /// fetch the GitHub pull ref in the worktree and reset the branch hard
@@ -6652,7 +6703,9 @@ mod tests {
 
     #[test]
     fn a_paused_daemon_dispatches_when_the_operator_resumes() {
-        let mut rig = Rig::make_paused(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in_paused(dir, steps);
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(rig.job_count(), 0);
 
@@ -6667,7 +6720,9 @@ mod tests {
 
     #[test]
     fn a_task_resume_override_dispatches_only_that_task() {
-        let mut rig = Rig::make_paused(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[143], 1);
+        let mut rig = Rig::make_in_paused(dir, steps);
         rig.poll(
             vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
             vec![],
@@ -6689,13 +6744,20 @@ mod tests {
 
     #[test]
     fn a_gate_admits_work_and_a_second_drive_dispatches_nothing() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(rig.job_count(), 1);
         let job = rig.job(0);
         assert_eq!(job.task, "borsuk/refine-i142");
         assert_eq!(job.stage, Stage::Refine);
-        assert_eq!(job.cwd, rig.repo);
+        assert_eq!(job.cwd, issue_wt(&dir, 142));
         assert_eq!(job.resume, None);
         assert!(job.yolo);
         assert!(job.log.ends_with("borsuk__refine-i142.jsonl"));
@@ -6710,7 +6772,7 @@ mod tests {
         let task = rig.task("borsuk/refine-i142");
         assert_eq!(task.state, TaskState::Running);
         assert_eq!(task.session_id.as_deref(), Some("sid-1"));
-        assert!(rig.repo.join(".aif/session").exists());
+        assert!(issue_wt(&dir, 142).join(".aif/session").exists());
 
         // A second drive with no new message dispatches nothing.
         rig.drive();
@@ -6719,6 +6781,32 @@ mod tests {
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(rig.job_count(), 1);
         assert!(rig.daemon.table.by_id.contains_key("borsuk/refine-i142"));
+    }
+
+    /// The refine stage of an issue runs in the issue worktree: the
+    /// dispatch cuts the branch in one `git worktree add` call and the
+    /// session works in `state/worktrees/borsuk/issue-<n>`.
+    #[test]
+    fn refine_dispatch_runs_in_the_issue_worktree() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 42), 42, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
+        rig.poll(vec![issue(42, &["to-refine"])], vec![]);
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/refine-i42");
+        assert_eq!(job.cwd, issue_wt(&dir, 42));
+        let adds = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "git"
+                    && call.argv().contains(&"worktree")
+                    && call.argv().contains(&"add")
+            })
+            .count();
+        assert_eq!(adds, 1, "{:?}", rig.exec.calls());
     }
 
     /// The implement limit is 1, so 142 holds the only slot. Ticket 143
@@ -7063,10 +7151,18 @@ mod tests {
 
     #[test]
     fn a_session_marker_error_stops_and_retries_the_task() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let worktree = issue_wt(&dir, 142);
+        // The refine runs in the issue worktree, and the session marker
+        // path is a directory, so the marker write fails.
+        fs::create_dir_all(worktree.join(".aif").join("session")).unwrap();
+        let mut steps = reuse_issue_steps(&repo, &worktree, &gitdir);
+        steps.extend(reuse_issue_steps(&repo, &worktree, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         let first = rig.session(0);
-        fs::create_dir_all(rig.repo.join(".aif").join("session")).unwrap();
 
         rig.event(started("borsuk/refine-i142", "sid-1"));
 
@@ -7090,12 +7186,9 @@ mod tests {
     #[test]
     fn one_dispatch_error_does_not_block_another_stage() {
         let dir = temp_root();
-        let steps = fresh_issue_steps(
-            &rig_repo(&dir),
-            &issue_wt(&dir, 143),
-            143,
-            &rig_gitdir(&dir),
-        );
+        // The refine dispatch of 142 fails at its prompt render, after its
+        // worktree steps ran; the implement dispatch of 143 follows them.
+        let steps = refine_worktree_steps(&dir, &[142, 143], 1);
         let mut rig = Rig::make_in(dir, steps, |_| {});
         fs::create_dir_all(&rig.prompts).unwrap();
         fs::write(rig.prompts.join("refine.md"), "bad {unknown}").unwrap();
@@ -7853,7 +7946,9 @@ mod tests {
 
     #[test]
     fn permission_asks_route_to_the_live_session() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().yolo = false;
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -7911,7 +8006,9 @@ mod tests {
 
     #[test]
     fn a_question_answer_reaches_the_runner_verbatim() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(RunEvent::Ask {
             task: "borsuk/refine-i142".to_string(),
@@ -7952,7 +8049,9 @@ mod tests {
 
     #[test]
     fn question_text_becomes_a_chat_line() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(RunEvent::Ask {
             task: "borsuk/refine-i142".to_string(),
@@ -8066,7 +8165,9 @@ mod tests {
         assert!(rig.daemon.allowed_permissions.is_empty());
 
         // A claude task with a live ask loses the row on failure, as today.
-        let mut claude = Rig::make_with(vec![], |config| {
+        let claude_dir = temp_root();
+        let claude_steps = refine_worktree_steps(&claude_dir, &[142], 1);
+        let mut claude = Rig::make_in(claude_dir, claude_steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().yolo = false;
         });
         claude.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -8443,7 +8544,9 @@ mod tests {
 
     #[test]
     fn turn_end_parks_a_session_and_the_queued_task_starts_after_exit() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142, 143], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
         rig.poll(
@@ -8624,7 +8727,9 @@ mod tests {
 
     #[test]
     fn a_parked_refine_turn_requests_an_immediate_github_poll() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
 
         rig.event(turn_ended("borsuk/refine-i142"));
@@ -8636,7 +8741,9 @@ mod tests {
 
     #[test]
     fn a_refined_poll_completes_the_parked_refine_task() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.act(Action::Pause {
             scope: PauseScope::Stage {
                 stage: Stage::Implement,
@@ -8658,12 +8765,9 @@ mod tests {
     #[test]
     fn a_turn_end_completes_a_refine_when_the_poll_won_the_race() {
         let dir = temp_root();
-        let steps = fresh_issue_steps(
-            &rig_repo(&dir),
-            &issue_wt(&dir, 142),
-            142,
-            &rig_gitdir(&dir),
-        );
+        // The refine creates the worktree; the implement dispatch after
+        // the turn end reuses it.
+        let steps = fresh_then_reuse_steps(&dir, 142, 2);
         let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
 
@@ -8713,7 +8817,9 @@ mod tests {
 
     #[test]
     fn a_live_chat_marks_the_parked_task_running() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(turn_ended("borsuk/refine-i142"));
 
@@ -8738,7 +8844,9 @@ mod tests {
     /// daemon stops it and retries the task, so the stage slot frees up.
     #[test]
     fn a_silent_run_fails_and_retries() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 2);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         let session = rig.session(0);
@@ -8761,7 +8869,9 @@ mod tests {
 
     #[test]
     fn a_reaped_chat_waits_for_a_live_process_slot() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142, 143], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -8812,7 +8922,15 @@ mod tests {
 
     #[test]
     fn a_parked_session_yields_its_slot_to_a_chat_resume() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        // The two first dispatches create the worktrees; the chat resume
+        // of 142 reuses the one its first run created.
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir);
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 143), 143, &gitdir));
+        steps.extend(reuse_issue_steps(&repo, &issue_wt(&dir, 142), &gitdir));
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
         rig.poll(
@@ -8878,7 +8996,9 @@ mod tests {
 
     #[test]
     fn a_paused_chat_does_not_stop_an_unrelated_parked_session() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142, 143], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
         rig.poll(
@@ -8923,7 +9043,9 @@ mod tests {
 
     #[test]
     fn a_parked_session_with_a_queued_chat_keeps_its_process() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().limit = 1;
         });
         rig.poll(
@@ -8964,7 +9086,9 @@ mod tests {
 
     #[test]
     fn a_pause_stops_the_parked_process_it_blocks() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(turn_ended("borsuk/refine-i142"));
         assert_eq!(
@@ -9004,7 +9128,9 @@ mod tests {
 
     #[test]
     fn a_pause_keeps_a_running_process() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
 
@@ -9138,7 +9264,12 @@ mod tests {
     #[test]
     fn concurrent_refine_tasks_resume_their_own_sessions() {
         let dir = temp_root();
-        let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        // The first dispatches create the two worktrees; the restart
+        // dispatches reuse them, because the runs wrote their markers.
+        let first_steps = refine_worktree_steps(&dir, &[142, 143], 1);
+        let mut first = Rig::make_in(dir.clone(), first_steps, |_| {});
         first.poll(
             vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
             vec![],
@@ -9147,7 +9278,9 @@ mod tests {
         first.event(started("borsuk/refine-i143", "session-143"));
         drop(first);
 
-        let mut second = Rig::make_in(dir, vec![], |_| {});
+        let mut second_steps = reuse_issue_steps(&repo, &issue_wt(&dir, 142), &gitdir);
+        second_steps.extend(reuse_issue_steps(&repo, &issue_wt(&dir, 143), &gitdir));
+        let mut second = Rig::make_in(dir, second_steps, |_| {});
         second.poll(
             vec![issue(142, &["to-refine"]), issue(143, &["to-refine"])],
             vec![],
@@ -9275,7 +9408,8 @@ mod tests {
             assert!(first.daemon.paused.global);
         }
 
-        let mut second = Rig::make_in(dir, vec![], |_| {});
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut second = Rig::make_in(dir, steps, |_| {});
         assert!(
             second.daemon.paused.global,
             "the saved pause mark survives the restart"
@@ -9427,14 +9561,19 @@ mod tests {
     #[test]
     fn a_task_restarts_on_its_attempt_count_not_on_attempt_one() {
         let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
         {
-            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            let steps = fresh_then_reuse_steps(&dir, 142, 2);
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
             first.poll(vec![issue(142, &["to-refine"])], vec![]);
             first.event(exited("borsuk/refine-i142", false, "boom"));
             assert_eq!(first.task("borsuk/refine-i142").attempt, 2);
         }
 
-        let mut second = Rig::make_in(dir, vec![], |_| {});
+        let mut second_steps = reuse_issue_steps(&repo, &issue_wt(&dir, 142), &gitdir);
+        second_steps.extend(reuse_issue_steps(&repo, &issue_wt(&dir, 142), &gitdir));
+        let mut second = Rig::make_in(dir, second_steps, |_| {});
         second.poll(vec![issue(142, &["to-refine"])], vec![]);
         assert_eq!(
             second.task("borsuk/refine-i142").attempt,
@@ -9461,14 +9600,19 @@ mod tests {
     #[test]
     fn a_running_task_restarts_as_queued_and_its_first_prompt_carries_the_notice() {
         let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
         {
-            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            let steps = refine_worktree_steps(&dir, &[142], 1);
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
             first.poll(vec![issue(142, &["to-refine"])], vec![]);
             first.event(started("borsuk/refine-i142", "session-142"));
             assert_eq!(first.task("borsuk/refine-i142").state, TaskState::Running);
         }
 
-        let mut second = Rig::make_in(dir, vec![], |_| {});
+        let mut second_steps = reuse_issue_steps(&repo, &issue_wt(&dir, 142), &gitdir);
+        second_steps.extend(reuse_issue_steps(&repo, &issue_wt(&dir, 142), &gitdir));
+        let mut second = Rig::make_in(dir, second_steps, |_| {});
         let task = second.task("borsuk/refine-i142");
         assert_eq!(
             task.state,
@@ -9626,7 +9770,8 @@ mod tests {
     #[test]
     fn the_shutdown_sequence_stops_sessions_reads_exits_and_forces_the_write() {
         let dir = temp_root();
-        let mut rig = Rig::make_in(dir.clone(), vec![], |_| {});
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         let session = rig.session(0);
@@ -9665,7 +9810,8 @@ mod tests {
     #[test]
     fn a_stop_runs_the_shutdown_sequence_and_returns() {
         let dir = temp_root();
-        let mut rig = Rig::make_in(dir.clone(), vec![], |_| {});
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir.clone(), steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         let session = rig.session(0);
@@ -9728,7 +9874,9 @@ mod tests {
 
     #[test]
     fn next_deadline_picks_the_earliest_and_none_when_idle() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         assert_eq!(
             rig.daemon.next_deadline(),
             None,
@@ -10051,7 +10199,18 @@ mod tests {
     /// ended, so the next poll queues a fresh refine task.
     #[test]
     fn an_answered_row_starts_the_stage_of_a_finished_one_shot_task_again() {
-        let mut rig = Rig::make_with(answer_steps("use Postgres"), |config| {
+        let dir = temp_root();
+        // Two refine dispatches: the first creates the worktree, the
+        // restarted stage reuses it. The answer posts its two gh calls
+        // between the two dispatches.
+        let mut steps = refine_worktree_steps(&dir, &[142], 1);
+        steps.extend(answer_steps("use Postgres"));
+        steps.extend(reuse_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, |config| {
             set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
         });
         rig.poll(vec![issue(142, &["to-refine", NEEDS_HUMAN_LABEL])], vec![]);
@@ -10079,7 +10238,10 @@ mod tests {
     /// chat message and its session continues.
     #[test]
     fn an_answered_row_delivers_its_text_to_the_parked_session() {
-        let mut rig = Rig::make(answer_steps("use Postgres"));
+        let dir = temp_root();
+        let mut steps = refine_worktree_steps(&dir, &[142], 1);
+        steps.extend(answer_steps("use Postgres"));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine", NEEDS_HUMAN_LABEL])], vec![]);
         rig.event(turn_ended("borsuk/refine-i142"));
         assert_eq!(
@@ -10294,7 +10456,9 @@ mod tests {
 
     #[test]
     fn a_failed_session_answer_keeps_the_decision_open() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config.stages.get_mut(&Stage::Refine).unwrap().yolo = false;
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -10320,7 +10484,9 @@ mod tests {
 
     #[test]
     fn a_failed_live_chat_waits_for_resume_without_extending_the_idle_deadline() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         rig.event(turn_ended("borsuk/refine-i142"));
@@ -10362,7 +10528,9 @@ mod tests {
     /// is refused instead of being queued for a resume.
     #[test]
     fn a_completed_pipeline_task_stops_its_process_and_refuses_a_chat() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         let session = rig.session(0);
@@ -10428,7 +10596,11 @@ mod tests {
 
     #[test]
     fn a_poll_completion_keeps_the_message_of_a_parked_claude_task() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        // The first dispatch creates the worktree; the resumed turn after
+        // the pause lift reuses it.
+        let steps = fresh_then_reuse_steps(&dir, 142, 2);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         rig.event(turn_ended("borsuk/refine-i142"));
@@ -10794,7 +10966,9 @@ mod tests {
 
     #[test]
     fn an_automatic_retry_keeps_the_first_role_binding() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = fresh_then_reuse_steps(&dir, 142, 2);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.daemon
             .config
@@ -10813,7 +10987,9 @@ mod tests {
 
     #[test]
     fn a_parked_follow_up_keeps_the_first_role_binding() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "session-142"));
         rig.event(turn_ended("borsuk/refine-i142"));
@@ -10840,12 +11016,15 @@ mod tests {
     fn a_daemon_restart_keeps_the_first_role_binding() {
         let dir = temp_root();
         {
-            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            let steps = refine_worktree_steps(&dir, &[142], 1);
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
             first.poll(vec![issue(142, &["to-refine"])], vec![]);
             assert_eq!(first.roles.lock().unwrap()[0].settings.model, "m");
         }
 
-        let mut second = Rig::make_in(dir, vec![], |config| {
+        // The first daemon created the worktree, so the restart reuses it.
+        let steps = reuse_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 142), &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |config| {
             config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
                 "changed-after-restart".to_string();
         });
@@ -10902,7 +11081,8 @@ mod tests {
     fn a_restart_drops_a_completed_binding_before_a_new_logical_task() {
         let dir = temp_root();
         {
-            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            let steps = refine_worktree_steps(&dir, &[142], 1);
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
             first.poll(vec![issue(142, &["to-refine"])], vec![]);
             first.daemon.sessions.remove("borsuk/refine-i142");
             first
@@ -10916,7 +11096,9 @@ mod tests {
             first.daemon.save_state();
         }
 
-        let mut second = Rig::make_in(dir, vec![], |config| {
+        // The first daemon created the worktree, so the restart reuses it.
+        let steps = reuse_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 142), &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |config| {
             config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
                 "new-task-after-restart".to_string();
         });
@@ -10931,7 +11113,10 @@ mod tests {
     fn a_daemon_restart_keeps_a_failed_task_binding_for_retry() {
         let dir = temp_root();
         {
-            let mut first = Rig::make_in(dir.clone(), vec![], |_| {});
+            // The first dispatch creates the worktree; the two retries
+            // reuse it.
+            let steps = fresh_then_reuse_steps(&dir, 142, 3);
+            let mut first = Rig::make_in(dir.clone(), steps, |_| {});
             first.poll(vec![issue(142, &["to-refine"])], vec![]);
             for attempt in 0..tasks::MAX_ATTEMPTS {
                 first.event(exited(
@@ -10946,7 +11131,8 @@ mod tests {
             ));
         }
 
-        let mut second = Rig::make_in(dir, vec![], |config| {
+        let steps = reuse_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 142), &rig_gitdir(&dir));
+        let mut second = Rig::make_in(dir, steps, |config| {
             config.roles.get_mut(&ExecutionRole::Refine).unwrap().model =
                 "changed-after-failure".to_string();
         });
@@ -10977,7 +11163,11 @@ mod tests {
 
     #[test]
     fn a_logically_new_task_replaces_a_stale_role_binding() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        // The first dispatch creates the worktree; the new logical task
+        // reuses it after the manual completion.
+        let steps = fresh_then_reuse_steps(&dir, 142, 2);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.daemon.sessions.remove("borsuk/refine-i142");
         rig.daemon
@@ -11503,7 +11693,9 @@ mod tests {
             .join("borsuk")
             .join("issue-142");
         fs::create_dir_all(&worktree).unwrap();
-        let mut rig = Rig::make_in(dir, vec![], |config| {
+        // The worktree directory exists, so the refine dispatch reuses it.
+        let steps = reuse_issue_steps(&rig_repo(&dir), &worktree, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |config| {
             config
                 .repos
                 .get_mut("borsuk")
@@ -11877,15 +12069,21 @@ mod tests {
     fn a_reloaded_role_applies_to_a_logically_new_task_only() {
         let dir = temp_root();
         let repo = rig_repo(&dir);
-        let mut rig = Rig::make_in(
-            dir,
-            vec![git_step(
-                &repo,
-                &["remote", "get-url", "origin"],
-                CmdOut::ok("git@github.com:acme/borsuk.git\n"),
-            )],
-            |_| {},
-        );
+        // The remote probe of the reload sits between the two dispatches.
+        // The first dispatch creates the worktree; the new logical task
+        // reuses it.
+        let mut steps = refine_worktree_steps(&dir, &[142], 1);
+        steps.push(git_step(
+            &repo,
+            &["remote", "get-url", "origin"],
+            CmdOut::ok("git@github.com:acme/borsuk.git\n"),
+        ));
+        steps.extend(reuse_issue_steps(
+            &repo,
+            &issue_wt(&dir, 142),
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         fs::create_dir_all(rig.repo.join(".git")).unwrap();
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         let config_path = rig.repo.parent().unwrap().join("factory.toml");
@@ -14121,7 +14319,9 @@ mod tests {
     /// transition, and the inbox row carries the work from there.
     #[test]
     fn a_needs_human_ticket_completes_its_refine_at_once() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
         });
         rig.poll(vec![issue(142, &["to-refine", NEEDS_HUMAN_LABEL])], vec![]);
@@ -14141,7 +14341,9 @@ mod tests {
     /// the only proof the daemon can accept, and the run completes on it.
     #[test]
     fn a_split_parent_completes_its_refine_on_the_epic_label() {
-        let mut rig = Rig::make_with(vec![], |config| {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |config| {
             set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
@@ -14738,7 +14940,9 @@ mod tests {
 
     #[test]
     fn a_live_chat_writes_one_user_line_into_the_task_log() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
 
@@ -14763,7 +14967,9 @@ mod tests {
 
     #[test]
     fn a_failed_live_send_still_writes_one_user_line() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         rig.session(0).fail_send.store(true, Ordering::SeqCst);
@@ -14818,7 +15024,9 @@ mod tests {
 
     #[test]
     fn the_logged_chat_line_reads_back_as_the_typed_text() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         // A quotation mark, a backslash, a newline, and a wide character
@@ -15164,7 +15372,7 @@ mod tests {
     }
 
     #[test]
-    fn a_follow_up_to_the_implement_waits_while_the_refine_is_active() {
+    fn a_follow_up_to_the_implement_waits_while_the_refine_owns_the_worktree() {
         for refine_state in [
             TaskState::Queued,
             TaskState::Running,
@@ -15178,7 +15386,8 @@ mod tests {
             rig.event(exited("borsuk/implement-i142", true, "code 0"));
             assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
             // A refine task of the same ticket that is not terminal. The
-            // refine works in the shared checkout, so it owns no worktree.
+            // refine owns the issue worktree, so it closes the input of
+            // the implement until it reaches a terminal state.
             let log = rig
                 .daemon
                 .log_path("borsuk", Stage::Refine, ItemKind::Issue, 142);
@@ -15212,54 +15421,49 @@ mod tests {
             assert_eq!(rig.task("borsuk/refine-i142").state, refine_state);
 
             let task = rig.task("borsuk/implement-i142");
-            assert!(!matches!(
+            let refusal = format!(
+                "the chat message for \"borsuk/implement-i142\" cannot start. Task \
+                 \"borsuk/refine-i142\" ({refine_state}) uses the worktree \"issue-142\". \
+                 Wait until that task is terminal."
+            );
+            assert_eq!(
+                rig.daemon.sibling_refusal(&task).as_deref(),
+                Some(refusal.as_str()),
+                "the refine state {refine_state:?} blocks the follow-up"
+            );
+            assert_eq!(
                 rig.daemon.input_mode(&task),
-                InputMode::Closed { .. }
-            ));
-            rig.act(Action::Chat {
-                task: "borsuk/implement-i142".to_string(),
-                text: "start from the specification".to_string(),
-            });
-
-            let implement_runs = (0..rig.job_count())
-                .filter(|&index| rig.job(index).task == "borsuk/implement-i142")
-                .count();
-            assert_eq!(
-                implement_runs, 1,
-                "the implement follow-up waits for the refine state {refine_state:?}"
-            );
-            assert_eq!(
-                rig.daemon
-                    .pending_chats
-                    .get("borsuk/implement-i142")
-                    .map(Vec::as_slice),
-                Some(&["start from the specification".to_string()][..]),
-                "the refine state {refine_state:?} must not block the implement chat"
-            );
-            // The chat reopened the task, so the bar now names the cause of
-            // the wait. The operator never faces a silent stall.
-            let queued = rig.task("borsuk/implement-i142");
-            assert_eq!(queued.state, TaskState::Queued);
-            assert_eq!(
-                rig.daemon.input_mode(&queued),
                 InputMode::Closed {
-                    reason: "This task waits for \"borsuk/refine-i142\" to finish.".to_string()
+                    reason: refusal.clone()
                 },
-                "the bar names the prior stage for the refine state {refine_state:?}"
+                "the bar names the worktree guard for the refine state {refine_state:?}"
             );
+            assert!(
+                !rig.daemon
+                    .chat("borsuk/implement-i142", "start from the specification"),
+                "the guard refuses the message for the refine state {refine_state:?}"
+            );
+            assert!(
+                rig.daemon.pending_chats.is_empty(),
+                "the refusal queues no message"
+            );
+            assert_eq!(rig.job_count(), 1, "the refusal starts no run");
+            assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
         }
     }
 
     #[test]
-    fn a_follow_up_to_the_refine_starts_while_the_implement_runs() {
+    fn a_follow_up_to_the_refine_waits_for_the_implement_worktree() {
         let dir = temp_root();
-        let checkout = rig_repo(&dir);
-        let steps = fresh_issue_steps(
-            &rig_repo(&dir),
-            &issue_wt(&dir, 142),
-            142,
-            &rig_gitdir(&dir),
-        );
+        // The first dispatch creates the issue worktree. The refine turn
+        // writes its session marker into it, so the implement dispatch and
+        // the refine follow-up both take the reuse path.
+        let repo = rig_repo(&dir);
+        let worktree = issue_wt(&dir, 142);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = fresh_issue_steps(&repo, &worktree, 142, &gitdir);
+        steps.extend(reuse_issue_steps(&repo, &worktree, &gitdir));
+        steps.extend(reuse_issue_steps(&repo, &worktree, &gitdir));
         let mut rig = Rig::make_in(dir, steps, |config| {
             set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
         });
@@ -15272,27 +15476,47 @@ mod tests {
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
         assert_eq!(rig.job_count(), 2, "the implement gate opened");
         rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.event(turn_finished("borsuk/implement-i142", true, "done"));
 
+        // The follow-up targets the issue worktree that the running
+        // implement owns, so the sibling guard refuses it.
         let task = rig.task("borsuk/refine-i142");
-        assert!(!matches!(
-            rig.daemon.input_mode(&task),
-            InputMode::Closed { .. }
-        ));
+        assert_eq!(
+            rig.daemon.sibling_refusal(&task).as_deref(),
+            Some(
+                "the chat message for \"borsuk/refine-i142\" cannot start. Task \
+                 \"borsuk/implement-i142\" (running) uses the worktree \"issue-142\". \
+                 Wait until that task is terminal."
+            )
+        );
+        assert!(
+            !rig.daemon
+                .chat("borsuk/refine-i142", "clarify the second requirement"),
+            "the guard refuses the follow-up while the implement runs"
+        );
+        assert!(rig.daemon.pending_chats.is_empty());
+        assert_eq!(rig.job_count(), 2, "the refusal starts no run");
+
+        // The implement confirms its result and exits, and the same
+        // message now starts in the issue worktree that the stages share.
+        rig.poll_implemented();
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "clarify the second requirement".to_string(),
         });
-
-        // The shared checkout carries no guard, and no prior stage holds a
-        // refine, so the follow-up turn runs while the implement runs.
         assert_eq!(rig.job_count(), 3, "the refine follow-up started");
         let followup = rig.job(2);
         assert_eq!(followup.task, "borsuk/refine-i142");
-        assert_eq!(followup.cwd, checkout, "the refine keeps the checkout");
+        assert_eq!(
+            followup.cwd, worktree,
+            "the follow-up runs in the issue worktree"
+        );
         assert_eq!(followup.prompt, "clarify the second requirement");
         assert!(rig.daemon.pending_chats.is_empty());
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
-        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Done);
     }
 
     #[test]
@@ -15407,7 +15631,10 @@ mod tests {
 
         // The stage walk keeps this test complete when the pipeline grows.
         let stage_cases = Stage::ALL.map(|stage| match stage {
-            Stage::Refine => ("borsuk/refine-i142", Workspace::Shared),
+            Stage::Refine => (
+                "borsuk/refine-i142",
+                Workspace::Exclusive(WorktreeKey::Issue(142)),
+            ),
             Stage::Implement => (
                 "borsuk/implement-i142",
                 Workspace::Exclusive(WorktreeKey::Issue(142)),
@@ -15445,11 +15672,16 @@ mod tests {
     #[test]
     fn an_implement_waits_while_the_refine_of_its_ticket_is_not_done() {
         let dir = temp_root();
-        let mut rig = opencode_rig(&dir, 0);
+        // The refine creates the worktree; the implement dispatch after the
+        // turn end reuses it.
+        let steps = fresh_then_reuse_steps(&dir, 142, 2);
+        let mut rig = Rig::make_in(dir.clone(), steps, |config| {
+            set_role_harness(config, ExecutionRole::Implement, Harness::Opencode);
+        });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
-        // The label change queues the implement. The shared checkout carries
-        // no worktree guard, so only the pipeline order holds it.
+        // The label change queues the implement. The refine still owns the
+        // worktree, so the sibling guard holds the dispatch too.
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
         rig.drive();
@@ -15510,7 +15742,9 @@ mod tests {
 
     #[test]
     fn the_pushed_view_carries_the_live_role_binding_of_each_task() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         let (push_tx, push_rx) = mpsc::channel();
         rig.daemon
             .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
@@ -15554,7 +15788,9 @@ mod tests {
 
     #[test]
     fn the_input_mode_follows_a_live_then_parked_claude_task() {
-        let mut rig = Rig::make(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(started("borsuk/refine-i142", "sid-142"));
         let task = rig.task("borsuk/refine-i142");
@@ -16535,7 +16771,12 @@ mod tests {
 
     #[test]
     fn a_change_publishes_a_view_with_the_real_task_and_train_values() {
-        let (mut rig, rx) = pushed_rig(vec![]);
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| tx.send(view).unwrap()));
         rig.poll(vec![], vec![pr(2, false, &["release-stacked"])]);
         let view = rx.try_recv().expect("the poll must publish a view");
         // The stacked pull request reaches the train queue and the gate row.

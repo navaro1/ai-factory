@@ -16,7 +16,7 @@ refine ──▶ implement ──▶ review ──▶ release
 
 | Stage | Default harness and model | Result |
 |---|---|---|
-| refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
+| refine | Claude, Opus | You shape the ticket in the issue worktree of the ticket. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
 | review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
@@ -55,8 +55,8 @@ of each repository. The poll is conditional: an unchanged repository costs
 almost nothing.
 
 Each implementation issue gets one git worktree (a second repository
-checkout). The implementation and review agents use this worktree. The
-factory creates the worktree. The agents never create it.
+checkout). The refine, implementation, and review agents use this worktree.
+The factory creates the worktree. The agents never create it.
 
 ### Ticket dependencies
 
