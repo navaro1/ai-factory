@@ -4807,6 +4807,7 @@ mod tests {
                     areas: vec!["web-checkout".to_string()],
                 }),
                 full: None,
+                delta: None,
                 labels: labels.iter().map(|label| label.to_string()).collect(),
                 ..crate::sock::RecordView::default()
             },

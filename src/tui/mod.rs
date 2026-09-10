@@ -56,7 +56,6 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::catalog;
-use crate::decisions::DecisionKind;
 use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView, TicketAction, WireProtocolMismatch};
@@ -783,9 +782,13 @@ impl App {
     /// True when the kind of the selected inbox row consumes this key, so
     /// it must not reach the global handler.
     ///
-    /// A `Question` row numbers its options with the digits, and a
-    /// `ReleaseGate` row toggles pull requests with them.
+    /// The `digits` field of [`inbox::presentation`] answers it: a
+    /// `Question` row numbers its options, a `ReleaseGate` row toggles
+    /// pull requests, and a `TheoryEvent` row takes the three rungs.
     fn inbox_row_owns(&self, key: KeyEvent) -> bool {
+        let KeyCode::Char(digit) = key.code else {
+            return false;
+        };
         if !digit_key(key) {
             return false;
         }
@@ -798,10 +801,7 @@ impl App {
         let Some(decision) = state.decisions.iter().find(|decision| decision.id == id) else {
             return false;
         };
-        matches!(
-            decision.kind,
-            DecisionKind::Question { .. } | DecisionKind::ReleaseGate { .. }
-        )
+        inbox::presentation(&decision.kind).digits.contains(digit)
     }
 
     /// Apply one key to the inbox and report whether an action crossed.

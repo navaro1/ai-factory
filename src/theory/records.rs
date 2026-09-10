@@ -373,7 +373,7 @@ fn parse_prediction(body: &str) -> Option<Prediction> {
 }
 
 /// The bodies of every complete block of one tag, in text order.
-fn scan_block_bodies<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
+pub(super) fn scan_block_bodies<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
     let close = close_tag(tag);
     let mut bodies = Vec::new();
     let mut rest = text;
@@ -841,12 +841,12 @@ impl TheoryRecords {
 }
 
 /// The title of the repository record of one alias.
-fn repo_record_title(alias: &str) -> String {
+pub fn repo_record_title(alias: &str) -> String {
     format!("{alias}/theory")
 }
 
 /// The item number of one shadow issue title, `<alias>#<n>`.
-fn shadow_item(alias: &str, title: &str) -> Option<u64> {
+pub fn shadow_item(alias: &str, title: &str) -> Option<u64> {
     title.strip_prefix(alias)?.strip_prefix('#')?.parse().ok()
 }
 

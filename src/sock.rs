@@ -40,8 +40,9 @@ use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStag
 use crate::sched::{Limits, Paused};
 use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
+use crate::theory::answers::AnswerBlock;
 use crate::theory::model::Model;
-use crate::theory::records::{DeltaBlock, FullPrediction, ShortPrediction};
+use crate::theory::records::{DeltaBlock, Event, FullPrediction, ShortPrediction};
 #[cfg(test)]
 use crate::theory::records::{DeltaOutcome, DeltaSlot, DeltaViolation, PredictionTag};
 use crate::theory::verify::Tier;
@@ -269,6 +270,15 @@ pub struct RecordView {
     /// The last delta of the record.
     #[serde(default)]
     pub delta: Option<DeltaBlock>,
+    /// Every theory event block of the record, in comment order.
+    ///
+    /// An answered event stays here. The answers say which event blocks
+    /// still wait for the operator.
+    #[serde(default)]
+    pub events: Vec<Event>,
+    /// The answers the operator posted on the record, in comment order.
+    #[serde(default)]
+    pub answers: Vec<AnswerBlock>,
     /// The labels of the record itself.
     ///
     /// In shadow mode the theory labels live on the shadow issue, not on
@@ -286,6 +296,9 @@ pub struct RecordView {
 pub struct AreaView {
     #[serde(default)]
     pub id: String,
+    /// The boundary entry of the model this area guards.
+    #[serde(default)]
+    pub boundary: String,
     /// The highest tier of the surfaces that map to the area.
     #[serde(default)]
     pub tier: Tier,
@@ -1005,9 +1018,15 @@ fn decision_items(
                     push_item(&mut items, snapshot, &decision.repo, ItemKind::Pr, *number);
                 }
             }
+            crate::decisions::DecisionKind::DeltaHit { kind, number, .. }
+            | crate::decisions::DecisionKind::TheoryEvent { kind, number, .. } => {
+                push_item(&mut items, snapshot, &decision.repo, *kind, *number);
+            }
             crate::decisions::DecisionKind::Permission { .. }
             | crate::decisions::DecisionKind::Question { .. }
-            | crate::decisions::DecisionKind::Stuck { .. } => {}
+            | crate::decisions::DecisionKind::Stuck { .. }
+            | crate::decisions::DecisionKind::Card { .. }
+            | crate::decisions::DecisionKind::FirstRun { .. } => {}
         }
     }
     for train in trains {
@@ -2588,6 +2607,20 @@ mod tests {
                         .collect(),
                 },
             }),
+            Action::Answer {
+                decision_id: "delta:borsuk:p7".to_string(),
+                response: crate::decisions::Response::Confirm,
+            },
+            Action::Answer {
+                decision_id: "theory:borsuk:p7:invariants".to_string(),
+                response: crate::decisions::Response::Theory {
+                    cause: crate::theory::answers::Cause::Model,
+                    entry: "INV-3".to_string(),
+                    rung: 2,
+                    area: "web-checkout".to_string(),
+                    note: String::new(),
+                },
+            },
             Action::Theory(TheoryAction::EditModel {
                 request: "edit-model-1".to_string(),
                 repo: "borsuk".to_string(),
@@ -2954,10 +2987,12 @@ mod tests {
                             question: "Does the cart keep the token?".to_string(),
                         }),
                         labels: vec![crate::theory::records::DELTA_OPEN_LABEL.to_string()],
+                        ..RecordView::default()
                     },
                 )]),
                 areas: vec![AreaView {
                     id: "web-checkout".to_string(),
+                    boundary: "B-checkout".to_string(),
                     tier: Tier::Browser,
                     min_tier: Tier::Http,
                     lint: true,

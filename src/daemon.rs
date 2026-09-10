@@ -67,6 +67,7 @@ use crate::sock::{
 };
 use crate::state::{ChatKey, DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::theory::answers::{self, AnswerBlock, Cause};
 use crate::theory::blocks;
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
@@ -94,6 +95,35 @@ const TEACH_DIFF_LINES: usize = 400;
 /// Why one governed review fails when its report carries no readable
 /// delta block.
 const NO_DELTA_BLOCK: &str = "no delta block";
+
+/// The comment one delta confirmation posts on the record.
+const DELTA_CONFIRMED: &str = "The operator confirmed the delta. Every slot hit.";
+
+/// The prefix of the comment one `pr` answer posts on the record.
+const PR_BROKE_THE_MODEL: &str = "the pull request broke";
+
+/// True when one diff line of the model file names `entry`.
+///
+/// A changed line starts with `+` or `-`. The `+++` and `---` file
+/// headers start the same way and name no entry, so they stay out.
+fn diff_names(line: &str, entry: &str) -> bool {
+    let changed = (line.starts_with('+') && !line.starts_with("+++"))
+        || (line.starts_with('-') && !line.starts_with("---"));
+    changed && line.contains(entry)
+}
+
+/// The record key one theory row names.
+///
+/// The rows of the repository record carry the number zero.
+fn record_key(kind: ItemKind, number: u64) -> RecordKey {
+    match (kind, number) {
+        // No issue and no pull request carries the number zero, so a
+        // theory row of the repository record travels under it.
+        (_, 0) => RecordKey::Repo,
+        (ItemKind::Issue, number) => RecordKey::Issue(number),
+        (ItemKind::Pr, number) => RecordKey::Pr(number),
+    }
+}
 
 /// What one run skill ticket creation produced.
 ///
@@ -1502,6 +1532,10 @@ impl Daemon {
                 continue;
             };
             self.observe_ready_work(&alias, &snapshot);
+            // A shadow label opens or closes a theory row of the record
+            // it lives on, and no code poll has to run first.
+            self.close_theory_records(&alias);
+            self.derive_theory_rows(&alias, &snapshot);
         }
         self.changed = true;
     }
@@ -1546,6 +1580,7 @@ impl Daemon {
         self.reconcile_ticket_conversations(repo, &fresh);
         let mut changed = self.observe_ready_work(repo, &fresh);
         changed |= self.derive_needs_human(repo, &fresh);
+        changed |= self.derive_theory_rows(repo, &fresh);
         if !unchanged {
             changed = true;
         }
@@ -1587,6 +1622,7 @@ impl Daemon {
         }
         self.refresh_records();
         self.first_sight(repo);
+        self.close_theory_records(repo);
         self.store_theory_view(repo);
     }
 
@@ -1697,11 +1733,355 @@ impl Daemon {
                 if let Some(delta) = parse_delta_blocks(&comment.body).pop() {
                     view.delta = Some(delta);
                 }
+                view.events.extend(parse_event_blocks(&comment.body));
+                view.answers
+                    .extend(answers::parse_answer_blocks(&comment.body));
             }
             read.insert(target, view.clone());
             self.theory_blocks.insert(seen.clone(), view);
             self.theory_fetched.insert(seen, labels);
         }
+    }
+
+    /// The items whose record can open a theory row this poll.
+    ///
+    /// A shadowed alias reads its shadow issues, because its theory
+    /// labels live there. Every other alias reads its own items. The
+    /// repository record joins the list under the number zero in both
+    /// modes, and the item that carries it in code mode drops out, so one
+    /// event on it opens one row.
+    fn theory_row_items<'a>(
+        &'a self,
+        alias: &str,
+        code: &'a RepoSnapshot,
+    ) -> Vec<(ItemKind, u64, &'a str)> {
+        let repo_title = records::repo_record_title(alias);
+        let shadowed = self
+            .config
+            .repos
+            .get(alias)
+            .is_some_and(|repo| repo.theory_repo().is_some());
+        let mut items: Vec<(ItemKind, u64, &str)> = Vec::new();
+        if shadowed {
+            if let Some(shadow) = self.theory_snapshots.get(alias) {
+                for issue in shadow.issues.values() {
+                    let Some(number) = records::shadow_item(alias, &issue.title) else {
+                        continue;
+                    };
+                    let kind = if code.prs.contains_key(&number) {
+                        ItemKind::Pr
+                    } else {
+                        ItemKind::Issue
+                    };
+                    items.push((kind, number, issue.title.as_str()));
+                }
+            }
+        } else {
+            for (number, issue) in &code.issues {
+                if issue.title == repo_title {
+                    continue;
+                }
+                items.push((ItemKind::Issue, *number, issue.title.as_str()));
+            }
+            items.extend(
+                code.prs
+                    .iter()
+                    .map(|(number, pr)| (ItemKind::Pr, *number, pr.title.as_str())),
+            );
+        }
+        items.push((ItemKind::Issue, 0, "the repository record"));
+        items
+    }
+
+    /// Remove the theory label of every record whose rows are answered.
+    ///
+    /// A record loses `delta-open` once every miss and every violation of
+    /// its delta carries an answer and every `model` answer of it closed.
+    /// A record loses `event-open` under the same rule over its event
+    /// blocks. A hit-only delta opens no key here: it closes on the
+    /// confirmation of the operator instead.
+    fn close_theory_records(&mut self, alias: &str) {
+        if !self.theory_records.is_governed(alias) {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.repos.get(alias) else {
+            return;
+        };
+        let keys: Vec<RecordKey> = self
+            .theory_row_items(alias, snapshot)
+            .into_iter()
+            .map(|(kind, number, _)| record_key(kind, number))
+            .collect();
+        let mut closed: Vec<(RecordKey, &'static str)> = Vec::new();
+        for key in keys {
+            let labels = self.theory_records.labels_of(alias, &key);
+            let Some(view) = self.theory_blocks.get(&(alias.to_string(), key.key_text())) else {
+                continue;
+            };
+            let delta_slots = view
+                .delta
+                .as_ref()
+                .map(answers::delta_slots)
+                .unwrap_or_default();
+            let delta_slots: Vec<String> = delta_slots
+                .into_iter()
+                .filter(|slot| slot != answers::DELTA_SLOT)
+                .collect();
+            for (label, slots) in [
+                (DELTA_OPEN_LABEL, delta_slots),
+                (EVENT_OPEN_LABEL, answers::event_slots(view)),
+            ] {
+                if slots.is_empty() || !labels.iter().any(|one| one == label) {
+                    continue;
+                }
+                if !answers::answered(view, &slots) {
+                    continue;
+                }
+                let waiting = answers::model_answers(view, &slots)
+                    .into_iter()
+                    .any(|answer| !self.model_change_landed(alias, answer));
+                if waiting {
+                    continue;
+                }
+                closed.push((key.clone(), label));
+            }
+        }
+        for (key, label) in closed {
+            self.remove_record_label(alias, &key, label);
+        }
+    }
+
+    /// True when the model file carries the entry of one `model` answer.
+    ///
+    /// The read is one `git log` of the default branch of the theory
+    /// checkout, limited to the model file and to the commits after the
+    /// answer. An added or a removed line that names the entry closes the
+    /// answer, because the operator can delete a wrong entry as well as
+    /// correct it.
+    fn model_change_landed(&self, alias: &str, answer: &AnswerBlock) -> bool {
+        let Some(config) = self.config.repos.get(alias) else {
+            return false;
+        };
+        let path = config.theory.checkout(&config.path);
+        let Ok(base) = self.worktrees.default_base(self.exec.as_ref(), &path) else {
+            return false;
+        };
+        let since = format!("--since=@{}", answer.answered_ms / 1000);
+        let args = ["log", base.as_str(), since.as_str(), "-p", "--", MODEL_FILE];
+        let Ok(out) = worktree::git(self.exec.as_ref(), &path, &args) else {
+            return false;
+        };
+        out.status == 0
+            && out
+                .stdout
+                .lines()
+                .any(|line| diff_names(line, &answer.entry))
+    }
+
+    /// Remove one theory label from the record of one item.
+    fn remove_record_label(&mut self, alias: &str, key: &RecordKey, label: &str) {
+        let target = match self.theory_record(alias, key) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("the theory record of {alias} {}: {error:#}", key.key_text());
+                return;
+            }
+        };
+        let gh = GhClient::new(&*self.exec);
+        if let Err(error) = gh.remove_label(&target.0, target.1, label) {
+            eprintln!("the {label} label of {alias} {}: {error:#}", key.key_text());
+            return;
+        }
+        self.changed = true;
+    }
+
+    /// Re-derive the theory decisions from the labels of one poll.
+    ///
+    /// A `delta-open` record opens one `DELTA` row for a hit-only delta,
+    /// and one `THEORY` row per miss and per violation otherwise. An
+    /// `event-open` record opens one `THEORY` row per event block. A row
+    /// whose slot already carries an answer opens nothing, and a record
+    /// that lost its label loses its rows. Returns true when any row
+    /// opened, refreshed, or closed.
+    fn derive_theory_rows(&mut self, repo: &str, fresh: &RepoSnapshot) -> bool {
+        if !self.theory_records.is_governed(repo) {
+            return self.drop_theory_rows(repo, &BTreeSet::new());
+        }
+        let now_ms = self.now_ms;
+        let daemon = &*self;
+        let view_of = |kind: ItemKind, number: u64| {
+            daemon
+                .theory_blocks
+                .get(&(repo.to_string(), record_key(kind, number).key_text()))
+        };
+        // The labels come from the theory read model, not from the item,
+        // so a shadowed alias derives its rows from the shadow issue.
+        let records: Vec<(ItemKind, u64, &[String], &str)> = daemon
+            .theory_row_items(repo, fresh)
+            .into_iter()
+            .map(|(kind, number, title)| {
+                (
+                    kind,
+                    number,
+                    daemon
+                        .theory_records
+                        .labels_of(repo, &record_key(kind, number)),
+                    title,
+                )
+            })
+            .collect();
+        let mut rows: Vec<Decision> = Self::derive_label_rows(
+            repo,
+            records.iter().copied(),
+            DELTA_OPEN_LABEL,
+            |repo, kind, number, _| {
+                view_of(kind, number)
+                    .map(|view| {
+                        let predicted = daemon.predicted_slots(repo, number);
+                        answers::delta_rows(repo, kind, number, view, &predicted, now_ms)
+                    })
+                    .unwrap_or_default()
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect();
+        rows.extend(
+            Self::derive_label_rows(
+                repo,
+                records.iter().copied(),
+                EVENT_OPEN_LABEL,
+                |repo, kind, number, _| {
+                    view_of(kind, number)
+                        .map(|view| answers::event_rows(repo, kind, number, view, now_ms))
+                        .unwrap_or_default()
+                },
+            )
+            .into_iter()
+            .flatten(),
+        );
+        let mut changed = false;
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        for row in rows {
+            live.insert(row.id.clone());
+            changed |= self.decisions.push(row).is_some();
+        }
+        changed | self.drop_theory_rows(repo, &live)
+    }
+
+    /// Close every theory row of one repository outside `live`.
+    fn drop_theory_rows(&mut self, repo: &str, live: &BTreeSet<String>) -> bool {
+        let stale: Vec<String> = self
+            .decisions
+            .open()
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    DecisionKind::DeltaHit { .. } | DecisionKind::TheoryEvent { .. }
+                )
+            })
+            .filter(|row| row.repo == repo && !live.contains(&row.id))
+            .map(|row| row.id.clone())
+            .collect();
+        let changed = !stale.is_empty();
+        for id in stale {
+            self.decisions.take(&id);
+        }
+        changed
+    }
+
+    /// Close one hit-only delta: post the confirmation and drop the label.
+    fn confirm_delta(&mut self, alias: &str, kind: ItemKind, number: u64) {
+        let key = record_key(kind, number);
+        if let Err(error) = self.post_record_comment(alias, &key, DELTA_CONFIRMED) {
+            eprintln!(
+                "the delta confirmation of {alias} {}: {error:#}",
+                key.key_text()
+            );
+            return;
+        }
+        self.remove_record_label(alias, &key, DELTA_OPEN_LABEL);
+    }
+
+    /// Answer one theory row: post the block, then act on the cause.
+    ///
+    /// A `recall` answer needs nothing more. A `pr` answer returns the
+    /// pull request to implement with the finding. A `model` answer
+    /// carries its time, so the poll can watch the model file for the
+    /// entry.
+    fn answer_theory_row(&mut self, decision: &Decision, response: &Response) {
+        let DecisionKind::TheoryEvent {
+            kind,
+            number,
+            slot,
+            question,
+            ..
+        } = &decision.kind
+        else {
+            return;
+        };
+        let Response::Theory {
+            cause,
+            entry,
+            rung,
+            area,
+            note,
+        } = response
+        else {
+            return;
+        };
+        let key = record_key(*kind, *number);
+        let block = AnswerBlock {
+            cause: *cause,
+            entry: entry.clone(),
+            rung: *rung,
+            area: area.clone(),
+            note: note.clone(),
+            slot: slot.clone(),
+            answered_ms: if *cause == Cause::Model {
+                self.now_ms
+            } else {
+                0
+            },
+        };
+        let text = answers::answer_block(&block);
+        if let Err(error) = self.post_record_comment(&decision.repo, &key, &text) {
+            eprintln!("the answer of {}: {error:#}", decision.id);
+            return;
+        }
+        self.theory_blocks
+            .entry((decision.repo.clone(), key.key_text()))
+            .or_default()
+            .answers
+            .push(block);
+        if *cause == Cause::Pr && *kind == ItemKind::Pr {
+            let finding = format!("{PR_BROKE_THE_MODEL} {entry}: {question}");
+            self.return_pr_to_implement(&decision.repo, *number, &finding);
+        }
+        self.changed = true;
+    }
+
+    /// Post the finding, cancel a live review, and queue implement again.
+    fn return_pr_to_implement(&mut self, alias: &str, number: u64, finding: &str) {
+        if let Err(error) = self.post_record_comment(alias, &RecordKey::Pr(number), finding) {
+            eprintln!("the finding of {alias} pull request {number}: {error:#}");
+        }
+        let review = self
+            .table
+            .by_id
+            .values()
+            .find(|task| {
+                task.repo == alias
+                    && task.stage == Stage::Review
+                    && task.number == number
+                    && !task.state.is_terminal()
+            })
+            .map(|task| task.id.clone());
+        if let Some(review) = review {
+            self.cancel_task_with_reason(&review, false, finding);
+        }
+        self.requeue_implement(alias, number);
     }
 
     /// Read `theory/model.toml` and `theory/verify.toml` at the theory
@@ -1891,6 +2271,7 @@ impl Daemon {
             .iter()
             .map(|area| AreaView {
                 id: area.id.clone(),
+                boundary: area.boundary.clone(),
                 tier: skills::area_tier(&area.id, map, set),
                 min_tier: area.min_tier,
                 lint: skills::surface_names(&area.id, map, set)
@@ -5653,6 +6034,12 @@ impl Daemon {
             (DecisionKind::NeedsHuman { .. }, Response::Cancel) => {
                 self.resolve_needs_human(decision, None)
             }
+            (DecisionKind::DeltaHit { kind, number, .. }, Response::Confirm) => {
+                self.confirm_delta(&decision.repo, *kind, *number)
+            }
+            (DecisionKind::TheoryEvent { .. }, Response::Theory { .. }) => {
+                self.answer_theory_row(&decision, &response)
+            }
             (DecisionKind::ReleaseGate { prs: expected }, Response::Go { prs }) => {
                 if expected != prs {
                     eprintln!(
@@ -5711,7 +6098,11 @@ impl Daemon {
             }
             DecisionKind::Stuck { .. }
             | DecisionKind::NeedsHuman { .. }
-            | DecisionKind::ReleaseGate { .. } => false,
+            | DecisionKind::ReleaseGate { .. }
+            | DecisionKind::DeltaHit { .. }
+            | DecisionKind::TheoryEvent { .. }
+            | DecisionKind::Card { .. }
+            | DecisionKind::FirstRun { .. } => false,
         }
     }
 
@@ -23660,6 +24051,566 @@ mod tests {
         ]
     }
 
+    // ------------------------------------------------------------------
+    // C14: closing a delta
+    // ------------------------------------------------------------------
+
+    /// The `delta-open` label on the merged pull request of the fixtures.
+    fn closed_pr_with(label: &str) -> Pr {
+        let mut merged = contract_pr(&delta_pr_body());
+        merged.open = false;
+        merged.draft = false;
+        merged.labels = vec![label.to_string()];
+        merged
+    }
+
+    /// A delta whose two slots both missed.
+    fn two_miss_delta() -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![
+                DeltaSlot {
+                    id: "behaviours".to_string(),
+                    outcome: DeltaOutcome::Miss,
+                    tag: PredictionTag::Sure,
+                },
+                DeltaSlot {
+                    id: "invariants".to_string(),
+                    outcome: DeltaOutcome::Miss,
+                    tag: PredictionTag::Sure,
+                },
+            ],
+            touched: Vec::new(),
+            violations: Vec::new(),
+            question: "Which entry is wrong?".to_string(),
+        }
+    }
+
+    /// A delta whose one slot hit and whose model rule broke.
+    fn violation_delta() -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![DeltaSlot {
+                id: "behaviours".to_string(),
+                outcome: DeltaOutcome::Hit,
+                tag: PredictionTag::Sure,
+            }],
+            touched: Vec::new(),
+            violations: vec![DeltaViolation {
+                entry: "INV-3".to_string(),
+                finding: "the retry crosses the boundary".to_string(),
+            }],
+            question: "Does the cart keep the token?".to_string(),
+        }
+    }
+
+    /// The first poll of a delta test: the theory read, the prediction of
+    /// ticket 142, and the delta of the record of pull request 7.
+    fn first_delta_poll_steps(repo: &Path, delta: &DeltaBlock) -> Vec<Step> {
+        let mut steps = body_theory_steps(repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(delta_prediction()))),
+        ));
+        steps.push(comment_page_step(7, &block_page(&delta_block(delta))));
+        steps
+    }
+
+    /// One answer of the row `slot`, as the operator sends it.
+    fn theory_answer(id: &str, cause: Cause, entry: &str, rung: u8) -> Action {
+        Action::Answer {
+            decision_id: id.to_string(),
+            response: Response::Theory {
+                cause,
+                entry: entry.to_string(),
+                rung,
+                area: "web-checkout".to_string(),
+                note: String::new(),
+            },
+        }
+    }
+
+    /// The `<aif-answer-v1>` comment step of one answer.
+    fn answer_comment_step(
+        cause: Cause,
+        entry: &str,
+        rung: u8,
+        slot: &str,
+        answered_ms: u64,
+    ) -> Step {
+        record_comment_step(&answers::answer_block(&AnswerBlock {
+            cause,
+            entry: entry.to_string(),
+            rung,
+            area: "web-checkout".to_string(),
+            note: String::new(),
+            slot: slot.to_string(),
+            answered_ms,
+        }))
+    }
+
+    /// The `DELETE` step of one label of the record of pull request 7.
+    fn remove_label_step(label: &str) -> Step {
+        let url = format!("repos/acme/borsuk/issues/7/labels/{label}");
+        gh_step(&["api", "-i", "-X", "DELETE", url.as_str()], gh_ok())
+    }
+
+    /// The `git log` step of one open `model` answer.
+    fn model_log_step(repo: &Path, answered_ms: u64, diff: &str) -> Vec<Step> {
+        let since = format!("--since=@{}", answered_ms / 1000);
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &[
+                    "log",
+                    "refs/remotes/origin/main",
+                    since.as_str(),
+                    "-p",
+                    "--",
+                    "theory/model.toml",
+                ],
+                CmdOut::ok(diff),
+            ),
+        ]
+    }
+
+    /// The open theory rows of the rig, by decision id.
+    fn theory_row_ids(rig: &Rig) -> Vec<String> {
+        rig.daemon
+            .decisions
+            .open()
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    DecisionKind::DeltaHit { .. } | DecisionKind::TheoryEvent { .. }
+                )
+            })
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// Two misses open two rows. The label leaves only when both carry an
+    /// answer, so the first `recall` answer closes one row and keeps the
+    /// label, and the second closes the record.
+    #[test]
+    fn two_misses_keep_the_delta_label_until_both_rows_carry_an_answer() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(answer_comment_step(
+            Cause::Recall,
+            "T-pay",
+            3,
+            "behaviours",
+            0,
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.push(answer_comment_step(
+            Cause::Recall,
+            "INV-3",
+            1,
+            "invariants",
+            0,
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.push(remove_label_step(DELTA_OPEN_LABEL));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(
+            theory_row_ids(&rig),
+            vec![
+                "theory:borsuk:p7:behaviours".to_string(),
+                "theory:borsuk:p7:invariants".to_string()
+            ]
+        );
+        let row = rig.decision("theory:borsuk:p7:invariants").unwrap();
+        assert_eq!(
+            row.kind,
+            DecisionKind::TheoryEvent {
+                kind: ItemKind::Pr,
+                number: 7,
+                slot: "invariants".to_string(),
+                entry: "INV-3".to_string(),
+                tag: "sure-miss".to_string(),
+                question: "Which entry is wrong?".to_string(),
+                source: "miss".to_string(),
+            }
+        );
+
+        rig.act(theory_answer(
+            "theory:borsuk:p7:behaviours",
+            Cause::Recall,
+            "T-pay",
+            3,
+        ));
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(
+            theory_row_ids(&rig),
+            vec!["theory:borsuk:p7:invariants".to_string()],
+            "the answered row closed"
+        );
+        assert_eq!(
+            label_delete_calls(&rig, DELTA_OPEN_LABEL),
+            0,
+            "one open miss keeps the label"
+        );
+
+        rig.act(theory_answer(
+            "theory:borsuk:p7:invariants",
+            Cause::Recall,
+            "INV-3",
+            1,
+        ));
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+    }
+
+    /// A `pr` answer posts the finding, fails the live review, and queues
+    /// the implement task of every linked ticket again.
+    #[test]
+    fn a_pr_answer_posts_the_finding_cancels_the_review_and_queues_implement() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(answer_comment_step(Cause::Pr, "INV-3", 2, "invariants", 0));
+        steps.push(record_comment_step(
+            "the pull request broke INV-3: Which entry is wrong?",
+        ));
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            governed(config);
+            config.stages.get_mut(&Stage::Implement).unwrap().limit = 0;
+        });
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        let log = rig
+            .daemon
+            .log_path("borsuk", Stage::Review, ItemKind::Pr, 7);
+        rig.daemon
+            .table
+            .upsert_queued("borsuk", Stage::Review, ItemKind::Pr, 7, log, T0)
+            .unwrap();
+        rig.daemon
+            .table
+            .by_id
+            .get_mut("borsuk/review-p7")
+            .unwrap()
+            .state = TaskState::Running;
+
+        rig.act(theory_answer(
+            "theory:borsuk:p7:invariants",
+            Cause::Pr,
+            "INV-3",
+            2,
+        ));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("the pull request broke INV-3: Which entry is wrong?".to_string())
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        assert_eq!(
+            posted_bodies(&rig)
+                .iter()
+                .filter(|body| body.starts_with("the pull request broke"))
+                .count(),
+            1,
+            "the finding posts once"
+        );
+    }
+
+    /// A `model` answer keeps the label until the default branch of the
+    /// theory checkout carries a change to the model file that names the
+    /// entry, after the answer.
+    #[test]
+    fn a_model_answer_keeps_the_label_until_the_model_file_names_the_entry() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = first_delta_poll_steps(&repo, &violation_delta());
+        steps.push(answer_comment_step(
+            Cause::Model,
+            "INV-3",
+            2,
+            "violation:INV-3",
+            T0,
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.extend(model_log_step(&repo, T0, ""));
+        steps.extend(cached_theory_steps(&repo));
+        steps.extend(model_log_step(
+            &repo,
+            T0,
+            "commit abc\n--- a/theory/model.toml\n+++ b/theory/model.toml\n+statement = \"the cart keeps the token of INV-3\"\n",
+        ));
+        steps.push(remove_label_step(DELTA_OPEN_LABEL));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        let row = rig.decision("theory:borsuk:p7:violation:INV-3").unwrap();
+        assert_eq!(
+            row.kind,
+            DecisionKind::TheoryEvent {
+                kind: ItemKind::Pr,
+                number: 7,
+                slot: "violation:INV-3".to_string(),
+                entry: "INV-3".to_string(),
+                tag: String::new(),
+                question: "the retry crosses the boundary".to_string(),
+                source: "violation".to_string(),
+            },
+            "one violation opens one row"
+        );
+        assert_eq!(theory_row_ids(&rig).len(), 1, "a hit slot opens no row");
+
+        rig.act(theory_answer(
+            "theory:borsuk:p7:violation:INV-3",
+            Cause::Model,
+            "INV-3",
+            2,
+        ));
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(
+            label_delete_calls(&rig, DELTA_OPEN_LABEL),
+            0,
+            "an unedited model keeps the label"
+        );
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+    }
+
+    /// The operator can delete a wrong entry instead of correcting it, so
+    /// a removed line that names the entry closes the `model` answer too.
+    #[test]
+    fn a_model_answer_closes_when_the_model_file_loses_the_entry() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = first_delta_poll_steps(&repo, &violation_delta());
+        steps.push(answer_comment_step(
+            Cause::Model,
+            "INV-3",
+            2,
+            "violation:INV-3",
+            T0,
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.extend(model_log_step(
+            &repo,
+            T0,
+            "commit abc\n--- a/theory/model.toml\n+++ b/theory/model.toml\n-statement = \"the cart keeps the token of INV-3\"\n",
+        ));
+        steps.push(remove_label_step(DELTA_OPEN_LABEL));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(theory_answer(
+            "theory:borsuk:p7:violation:INV-3",
+            Cause::Model,
+            "INV-3",
+            2,
+        ));
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+        assert!(theory_row_ids(&rig).is_empty());
+    }
+
+    /// In shadow mode the sweep and the teach events land on the shadow
+    /// issue `<alias>/theory`, so its `event-open` label must open a
+    /// theory row of the repository record and the answer must close it
+    /// on the shadow issue.
+    #[test]
+    fn a_shadow_repository_record_opens_a_theory_row_for_its_event() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let event = shadow_sweep();
+        let answer = AnswerBlock {
+            cause: Cause::Recall,
+            entry: "B-checkout".to_string(),
+            rung: 1,
+            area: "web-checkout".to_string(),
+            note: String::new(),
+            slot: "event:0".to_string(),
+            answered_ms: 0,
+        };
+        // The theory poller already read every shadow issue, so the
+        // record resolves with no search call.
+        let mut steps = body_theory_steps(&repo);
+        steps.push(shadow_comment_page_step(
+            SHADOW_ROOT,
+            &block_page(&event_block(&event)),
+        ));
+        steps.push(shadow_comment_step(
+            SHADOW_ROOT,
+            &answers::answer_block(&answer),
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                &format!("repos/{SHADOW_REPO}/issues/{SHADOW_ROOT}/labels/{EVENT_OPEN_LABEL}"),
+            ],
+            gh_ok(),
+        ));
+        let mut rig = Rig::make_in(dir, steps, shadow_of_the_rig);
+
+        rig.poll(vec![issue(142, &[])], Vec::new());
+        theory_poll(
+            &mut rig,
+            vec![shadow_issue(
+                SHADOW_ROOT,
+                "borsuk/theory",
+                &[EVENT_OPEN_LABEL],
+            )],
+        );
+
+        assert_eq!(
+            rig.decision("theory:borsuk:i0:event:0").unwrap().kind,
+            DecisionKind::TheoryEvent {
+                kind: ItemKind::Issue,
+                number: 0,
+                slot: "event:0".to_string(),
+                entry: "web-checkout".to_string(),
+                tag: "sweep".to_string(),
+                question: "INV-9 names a path the code removed".to_string(),
+                source: "event".to_string(),
+            },
+            "the repository record opens its row under the number zero"
+        );
+
+        rig.act(theory_answer(
+            "theory:borsuk:i0:event:0",
+            Cause::Recall,
+            "B-checkout",
+            1,
+        ));
+        rig.poll(vec![issue(142, &[])], Vec::new());
+
+        assert_eq!(label_delete_calls(&rig, EVENT_OPEN_LABEL), 1);
+        assert!(
+            posted_bodies(&rig)
+                .iter()
+                .any(|body| body.contains("\"slot\":\"event:0\"")),
+            "the answer posts on the shadow record"
+        );
+        assert!(theory_row_ids(&rig).is_empty());
+    }
+
+    /// A hit-only delta opens one `DELTA` row, and the confirmation posts
+    /// the comment and drops the label.
+    #[test]
+    fn a_hit_only_delta_closes_on_one_confirmation() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let hits = DeltaBlock {
+            slots: vec![DeltaSlot {
+                id: "behaviours".to_string(),
+                outcome: DeltaOutcome::Hit,
+                tag: PredictionTag::Sure,
+            }],
+            touched: Vec::new(),
+            violations: Vec::new(),
+            question: String::new(),
+        };
+        let mut steps = first_delta_poll_steps(&repo, &hits);
+        steps.push(record_comment_step(DELTA_CONFIRMED));
+        steps.push(remove_label_step(DELTA_OPEN_LABEL));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(
+            rig.decision("delta:borsuk:p7").unwrap().kind,
+            DecisionKind::DeltaHit {
+                kind: ItemKind::Pr,
+                number: 7,
+                hits: 1,
+            }
+        );
+
+        rig.act(Action::Answer {
+            decision_id: "delta:borsuk:p7".to_string(),
+            response: Response::Confirm,
+        });
+
+        assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+        assert!(posted_bodies(&rig)
+            .iter()
+            .any(|body| body == DELTA_CONFIRMED));
+    }
+
+    /// An `event-open` record opens one row per event block, and the
+    /// answer of every event drops the label.
+    #[test]
+    fn an_event_open_record_opens_one_row_per_event_block() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let event = Event {
+            kind: "floor".to_string(),
+            text: "the area asks for a higher tier".to_string(),
+            area: Some("web-checkout".to_string()),
+            number: Some(7),
+            surface: None,
+        };
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(7, &block_page(&event_block(&event))));
+        steps.push(answer_comment_step(
+            Cause::Recall,
+            "B-checkout",
+            1,
+            "event:0",
+            0,
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.push(remove_label_step(EVENT_OPEN_LABEL));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue(142, &[])],
+            vec![closed_pr_with(EVENT_OPEN_LABEL)],
+        );
+
+        assert_eq!(
+            rig.decision("theory:borsuk:p7:event:0").unwrap().kind,
+            DecisionKind::TheoryEvent {
+                kind: ItemKind::Pr,
+                number: 7,
+                slot: "event:0".to_string(),
+                entry: "web-checkout".to_string(),
+                tag: "floor".to_string(),
+                question: "the area asks for a higher tier".to_string(),
+                source: "event".to_string(),
+            }
+        );
+
+        rig.act(theory_answer(
+            "theory:borsuk:p7:event:0",
+            Cause::Recall,
+            "B-checkout",
+            1,
+        ));
+        rig.poll(
+            vec![issue(142, &[])],
+            vec![closed_pr_with(EVENT_OPEN_LABEL)],
+        );
+
+        assert_eq!(label_delete_calls(&rig, EVENT_OPEN_LABEL), 1);
+        assert!(theory_row_ids(&rig).is_empty());
+    }
+
     /// The review gate fires on the edge of readiness, so a queued review
     /// re-enters the admission when a pull request leaves readiness and
     /// returns at the same head. The body of one head yields one answer,
@@ -26752,6 +27703,34 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 gh_ok(),
             ),
         ]
+    }
+
+    /// The count of the label removals of the scripted exec.
+    fn label_delete_calls(rig: &Rig, label: &str) -> usize {
+        let url = format!("labels/{label}");
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "gh"
+                    && call.args.iter().any(|arg| arg == "DELETE")
+                    && call.args.iter().any(|arg| arg.ends_with(&url))
+            })
+            .count()
+    }
+
+    /// Every comment body the scripted exec posted, in call order.
+    fn posted_bodies(rig: &Rig) -> Vec<String> {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .filter_map(|call| {
+                call.args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("body=").map(str::to_string))
+            })
+            .collect()
     }
 
     /// The count of one label call of the scripted exec.

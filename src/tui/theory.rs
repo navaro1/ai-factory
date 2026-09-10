@@ -789,6 +789,7 @@ mod tests {
     fn area(id: &str, tier: Tier, min_tier: Tier, lint: bool) -> AreaView {
         AreaView {
             id: id.to_string(),
+            boundary: String::new(),
             tier,
             min_tier,
             lint,
