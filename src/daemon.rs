@@ -28353,6 +28353,84 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
     }
 
+    /// A delta teach whose linked ticket predicted nothing names each
+    /// missed slot alone, with no predicted entry on the line.
+    #[test]
+    fn a_delta_teach_without_a_full_prediction_names_the_missed_slot_alone() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Delta(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let prompt = rig.job(0).prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the pull request:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("\nmiss invariants\nviolation INV-3: the retry crosses the boundary"),
+            "the bare miss line before the violation:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("miss invariants INV"),
+            "no predicted entry joins the miss line:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("\nquestion Does the cart keep the token?"),
+            "the question of the review:\n{prompt}"
+        );
+    }
+
+    /// A delta teach whose record holds no cached delta teaches the
+    /// plain diff, with no delta line at all.
+    #[test]
+    fn a_delta_teach_without_a_cached_delta_teaches_the_plain_diff() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Delta(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-delta-7");
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the pull request:\n{prompt}"
+        );
+        for prefix in ["miss ", "violation ", "question "] {
+            assert_eq!(
+                prompt
+                    .lines()
+                    .filter(|line| line.starts_with(prefix))
+                    .count(),
+                0,
+                "no {prefix}line without a delta:\n{prompt}"
+            );
+        }
+    }
+
     #[test]
     fn a_teach_dispatch_fails_when_github_cannot_name_the_pull_request() {
         let dir = temp_root();
