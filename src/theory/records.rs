@@ -119,29 +119,10 @@ pub fn event_block(event: &Event) -> String {
 /// A block whose body does not parse as an event, and a block with no
 /// closing tag, is skipped. The order of the blocks is kept.
 pub fn parse_event_blocks(text: &str) -> Vec<Event> {
-    let close = close_tag(EVENT_BLOCK);
-    let mut events = Vec::new();
-    let mut rest = text;
-    'scan: while let Some(start) = rest.find(EVENT_BLOCK) {
-        let after_open = &rest[start + EVENT_BLOCK.len()..];
-        let Some(end) = after_open.find(&close) else {
-            break;
-        };
-        let span = &after_open[..end];
-        if let Some(next_open) = span.find(EVENT_BLOCK) {
-            // The opening tag is truncated: the later tag owns the close,
-            // so the scan restarts there. The restart reads from
-            // `after_open`, because `span` ends before the close.
-            rest = &after_open[next_open..];
-            continue 'scan;
-        }
-        let body = span.trim();
-        rest = &after_open[end + close.len()..];
-        if let Ok(event) = serde_json::from_str::<Event>(body) {
-            events.push(event);
-        }
-    }
-    events
+    scan_block_bodies(text, EVENT_BLOCK)
+        .into_iter()
+        .filter_map(|body| serde_json::from_str::<Event>(body).ok())
+        .collect()
 }
 
 /// The closing tag of one opening tag: `<aif-event-v1>` closes as
@@ -300,9 +281,10 @@ impl TheoryRecords {
     ///
     /// `config` names every repository and its theory settings;
     /// `snapshots` holds the code snapshots and `theory_snapshots` the
-    /// theory snapshots, keyed by alias. A shadowed alias reads its
-    /// labels from its theory snapshot; every other governed alias reads
-    /// the code snapshot. An alias with the governor off derives nothing.
+    /// theory snapshots, keyed by alias. A shadowed alias is one whose
+    /// `theory.repo` is set; it reads its labels from its theory
+    /// snapshot. Every other governed alias reads the code snapshot. An
+    /// alias with the governor off derives nothing.
     pub fn derive(
         config: &Config,
         snapshots: &Snapshot,
@@ -313,7 +295,11 @@ impl TheoryRecords {
             if !repo.theory.governor.is_on() {
                 continue;
             }
-            let shadowed = repo.theory.theory.is_some();
+            let shadowed = repo
+                .theory
+                .theory
+                .as_ref()
+                .is_some_and(|theory| theory.repo.is_some());
             let source = if shadowed {
                 theory_snapshots.get(alias)
             } else {
@@ -324,20 +310,30 @@ impl TheoryRecords {
             };
             let mut open = 0usize;
             for (number, issue) in &source.issues {
+                let mut record = true;
                 if shadowed {
-                    if let Some(item) = shadow_item(alias, &issue.title) {
+                    if issue.title == repo_record_title(alias) {
+                        records.repos.insert(alias.clone(), issue.labels.clone());
+                    } else if let Some(item) = shadow_item(alias, &issue.title) {
                         records
                             .items
                             .insert((alias.clone(), item), issue.labels.clone());
+                    } else {
+                        // One theory repository may hold the shadow issues
+                        // of several aliases; this issue is not a record
+                        // of this alias.
+                        record = false;
                     }
                 } else {
                     records
                         .items
                         .insert((alias.clone(), *number), issue.labels.clone());
+                    if issue.title == repo_record_title(alias) {
+                        records.repos.insert(alias.clone(), issue.labels.clone());
+                    }
                 }
-                open += open_markers(&issue.labels);
-                if issue.title == repo_record_title(alias) {
-                    records.repos.insert(alias.clone(), issue.labels.clone());
+                if record {
+                    open += open_markers(&issue.labels);
                 }
             }
             if !shadowed {
@@ -368,10 +364,11 @@ impl TheoryRecords {
         }
     }
 
-    /// The count of open deltas plus open events of one alias.
+    /// The count of records labelled `delta-open` or `event-open` of one
+    /// alias.
     ///
-    /// A record counts once per marker it carries, so a record with both
-    /// labels counts twice. An alias with the governor off answers zero.
+    /// A record with both labels counts once. An alias with the governor
+    /// off answers zero.
     pub fn open_count(&self, alias: &str) -> usize {
         self.open.get(alias).copied().unwrap_or(0)
     }
@@ -387,13 +384,14 @@ fn shadow_item(alias: &str, title: &str) -> Option<u64> {
     title.strip_prefix(alias)?.strip_prefix('#')?.parse().ok()
 }
 
-/// The open markers one record carries: one per `delta-open` or
-/// `event-open` label.
+/// One if the record carries `delta-open` or `event-open`, else zero.
+/// A record with both labels counts once.
 fn open_markers(labels: &[String]) -> usize {
-    labels
-        .iter()
-        .filter(|label| label.as_str() == DELTA_OPEN_LABEL || label.as_str() == EVENT_OPEN_LABEL)
-        .count()
+    usize::from(
+        labels
+            .iter()
+            .any(|label| label.as_str() == DELTA_OPEN_LABEL || label.as_str() == EVENT_OPEN_LABEL),
+    )
 }
 
 #[cfg(test)]
@@ -678,7 +676,7 @@ mod tests {
         assert!(records
             .labels_of("borsuk", &RecordKey::Issue(11))
             .is_empty());
-        assert_eq!(records.open_count("borsuk"), 5);
+        assert_eq!(records.open_count("borsuk"), 4);
     }
 
     #[test]
@@ -691,6 +689,7 @@ mod tests {
                     issue(11, "shade#5", &["theory-short"]),
                     issue(12, "shade/theory", &["event-open"]),
                     issue(13, "unrelated", &["delta-open"]),
+                    issue(14, "other#7", &["event-open"]),
                 ],
                 vec![],
             ),
@@ -711,7 +710,40 @@ mod tests {
             names(records.labels_of("shade", &RecordKey::Repo)),
             vec!["event-open"]
         );
-        assert_eq!(records.open_count("shade"), 2);
+        // One theory repository may hold the shadow issues of several
+        // aliases, so issues outside `shade` derive nothing and count
+        // nothing.
+        assert!(records.labels_of("shade", &RecordKey::Issue(13)).is_empty());
+        assert!(records.labels_of("shade", &RecordKey::Issue(7)).is_empty());
+        assert_eq!(records.open_count("shade"), 1);
+    }
+
+    #[test]
+    fn derive_treats_a_path_only_theory_config_as_code_mode() {
+        let mut snapshots = Snapshot::default();
+        snapshots.repos.insert(
+            "solo".to_string(),
+            snapshot(vec![issue(5, "Add the poller", &["to-refine"])], vec![]),
+        );
+        let config = config_with(vec![(
+            "solo",
+            TheoryConfig {
+                governor: Governor::On,
+                theory: Some(TheoryRepo {
+                    repo: None,
+                    path: PathBuf::from("/tmp/theory"),
+                }),
+                ..TheoryConfig::default()
+            },
+        )]);
+
+        let records = TheoryRecords::derive(&config, &snapshots, &BTreeMap::new());
+
+        assert_eq!(
+            names(records.labels_of("solo", &RecordKey::Issue(5))),
+            vec!["to-refine"]
+        );
+        assert_eq!(records.open_count("solo"), 0);
     }
 
     #[test]

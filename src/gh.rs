@@ -292,21 +292,20 @@ impl<'a> GhClient<'a> {
 
     /// Fetch one page of the comments of one issue or pull request.
     ///
-    /// The call asks for one page of [`PAGE_SIZE`] comments. The caller
-    /// passes the ETag of its last page as `etag`; the method sends it as
-    /// `If-None-Match`, and a 304 answer then returns the page the client
-    /// cached at its last 200. A 304 with no cached page is an error.
-    pub fn fetch_comments(
-        &mut self,
-        owner_repo: &str,
-        number: u64,
-        etag: Option<&str>,
-    ) -> Result<CommentPage> {
+    /// The call asks for one page of [`PAGE_SIZE`] comments. The client
+    /// owns the ETag and the page together: it sends the ETag it cached
+    /// at the last fetch as `If-None-Match`, and a 304 answer then
+    /// returns that cached page. A 304 with no cached page is an error.
+    pub fn fetch_comments(&mut self, owner_repo: &str, number: u64) -> Result<CommentPage> {
         let url = format!("repos/{owner_repo}/issues/{number}/comments?per_page={PAGE_SIZE}");
         let key = (owner_repo.to_string(), number);
         let mut args: Vec<&str> = vec!["api", "-i"];
         let header;
-        if let Some(etag) = etag {
+        if let Some(etag) = self
+            .comment_pages
+            .get(&key)
+            .and_then(|cached| cached.etag.as_deref())
+        {
             header = format!("If-None-Match: {etag}");
             args.push("-H");
             args.push(&header);
@@ -2068,7 +2067,7 @@ mod tests {
             CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], body)),
         );
         let mut client = GhClient::new(&exec);
-        let page = client.fetch_comments("acme/borsuk", 9, None).unwrap();
+        let page = client.fetch_comments("acme/borsuk", 9).unwrap();
 
         assert_eq!(page.etag, Some("\"c1\"".to_string()));
         assert_eq!(page.comments.len(), 2);
@@ -2119,10 +2118,10 @@ mod tests {
                 },
             );
         let mut client = GhClient::new(&exec);
-        let first = client.fetch_comments("acme/borsuk", 9, None).unwrap();
-        let second = client
-            .fetch_comments("acme/borsuk", 9, Some("\"c1\""))
-            .unwrap();
+        let first = client.fetch_comments("acme/borsuk", 9).unwrap();
+        // The second call sends the ETag of the cached page itself; the
+        // caller passes no ETag.
+        let second = client.fetch_comments("acme/borsuk", 9).unwrap();
 
         assert_eq!(second, first);
         assert_eq!(second.comments[1].body, "comment 1");
@@ -2132,12 +2131,12 @@ mod tests {
 
     #[test]
     fn fetch_comments_rejects_a_304_without_a_cached_page() {
+        // A cold cache sends no `If-None-Match`, so a first-call 304 has
+        // no cached page to answer with.
         let exec = ScriptExec::new().expect(
             gh(&[
                 "api",
                 "-i",
-                "-H",
-                "If-None-Match: \"c9\"",
                 "-X",
                 "GET",
                 "repos/acme/borsuk/issues/9/comments?per_page=100",
@@ -2145,9 +2144,7 @@ mod tests {
             CmdOut::ok(response("HTTP/2 304", &["etag: \"c9\""], "")),
         );
         let mut client = GhClient::new(&exec);
-        let error = client
-            .fetch_comments("acme/borsuk", 9, Some("\"c9\""))
-            .unwrap_err();
+        let error = client.fetch_comments("acme/borsuk", 9).unwrap_err();
 
         assert!(error.to_string().contains("no cached page"), "{error:#}");
     }
