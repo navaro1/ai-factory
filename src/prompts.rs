@@ -442,6 +442,16 @@ this diff touches, and they are empty when the governor is off.
 
 {skills}
 
+# The prediction
+
+The block below holds what the operator predicted this change would touch. It
+reads `none` when the ticket carries no prediction. Compare the prediction
+with what the diff did. Name every area the diff touched that the prediction
+left out, and every predicted area the diff never reached, in your record
+comment.
+
+{prediction}
+
 # The base worktree
 
 Create the base worktree once, and only when the re-drive below asks for it.
@@ -1466,6 +1476,8 @@ mod tests {
             "no criterion needs",
             "{model}",
             "{skills}",
+            "{prediction}",
+            "Compare the prediction",
         ] {
             assert!(
                 REVIEW_PROMPT.contains(required),
