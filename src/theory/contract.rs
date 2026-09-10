@@ -54,8 +54,9 @@ impl Display for Finding {
 ///
 /// The function reads the non-empty lines under [`ACCEPTANCE_HEADING`] up
 /// to the next heading. One line yields one [`Criterion`], or one
-/// [`Finding`] when the line carries no `check:` or names an unknown
-/// target form. A body without the heading yields nothing.
+/// [`Finding`] when the line carries no `check:`, carries no usable
+/// `AC-<n>` id, or names an unknown or empty target. A body without the
+/// heading yields nothing.
 pub fn parse_criteria(body: &str) -> (Vec<Criterion>, Vec<Finding>) {
     let mut criteria = Vec::new();
     let mut findings = Vec::new();
@@ -81,21 +82,31 @@ pub fn parse_criteria(body: &str) -> (Vec<Criterion>, Vec<Finding>) {
 }
 
 /// Parse one criterion line, or name the rule it breaks.
-fn parse_criterion(line: &str) -> Result<Criterion, &'static str> {
+fn parse_criterion(line: &str) -> Result<Criterion, String> {
     let Some((head, check)) = line.rsplit_once(SEPARATOR) else {
-        return Err("criterion without a check");
+        return Err("criterion without a check".to_string());
     };
     let Some(check) = check.strip_prefix("check: ") else {
-        return Err("criterion without a check");
+        return Err("criterion without a check".to_string());
     };
     let Some((id, statement)) = head.split_once(SEPARATOR) else {
-        return Err("criterion without a check");
+        return Err("criterion without a check".to_string());
     };
-    let Some(id) = id.strip_prefix("- AC-").and_then(|id| id.parse().ok()) else {
-        return Err("criterion without a check");
+    let Some(id) = id
+        .strip_prefix("- AC-")
+        .and_then(|id| id.parse::<u32>().ok())
+        .filter(|id| *id > 0)
+    else {
+        return Err("criterion without an AC-<n> id".to_string());
     };
-    let Some(target) = parse_target(check) else {
-        return Err("criterion names an unknown check target");
+    let target = if let Some(feature) = check.strip_suffix(" drive") {
+        named_target(id, feature, CheckTarget::Drive)?
+    } else if let Some(feature) = check.strip_suffix(" fast") {
+        named_target(id, feature, CheckTarget::Fast)?
+    } else if let Some(measurer) = check.strip_prefix("measure ") {
+        CheckTarget::Measure(measurer.to_string())
+    } else {
+        return Err("criterion names an unknown check target".to_string());
     };
     Ok(Criterion {
         id,
@@ -104,17 +115,16 @@ fn parse_criterion(line: &str) -> Result<Criterion, &'static str> {
     })
 }
 
-/// Parse the three target forms of a criterion check.
-fn parse_target(check: &str) -> Option<CheckTarget> {
-    if let Some(feature) = check.strip_suffix(" drive") {
-        return Some(CheckTarget::Drive(feature.to_string()));
+/// Wrap one feature name into a target, or reject an empty name.
+fn named_target(
+    id: u32,
+    feature: &str,
+    build: fn(String) -> CheckTarget,
+) -> Result<CheckTarget, String> {
+    if feature.is_empty() {
+        return Err(format!("AC-{id} check names no feature"));
     }
-    if let Some(feature) = check.strip_suffix(" fast") {
-        return Some(CheckTarget::Fast(feature.to_string()));
-    }
-    check
-        .strip_prefix("measure ")
-        .map(|id| CheckTarget::Measure(id.to_string()))
+    Ok(build(feature.to_string()))
 }
 
 #[cfg(test)]
@@ -178,6 +188,61 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(
             findings[0].reason.contains("unknown check target"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
+    fn parse_criteria_reports_an_id_that_is_not_a_number() {
+        let body =
+            "## Acceptance criteria\n- AC-x · The card is validated · check: checkout drive\n";
+        let (criteria, findings) = parse_criteria(body);
+        assert!(criteria.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].reason.contains("without an AC-<n> id"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
+    fn parse_criteria_reports_a_negative_id() {
+        let body =
+            "## Acceptance criteria\n- AC--1 · The card is validated · check: checkout drive\n";
+        let (criteria, findings) = parse_criteria(body);
+        assert!(criteria.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].reason.contains("without an AC-<n> id"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
+    fn parse_criteria_reports_the_zero_id() {
+        let body =
+            "## Acceptance criteria\n- AC-0 · The card is validated · check: checkout drive\n";
+        let (criteria, findings) = parse_criteria(body);
+        assert!(criteria.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].reason.contains("without an AC-<n> id"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
+    fn parse_criteria_reports_an_empty_target_name() {
+        let body = "## Acceptance criteria\n- AC-1 · The card is validated · check:  drive\n";
+        let (criteria, findings) = parse_criteria(body);
+        assert!(criteria.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].reason.contains("check names no feature"),
             "{}",
             findings[0]
         );
