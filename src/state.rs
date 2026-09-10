@@ -21,13 +21,41 @@ use crate::sock::TicketProposal;
 use crate::tasks::{Task, MAX_ATTEMPTS};
 use crate::usage::{SpendTotals, UsageRecord};
 
+/// What one live conversation is about.
+///
+/// A ticket chat names its issue number. A theory chat names its subject,
+/// which is the area a bootstrap chat writes. The value is untagged, so a
+/// `state.json` written before the theory chats loads its bare issue
+/// numbers as [`ChatKey::Ticket`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatKey {
+    /// One open issue of the repository.
+    Ticket(u64),
+    /// One theory subject of the repository.
+    Theory(String),
+}
+
+impl ChatKey {
+    /// The issue number of a ticket chat, else `None`.
+    pub fn ticket(&self) -> Option<u64> {
+        match self {
+            ChatKey::Ticket(number) => Some(*number),
+            ChatKey::Theory(_) => None,
+        }
+    }
+}
+
 /// One issue conversation that survives a daemon restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketConversationState {
     /// The repository alias.
     pub repo: String,
-    /// The issue number.
-    pub number: u64,
+    /// The subject of the conversation.
+    ///
+    /// The alias reads the issue number an older file wrote.
+    #[serde(alias = "number")]
+    pub key: ChatKey,
     /// The Claude session identity, when the first run started.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -715,13 +743,22 @@ mod tests {
                 ReleasePolicy::Interval { minutes: 5 },
             )]),
             last_fire_ms: BTreeMap::from([("borsuk".to_string(), 1_000)]),
-            ticket_conversations: vec![TicketConversationState {
-                repo: "borsuk".to_string(),
-                number: 42,
-                session_id: Some("session-42".to_string()),
-                handoff_active: true,
-                proposal: None,
-            }],
+            ticket_conversations: vec![
+                TicketConversationState {
+                    repo: "borsuk".to_string(),
+                    key: ChatKey::Ticket(42),
+                    session_id: Some("session-42".to_string()),
+                    handoff_active: true,
+                    proposal: None,
+                },
+                TicketConversationState {
+                    repo: "borsuk".to_string(),
+                    key: ChatKey::Theory("gh".to_string()),
+                    session_id: Some("session-gh".to_string()),
+                    handoff_active: false,
+                    proposal: None,
+                },
+            ],
             role_bindings: BTreeMap::new(),
             runtime: RuntimeState {
                 paused: PausedState {
@@ -750,6 +787,30 @@ mod tests {
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);
         assert_eq!(loaded, state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file written before the theory chats keys each conversation by a
+    /// bare issue number, and that number still names the ticket.
+    #[test]
+    fn an_old_conversation_key_loads_as_a_ticket_chat() {
+        let dir = temp_dir("old-conversation-key");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"stage_limits":{},"lanes":[],"policies":{},"last_fire_ms":{},
+                "ticket_conversations":[{"repo":"borsuk","number":7,
+                "session_id":"session-7","handoff_active":true}],
+                "runtime":{"paused":{"global":false},"tasks":[],"pending_chats":{},
+                "review_tickets":{},"release_batches":{},"stuck":[]}}"#,
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert_eq!(loaded.ticket_conversations.len(), 1);
+        assert_eq!(loaded.ticket_conversations[0].key, ChatKey::Ticket(7));
+        assert_eq!(loaded.ticket_conversations[0].key.ticket(), Some(7));
         let _ = fs::remove_dir_all(dir);
     }
 
