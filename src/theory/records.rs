@@ -60,12 +60,23 @@ pub const MODEL_FILE: &str = "theory/model.toml";
 /// The theory files only a model branch may change.
 pub const MODEL_FILES: [&str; 3] = [MODEL_FILE, "theory/verify.toml", "theory/rules.md"];
 
+/// The heading one pull request body must carry.
+pub const SECTION_WHY: &str = "## Why";
+
+/// The heading one pull request body must not carry.
+pub const SECTION_HOW: &str = "## How";
+
+/// The heading text no pull request body may open with.
+const IMPLEMENTATION_PREFIX: &str = "Implementation";
+
 /// Check the body and the diff of one governed pull request.
 ///
 /// A branch that is not the model branch may not change a theory file.
-/// Every other rule is the Before / After contract of
-/// [`contract::check_body_lines`], and the changed paths of `ctx` are the
-/// same list both rules read. The first broken rule wins.
+/// The body then carries [`SECTION_WHY`], carries no [`SECTION_HOW`], and
+/// opens no heading with [`IMPLEMENTATION_PREFIX`]. Every other rule is
+/// the Before / After contract of [`contract::check_body_lines`], and the
+/// changed paths of `ctx` are the same list both rules read. The first
+/// broken rule wins.
 pub fn check_pr(body: &str, branch: &str, ctx: &ContractContext<'_>) -> Result<(), Finding> {
     if !is_model_branch(branch) {
         for path in &ctx.changed_paths {
@@ -74,7 +85,33 @@ pub fn check_pr(body: &str, branch: &str, ctx: &ContractContext<'_>) -> Result<(
             }
         }
     }
+    check_headings(body)?;
     contract::check_body_lines(body, ctx)
+}
+
+/// The heading rules of one pull request body.
+///
+/// The body says why the change happened. It never says how the agent
+/// worked, so a `## How` section and a heading that opens with
+/// `Implementation` are both refused.
+fn check_headings(body: &str) -> Result<(), Finding> {
+    if !body.lines().any(|line| line.trim() == SECTION_WHY) {
+        return Err(Finding::plain("section Why missing"));
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        if line == SECTION_HOW {
+            return Err(Finding::plain("section How is not allowed"));
+        }
+        let Some(rest) = line.strip_prefix('#') else {
+            continue;
+        };
+        let name = rest.trim_start_matches('#').trim();
+        if name.starts_with(IMPLEMENTATION_PREFIX) {
+            return Err(Finding::plain(format!("heading {name} is not allowed")));
+        }
+    }
+    Ok(())
 }
 
 /// True when one branch is a model branch, in the form
@@ -221,6 +258,16 @@ pub enum PredictionTag {
     Sure,
     /// The operator is not sure.
     Unsure,
+}
+
+impl PredictionTag {
+    /// The lowercase name of the tag, as a block writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sure => "sure",
+            Self::Unsure => "unsure",
+        }
+    }
 }
 
 /// One slot of a full prediction.
@@ -1018,6 +1065,52 @@ mod tests {
         let ctx = model_context(&["theory/model.toml"]);
         check_pr(EMPTY_CONTRACT, "aif/borsuk/model-a1b2c3d4", &ctx)
             .expect("the model branch owns the model file");
+    }
+
+    #[test]
+    fn check_pr_reads_the_headings_of_one_body_by_the_table() {
+        let ctx = model_context(&[]);
+        check_pr("## Why\n\n## Evidence\n\n## Before / After\n", "main", &ctx)
+            .expect("Why and Evidence are the accepted pair");
+
+        let cases = [
+            ("## Evidence\n\n## Before / After\n", "section Why missing"),
+            (
+                "## Why\n\n## How\n\n## Before / After\n",
+                "section How is not allowed",
+            ),
+            (
+                "## Why\n\n## Implementation notes\n\n## Before / After\n",
+                "heading Implementation notes is not allowed",
+            ),
+            (
+                "## Why\n\n# Implementation\n\n## Before / After\n",
+                "heading Implementation is not allowed",
+            ),
+        ];
+        for (body, expected) in cases {
+            let finding = check_pr(body, "main", &ctx).expect_err(expected);
+            assert_eq!(finding.reason, expected, "body:\n{body}");
+        }
+    }
+
+    #[test]
+    fn check_pr_runs_the_heading_rules_after_the_model_rule() {
+        let ctx = model_context(&["theory/verify.toml"]);
+        let body = "## Why\n\n## How\n";
+
+        let finding =
+            check_pr(body, "aif/borsuk/issue-142", &ctx).expect_err("the model file rule wins");
+        assert_eq!(
+            finding.reason,
+            "theory/verify.toml changed off a model branch"
+        );
+
+        // The model branch clears the first rule, so the heading rule
+        // answers the same body.
+        let finding =
+            check_pr(body, "aif/borsuk/model-1", &ctx).expect_err("the heading rule answers");
+        assert_eq!(finding.reason, "section How is not allowed");
     }
 
     #[test]
