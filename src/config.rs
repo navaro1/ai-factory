@@ -357,6 +357,15 @@ impl TheoryConfig {
     }
 }
 
+/// The per-repository skills checkout of `factory.toml`.
+///
+/// It points at the checkout that holds `.claude/skills/`. The operator
+/// sets it to experiment against a repository that many people share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsPath {
+    pub path: PathBuf,
+}
+
 /// Temporary stage data for callers that still use the old runner interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageConfig {
@@ -384,8 +393,22 @@ pub struct RepoConfig {
     pub lanes: BTreeMap<Stage, usize>,
     pub release: ReleasePolicy,
     pub theory: TheoryConfig,
+    /// The checkout that holds the run skills. Absent means the theory
+    /// checkout.
+    pub skills: Option<SkillsPath>,
     pub role_overrides: BTreeMap<ExecutionRole, RoleOverride>,
     pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
+}
+
+impl RepoConfig {
+    /// The checkout that holds `.claude/skills/`: the skills path when the
+    /// operator set one, else the theory checkout.
+    pub fn skills_checkout(&self) -> PathBuf {
+        self.skills.as_ref().map_or_else(
+            || self.theory.checkout(&self.path),
+            |skills| skills.path.clone(),
+        )
+    }
 }
 
 /// Temporary chat data for callers that still use the old ticket interface.
@@ -620,6 +643,7 @@ impl Config {
             }
             validate_release(&raw_repo.release, &alias)?;
             let theory = theory_config(&raw_repo, &alias)?;
+            let skills = skills_config(&raw_repo, &alias)?;
             let raw_overrides = raw_repo.overrides();
             let raw_tag_route_overrides = raw_repo.tag_routes.entries();
             let mut lanes = BTreeMap::new();
@@ -667,6 +691,7 @@ impl Config {
                     lanes,
                     release: raw_repo.release,
                     theory,
+                    skills,
                     role_overrides,
                     tag_route_overrides: repository_tag_route_overrides,
                 },
@@ -980,6 +1005,7 @@ struct RawRepo {
     governor: Option<String>,
     window: Option<usize>,
     theory: Option<RawTheoryRepo>,
+    skills: Option<RawSkills>,
     sweep: Option<RawSweep>,
     cards: Option<RawCards>,
     interview: Option<RawInterview>,
@@ -994,6 +1020,11 @@ struct RawRepo {
 #[serde(deny_unknown_fields)]
 struct RawTheoryRepo {
     repo: Option<String>,
+    path: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSkills {
     path: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
@@ -1471,6 +1502,23 @@ fn validate_usage(value: &UsageConfig) -> Result<()> {
     }
     Ok(())
 }
+/// Build the skills checkout override of one repository.
+fn skills_config(raw: &RawRepo, alias: &str) -> Result<Option<SkillsPath>> {
+    let Some(raw) = &raw.skills else {
+        return Ok(None);
+    };
+    let path = raw
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow!("repo.{alias}.skills.path is required"))?;
+    if path.trim().is_empty() {
+        bail!("repo.{alias}.skills.path must not be empty");
+    }
+    Ok(Some(SkillsPath {
+        path: PathBuf::from(path),
+    }))
+}
+
 fn theory_config(raw: &RawRepo, alias: &str) -> Result<TheoryConfig> {
     let governor = match raw.governor.as_deref() {
         None | Some("on") => Governor::On,

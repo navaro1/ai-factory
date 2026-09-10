@@ -490,7 +490,7 @@ impl WorktreeManager {
     /// Resolve the base commitish: `origin/HEAD` when git knows it, else the
     /// repository's own `HEAD`. Status 1 means that the reference is absent.
     /// Other failures propagate.
-    fn default_base(&self, exec: &dyn Exec, repo_path: &Path) -> Result<String> {
+    pub(crate) fn default_base(&self, exec: &dyn Exec, repo_path: &Path) -> Result<String> {
         let out = git(
             exec,
             repo_path,
@@ -563,7 +563,7 @@ impl WorktreeManager {
 }
 
 /// Run `git -C <dir> <args>` and return the raw output.
-fn git(exec: &dyn Exec, dir: &Path, args: &[&str]) -> Result<CmdOut> {
+pub(crate) fn git(exec: &dyn Exec, dir: &Path, args: &[&str]) -> Result<CmdOut> {
     let dir_text = dir.to_string_lossy().into_owned();
     let mut argv: Vec<&str> = vec!["-C", dir_text.as_str()];
     argv.extend_from_slice(args);
@@ -700,6 +700,7 @@ mod tests {
             lanes: BTreeMap::new(),
             release: ReleasePolicy::Manual,
             theory: crate::config::TheoryConfig::default(),
+            skills: None,
             role_overrides: BTreeMap::new(),
             tag_route_overrides: BTreeMap::new(),
         }

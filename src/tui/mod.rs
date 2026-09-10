@@ -31,6 +31,7 @@ pub mod pipeline;
 pub mod session;
 pub mod settings;
 pub mod theme;
+pub mod theory;
 pub mod tickets;
 pub mod transcript;
 
@@ -79,6 +80,8 @@ enum View {
     Tickets,
     /// The execution role settings editor.
     Settings,
+    /// What the governor knows about each repository.
+    Theory,
 }
 
 /// What the operator has marked in the visible view.
@@ -383,7 +386,7 @@ impl App {
             View::Inbox => self.inbox.typing(),
             View::Tickets => self.tickets.typing(),
             View::Settings => self.settings.typing(),
-            View::Pipeline => false,
+            View::Pipeline | View::Theory => false,
         }
     }
 
@@ -533,6 +536,10 @@ impl App {
                             self.view = View::Settings;
                             return true;
                         }
+                        KeyCode::Char('6') => {
+                            self.view = View::Theory;
+                            return true;
+                        }
                         KeyCode::Char('?') => {
                             self.help = true;
                             return true;
@@ -592,6 +599,7 @@ impl App {
                     KeyCode::Char('3') => {}
                     KeyCode::Char('4') => self.view = View::Tickets,
                     KeyCode::Char('5') => self.view = View::Settings,
+                    KeyCode::Char('6') => self.view = View::Theory,
                     KeyCode::Char('?') => self.help = true,
                     KeyCode::Esc => self.view = View::Pipeline,
                     _ => {
@@ -605,6 +613,7 @@ impl App {
                 KeyCode::Char('3') => self.view = View::Inbox,
                 KeyCode::Char('4') => self.view = View::Tickets,
                 KeyCode::Char('5') => self.view = View::Settings,
+                KeyCode::Char('6') => self.view = View::Theory,
                 KeyCode::Char('?') => self.help = true,
                 KeyCode::Char('j') | KeyCode::Down => pipeline::move_selection(self, 1),
                 KeyCode::Char('k') | KeyCode::Up => pipeline::move_selection(self, -1),
@@ -630,6 +639,10 @@ impl App {
                         KeyCode::Char('4') => return true,
                         KeyCode::Char('5') => {
                             self.view = View::Settings;
+                            return true;
+                        }
+                        KeyCode::Char('6') => {
+                            self.view = View::Theory;
                             return true;
                         }
                         KeyCode::Char('?') => {
@@ -684,6 +697,10 @@ impl App {
                             true
                         }
                         KeyCode::Char('5') => true,
+                        KeyCode::Char('6') => {
+                            self.view = View::Theory;
+                            true
+                        }
                         KeyCode::Char('?') => {
                             self.help = true;
                             true
@@ -708,6 +725,16 @@ impl App {
                     }
                 }
             }
+            View::Theory => match key.code {
+                KeyCode::Char('1') => self.view = View::Pipeline,
+                KeyCode::Char('2') => self.enter_session(),
+                KeyCode::Char('3') => self.view = View::Inbox,
+                KeyCode::Char('4') => self.view = View::Tickets,
+                KeyCode::Char('5') => self.view = View::Settings,
+                KeyCode::Char('?') => self.help = true,
+                KeyCode::Esc => self.view = View::Pipeline,
+                _ => {}
+            },
         }
         true
     }
@@ -1179,7 +1206,7 @@ fn run_loop(
                     let changed = match app.view {
                         View::Session => app.session.poll(now),
                         View::Tickets => app.tickets.poll(now),
-                        View::Pipeline | View::Inbox | View::Settings => false,
+                        View::Pipeline | View::Inbox | View::Settings | View::Theory => false,
                     };
                     if app.view == View::Tickets {
                         if let Some(action) = app.tickets.take_status_refresh(now) {
@@ -1356,6 +1383,11 @@ fn render_with_clock(
                 app.settings.draw(f, body, state);
             }
         }
+        View::Theory => {
+            if let Some(state) = app.state.as_ref() {
+                theory::draw(f, body, state);
+            }
+        }
     }
     draw_toast(f, app, body);
     draw_footer(f, app, footer);
@@ -1378,6 +1410,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     tabs.push(tab_span("3", "inbox", app.view == View::Inbox));
     tabs.push(tab_span("4", "tickets", app.view == View::Tickets));
     tabs.push(tab_span("5", "settings", app.view == View::Settings));
+    tabs.push(tab_span("6", "theory", app.view == View::Theory));
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
@@ -1402,7 +1435,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// The styled tab label of one view.
 fn tab_span(number: &str, label: &str, active: bool) -> Span<'static> {
-    let text = format!(" {number} {label} ");
+    // One space between tabs, not two: six tabs and the connection state
+    // fill a terminal of eighty columns exactly.
+    let text = format!("{number} {label} ");
     if active {
         Span::styled(
             text,
@@ -1467,6 +1502,7 @@ fn footer_hints(app: &App) -> String {
         View::Inbox => inbox::footer_text(state, &app.inbox),
         View::Tickets => app.tickets.footer_hints(),
         View::Settings => app.settings.footer_hints(),
+        View::Theory => "1-6 view · esc home".to_string(),
     }
 }
 
@@ -1550,7 +1586,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let panel = centered(78, HELP_ROWS as u16 / 2 + 2, area);
     f.render_widget(Clear, panel);
     let rows: [(&str, &str); HELP_ROWS] = [
-        ("1 2 3 4 5", "switch view"),
+        ("1 2 3 4 5 6", "switch view"),
         ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
         ("j k Up Down", "move inside a lane"),
@@ -2911,6 +2947,51 @@ mod tests {
             let text = render_to_string(&mut app);
             assert!(text.contains("! 1 open"), "view {view:?} misses the badge");
         }
+    }
+
+    #[test]
+    fn the_theory_tab_joins_the_view_cycle_the_strip_and_the_help() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                areas: vec![crate::sock::AreaView {
+                    id: "web-checkout".to_string(),
+                    tier: crate::theory::verify::Tier::Browser,
+                    ..crate::sock::AreaView::default()
+                }],
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Theory);
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("6 theory"), "{screen}");
+        assert!(screen.contains("web-checkout \u{b7} browser"), "{screen}");
+        assert!(screen.contains("1-6 view"), "{screen}");
+
+        app.help = true;
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("1 2 3 4 5 6"), "{screen}");
+        app.help = false;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert_eq!(app.view, View::Pipeline);
     }
 
     #[test]

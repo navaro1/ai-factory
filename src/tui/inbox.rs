@@ -2456,6 +2456,7 @@ mod tests {
             },
             settings: crate::sock::SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         }
     }
 
@@ -4293,6 +4294,7 @@ mod tests {
             },
             settings: crate::sock::SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         }
     }
 

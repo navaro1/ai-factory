@@ -40,6 +40,7 @@ use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 use crate::sched::{Limits, Paused};
 use crate::tasks::{TaskState, TaskTable};
+use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
 
@@ -121,6 +122,81 @@ pub struct StateView {
     /// One usage row per billed identity, in panel order.
     #[serde(default)]
     pub usage: Vec<UsageView>,
+    /// What the governor knows about each repository, by alias. A
+    /// repository with the governor off carries an empty view.
+    #[serde(default)]
+    pub theory: BTreeMap<String, TheoryView>,
+}
+
+/// What the Theory view draws for one repository.
+///
+/// The daemon rebuilds it on every poll from the theory checkout commit,
+/// so it never outlives the files it describes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TheoryView {
+    /// Whether the governor runs for this repository.
+    #[serde(default)]
+    pub governor: bool,
+    /// The theory read error, empty when every file parsed.
+    #[serde(default)]
+    pub error: String,
+    /// The model entries, in file order.
+    #[serde(default)]
+    pub entries: Vec<EntryView>,
+    /// The areas of the verification map, in file order.
+    #[serde(default)]
+    pub areas: Vec<AreaView>,
+    /// The run skills, by surface.
+    #[serde(default)]
+    pub skills: BTreeMap<String, SurfaceView>,
+}
+
+/// One model entry, as the Theory view shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryView {
+    #[serde(default)]
+    pub id: String,
+    /// The entry kind name: `invariant`, `state`, `transition`,
+    /// `boundary`, or `failure`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub statement: String,
+}
+
+/// One row of the AREAS panel.
+///
+/// The view ships the facts and the panel renders the mark, so the doctor
+/// can apply the same rule to the same numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AreaView {
+    #[serde(default)]
+    pub id: String,
+    /// The highest tier of the surfaces that map to the area.
+    #[serde(default)]
+    pub tier: Tier,
+    /// The floor the operator set on the area.
+    #[serde(default)]
+    pub min_tier: Tier,
+    /// Whether a lint finding names a surface of the area.
+    #[serde(default)]
+    pub lint: bool,
+}
+
+/// One run skill, as the Theory view shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceView {
+    /// How far the surface's driver reaches.
+    #[serde(default)]
+    pub tier: Tier,
+    /// The feature ids of the surface, in path order.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// The lint findings of the surface, rendered.
+    #[serde(default)]
+    pub lint: Vec<String>,
 }
 
 /// The editable factory settings and their current file revision.
@@ -563,6 +639,8 @@ pub struct StateInput<'a> {
     pub prompts: &'a [PromptView],
     /// The immutable role binding of each bound task, keyed by task id.
     pub role_bindings: &'a BTreeMap<String, ResolvedRoleSettings>,
+    /// The Theory view of each repository, keyed by alias.
+    pub theory: &'a BTreeMap<String, TheoryView>,
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -585,6 +663,7 @@ impl StateInput<'_> {
             usage,
             prompts,
             role_bindings,
+            theory,
             now_ms,
         } = *self;
         let repos = config
@@ -776,6 +855,7 @@ impl StateInput<'_> {
             paused,
             settings: SettingsView::from_config(config, settings_revision, prompts)?,
             usage: usage.to_vec(),
+            theory: theory.clone(),
         })
     }
 }
@@ -2159,6 +2239,7 @@ mod tests {
             },
             settings: SettingsView::default(),
             usage: Vec::new(),
+            theory: BTreeMap::new(),
         }
     }
 
@@ -2356,6 +2437,7 @@ mod tests {
             usage: &[],
             prompts: &prompts,
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -2524,7 +2606,36 @@ mod tests {
 
     #[test]
     fn a_state_view_round_trips_through_json() {
+        let mut theory = BTreeMap::new();
+        theory.insert(
+            "borsuk".to_string(),
+            TheoryView {
+                governor: true,
+                error: String::new(),
+                entries: vec![EntryView {
+                    id: "B-checkout".to_string(),
+                    kind: "boundary".to_string(),
+                    title: "checkout".to_string(),
+                    statement: "the cart pays".to_string(),
+                }],
+                areas: vec![AreaView {
+                    id: "web-checkout".to_string(),
+                    tier: Tier::Browser,
+                    min_tier: Tier::Http,
+                    lint: true,
+                }],
+                skills: BTreeMap::from([(
+                    "web".to_string(),
+                    SurfaceView {
+                        tier: Tier::Browser,
+                        features: vec!["checkout".to_string()],
+                        lint: vec!["features/x.md: area nope unknown".to_string()],
+                    },
+                )]),
+            },
+        );
         let view = StateView {
+            theory,
             decisions: vec![crate::decisions::Decision::release_gate(
                 "borsuk",
                 vec![7, 9],
@@ -2551,7 +2662,27 @@ mod tests {
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert!(text.contains("\"usage\":["), "line: {text}");
+        assert!(text.contains("\"tier\":\"browser\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_state_view_without_the_theory_field_parses_with_an_empty_map() {
+        let mut value = serde_json::to_value(sample_view(1)).unwrap();
+        value.as_object_mut().unwrap().remove("theory");
+        let text = serde_json::to_string(&value).unwrap();
+
+        let view: StateView = serde_json::from_str(&text).unwrap();
+
+        assert!(view.theory.is_empty());
+
+        let partial = serde_json::json!({"governor": true});
+        let one: TheoryView = serde_json::from_value(partial).unwrap();
+        assert!(one.governor);
+        assert!(one.entries.is_empty());
+        assert!(one.areas.is_empty());
+        assert!(one.skills.is_empty());
+        assert_eq!(one.error, "");
     }
 
     #[test]
@@ -2908,6 +3039,7 @@ mod tests {
             prompts: &[],
             role_bindings: &role_bindings,
             usage: &[],
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -2958,6 +3090,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -3250,6 +3383,7 @@ mod tests {
             },
             settings: SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         };
         let text = serde_json::to_string(&view).unwrap();
         let back: StateView = serde_json::from_str(&text).unwrap();
@@ -3317,6 +3451,7 @@ mod tests {
             input_modes: &input_modes,
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             usage: &[],
             now_ms: 0,
         }
@@ -3562,6 +3697,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -3630,6 +3766,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -3738,6 +3875,7 @@ mod tests {
             input_modes: &BTreeMap::new(),
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             usage: &[],
@@ -3835,6 +3973,7 @@ mod tests {
             input_modes: &BTreeMap::new(),
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             usage: &[],
@@ -3881,6 +4020,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -3978,6 +4118,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 120_000,
         }
         .build()
