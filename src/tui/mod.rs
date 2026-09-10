@@ -278,6 +278,8 @@ struct App {
     settings: Settings,
     /// The Theory view cursor and its surface input.
     theory: theory::Theory,
+    /// The short prediction the pipeline view is taking, if any.
+    prediction: Option<pipeline::PredictionInput>,
     /// The task id the session view follows.
     session_task: Option<String>,
     /// The task the shell still waits for, from `r` or `n`.
@@ -390,7 +392,7 @@ impl App {
             View::Tickets => self.tickets.typing(),
             View::Settings => self.settings.typing(),
             View::Theory => self.theory.typing(),
-            View::Pipeline => false,
+            View::Pipeline => self.prediction.is_some(),
         }
     }
 
@@ -610,6 +612,9 @@ impl App {
                         self.inbox_dispatch(key, sink);
                     }
                 }
+            }
+            View::Pipeline if self.prediction.is_some() => {
+                pipeline::typing_key(self, key, sink);
             }
             View::Pipeline => match key.code {
                 KeyCode::Char('1') => {}
@@ -1283,6 +1288,7 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
             if result
                 .request
                 .starts_with(crate::sock::SKILL_TICKET_REQUEST)
+                || result.request.starts_with(crate::sock::PREDICTION_REQUEST)
             {
                 app.show_toast(&result.message);
             } else {
@@ -3086,6 +3092,34 @@ mod tests {
         );
     }
 
+    /// A refused short prediction has no ticket row that waits for it, so
+    /// its reason becomes a toast.
+    #[test]
+    fn a_refused_short_prediction_reaches_the_operator_as_a_toast() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::TicketResult(crate::sock::TicketResult {
+                request: "prediction:borsuk/142".to_string(),
+                repo: "borsuk".to_string(),
+                number: 142,
+                kind: crate::sock::TicketResultKind::Failure,
+                message: "area gh has no entries".to_string(),
+                issue: None,
+                conflict: None,
+            })]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.visible_toast(), Some("area gh has no entries"));
+    }
+
     #[test]
     fn t_on_an_areas_row_sends_one_teach_request_for_that_area() {
         let mut surface = CountingSurface { draws: 0 };
@@ -4039,7 +4073,8 @@ mod tests {
             vec![Action::Refine {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
-                number: 140
+                number: 140,
+                prediction: None
             }]
         );
 
@@ -4100,7 +4135,8 @@ mod tests {
             vec![Action::Refine {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
-                number: 140
+                number: 140,
+                prediction: None
             }]
         );
         assert_eq!(app.session.task_id(), None);

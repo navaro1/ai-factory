@@ -376,6 +376,8 @@ mod tests {
                 entries: vec![crate::sock::EntryView::default(); entries],
                 areas,
                 skills: BTreeMap::new(),
+                holds: Vec::new(),
+                records: BTreeMap::new(),
             },
         );
         StateView {

@@ -15,12 +15,17 @@ use crate::sock::{
     TicketSummary,
 };
 
+use crate::theory::records::{skips_prediction_gates, THEORY_SHORT_LABEL};
+
 use super::markdown::{markdown_lines_with_mentions, MentionStatuses};
 use super::session::SessionView;
 use super::theme::THEME;
 
 /// How often the open focus refreshes its mention statuses.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What the chat pane says while the ticket still owes its prediction.
+const CHAT_WAITS: &str = "chat waits for the short prediction";
 
 /// The active field of the direct editor.
 #[derive(Debug, Clone, Copy, Default)]
@@ -148,6 +153,8 @@ pub struct Tickets {
     mentions: MentionStatuses,
     /// The last time the focus sent a mention-status refresh.
     status_polled_at: Option<Instant>,
+    /// Why the chat key opened nothing, until the focus moves.
+    chat_lock: Option<String>,
     /// The scroll offset of the focused ticket pane.
     body_scroll: Cell<u16>,
     /// The highest offset that the focused ticket pane accepts.
@@ -176,6 +183,18 @@ impl Tickets {
     /// The issue identity of the open focus.
     pub fn focus_key(&self) -> Option<(String, u64)> {
         self.focus_key.clone()
+    }
+
+    /// True while the focused ticket of a governed repository still owes
+    /// its short prediction.
+    fn awaits_short_prediction(&self, state: &StateView, repo: &str) -> bool {
+        if !state.theory.get(repo).is_some_and(|theory| theory.governor) {
+            return false;
+        }
+        let Some(details) = self.details.as_ref() else {
+            return false;
+        };
+        !self.focus_has_label(THEORY_SHORT_LABEL) && !skips_prediction_gates(&details.issue.labels)
     }
 
     /// True when the focused issue carries the label.
@@ -609,6 +628,14 @@ impl Tickets {
                         return None;
                     }
                     let (repo, number) = self.focus_key.clone()?;
+                    // The operator writes the prediction from memory and
+                    // from the raw ticket alone, so no agent may speak
+                    // before it exists.
+                    if self.awaits_short_prediction(state, &repo) {
+                        self.chat_lock = Some(CHAT_WAITS.to_string());
+                        return None;
+                    }
+                    self.chat_lock = None;
                     self.chat_active = true;
                     let id = crate::tasks::ticket_chat_id(&repo, number);
                     if let Some(task) = state.tasks.iter().find(|task| task.id == id) {
@@ -753,6 +780,7 @@ impl Tickets {
         self.conflict_open = false;
         self.chat.clear();
         self.chat_active = false;
+        self.chat_lock = None;
         self.proposal_request = None;
         self.body_lines.clear();
         self.proposal_lines.clear();
@@ -1268,12 +1296,12 @@ impl Tickets {
                 .as_ref()
                 .and_then(|details| details.chat_error.as_deref())
                 .map_or_else(
-                    || {
-                        if self.chat_active {
+                    || match self.chat_lock.as_deref() {
+                        Some(reason) => format!("× {reason}"),
+                        None if self.chat_active => {
                             "… pending: the configured chat session starts.".to_string()
-                        } else {
-                            format!("{chat_ready}\n\nc  start or resume chat")
                         }
+                        None => format!("{chat_ready}\n\nc  start or resume chat"),
                     },
                     |error| format!("× chat needs configuration.\n\n{error}"),
                 );
@@ -2725,6 +2753,61 @@ mod tests {
         assert_eq!(repo, "borsuk");
         assert_eq!(number, 7);
         assert!(tickets.typing(), "the chat input must own the keyboard");
+    }
+
+    /// `c` on a governed ticket that still owes its short prediction
+    /// opens no conversation and says so in the chat pane.
+    #[test]
+    fn c_waits_for_the_short_prediction_on_a_governed_ticket() {
+        let mut state = state();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        tickets.observe_details(details());
+
+        let action = tickets.handle_key(&state, key(KeyCode::Char('c')));
+
+        assert!(action.is_none(), "the key opens no conversation");
+        assert!(!tickets.typing(), "the chat input takes no keyboard");
+        let screen = render_focus(&tickets, &state, 120, 24).join("\n");
+        assert!(
+            screen.contains("chat waits for the short prediction"),
+            "the chat pane names the reason:\n{screen}"
+        );
+    }
+
+    /// The same ticket with its prediction accepted starts the chat.
+    #[test]
+    fn c_starts_chat_once_the_short_prediction_landed() {
+        let mut state = state();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        let mut issue_details = details();
+        issue_details
+            .issue
+            .labels
+            .push(THEORY_SHORT_LABEL.to_string());
+        tickets.observe_details(issue_details);
+
+        let action = tickets.handle_key(&state, key(KeyCode::Char('c')));
+
+        assert!(
+            matches!(action, Some(Action::Ticket(TicketAction::Chat { .. }))),
+            "the prediction unlocks the chat"
+        );
     }
 
     #[test]

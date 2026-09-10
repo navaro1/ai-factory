@@ -40,6 +40,7 @@ use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStag
 use crate::sched::{Limits, Paused};
 use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
+use crate::theory::records::{FullPrediction, ShortPrediction};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
@@ -149,6 +150,38 @@ pub struct TheoryView {
     /// The run skills, by surface.
     #[serde(default)]
     pub skills: BTreeMap<String, SurfaceView>,
+    /// The predictions the daemon refused, in refusal order. An entry
+    /// lives until a prediction of the same item posts.
+    #[serde(default)]
+    pub holds: Vec<HoldView>,
+    /// The blocks of each theory record the daemon read, by record key.
+    #[serde(default)]
+    pub records: BTreeMap<String, RecordView>,
+}
+
+/// One prediction the daemon refused to post.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldView {
+    /// The issue or pull request the prediction named.
+    #[serde(default)]
+    pub number: u64,
+    /// Why the daemon refused it, in one line.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// The blocks of one theory record, as the first sight read them.
+///
+/// The daemon fetches the comments of a record once per label set and
+/// parses every block it knows. The UI never reads comments itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordView {
+    /// The last short prediction of the record.
+    #[serde(default)]
+    pub short: Option<ShortPrediction>,
+    /// The last full prediction of the record.
+    #[serde(default)]
+    pub full: Option<FullPrediction>,
 }
 
 /// One model entry, as the Theory view shows it.
@@ -1247,6 +1280,13 @@ pub enum TheoryAction {
 /// the Theory view and no ticket row waits for it.
 pub const SKILL_TICKET_REQUEST: &str = "skill-ticket:";
 
+/// The request identity prefix of one short prediction refusal.
+///
+/// The refusal rides [`Push::TicketResult`] like a run skill ticket does,
+/// and the UI toasts it. The operator pressed `r` in the pipeline view,
+/// so no ticket row waits for the answer.
+pub const PREDICTION_REQUEST: &str = "prediction:";
+
 /// One ticket command inside [`Action::Ticket`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "ticket_action", rename_all = "snake_case")]
@@ -1537,6 +1577,12 @@ pub enum Push {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     /// Queue a refine task for one item.
+    ///
+    /// On a governed repository the action carries the short prediction
+    /// the operator typed. The daemon posts it, labels the record, and
+    /// adds `to-refine`; the poll gate then queues the task. With the
+    /// governor off the prediction is absent and the daemon queues the
+    /// task itself.
     Refine {
         /// The repository alias.
         repo: String,
@@ -1544,6 +1590,9 @@ pub enum Action {
         kind: ItemKind,
         /// The issue or pull request number.
         number: u64,
+        /// The short prediction of a governed item.
+        #[serde(default)]
+        prediction: Option<ShortPrediction>,
     },
     /// Fetch the question comment of one `needs-human` item.
     ///
@@ -2300,6 +2349,11 @@ mod tests {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
                 number: 142,
+                prediction: Some(ShortPrediction {
+                    kind: crate::theory::records::PREDICTION_SHORT.to_string(),
+                    text: "the poller parks on a 304".to_string(),
+                    areas: vec!["poll".to_string()],
+                }),
             },
             Action::Ask {
                 repo: "borsuk".to_string(),
@@ -2683,6 +2737,8 @@ mod tests {
                     title: "checkout".to_string(),
                     statement: "the cart pays".to_string(),
                 }],
+                holds: Vec::new(),
+                records: BTreeMap::new(),
                 areas: vec![AreaView {
                     id: "web-checkout".to_string(),
                     tier: Tier::Browser,
@@ -3306,6 +3362,7 @@ mod tests {
             repo: "borsuk".to_string(),
             kind: ItemKind::Issue,
             number: 142,
+            prediction: None,
         };
         client.send(&action).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), action);
