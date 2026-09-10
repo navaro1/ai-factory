@@ -12,6 +12,7 @@ pub mod decisions;
 pub mod exec;
 pub mod gates;
 pub mod gh;
+pub mod labels;
 pub mod links;
 pub mod mentions;
 pub mod model;

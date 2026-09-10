@@ -6276,6 +6276,7 @@ mod tests {
                 theory: crate::config::TheoryConfig::default(),
                 role_overrides: BTreeMap::new(),
                 tag_route_overrides: BTreeMap::new(),
+                label_overrides: BTreeMap::new(),
             },
         );
         let route_override = complete_role_override(&role_settings);
@@ -6294,6 +6295,7 @@ mod tests {
             stages,
             repos,
             tag_route_overrides,
+            labels: crate::labels::LabelNames::default(),
             ticket_chat: crate::config::TicketChatConfig {
                 model: Some("m".to_string()),
             },
