@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{ItemKind, Stage};
 use crate::tasks::Task;
 use crate::theory::answers::{Cause, TheoryRow};
+use crate::theory::cards::CardView;
 
 /// One condition that waits for a human answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +99,15 @@ pub enum DecisionKind {
         source: String,
         /// The question the card asks.
         prompt: String,
+        /// The merged pull request the card names, when it names one.
+        #[serde(default)]
+        number: Option<u64>,
+        /// The model entry the card names, when it names one.
+        #[serde(default)]
+        entry: Option<String>,
+        /// Whether the operator answered the card with a recall.
+        #[serde(default)]
+        recalled: bool,
     },
     /// The first run of one measurer waits for a confirmation.
     FirstRun {
@@ -292,6 +302,27 @@ impl Decision {
                 tag: row.tag,
                 question: row.question,
                 source: row.source,
+            },
+            opened_ms,
+        )
+    }
+
+    /// Build one card row from the card of the day.
+    ///
+    /// `recalled` is true once the operator answered the card with a
+    /// recall, and the row then offers the teach key instead of the
+    /// answer key.
+    pub fn card(repo: &str, card: &CardView, recalled: bool, opened_ms: u64) -> Self {
+        Self::from_parts(
+            format!("card:{repo}:{}", card.slug()),
+            repo.to_string(),
+            None,
+            DecisionKind::Card {
+                source: card.source.clone(),
+                prompt: card.prompt.clone(),
+                number: card.number,
+                entry: card.entry.clone(),
+                recalled,
             },
             opened_ms,
         )
@@ -569,14 +600,15 @@ mod tests {
                 },
                 NOW,
             ),
-            Decision::from_parts(
-                "card:borsuk:1".to_string(),
-                "borsuk".to_string(),
-                None,
-                DecisionKind::Card {
-                    source: "merged-pr".to_string(),
-                    prompt: "State INV-3.".to_string(),
+            Decision::card(
+                "borsuk",
+                &CardView {
+                    source: "stale-entry".to_string(),
+                    prompt: "State INV-3. What would violate it?".to_string(),
+                    number: None,
+                    entry: Some("INV-3".to_string()),
                 },
+                false,
                 NOW,
             ),
             Decision::from_parts(

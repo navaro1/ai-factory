@@ -734,6 +734,7 @@ mod tests {
                 stale_entries: Vec::new(),
                 deltas: Vec::new(),
                 window: (0, 0),
+                cards: Vec::new(),
             },
         );
         StateView {

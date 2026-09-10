@@ -66,10 +66,13 @@ use crate::sock::{
     MODEL_COMMIT_REQUEST, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
 };
 use crate::state::{ChatKey, DaemonState, RuntimeState, TaskBinding, TicketConversationState};
-use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::tasks::{
+    self, AuditJob, CardKey, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey,
+};
 use crate::theory::answers::{self, AnswerBlock, Cause};
 use crate::theory::blocks;
 use crate::theory::cadence::{self, Schedule, ScheduleKind, SweepStats};
+use crate::theory::cards::{self, CardView};
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
@@ -339,6 +342,29 @@ struct MeasureJob {
     record: String,
 }
 
+/// One card of the day and the answer the operator gave it.
+///
+/// The answer stays until the teach task starts or the next daily sweep
+/// replaces the batch, so the inbox row can offer the teach key after a
+/// recall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CardState {
+    /// The card as the Theory view shows it.
+    card: CardView,
+    /// The answer the operator typed, empty until they answer.
+    answer: String,
+}
+
+impl CardState {
+    /// True when the operator answered the card with a recall.
+    fn recalled(&self) -> bool {
+        self.answer
+            .trim_start()
+            .to_lowercase()
+            .starts_with("recall")
+    }
+}
+
 /// The run skills of one repository, at one skills checkout commit.
 struct SkillCache {
     /// The commit the files were read at. Empty when the read failed.
@@ -498,6 +524,16 @@ pub struct Daemon {
     /// One client held across sweeps, so the second day pays 304s on
     /// the comment pages the first day fetched. Runtime only.
     theory_client: Option<GhClient<'static>>,
+    /// The cards of the day of each repository, with the answer of each
+    /// answered card. Runtime only: the next daily sweep replaces the
+    /// batch, and a restart drops it until that sweep.
+    theory_cards: BTreeMap<String, Vec<CardState>>,
+    /// The GitHub login the `gh` CLI runs as. Runtime only: one call per
+    /// daemon run answers it.
+    gh_login: Option<String>,
+    /// The card and the answer of each queued card audit, by task id.
+    /// The dispatch renders them and the exit drops them.
+    card_answers: BTreeMap<String, (CardView, String)>,
     /// The theory record labels of every governed repository, rebuilt on
     /// every poll like [`Links`].
     theory_records: TheoryRecords,
@@ -925,6 +961,9 @@ impl Daemon {
             cadences,
             theory_sweeps: BTreeMap::new(),
             theory_client: None,
+            theory_cards: BTreeMap::new(),
+            gh_login: None,
+            card_answers: BTreeMap::new(),
             ticket_check_failures: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
@@ -1120,6 +1159,7 @@ impl Daemon {
         self.fire_due_trains();
         self.fire_due_cadences();
         self.refresh_release_gates();
+        self.refresh_cards();
         self.reconcile_trains();
         self.reap_idle_sessions();
         self.fail_silent_runs();
@@ -2336,6 +2376,11 @@ impl Daemon {
             view.events_per_day = stats.events_per_day;
             view.stale_entries = stats.stale_entries.clone();
         }
+        view.cards = self
+            .theory_cards
+            .get(repo)
+            .map(|batch| batch.iter().map(|held| held.card.clone()).collect())
+            .unwrap_or_default();
         view
     }
 
@@ -3180,6 +3225,7 @@ impl Daemon {
             return;
         }
         let stale_days = repo_cfg.theory.cards.stale_days;
+        let per_day = repo_cfg.theory.cards.per_day;
         let theory_path = repo_cfg.theory.checkout(&repo_cfg.path);
         let now = self.now_ms;
         let since =
@@ -3209,6 +3255,26 @@ impl Daemon {
                 Err(_) => return,
             }
         };
+        // Source one of the cards: the pull requests that merged since
+        // the last sweep. The scan reads every row, because a pull
+        // request the operator never predicted carries no theory label.
+        // A shadowed alias lists only its theory repository, which holds
+        // no pull request, so it feeds source two alone.
+        let last_ms = self
+            .cadences
+            .iter()
+            .find(|schedule| schedule.kind == ScheduleKind::Daily && schedule.repo == alias)
+            .and_then(|schedule| schedule.last_ms);
+        let merged: Vec<u64> = if shadow_repo.is_some() {
+            Vec::new()
+        } else {
+            rows.iter()
+                .filter_map(|row| {
+                    let at = row.merged_at.as_deref().and_then(cadence::rfc3339_ms)?;
+                    last_ms.is_none_or(|last| at >= last).then_some(row.number)
+                })
+                .collect()
+        };
         // A record without a theory label stays out of the sweep, as on
         // the pull-request side before.
         let rows: Vec<gh::RecordRow> = rows
@@ -3221,6 +3287,12 @@ impl Daemon {
             .collect();
         let label_sets: Vec<&[String]> = rows.iter().map(|row| row.labels.as_slice()).collect();
         let rungs = cadence::rung_counts(&label_sets);
+        // The login costs one call per daemon run, and only a merged
+        // pull request needs it.
+        let login = (!merged.is_empty())
+            .then(|| self.operator_login())
+            .flatten()
+            .unwrap_or_default();
 
         let mut gh = self
             .theory_client
@@ -3228,6 +3300,7 @@ impl Daemon {
             .unwrap_or_else(|| GhClient::new_owned(self.exec.clone()));
         let mut calibration = cadence::Calibration::default();
         let mut events_last_day = 0usize;
+        let mut predicted: BTreeSet<u64> = BTreeSet::new();
         for row in &rows {
             // A row of the code repository resolves through the record
             // lookup; a row of the theory repository is itself the
@@ -3265,6 +3338,15 @@ impl Daemon {
                 if cadence::rfc3339_ms(&comment.created_at).is_some_and(|at| at >= day_cutoff) {
                     events_last_day += parse_event_blocks(&comment.body).len();
                 }
+                // A prediction the operator wrote takes the ticket out
+                // of source one. An agent prediction leaves it in.
+                if !login.is_empty()
+                    && !row.pull_request
+                    && comment.author == login
+                    && !parse_prediction_blocks(&comment.body).is_empty()
+                {
+                    predicted.insert(row.number);
+                }
             }
             calibration.add(&deltas, &tags);
         }
@@ -3301,7 +3383,32 @@ impl Daemon {
                 }
             }
         }
-        if self.theory_sweeps.get(alias) != Some(&stats) {
+        // A merged pull request whose every linked ticket carries an
+        // operator prediction taught the operator nothing new, so it
+        // asks no card.
+        let unpredicted: Vec<u64> = merged
+            .into_iter()
+            .filter(|number| {
+                self.linked_tickets(alias, *number)
+                    .iter()
+                    .all(|ticket| !predicted.contains(ticket))
+            })
+            .collect();
+        let batch: Vec<CardState> = cards::build(&unpredicted, &stats.stale_entries, per_day)
+            .into_iter()
+            .map(|card| CardState {
+                card,
+                answer: String::new(),
+            })
+            .collect();
+        let same_cards = self
+            .theory_cards
+            .get(alias)
+            .map_or(batch.is_empty(), |held| held == &batch);
+        if !same_cards {
+            self.theory_cards.insert(alias.to_string(), batch);
+        }
+        if self.theory_sweeps.get(alias) != Some(&stats) || !same_cards {
             self.theory_sweeps.insert(alias.to_string(), stats);
             // The stored view predates the sweep, so the sweep joins it
             // here and the socket answers with the fresh numbers.
@@ -3310,6 +3417,59 @@ impl Daemon {
                 self.theory_views.insert(alias.to_string(), view);
             }
             self.changed = true;
+        }
+    }
+
+    /// The GitHub login the `gh` CLI runs as, cached per daemon run.
+    ///
+    /// A failed call names no login, and the sweep then counts no
+    /// prediction as the operator's.
+    fn operator_login(&mut self) -> Option<String> {
+        if self.gh_login.is_none() {
+            let gh = GhClient::new_owned(self.exec.clone());
+            match gh.viewer_login() {
+                Ok(login) => self.gh_login = Some(login),
+                Err(error) => eprintln!("the gh login: {error:#}"),
+            }
+        }
+        self.gh_login.clone()
+    }
+
+    /// Open one card row per card of the day and close the rest.
+    ///
+    /// The rows follow the batch the daily sweep built. A card the
+    /// operator answered with a recall keeps its row and offers the
+    /// teach key; every other answered card leaves the batch at once.
+    fn refresh_cards(&mut self) {
+        let mut wanted: BTreeMap<String, Decision> = BTreeMap::new();
+        for (alias, batch) in &self.theory_cards {
+            for held in batch {
+                let row = Decision::card(alias, &held.card, held.recalled(), self.now_ms);
+                wanted.insert(row.id.clone(), row);
+            }
+        }
+        let stale: Vec<String> = self
+            .decisions
+            .open()
+            .iter()
+            .filter(|row| matches!(row.kind, DecisionKind::Card { .. }))
+            .filter(|row| !wanted.contains_key(&row.id))
+            .map(|row| row.id.clone())
+            .collect();
+        for id in stale {
+            self.decisions.take(&id);
+            self.changed = true;
+        }
+        for (id, row) in wanted {
+            let same = self
+                .decisions
+                .open()
+                .iter()
+                .any(|open| open.id == id && open.kind == row.kind);
+            if !same {
+                self.decisions.push(row);
+                self.changed = true;
+            }
         }
     }
 
@@ -4303,7 +4463,7 @@ impl Daemon {
                 self.on_turn_end(&task_id, ok, &summary);
             }
             RunEvent::Exit { ok, detail, .. } => {
-                self.finish_audit_sweep(&task_id);
+                self.finish_audit(&task_id);
                 self.ticket_turn_text.remove(&task_id);
                 self.on_exit_event(&task_id, ok, &detail);
             }
@@ -6314,6 +6474,9 @@ impl Daemon {
             (DecisionKind::TheoryEvent { .. }, Response::Theory { .. }) => {
                 self.answer_theory_row(&decision, &response)
             }
+            (DecisionKind::Card { .. }, Response::Text { text }) => {
+                self.answer_card(&decision, text)
+            }
             (DecisionKind::ReleaseGate { prs: expected }, Response::Go { prs }) => {
                 if expected != prs {
                     eprintln!(
@@ -8311,6 +8474,74 @@ impl Daemon {
         }
     }
 
+    /// Grade one answered card and keep it for a recall.
+    ///
+    /// The answer queues one card audit task. An answer that starts with
+    /// `recall` stays in the batch with its text, so the row offers the
+    /// teach key; every other answer drops the card, and the next drive
+    /// closes its row.
+    fn answer_card(&mut self, decision: &Decision, text: &str) {
+        let DecisionKind::Card { number, entry, .. } = &decision.kind else {
+            return;
+        };
+        let key = match (number, entry) {
+            (Some(number), _) => CardKey::Pr(*number),
+            (None, Some(entry)) => CardKey::Entry(entry.clone()),
+            (None, None) => {
+                eprintln!("the card {} names no subject", decision.id);
+                return;
+            }
+        };
+        let Some(batch) = self.theory_cards.get_mut(&decision.repo) else {
+            return;
+        };
+        let Some(held) = batch.iter_mut().find(|held| held.card.slug() == key.slug()) else {
+            return;
+        };
+        held.answer = text.to_string();
+        let keep = held.recalled();
+        let card = held.card.clone();
+        if !keep {
+            batch.retain(|held| held.card.slug() != key.slug());
+        }
+        self.queue_card_audit(&decision.repo, key, &card, text);
+    }
+
+    /// Queue one card audit task for one answered card.
+    ///
+    /// The task runs one turn in the repository checkout, like the audit
+    /// sweep. Its item is the ticket-session item, so no worktree and no
+    /// pipeline sweep claims it.
+    fn queue_card_audit(&mut self, repo: &str, key: CardKey, card: &CardView, answer: &str) {
+        let job = AuditJob::Card(key);
+        let id = tasks::audit_id(repo, &job);
+        let log = self
+            .state_dir
+            .join("logs")
+            .join(format!("{repo}__audit-card-{}.jsonl", card.slug()));
+        let queued = self.table.upsert_with_id(
+            ScopedTask {
+                id: &id,
+                repo,
+                stage: Stage::Refine,
+                kind: ItemKind::Issue,
+                number: TICKET_NUMBER,
+            },
+            log,
+            self.now_ms,
+        );
+        match queued {
+            Ok(task) => {
+                task.purpose = TaskPurpose::Audit(job);
+                self.role_bindings.remove(&id);
+                self.card_answers
+                    .insert(id, (card.clone(), answer.to_string()));
+                self.changed = true;
+            }
+            Err(error) => eprintln!("the card audit task {id}: {error:#}"),
+        }
+    }
+
     /// Queue one audit sweep task for one repository.
     ///
     /// The task runs one turn in the repository checkout, like a teach
@@ -8379,11 +8610,57 @@ impl Daemon {
         );
         match queued {
             Ok(task) => {
-                task.purpose = TaskPurpose::Teach(key);
+                task.purpose = TaskPurpose::Teach(key.clone());
                 self.role_bindings.remove(&id);
                 self.changed = true;
             }
             Err(error) => eprintln!("the teach task {id}: {error:#}"),
+        }
+        // A recalled card asked for this teach, so the card leaves the
+        // batch and its inbox row closes on the next drive.
+        let drop: Vec<String> = self
+            .theory_cards
+            .get(repo)
+            .map(|batch| {
+                batch
+                    .iter()
+                    .filter(|held| held.recalled() && self.card_teaches(repo, &held.card, &key))
+                    .map(|held| held.card.slug())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(batch) = self.theory_cards.get_mut(repo) {
+            batch.retain(|held| !drop.contains(&held.card.slug()));
+        }
+    }
+
+    /// True when one card asked for the teach of `key`.
+    ///
+    /// A `merged-pr` card names its pull request. A `stale-entry` card
+    /// names one entry, and the teach of an area covers it when the
+    /// model slice of that area's boundary holds the entry.
+    fn card_teaches(&self, repo: &str, card: &CardView, key: &TeachKey) -> bool {
+        match key {
+            TeachKey::Pr(number) => card.number == Some(*number),
+            TeachKey::Area(id) => {
+                let Some(entry) = card.entry.as_deref() else {
+                    return false;
+                };
+                let Some((model, verify)) = self.theory_pair(repo) else {
+                    return false;
+                };
+                verify
+                    .areas
+                    .iter()
+                    .find(|area| area.id == *id)
+                    .is_some_and(|area| {
+                        model
+                            .slice(&[area.boundary.as_str()])
+                            .entries
+                            .iter()
+                            .any(|one| one.id() == entry)
+                    })
+            }
         }
     }
 
@@ -8655,6 +8932,41 @@ impl Daemon {
         let record = match key {
             TeachKey::Pr(number) => RecordKey::Pr(*number),
             TeachKey::Area(_) => RecordKey::Repo,
+        };
+        for event in parse_event_blocks(&turn.all) {
+            if let Err(error) = self.open_event(&task.repo, &record, &event) {
+                eprintln!("task {id}: cannot open the theory event: {error:#}");
+            }
+        }
+    }
+
+    /// Apply the blocks of one finished audit task, per its job.
+    fn finish_audit(&mut self, id: &str) {
+        match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
+            Some(TaskPurpose::Audit(AuditJob::Sweep)) => self.finish_audit_sweep(id),
+            Some(TaskPurpose::Audit(AuditJob::Card(key))) => self.finish_audit_card(id, &key),
+            _ => {}
+        }
+    }
+
+    /// Open one theory event per block of one finished card audit.
+    ///
+    /// A `merged-pr` card opens its events on the record of the pull
+    /// request; a `stale-entry` card opens them on the repository
+    /// record. A turn with no block opens nothing, because the answer
+    /// passed. A failed post goes to standard error only, because the
+    /// grading itself succeeded.
+    fn finish_audit_card(&mut self, id: &str, key: &CardKey) {
+        self.card_answers.remove(id);
+        let Some(task) = self.table.by_id.get(id).cloned() else {
+            return;
+        };
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        let record = match key {
+            CardKey::Pr(number) => RecordKey::Pr(*number),
+            CardKey::Entry(_) => RecordKey::Repo,
         };
         for event in parse_event_blocks(&turn.all) {
             if let Err(error) = self.open_event(&task.repo, &record, &event) {
@@ -9316,7 +9628,11 @@ impl Daemon {
             let values = self.teach_values(task, key, repo_cfg, worktree)?;
             return prompts::fill_template(prompts::TEACH_PROMPT, &values);
         }
-        if let TaskPurpose::Audit(_) = &task.purpose {
+        if let TaskPurpose::Audit(job) = &task.purpose {
+            if let AuditJob::Card(key) = job {
+                let values = self.card_values(task, key.clone(), repo_cfg, worktree)?;
+                return prompts::fill_template(prompts::AUDIT_CARD_PROMPT, &values);
+            }
             let values = self.audit_values(task, worktree);
             return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
         }
@@ -9707,6 +10023,54 @@ impl Daemon {
             ("model", self.model_entries(&task.repo)),
             ("skills", self.audit_skills(task)),
         ]
+    }
+
+    /// The placeholder values of one card audit.
+    ///
+    /// The subject of a `merged-pr` card is the diff of the pull
+    /// request, read the way a teach task reads it. The subject of a
+    /// `stale-entry` card is the model entry itself. A card whose task
+    /// lost its answer is an error that fails the dispatch, because a
+    /// grader with no answer grades nothing.
+    fn card_values(
+        &self,
+        task: &Task,
+        key: CardKey,
+        repo_cfg: &RepoConfig,
+        worktree: &Path,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let (card, answer) = self
+            .card_answers
+            .get(&task.id)
+            .ok_or_else(|| anyhow!("the card audit task {} carries no answer", task.id))?;
+        let subject = match key {
+            CardKey::Pr(number) => self.teach_pr_subject(repo_cfg, number, worktree)?.0,
+            CardKey::Entry(id) => self.card_entry_subject(&task.repo, &id),
+        };
+        Ok(vec![
+            ("repo", task.repo.clone()),
+            ("worktree", worktree.display().to_string()),
+            ("card", card.prompt.clone()),
+            ("answer", answer.clone()),
+            ("subject", subject),
+        ])
+    }
+
+    /// The subject of one `stale-entry` card: the model entry as a line.
+    fn card_entry_subject(&self, repo: &str, id: &str) -> String {
+        self.theory_models
+            .get(repo)
+            .and_then(|cache| cache.model.as_ref().ok())
+            .and_then(|model| model.entries.iter().find(|entry| entry.id() == id))
+            .map(|entry| {
+                format!(
+                    "- {} ({}): {}",
+                    entry.id(),
+                    entry.kind_name(),
+                    entry.statement()
+                )
+            })
+            .unwrap_or_default()
     }
 
     /// The `{skills}` value of one audit sweep: the implement-shaped slice
@@ -30061,6 +30425,442 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 call.argv()
             );
         }
+    }
+
+    // C22: the cards of the day
+    // ------------------------------------------------------------------
+
+    /// The model log of the card window. The entries INV-7, INV-8, and
+    /// INV-9 show no hunk, so three entries feed source two. Every other
+    /// entry was touched five days ago and feeds none.
+    const CARD_LOG: &str = concat!(
+        "commit 111\n",
+        "diff --git a/theory/model.toml b/theory/model.toml\n",
+        "+id = \"B-checkout\"\n",
+        "+id = \"INV-1\"\n",
+        "+id = \"INV-2\"\n",
+        "+id = \"INV-3\"\n",
+        "+id = \"INV-4\"\n",
+        "+id = \"INV-5\"\n",
+        "+id = \"INV-6\"\n",
+    );
+
+    /// The comment body of one ticket that carries a full prediction.
+    const CARD_PREDICTION: &str = concat!(
+        "<aif-prediction-v1>\n",
+        "{\"kind\":\"full\",\"slots\":[",
+        "{\"name\":\"behaviours\",\"entries\":[\"B-checkout\"],\"tag\":\"sure\"}]}",
+        "\n</aif-prediction-v1>",
+    );
+
+    /// The record list of the card sweep.
+    ///
+    /// Ticket 142 and ticket 143 carry a theory label, so the sweep reads
+    /// a comment page of each. Pull request 7 and pull request 9 merged
+    /// in the window and carry no label at all, which is what a pull
+    /// request the operator never predicted looks like.
+    fn card_rows() -> String {
+        let rows = [
+            "{\"number\":142,\"state\":\"closed\",\
+             \"updated_at\":\"2026-09-10T09:00:00Z\",\
+             \"labels\":[{\"name\":\"theory-full\"}]}",
+            "{\"number\":143,\"state\":\"closed\",\
+             \"updated_at\":\"2026-09-10T09:10:00Z\",\
+             \"labels\":[{\"name\":\"theory-full\"}]}",
+            "{\"number\":7,\"state\":\"closed\",\
+             \"updated_at\":\"2026-09-10T10:00:00Z\",\"labels\":[],\
+             \"pull_request\":{\"merged_at\":\"2026-09-10T10:00:00Z\"}}",
+            "{\"number\":9,\"state\":\"closed\",\
+             \"updated_at\":\"2026-09-10T10:30:00Z\",\"labels\":[],\
+             \"pull_request\":{\"merged_at\":\"2026-09-10T10:30:00Z\"}}",
+        ];
+        format!("[{}]", rows.join(","))
+    }
+
+    /// One comment page of one swept record, from one author.
+    fn card_comment_step(number: u64, author: &str, body: &str) -> Step {
+        let url = format!("repos/acme/borsuk/issues/{number}/comments?per_page=100");
+        let page = format!(
+            "[{{\"user\":{{\"login\":\"{author}\"}},\
+             \"created_at\":\"2026-09-10T09:00:00Z\",\
+             \"body\":\"{}\"}}]",
+            body.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        );
+        gh_step(
+            &["api", "-i", "-X", "GET", &url],
+            CmdOut::ok(format!("HTTP/2 200\r\netag: \"c{number}\"\r\n\r\n{page}")),
+        )
+    }
+
+    /// The scripted sweep that builds the cards of one day.
+    ///
+    /// The operator is `piotr`. Ticket 143 carries their prediction and
+    /// ticket 142 carries an agent's, so only pull request 7 feeds
+    /// source one.
+    fn card_sweep_steps(repo: &Path) -> Vec<Step> {
+        let mut steps = sweep_theory_steps(repo, "aaa111");
+        let url = "repos/acme/borsuk/issues?state=all&\
+                   since=2026-08-12T10:00:00Z&per_page=100&page=1";
+        steps.push(gh_step(
+            &["api", "-i", "-X", "GET", url],
+            CmdOut::ok(format!("HTTP/2 200\r\n\r\n{}", card_rows())),
+        ));
+        steps.push(gh_step(
+            &["api", "user"],
+            CmdOut::ok("{\"login\":\"piotr\"}"),
+        ));
+        steps.push(card_comment_step(142, "agent", CARD_PREDICTION));
+        steps.push(card_comment_step(143, "piotr", CARD_PREDICTION));
+        steps.push(git_step(
+            repo,
+            &["log", "--since=30.days.ago", "-p", "--", MODEL_FILE],
+            CmdOut::ok(CARD_LOG),
+        ));
+        steps
+    }
+
+    /// The moment of the card sweep: 2026-09-11T10:00:00Z.
+    const CARD_NOW: u64 = 1_789_120_800_000;
+
+    /// Run one card sweep and hand back the rig.
+    fn card_rig(dir: PathBuf, extra: Vec<Step>) -> Rig {
+        let repo = dir.join("repo");
+        let mut steps = card_sweep_steps(&repo);
+        steps.extend(extra);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.set_now(CARD_NOW);
+        rig.poll(
+            vec![theory_issue()],
+            vec![linked_pr(7, 142), linked_pr(9, 143)],
+        );
+        rig
+    }
+
+    /// The open card rows of the rig, in feed order.
+    fn card_rows_of(rig: &Rig) -> Vec<(String, DecisionKind)> {
+        rig.daemon
+            .decisions
+            .open()
+            .iter()
+            .filter(|row| matches!(row.kind, DecisionKind::Card { .. }))
+            .map(|row| (row.id.clone(), row.kind.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_daily_sweep_builds_one_card_per_source_and_stops_at_the_cap() {
+        let rig = card_rig(temp_root(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(
+            view.cards,
+            vec![
+                CardView {
+                    source: cards::MERGED_PR_SOURCE.to_string(),
+                    prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+                    number: Some(7),
+                    entry: None,
+                },
+                CardView {
+                    source: cards::STALE_ENTRY_SOURCE.to_string(),
+                    prompt: "State INV-7. What would violate it?".to_string(),
+                    number: None,
+                    entry: Some("INV-7".to_string()),
+                },
+                CardView {
+                    source: cards::STALE_ENTRY_SOURCE.to_string(),
+                    prompt: "State INV-8. What would violate it?".to_string(),
+                    number: None,
+                    entry: Some("INV-8".to_string()),
+                },
+            ],
+            "pull request 9 carries the operator prediction, and INV-9 is \
+             the fourth card of a three-card day"
+        );
+        // The entries the log touched five days ago feed no card.
+        for touched in ["INV-1", "INV-6", "B-checkout"] {
+            assert!(
+                !view
+                    .cards
+                    .iter()
+                    .any(|card| card.entry.as_deref() == Some(touched)),
+                "the entry {touched} is not stale"
+            );
+        }
+
+        let rows = card_rows_of(&rig);
+        assert_eq!(
+            rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["card:borsuk:7", "card:borsuk:INV-7", "card:borsuk:INV-8"],
+            "one inbox row per card of the day"
+        );
+        assert_eq!(
+            rows[0].1,
+            DecisionKind::Card {
+                source: cards::MERGED_PR_SOURCE.to_string(),
+                prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+                number: Some(7),
+                entry: None,
+                recalled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn answering_a_card_queues_one_audit_task_that_carries_the_card_and_the_answer() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let extra = teach_pr_steps(&repo);
+        let mut rig = card_rig(dir, extra);
+
+        rig.act(Action::Answer {
+            decision_id: "card:borsuk:7".to_string(),
+            response: Response::Text {
+                text: "the checkout boundary gained a retry".to_string(),
+            },
+        });
+
+        assert_eq!(rig.job_count(), 1, "one audit task runs the grading");
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/audit-card-7");
+        assert_eq!(job.cwd, repo);
+        assert_eq!(
+            rig.task("borsuk/audit-card-7").purpose,
+            TaskPurpose::Audit(AuditJob::Card(CardKey::Pr(7)))
+        );
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("PR #7 merged. Which entries changed, and how?"),
+            "the card text:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("the checkout boundary gained a retry"),
+            "the answer of the operator:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the merged pull request:\n{prompt}"
+        );
+        assert!(
+            card_rows_of(&rig)
+                .iter()
+                .all(|(id, _)| id != "card:borsuk:7"),
+            "an answer that is no recall closes its row"
+        );
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles[0].role, ExecutionRole::TheoryAudit);
+    }
+
+    /// One card event of the `web-checkout` area.
+    fn card_event(text: &str) -> Event {
+        Event {
+            kind: "card".to_string(),
+            text: text.to_string(),
+            area: Some("web-checkout".to_string()),
+            number: None,
+            surface: None,
+        }
+    }
+
+    /// The scripted `open_event` calls of one block on the record of
+    /// pull request 7, which is the pull request itself in code mode.
+    fn open_pr_event_steps(event: &Event) -> Vec<Step> {
+        let body = format!("body={}", event_block(event));
+        vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=event-open",
+                    "-f",
+                    "color=d4c5f9",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"event-open\",\"color\":\"d4c5f9\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=event-open",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_card_grading_with_one_gap_opens_one_event_and_an_empty_one_opens_none() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let gap = card_event("The answer misses the new retry count.");
+        let mut extra = teach_pr_steps(&repo);
+        extra.extend(open_pr_event_steps(&gap));
+        let mut rig = card_rig(dir, extra);
+        rig.act(Action::Answer {
+            decision_id: "card:borsuk:7".to_string(),
+            response: Response::Text {
+                text: "nothing changed".to_string(),
+            },
+        });
+        let id = "borsuk/audit-card-7";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: format!("The answer misses one change.\n{}", event_block(&gap)),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![gap], "one event per gap block");
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_card_grading_with_no_block_opens_no_event() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let extra = teach_pr_steps(&repo);
+        let mut rig = card_rig(dir, extra);
+        rig.act(Action::Answer {
+            decision_id: "card:borsuk:7".to_string(),
+            response: Response::Text {
+                text: "the checkout boundary gained a retry".to_string(),
+            },
+        });
+        let id = "borsuk/audit-card-7";
+        let before = rig.exec.calls().len();
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The answer names every change of the diff.".to_string(),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert!(opened_events(&rig).is_empty(), "a pass opens no event");
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a pass costs no call at all"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_stale_entry_card_grades_the_entry_and_opens_its_event_on_the_repository_record() {
+        let dir = temp_root();
+        let gap = card_event("The answer names no failure mode of INV-7.");
+        let mut rig = card_rig(dir, open_event_steps(&gap));
+
+        rig.act(Action::Answer {
+            decision_id: "card:borsuk:INV-7".to_string(),
+            response: Response::Text {
+                text: "the login holds after a reload".to_string(),
+            },
+        });
+
+        assert_eq!(rig.job_count(), 1, "the entry card needs no diff to grade");
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/audit-card-INV-7");
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("State INV-7. What would violate it?"),
+            "the card text:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- INV-7 (invariant): the login holds"),
+            "the model entry the card names:\n{prompt}"
+        );
+
+        let id = "borsuk/audit-card-INV-7";
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&gap),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(
+            opened_events(&rig),
+            vec![gap],
+            "a miss on a source-two card opens its event on the repository record"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_card_answered_with_a_recall_keeps_its_row_and_offers_the_teach() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        // The grading reads the diff, and the teach the recall offers
+        // reads it again with the history of the paths it touched.
+        let mut extra = teach_pr_steps(&repo);
+        extra.extend(teach_pr_steps(&repo));
+        extra.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = card_rig(dir, extra);
+
+        rig.act(Action::Answer {
+            decision_id: "card:borsuk:7".to_string(),
+            response: Response::Text {
+                text: "recall the retry landed in the checkout".to_string(),
+            },
+        });
+
+        assert!(
+            rig.daemon.table.by_id.contains_key("borsuk/audit-card-7"),
+            "the recall still grades the answer"
+        );
+        let rows = card_rows_of(&rig);
+        let (_, kind) = rows
+            .iter()
+            .find(|(id, _)| id == "card:borsuk:7")
+            .expect("the recalled card keeps its row");
+        assert_eq!(
+            kind,
+            &DecisionKind::Card {
+                source: cards::MERGED_PR_SOURCE.to_string(),
+                prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+                number: Some(7),
+                entry: None,
+                recalled: true,
+            }
+        );
+
+        // The teach the row offers closes the card.
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Pr(7),
+        }));
+
+        assert_eq!(rig.job(1).task, "borsuk/teach-pr-7", "the teach task ran");
+        assert_eq!(rig.task("borsuk/teach-pr-7").attempt, 1);
+        assert!(
+            card_rows_of(&rig)
+                .iter()
+                .all(|(id, _)| id != "card:borsuk:7"),
+            "the card leaves the batch once its teach starts"
+        );
     }
 
     #[test]

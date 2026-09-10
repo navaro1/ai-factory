@@ -3,6 +3,7 @@
 pub mod answers;
 pub mod blocks;
 pub mod cadence;
+pub mod cards;
 pub mod contract;
 pub mod measure;
 pub mod model;
