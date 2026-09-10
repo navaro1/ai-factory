@@ -1232,6 +1232,11 @@ pub enum TheoryAction {
         /// The subject of the explanation.
         key: crate::tasks::TeachKey,
     },
+    /// Start one audit sweep over the model and the run skills.
+    Sweep {
+        /// The repository alias.
+        repo: String,
+    },
 }
 
 /// The request identity prefix of one run skill ticket creation.
@@ -2359,6 +2364,9 @@ mod tests {
             Action::Theory(TheoryAction::Teach {
                 repo: "borsuk".to_string(),
                 key: crate::tasks::TeachKey::Pr(7),
+            }),
+            Action::Theory(TheoryAction::Sweep {
+                repo: "borsuk".to_string(),
             }),
             Action::Stop,
         ]

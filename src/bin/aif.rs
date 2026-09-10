@@ -11,7 +11,7 @@ use anyhow::{bail, Context};
 
 use aif::config;
 use aif::exec::RealExec;
-use aif::sock::{Action, Client};
+use aif::sock::{Action, Client, TheoryAction};
 
 #[path = "../doctor.rs"]
 mod doctor;
@@ -71,6 +71,12 @@ enum Command {
         /// Answer the confirmation question of `--clean` with yes.
         #[arg(long)]
         yes: bool,
+        /// Start one audit sweep in this repository through the running
+        /// daemon, then exit. The daemon reads the model and the run
+        /// skills, audits them against the code, and opens one theory
+        /// event per finding.
+        #[arg(long, value_name = "ALIAS", conflicts_with = "clean")]
+        audit: Option<String>,
     },
 }
 
@@ -78,7 +84,12 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Some(Command::Stop) => stop(),
-        Some(Command::Doctor { config, clean, yes }) => doctor_main(config, clean, yes),
+        Some(Command::Doctor {
+            config,
+            clean,
+            yes,
+            audit,
+        }) => doctor_main(config, clean, yes, audit),
         Some(Command::Tui { paused }) => tui(paused),
         None => tui(cli.paused),
     };
@@ -175,7 +186,15 @@ fn stop() -> i32 {
 ///
 /// The exit code is 0 when nothing failed and 1 when a check or a removal
 /// failed.
-fn doctor_main(config_path: Option<PathBuf>, do_clean: bool, yes: bool) -> i32 {
+fn doctor_main(
+    config_path: Option<PathBuf>,
+    do_clean: bool,
+    yes: bool,
+    audit: Option<String>,
+) -> i32 {
+    if let Some(alias) = audit {
+        return audit_sweep(&alias);
+    }
     let config_path = config_path.unwrap_or_else(config::default_config_path);
     let state_dir = config::state_dir();
     let socket = config::socket_path();
@@ -198,6 +217,37 @@ fn doctor_main(config_path: Option<PathBuf>, do_clean: bool, yes: bool) -> i32 {
         doctor::print_report(&checks);
         i32::from(doctor::has_failures(&checks))
     }
+}
+
+/// Send one audit sweep request to the daemon.
+///
+/// The exit code is 0 when the daemon took the request and 1 when no
+/// daemon listens or the send failed.
+fn audit_sweep(alias: &str) -> i32 {
+    let path = config::socket_path();
+    let mut client = match Client::connect(&path) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!(
+                "aif doctor --audit: no daemon is listening on {}: {error}",
+                path.display()
+            );
+            return 1;
+        }
+    };
+    if let Err(error) = client.send(&audit_action(alias)) {
+        eprintln!("aif doctor --audit: cannot send the audit request: {error}");
+        return 1;
+    }
+    println!("aif doctor --audit: the daemon starts the audit sweep of {alias}");
+    0
+}
+
+/// The action behind one `--audit` request.
+fn audit_action(alias: &str) -> Action {
+    Action::Theory(TheoryAction::Sweep {
+        repo: alias.to_string(),
+    })
 }
 
 /// Ask the operator on the terminal to confirm the removal.
@@ -248,5 +298,24 @@ mod tests {
 
         assert!(Cli::try_parse_from(["aif", "--paused", "stop"]).is_err());
         assert!(Cli::try_parse_from(["aif", "--paused", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn the_audit_option_builds_the_sweep_action_and_refuses_the_clean() {
+        let parsed = Cli::try_parse_from(["aif", "doctor", "--audit", "borsuk"])
+            .expect("the arguments must parse");
+        let Some(Command::Doctor { audit, .. }) = parsed.command else {
+            panic!("the doctor command must parse");
+        };
+        assert_eq!(audit.as_deref(), Some("borsuk"));
+
+        assert!(Cli::try_parse_from(["aif", "doctor", "--audit", "borsuk", "--clean"]).is_err());
+
+        assert_eq!(
+            audit_action("borsuk"),
+            Action::Theory(TheoryAction::Sweep {
+                repo: "borsuk".to_string()
+            })
+        );
     }
 }

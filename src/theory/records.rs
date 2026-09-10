@@ -60,6 +60,9 @@ pub struct Event {
     /// The GitHub number the event names, when it names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<u64>,
+    /// The run skill surface the event names, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 /// Render one event as a complete `<aif-event-v1>` block.
@@ -120,6 +123,7 @@ mod tests {
             text: "INV-3 broke: the poller never parked.".to_string(),
             area: Some("poll".to_string()),
             number: Some(142),
+            surface: None,
         }
     }
 
@@ -140,6 +144,7 @@ mod tests {
             text: "FM-2 missed its fast check.".to_string(),
             area: None,
             number: None,
+            surface: None,
         };
         let transcript = format!(
             "prose before\n{}\nprose between\n{}\nprose after",
@@ -195,6 +200,7 @@ mod tests {
                 text: "late".to_string(),
                 area: None,
                 number: None,
+                surface: None,
             }]
         );
     }
