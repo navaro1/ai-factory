@@ -17,7 +17,7 @@ refine ──▶ implement ──▶ review ──▶ release
 
 | Stage | Default harness and model | Result |
 |---|---|---|
-| refine | Claude, Opus | You shape the ticket in the issue worktree of the ticket. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
+| refine | Claude, Opus | You shape the ticket in its own issue worktree. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
 | review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
