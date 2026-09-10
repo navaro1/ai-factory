@@ -43,6 +43,8 @@ use crate::tasks::{TaskState, TaskTable};
 use crate::theory::answers::AnswerBlock;
 use crate::theory::model::Model;
 use crate::theory::records::{DeltaBlock, Event, FullPrediction, ShortPrediction};
+#[cfg(test)]
+use crate::theory::records::{DeltaOutcome, DeltaSlot, DeltaViolation, PredictionTag};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
@@ -145,9 +147,10 @@ pub struct TheoryView {
     pub error: String,
     /// The parsed model, empty when the model did not parse.
     ///
-    /// The Theory view counts its entries, and the full prediction
-    /// template reads its relations, so the view carries the model
-    /// itself instead of a flattened copy of it.
+    /// This field replaces the flat `entries` view of C1. The full
+    /// prediction template runs in the interface and reads the relations
+    /// of each entry, and only the model carries them. The Theory view
+    /// still counts `model.entries` for its header strip.
     #[serde(default)]
     pub model: Model,
     /// The areas of the verification map, in file order.
@@ -211,6 +214,23 @@ pub struct DeltaView {
     pub question: String,
 }
 
+impl TheoryView {
+    /// True when the theory record of one item carries `label`.
+    ///
+    /// `key` is [`RecordKey::key_text`] and `item` the labels of the code
+    /// item. A record the daemon read answers for itself, because in
+    /// shadow mode the theory labels sit on the shadow issue. An item
+    /// with no record read yet answers from its own labels.
+    ///
+    /// [`RecordKey::key_text`]: crate::theory::records::RecordKey::key_text
+    pub fn record_carries(&self, key: &str, item: &[String], label: &str) -> bool {
+        match self.records.get(key) {
+            Some(record) => record.labels.iter().any(|one| one == label),
+            None => item.iter().any(|one| one == label),
+        }
+    }
+}
+
 /// One item the governor holds out of a stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoldView {
@@ -251,6 +271,13 @@ pub struct RecordView {
     /// The answers the operator posted on the record, in comment order.
     #[serde(default)]
     pub answers: Vec<AnswerBlock>,
+    /// The labels of the record itself.
+    ///
+    /// In shadow mode the theory labels live on the shadow issue, not on
+    /// the code ticket, so the interface reads them here. In code mode
+    /// they repeat the item labels.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// One row of the AREAS panel.
@@ -1342,7 +1369,61 @@ pub enum TheoryAction {
         /// The five slots the operator wrote.
         prediction: FullPrediction,
     },
+    /// Ask for the model worktree, so the UI can edit `theory/model.toml`.
+    ///
+    /// The daemon answers with one [`Push::ModelPath`] that carries the
+    /// same `request`, so only the UI that asked opens an editor.
+    EditModel {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+    },
+    /// Commit, push, and open the model pull request of one repository.
+    CommitModel {
+        /// The repository alias.
+        repo: String,
+    },
+    /// Start or reuse one theory conversation.
+    Chat {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// What the conversation is for.
+        purpose: ChatPurpose,
+        /// The subject of the conversation. A bootstrap chat names its
+        /// area.
+        key: String,
+    },
 }
+
+/// What one theory conversation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatPurpose {
+    /// Write the entries of one area the model does not cover.
+    Bootstrap,
+}
+
+/// The model worktree of one repository, as one edit-model reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPath {
+    /// The request identity from the UI.
+    pub request: String,
+    /// The repository alias.
+    pub repo: String,
+    /// The model worktree path. `theory/model.toml` lives under it.
+    pub path: PathBuf,
+}
+
+/// The request identity prefix of one model commit.
+///
+/// The daemon reports the outcome through [`Push::TicketResult`], the one
+/// result channel a GitHub mutation already has. The UI toasts a result
+/// that carries this prefix, because the operator asked for it in the
+/// Theory view and no ticket row waits for it.
+pub const MODEL_COMMIT_REQUEST: &str = "model-commit:";
 
 /// The request identity prefix of one run skill ticket creation.
 ///
@@ -1639,6 +1720,8 @@ pub enum Push {
     Ask(AskView),
     /// One settings save or reload result.
     SettingsResult(SettingsResult),
+    /// The model worktree path of one edit-model request.
+    ModelPath(ModelPath),
 }
 
 /// One command from a UI or from `aif stop` to the daemon.
@@ -2524,6 +2607,19 @@ mod tests {
                     note: String::new(),
                 },
             },
+            Action::Theory(TheoryAction::EditModel {
+                request: "edit-model-1".to_string(),
+                repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::CommitModel {
+                repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::Chat {
+                request: "chat-gh".to_string(),
+                repo: "borsuk".to_string(),
+                purpose: ChatPurpose::Bootstrap,
+                key: "gh".to_string(),
+            }),
             Action::Stop,
         ]
     }
@@ -2858,7 +2954,28 @@ mod tests {
                     reason: "awaits full prediction".to_string(),
                     stage: Stage::Implement,
                 }],
-                records: BTreeMap::new(),
+                records: BTreeMap::from([(
+                    "pr-7".to_string(),
+                    RecordView {
+                        short: None,
+                        full: None,
+                        delta: Some(DeltaBlock {
+                            slots: vec![DeltaSlot {
+                                id: "invariants".to_string(),
+                                outcome: DeltaOutcome::Miss,
+                                tag: PredictionTag::Sure,
+                            }],
+                            touched: vec!["INV-3".to_string()],
+                            violations: vec![DeltaViolation {
+                                entry: "INV-3".to_string(),
+                                finding: "the retry crosses the boundary".to_string(),
+                            }],
+                            question: "Does the cart keep the token?".to_string(),
+                        }),
+                        labels: vec![crate::theory::records::DELTA_OPEN_LABEL.to_string()],
+                        ..RecordView::default()
+                    },
+                )]),
                 areas: vec![AreaView {
                     id: "web-checkout".to_string(),
                     boundary: "B-checkout".to_string(),
@@ -2907,6 +3024,8 @@ mod tests {
         assert!(text.contains("\"tier\":\"browser\""), "line: {text}");
         assert!(text.contains("\"sure-miss\""), "line: {text}");
         assert!(text.contains("\"state\":\"open\""), "line: {text}");
+        assert!(text.contains("\"outcome\":\"miss\""), "line: {text}");
+        assert!(text.contains("\"tag\":\"sure\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 
@@ -3021,6 +3140,23 @@ mod tests {
         };
 
         assert!(matches!(pushes.next(), Some(Ok(Push::State(_)))));
+    }
+
+    #[test]
+    fn a_model_path_push_round_trips_and_carries_the_request() {
+        let push = Push::ModelPath(ModelPath {
+            request: "edit-model-1".to_string(),
+            repo: "borsuk".to_string(),
+            path: PathBuf::from("/state/worktrees/borsuk/model"),
+        });
+
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert_eq!(
+            text,
+            "{\"type\":\"model_path\",\"request\":\"edit-model-1\",\"repo\":\"borsuk\",\"path\":\"/state/worktrees/borsuk/model\"}"
+        );
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 
     #[test]
