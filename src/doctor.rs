@@ -19,12 +19,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 use aif::config::{parse_owner_repo, Config, ExecutionRole, Harness, RepoConfig};
-use aif::daemon::SKILLS_DIR;
 use aif::exec::Exec;
 use aif::routing::{model_family, ComplexityLevel, TagRouteKey, TagRouteStage};
 use aif::sched::{self, Limits};
 use aif::sock::{Client, PauseScope, PausedView, Push};
 use aif::theory::model;
+use aif::theory::skills::SKILLS_DIR;
 use aif::theory::skills::{self, SkillSet};
 use aif::theory::verify::VerifyMap;
 use aif::worktree::{Cleanable, WorktreeKind, WorktreeManager, WORKTREE_KINDS};

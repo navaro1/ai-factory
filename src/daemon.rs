@@ -18519,8 +18519,14 @@ surface: api\ndriver: curl\ntier: http\n---\n\
     fn a_bug_ticket_refine_prompt_carries_the_drive_section_and_a_plain_one_does_not() {
         let dir = temp_root();
         let repo = dir.join("repo");
+        let gitdir = rig_gitdir(&dir);
+        // The theory read of the first poll, then the worktree create of
+        // the refine dispatch of 142, then the revalidation and the
+        // dispatch of 143 in the second poll.
         let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
         steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 143), 143, &gitdir));
         let mut rig = Rig::make_in(dir, steps, governed);
         // A prompt override that carries {skills}, so the slice reaches
         // the rendered prompt.
