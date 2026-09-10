@@ -1275,9 +1275,6 @@ impl Daemon {
         let theory_path = config.theory.checkout(&config.path);
         let skills_path = config.skills_checkout();
         if governed {
-            // One checkout answers one `rev-parse`. In-repository mode
-            // points both paths at the same tree, so the common case
-            // resolves the commit once.
             let theory_commit = self.head_commit(&theory_path);
             let skills_commit = if skills_path == theory_path {
                 theory_commit.clone()
@@ -6562,9 +6559,6 @@ mod tests {
                 owner_repo: "acme/borsuk".to_string(),
                 lanes: BTreeMap::new(),
                 release: ReleasePolicy::Manual,
-                // The governor is off in the rig, so a poll of a v0.6
-                // test reads no theory file through the scripted exec. A
-                // theory test turns it on with `make_with`.
                 theory: crate::config::TheoryConfig {
                     governor: Governor::Off,
                     ..crate::config::TheoryConfig::default()
@@ -17245,12 +17239,15 @@ mod tests {
         )
     }
 
+    /// The feature index of `run-web`.
+    const RUN_INDEX: &str = "# Features of web\n\n- checkout: the cart pays\n";
+
     /// The one feature file of `run-web`.
     const RUN_FEATURE: &str =
         "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n";
 
-    /// The tree listing of one skills checkout. The index and the helper
-    /// script are listed and never read.
+    /// The tree listing of one skills checkout. The helper script is
+    /// listed and never read.
     const SKILLS_TREE: &str = concat!(
         ".claude/skills/run-web/SKILL.md\n",
         ".claude/skills/run-web/features/README.md\n",
@@ -17290,6 +17287,14 @@ mod tests {
                 repo,
                 &["show", &format!("{commit}:.claude/skills/run-web/SKILL.md")],
                 CmdOut::ok(skill),
+            ),
+            git_step(
+                repo,
+                &[
+                    "show",
+                    &format!("{commit}:.claude/skills/run-web/features/README.md"),
+                ],
+                CmdOut::ok(RUN_INDEX),
             ),
             git_step(
                 repo,
@@ -17352,8 +17357,8 @@ mod tests {
         assert_eq!(git_calls(&rig, "ls-tree"), 1);
         assert_eq!(
             git_calls(&rig, "show"),
-            4,
-            "two theory files and two skill files"
+            5,
+            "two theory files, the skill, its index, and one feature"
         );
         assert_eq!(
             git_calls(&rig, "rev-parse"),
@@ -17379,6 +17384,8 @@ mod tests {
         assert_eq!(view.skills["web"].tier, Tier::Browser);
         assert_eq!(view.skills["web"].features, vec!["checkout".to_string()]);
         assert!(view.skills["web"].lint.is_empty());
+        let cached = rig.daemon.theory_skills["borsuk"].skills.as_ref().unwrap();
+        assert_eq!(cached.surfaces["web"].index.as_deref(), Some(RUN_INDEX));
 
         rig.poll(Vec::new(), Vec::new());
 
@@ -17387,7 +17394,7 @@ mod tests {
             1,
             "the same commit reads no tree"
         );
-        assert_eq!(git_calls(&rig, "show"), 4, "the same commit reads no file");
+        assert_eq!(git_calls(&rig, "show"), 5, "the same commit reads no file");
         assert_eq!(theory_of(&rig), view);
 
         rig.poll(Vec::new(), Vec::new());
@@ -17399,7 +17406,7 @@ mod tests {
         );
         assert_eq!(
             git_calls(&rig, "show"),
-            8,
+            10,
             "a moved commit reads every file"
         );
     }
@@ -17540,6 +17547,11 @@ mod tests {
                 &elsewhere,
                 &["show", "ccc333:.claude/skills/run-web/SKILL.md"],
                 CmdOut::ok(run_skill("browser")),
+            ),
+            git_step(
+                &elsewhere,
+                &["show", "ccc333:.claude/skills/run-web/features/README.md"],
+                CmdOut::ok(RUN_INDEX),
             ),
             git_step(
                 &elsewhere,

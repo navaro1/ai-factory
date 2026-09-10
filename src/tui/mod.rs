@@ -1435,8 +1435,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// The styled tab label of one view.
 fn tab_span(number: &str, label: &str, active: bool) -> Span<'static> {
-    // One space between tabs, not two: six tabs and the connection state
-    // fill a terminal of eighty columns exactly.
     let text = format!("{number} {label} ");
     if active {
         Span::styled(

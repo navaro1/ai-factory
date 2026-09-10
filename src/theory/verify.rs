@@ -18,9 +18,7 @@ use super::model::{Entry, Model};
 ///
 /// The order is the ladder order, so `Ord` answers the floor question:
 /// a line holds when its tier is at or above the area's `min_tier`.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     /// No driver reaches the feature.
@@ -69,9 +67,8 @@ impl Display for Tier {
     }
 }
 
-/// When a measurer runs. The order is the stage order: implement runs
-/// `fast`, review runs `pr`, and the release train runs `full`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// When a measurer runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Fast,

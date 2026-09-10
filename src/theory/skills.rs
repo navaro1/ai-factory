@@ -13,7 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 
-use super::verify::{Area, Tier, VerifyMap};
+use super::verify::{Area, VerifyMap};
+
+pub use super::verify::Tier;
 
 /// The six sections of a skill file, in the order design section 4.2
 /// lists them. The set is closed: a heading outside it is prose.
@@ -40,6 +42,9 @@ pub struct RunSkill {
     pub body: String,
     /// The sections of [`SECTIONS`] the body carries, by heading.
     pub sections: BTreeMap<String, String>,
+    /// The `features/README.md` index of the surface, when it has one.
+    /// Every slice of design section 4.6 inlines it.
+    pub index: Option<String>,
 }
 
 /// One feature file, parsed from `run-<surface>/features/<id>.md`.
@@ -90,6 +95,8 @@ pub struct SkillSet {
 pub enum FileKind {
     /// The `SKILL.md` of one surface.
     Skill,
+    /// The `features/README.md` index of one surface.
+    Index,
     /// One `features/<id>.md` file.
     Feature,
 }
@@ -98,16 +105,19 @@ pub enum FileKind {
 ///
 /// The listing carries everything under `.claude/skills/`. Only a
 /// `run-<surface>` directory holds a run skill, and inside it only the
-/// skill file and the feature files carry front matter. The feature index,
-/// `features/README.md`, is prose, and a helper script is not markdown.
+/// skill file, the feature index, and the feature files are markdown. A
+/// helper script is not.
 pub fn classify(path: &str) -> Option<FileKind> {
     let inside = inside(path)?;
     if inside == "SKILL.md" {
         return Some(FileKind::Skill);
     }
     let rest = inside.strip_prefix("features/")?;
-    if rest.contains('/') || !rest.ends_with(".md") || rest == "README.md" {
+    if rest.contains('/') || !rest.ends_with(".md") {
         return None;
+    }
+    if rest == "README.md" {
+        return Some(FileKind::Index);
     }
     Some(FileKind::Feature)
 }
@@ -120,6 +130,7 @@ impl SkillSet {
     /// blocks nothing.
     pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let mut set = SkillSet::default();
+        let mut indexes: BTreeMap<String, String> = BTreeMap::new();
         for (path, text) in files {
             match classify(path) {
                 Some(FileKind::Skill) => match parse_skill(path, text) {
@@ -128,11 +139,21 @@ impl SkillSet {
                     }
                     Err(finding) => set.lint.push(finding),
                 },
+                Some(FileKind::Index) => {
+                    indexes.insert(surface_of(path), text.to_string());
+                }
                 Some(FileKind::Feature) => match parse_feature(path, text) {
                     Ok(feature) => set.features.push(feature),
                     Err(finding) => set.lint.push(finding),
                 },
                 None => {}
+            }
+        }
+        // A skill file can follow its index in tree order, so the
+        // attachment waits for the whole listing.
+        for (surface, text) in indexes {
+            if let Some(skill) = set.surfaces.get_mut(&surface) {
+                skill.index = Some(text);
             }
         }
         set
@@ -184,6 +205,7 @@ pub fn parse_skill(path: &str, text: &str) -> Result<RunSkill, Finding> {
         blind: keys.get("blind").cloned().unwrap_or_default(),
         sections: sections(body),
         body: body.to_string(),
+        index: None,
     })
 }
 
@@ -590,17 +612,27 @@ fast: npx playwright test checkout --reporter=line\n---\n\
     }
 
     #[test]
-    fn classify_reads_the_skill_and_the_feature_files_only() {
+    fn the_tier_names_one_type_through_both_module_paths() {
+        let tier: crate::theory::skills::Tier = crate::theory::verify::Tier::Browser;
+
+        assert_eq!(tier.name(), "browser");
+    }
+
+    #[test]
+    fn classify_reads_the_skill_the_index_and_the_feature_files_only() {
         assert_eq!(
             classify(".claude/skills/run-web/SKILL.md"),
             Some(FileKind::Skill)
+        );
+        assert_eq!(
+            classify(".claude/skills/run-web/features/README.md"),
+            Some(FileKind::Index)
         );
         assert_eq!(
             classify(".claude/skills/run-web/features/checkout.md"),
             Some(FileKind::Feature)
         );
         for path in [
-            ".claude/skills/run-web/features/README.md",
             ".claude/skills/run-web/wait_for.sh",
             ".claude/skills/run-web/features/deep/x.md",
             ".claude/skills/verify/SKILL.md",
@@ -608,6 +640,30 @@ fast: npx playwright test checkout --reporter=line\n---\n\
         ] {
             assert_eq!(classify(path), None, "path {path} must be skipped");
         }
+    }
+
+    #[test]
+    fn the_feature_index_joins_its_surface_whatever_the_tree_order() {
+        let index = "# Features of web\n\n- checkout: the cart pays\n";
+        for order in [0, 1] {
+            let mut files = vec![
+                (".claude/skills/run-web/SKILL.md", SKILL),
+                (".claude/skills/run-web/features/README.md", index),
+            ];
+            if order == 1 {
+                files.reverse();
+            }
+            files.push((".claude/skills/run-web/features/checkout.md", FEATURE));
+
+            let set = SkillSet::from_files(files);
+
+            assert_eq!(set.surfaces["web"].index.as_deref(), Some(index));
+            assert_eq!(set.feature_ids("web"), vec!["checkout".to_string()]);
+            assert!(set.lint.is_empty(), "the index carries no front matter");
+        }
+
+        let bare = SkillSet::from_files([(".claude/skills/run-api/SKILL.md", SKILL)]);
+        assert_eq!(bare.surfaces["web"].index, None);
     }
 
     #[test]
