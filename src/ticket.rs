@@ -859,25 +859,7 @@ pub const TICKET_PROPOSAL_BLOCK: &str = "<aif-ticket-proposal-v1>";
 
 /// Parse the final strict proposal block from one assistant text event.
 pub fn parse_ticket_proposal(text: &str) -> Option<TicketContent> {
-    const OPEN: &str = TICKET_PROPOSAL_BLOCK;
-    const CLOSE: &str = "</aif-ticket-proposal-v1>";
-
-    let text = text.trim_end();
-    if text.contains("```")
-        || text.match_indices(OPEN).count() != 1
-        || text.match_indices(CLOSE).count() != 1
-        || !text.ends_with(CLOSE)
-    {
-        return None;
-    }
-    let open = text.find(OPEN)?;
-    if open > 0 && text.as_bytes().get(open - 1) != Some(&b'\n') {
-        return None;
-    }
-    let block = &text[open..];
-    let json = block
-        .strip_prefix(&format!("{OPEN}\n"))?
-        .strip_suffix(&format!("\n{CLOSE}"))?;
+    let json = crate::theory::blocks::parse_block(TICKET_PROPOSAL_BLOCK, text).ok()?;
     if json.contains('\n') {
         return None;
     }
@@ -889,7 +871,7 @@ pub fn parse_ticket_proposal(text: &str) -> Option<TicketContent> {
         body: String,
     }
 
-    let proposal: ProposalWire = serde_json::from_str(json).ok()?;
+    let proposal: ProposalWire = serde_json::from_str(&json).ok()?;
     if proposal.title.trim().is_empty() {
         return None;
     }

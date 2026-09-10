@@ -4,10 +4,16 @@
 //! item. [`RecordKey`] names the item; the daemon resolves it to an
 //! `(owner_repo, number)` pair. Agents and the daemon ship facts as tagged
 //! blocks, and [`parse_event_blocks`] reads the event blocks back.
+//! [`TheoryRecords`] is the read model of one poll: the labels of every
+//! record, the open marker count, and the predictions.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::contract::{self, ContractContext, Finding};
+use crate::config::Config;
+use crate::model::{RepoSnapshot, Snapshot};
 
 /// The label that marks a ticket with an accepted short prediction.
 pub const THEORY_SHORT_LABEL: &str = "theory-short";
@@ -113,35 +119,279 @@ pub fn event_block(event: &Event) -> String {
 /// A block whose body does not parse as an event, and a block with no
 /// closing tag, is skipped. The order of the blocks is kept.
 pub fn parse_event_blocks(text: &str) -> Vec<Event> {
-    let close = close_tag(EVENT_BLOCK);
-    let mut events = Vec::new();
-    let mut rest = text;
-    'scan: while let Some(start) = rest.find(EVENT_BLOCK) {
-        let after_open = &rest[start + EVENT_BLOCK.len()..];
-        let Some(end) = after_open.find(&close) else {
-            break;
-        };
-        let span = &after_open[..end];
-        if let Some(next_open) = span.find(EVENT_BLOCK) {
-            // The opening tag is truncated: the later tag owns the close,
-            // so the scan restarts there. The restart reads from
-            // `after_open`, because `span` ends before the close.
-            rest = &after_open[next_open..];
-            continue 'scan;
-        }
-        let body = span.trim();
-        rest = &after_open[end + close.len()..];
-        if let Ok(event) = serde_json::from_str::<Event>(body) {
-            events.push(event);
-        }
-    }
-    events
+    scan_block_bodies(text, EVENT_BLOCK)
+        .into_iter()
+        .filter_map(|body| serde_json::from_str::<Event>(body).ok())
+        .collect()
 }
 
 /// The closing tag of one opening tag: `<aif-event-v1>` closes as
 /// `</aif-event-v1>`.
 pub fn close_tag(open: &str) -> String {
     format!("</{}>", open.trim_start_matches('<').trim_end_matches('>'))
+}
+
+/// The value of the `kind` field of a short prediction.
+pub const PREDICTION_SHORT: &str = "short";
+/// The value of the `kind` field of a full prediction.
+pub const PREDICTION_FULL: &str = "full";
+
+/// The five slot names of a full prediction, in design order: the
+/// behaviours that change, the states or transitions that change, the
+/// invariants at risk, the failure modes added or changed, and the other
+/// areas the change can touch.
+pub const PREDICTION_SLOT_NAMES: [&str; 5] = [
+    "behaviours",
+    "states",
+    "invariants",
+    "failure-modes",
+    "other-areas",
+];
+
+/// The confidence tag of one prediction slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PredictionTag {
+    /// The operator is sure the slot lists every entry in play.
+    Sure,
+    /// The operator is not sure.
+    Unsure,
+}
+
+/// One slot of a full prediction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredictionSlot {
+    /// The slot name; one of [`PREDICTION_SLOT_NAMES`].
+    pub name: String,
+    /// The entry ids the operator named, in order.
+    pub entries: Vec<String>,
+    /// The confidence tag of the slot.
+    pub tag: PredictionTag,
+}
+
+/// The short prediction of one ticket: `{ kind, text, areas }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortPrediction {
+    /// The block kind; always [`PREDICTION_SHORT`].
+    pub kind: String,
+    /// The operator's statement of the change, in one line.
+    pub text: String,
+    /// The model areas the change touches.
+    pub areas: Vec<String>,
+}
+
+/// The full prediction of one ticket: `{ kind, slots }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullPrediction {
+    /// The block kind; always [`PREDICTION_FULL`].
+    pub kind: String,
+    /// The five slots of the prediction.
+    pub slots: Vec<PredictionSlot>,
+}
+
+/// One prediction, as one `<aif-prediction-v1>` block holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prediction {
+    /// The short prediction the operator writes before refine.
+    Short(ShortPrediction),
+    /// The full prediction the operator writes after `refined`.
+    Full(FullPrediction),
+}
+
+/// Render one prediction as a complete `<aif-prediction-v1>` block.
+pub fn prediction_block(prediction: &Prediction) -> String {
+    let body = match prediction {
+        Prediction::Short(value) => serde_json::to_string(value),
+        Prediction::Full(value) => serde_json::to_string(value),
+    }
+    .expect("a prediction serializes");
+    let close = close_tag(PREDICTION_BLOCK);
+    format!("{PREDICTION_BLOCK}\n{body}\n{close}")
+}
+
+/// Parse every complete `<aif-prediction-v1>` block of one text.
+///
+/// A block whose body holds neither a short nor a full prediction, and a
+/// block with no closing tag, is skipped. The order of the blocks is kept.
+pub fn parse_prediction_blocks(text: &str) -> Vec<Prediction> {
+    scan_block_bodies(text, PREDICTION_BLOCK)
+        .into_iter()
+        .filter_map(parse_prediction)
+        .collect()
+}
+
+/// Parse one block body into a prediction; `None` for any other body.
+///
+/// The kind field must name the variant the fields carry, so a body with
+/// a wrong or unknown kind is skipped.
+fn parse_prediction(body: &str) -> Option<Prediction> {
+    if let Ok(value) = serde_json::from_str::<ShortPrediction>(body) {
+        if value.kind == PREDICTION_SHORT {
+            return Some(Prediction::Short(value));
+        }
+    }
+    if let Ok(value) = serde_json::from_str::<FullPrediction>(body) {
+        if value.kind == PREDICTION_FULL {
+            return Some(Prediction::Full(value));
+        }
+    }
+    None
+}
+
+/// The bodies of every complete block of one tag, in text order.
+fn scan_block_bodies<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
+    let close = close_tag(tag);
+    let mut bodies = Vec::new();
+    let mut rest = text;
+    'scan: while let Some(start) = rest.find(tag) {
+        let after_open = &rest[start + tag.len()..];
+        let Some(end) = after_open.find(&close) else {
+            break;
+        };
+        let span = &after_open[..end];
+        if let Some(next_open) = span.find(tag) {
+            // The opening tag is truncated: the later tag owns the close,
+            // so the scan restarts there.
+            rest = &after_open[next_open..];
+            continue 'scan;
+        }
+        bodies.push(span.trim());
+        rest = &after_open[end + close.len()..];
+    }
+    bodies
+}
+
+/// The theory read model of one poll: the labels of every record.
+///
+/// [`TheoryRecords::derive`] reads the labels from the code snapshot, or
+/// from the theory snapshot of a shadowed alias, and every gate and row
+/// derivation reads this model instead of `issue.labels`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TheoryRecords {
+    /// The labels of each item record, keyed by alias and item number.
+    items: BTreeMap<(String, u64), Vec<String>>,
+    /// The labels of each repository record, keyed by alias.
+    repos: BTreeMap<String, Vec<String>>,
+    /// The open marker count of each governed alias.
+    open: BTreeMap<String, usize>,
+}
+
+impl TheoryRecords {
+    /// Derive the record labels of every governed repository.
+    ///
+    /// `config` names every repository and its theory settings;
+    /// `snapshots` holds the code snapshots and `theory_snapshots` the
+    /// theory snapshots, keyed by alias. A shadowed alias is one whose
+    /// `theory.repo` is set; it reads its labels from its theory
+    /// snapshot. Every other governed alias reads the code snapshot. An
+    /// alias with the governor off derives nothing.
+    pub fn derive(
+        config: &Config,
+        snapshots: &Snapshot,
+        theory_snapshots: &BTreeMap<String, RepoSnapshot>,
+    ) -> TheoryRecords {
+        let mut records = TheoryRecords::default();
+        for (alias, repo) in &config.repos {
+            if !repo.theory.governor.is_on() {
+                continue;
+            }
+            let shadowed = repo
+                .theory
+                .theory
+                .as_ref()
+                .is_some_and(|theory| theory.repo.is_some());
+            let source = if shadowed {
+                theory_snapshots.get(alias)
+            } else {
+                snapshots.repos.get(alias)
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            let mut open = 0usize;
+            for (number, issue) in &source.issues {
+                let mut record = true;
+                if shadowed {
+                    if issue.title == repo_record_title(alias) {
+                        records.repos.insert(alias.clone(), issue.labels.clone());
+                    } else if let Some(item) = shadow_item(alias, &issue.title) {
+                        records
+                            .items
+                            .insert((alias.clone(), item), issue.labels.clone());
+                    } else {
+                        // One theory repository may hold the shadow issues
+                        // of several aliases; this issue is not a record
+                        // of this alias.
+                        record = false;
+                    }
+                } else {
+                    records
+                        .items
+                        .insert((alias.clone(), *number), issue.labels.clone());
+                    if issue.title == repo_record_title(alias) {
+                        records.repos.insert(alias.clone(), issue.labels.clone());
+                    }
+                }
+                if record {
+                    open += open_markers(&issue.labels);
+                }
+            }
+            if !shadowed {
+                for (number, pr) in &source.prs {
+                    records
+                        .items
+                        .insert((alias.clone(), *number), pr.labels.clone());
+                    open += open_markers(&pr.labels);
+                }
+            }
+            records.open.insert(alias.clone(), open);
+        }
+        records
+    }
+
+    /// The labels of the record of one item.
+    ///
+    /// An item with no record yet, and an alias the derive skipped,
+    /// answers no labels.
+    pub fn labels_of(&self, alias: &str, key: &RecordKey) -> &[String] {
+        match key {
+            RecordKey::Issue(number) | RecordKey::Pr(number) => self
+                .items
+                .get(&(alias.to_string(), *number))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            RecordKey::Repo => self.repos.get(alias).map(Vec::as_slice).unwrap_or(&[]),
+        }
+    }
+
+    /// The count of records labelled `delta-open` or `event-open` of one
+    /// alias.
+    ///
+    /// A record with both labels counts once. An alias with the governor
+    /// off answers zero.
+    pub fn open_count(&self, alias: &str) -> usize {
+        self.open.get(alias).copied().unwrap_or(0)
+    }
+}
+
+/// The title of the repository record of one alias.
+fn repo_record_title(alias: &str) -> String {
+    format!("{alias}/theory")
+}
+
+/// The item number of one shadow issue title, `<alias>#<n>`.
+fn shadow_item(alias: &str, title: &str) -> Option<u64> {
+    title.strip_prefix(alias)?.strip_prefix('#')?.parse().ok()
+}
+
+/// One if the record carries `delta-open` or `event-open`, else zero.
+/// A record with both labels counts once.
+fn open_markers(labels: &[String]) -> usize {
+    usize::from(
+        labels
+            .iter()
+            .any(|label| label.as_str() == DELTA_OPEN_LABEL || label.as_str() == EVENT_OPEN_LABEL),
+    )
 }
 
 #[cfg(test)]
@@ -277,5 +527,328 @@ mod tests {
         let finding = check_pr("## Why\n", "aif/borsuk/model-1", &ctx)
             .expect_err("the body carries no Before / After section");
         assert_eq!(finding.reason, "section Before / After missing");
+    }
+
+    use std::path::PathBuf;
+
+    use crate::config::{Config, Governor, RepoConfig, TheoryConfig, TheoryRepo};
+    use crate::model::{Issue, Pr};
+
+    /// The label names of one record, as plain string slices.
+    fn names(labels: &[String]) -> Vec<&str> {
+        labels.iter().map(String::as_str).collect()
+    }
+
+    /// One open issue with the given labels.
+    fn issue(number: u64, title: &str, labels: &[&str]) -> Issue {
+        Issue {
+            number,
+            node_id: format!("node-{number}"),
+            title: title.to_string(),
+            body: String::new(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            author: String::new(),
+            assignees: Vec::new(),
+            updated_at: String::new(),
+            github_url: String::new(),
+            open: true,
+        }
+    }
+
+    /// One open pull request with the given labels.
+    fn pr(number: u64, labels: &[&str]) -> Pr {
+        Pr {
+            number,
+            node_id: format!("node-{number}"),
+            title: format!("pr {number}"),
+            body: String::new(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            open: true,
+            draft: false,
+            head_sha: String::new(),
+            head_ref: String::new(),
+        }
+    }
+
+    /// One snapshot with the given issues and pull requests.
+    fn snapshot(issues: Vec<Issue>, pulls: Vec<Pr>) -> RepoSnapshot {
+        let mut snap = RepoSnapshot::default();
+        for issue in issues {
+            snap.issues.insert(issue.number, issue);
+        }
+        for pr in pulls {
+            snap.prs.insert(pr.number, pr);
+        }
+        snap
+    }
+
+    /// The theory settings of one governed code-mode repository.
+    fn governed() -> TheoryConfig {
+        TheoryConfig {
+            governor: Governor::On,
+            ..TheoryConfig::default()
+        }
+    }
+
+    /// The theory settings of one governed shadow-mode repository.
+    fn shadowed() -> TheoryConfig {
+        TheoryConfig {
+            theory: Some(TheoryRepo {
+                repo: Some("acme/theory".to_string()),
+                path: PathBuf::from("/tmp/theory"),
+            }),
+            ..TheoryConfig::default()
+        }
+    }
+
+    /// The theory settings of one repository with the governor off.
+    fn ungoverned() -> TheoryConfig {
+        TheoryConfig {
+            governor: Governor::Off,
+            ..TheoryConfig::default()
+        }
+    }
+
+    /// One config over the given repositories, keyed by alias.
+    fn config_with(repos: Vec<(&str, TheoryConfig)>) -> Config {
+        let config_repos = repos
+            .into_iter()
+            .map(|(alias, theory)| {
+                (
+                    alias.to_string(),
+                    RepoConfig {
+                        alias: alias.to_string(),
+                        path: PathBuf::from(format!("/tmp/{alias}")),
+                        owner_repo: format!("acme/{alias}"),
+                        lanes: BTreeMap::new(),
+                        release: crate::config::ReleasePolicy::Manual,
+                        theory,
+                        skills: None,
+                        role_overrides: BTreeMap::new(),
+                        tag_route_overrides: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+        Config {
+            schema_version: 1,
+            roles: BTreeMap::new(),
+            stages: BTreeMap::new(),
+            repos: config_repos,
+            tag_route_overrides: BTreeMap::new(),
+            ticket_chat: Default::default(),
+            usage: Default::default(),
+            measure: Default::default(),
+        }
+    }
+
+    #[test]
+    fn derive_reads_the_code_labels_and_open_markers_of_a_governed_alias() {
+        let mut snapshots = Snapshot::default();
+        snapshots.repos.insert(
+            "borsuk".to_string(),
+            snapshot(
+                vec![
+                    issue(5, "Add the poller", &["to-refine"]),
+                    issue(7, "Bug report", &["delta-open"]),
+                    issue(3, "borsuk/theory", &["event-open"]),
+                    issue(4, "Both markers", &["delta-open", "event-open"]),
+                ],
+                vec![pr(9, &["event-open"])],
+            ),
+        );
+        let config = config_with(vec![("borsuk", governed())]);
+
+        let records = TheoryRecords::derive(&config, &snapshots, &BTreeMap::new());
+
+        assert_eq!(
+            names(records.labels_of("borsuk", &RecordKey::Issue(5))),
+            vec!["to-refine"]
+        );
+        assert_eq!(
+            names(records.labels_of("borsuk", &RecordKey::Pr(9))),
+            vec!["event-open"]
+        );
+        assert_eq!(
+            names(records.labels_of("borsuk", &RecordKey::Repo)),
+            vec!["event-open"]
+        );
+        assert!(records
+            .labels_of("borsuk", &RecordKey::Issue(11))
+            .is_empty());
+        assert_eq!(records.open_count("borsuk"), 4);
+    }
+
+    #[test]
+    fn derive_reads_the_shadow_labels_of_a_shadowed_alias() {
+        let mut theory_snapshots = BTreeMap::new();
+        theory_snapshots.insert(
+            "shade".to_string(),
+            snapshot(
+                vec![
+                    issue(11, "shade#5", &["theory-short"]),
+                    issue(12, "shade/theory", &["event-open"]),
+                    issue(13, "unrelated", &["delta-open"]),
+                    issue(14, "other#7", &["event-open"]),
+                ],
+                vec![],
+            ),
+        );
+        let config = config_with(vec![("shade", shadowed())]);
+
+        let records = TheoryRecords::derive(&config, &Snapshot::default(), &theory_snapshots);
+
+        assert_eq!(
+            names(records.labels_of("shade", &RecordKey::Issue(5))),
+            vec!["theory-short"]
+        );
+        assert_eq!(
+            names(records.labels_of("shade", &RecordKey::Pr(5))),
+            vec!["theory-short"]
+        );
+        assert_eq!(
+            names(records.labels_of("shade", &RecordKey::Repo)),
+            vec!["event-open"]
+        );
+        // One theory repository may hold the shadow issues of several
+        // aliases, so issues outside `shade` derive nothing and count
+        // nothing.
+        assert!(records.labels_of("shade", &RecordKey::Issue(13)).is_empty());
+        assert!(records.labels_of("shade", &RecordKey::Issue(7)).is_empty());
+        assert_eq!(records.open_count("shade"), 1);
+    }
+
+    #[test]
+    fn derive_treats_a_path_only_theory_config_as_code_mode() {
+        let mut snapshots = Snapshot::default();
+        snapshots.repos.insert(
+            "solo".to_string(),
+            snapshot(vec![issue(5, "Add the poller", &["to-refine"])], vec![]),
+        );
+        let config = config_with(vec![(
+            "solo",
+            TheoryConfig {
+                governor: Governor::On,
+                theory: Some(TheoryRepo {
+                    repo: None,
+                    path: PathBuf::from("/tmp/theory"),
+                }),
+                ..TheoryConfig::default()
+            },
+        )]);
+
+        let records = TheoryRecords::derive(&config, &snapshots, &BTreeMap::new());
+
+        assert_eq!(
+            names(records.labels_of("solo", &RecordKey::Issue(5))),
+            vec!["to-refine"]
+        );
+        assert_eq!(records.open_count("solo"), 0);
+    }
+
+    #[test]
+    fn derive_ignores_an_alias_with_the_governor_off_and_one_without_a_snapshot() {
+        let mut snapshots = Snapshot::default();
+        snapshots.repos.insert(
+            "off".to_string(),
+            snapshot(vec![issue(5, "Bug", &["delta-open"])], vec![]),
+        );
+        let config = config_with(vec![("off", ungoverned()), ("cold", governed())]);
+
+        let records = TheoryRecords::derive(&config, &snapshots, &BTreeMap::new());
+
+        assert!(records.labels_of("off", &RecordKey::Issue(5)).is_empty());
+        assert_eq!(records.open_count("off"), 0);
+        assert!(records.labels_of("cold", &RecordKey::Issue(5)).is_empty());
+        assert_eq!(records.open_count("cold"), 0);
+    }
+
+    #[test]
+    fn a_short_prediction_round_trips_through_its_block() {
+        let prediction = ShortPrediction {
+            kind: PREDICTION_SHORT.to_string(),
+            text: "The poller parks the worker.".to_string(),
+            areas: vec!["poll".to_string()],
+        };
+        let block = prediction_block(&Prediction::Short(prediction.clone()));
+
+        assert!(block.starts_with(PREDICTION_BLOCK));
+        assert!(block.contains("\"kind\":\"short\""), "{block}");
+        assert_eq!(
+            parse_prediction_blocks(&block),
+            vec![Prediction::Short(prediction)]
+        );
+    }
+
+    #[test]
+    fn a_full_prediction_round_trips_through_its_block() {
+        let prediction = FullPrediction {
+            kind: PREDICTION_FULL.to_string(),
+            slots: PREDICTION_SLOT_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, name)| PredictionSlot {
+                    name: (*name).to_string(),
+                    entries: vec![format!("INV-{index}")],
+                    tag: if index % 2 == 0 {
+                        PredictionTag::Sure
+                    } else {
+                        PredictionTag::Unsure
+                    },
+                })
+                .collect(),
+        };
+        assert_eq!(prediction.slots.len(), PREDICTION_SLOT_NAMES.len());
+
+        let block = prediction_block(&Prediction::Full(prediction.clone()));
+
+        assert_eq!(
+            parse_prediction_blocks(&block),
+            vec![Prediction::Full(prediction)]
+        );
+    }
+
+    #[test]
+    fn parse_prediction_blocks_skips_broken_bodies_and_keeps_the_order() {
+        let short = ShortPrediction {
+            kind: PREDICTION_SHORT.to_string(),
+            text: "one line".to_string(),
+            areas: vec![],
+        };
+        let full = FullPrediction {
+            kind: PREDICTION_FULL.to_string(),
+            slots: vec![PredictionSlot {
+                name: "behaviours".to_string(),
+                entries: vec!["INV-3".to_string()],
+                tag: PredictionTag::Unsure,
+            }],
+        };
+        let transcript = format!(
+            "prose\n{}\nmid\n{PREDICTION_BLOCK}\nnot json\n{}\n{PREDICTION_BLOCK}\n\
+             {{\"kind\":\"banana\",\"text\":\"x\",\"areas\":[]}}\n{}\n\
+             {PREDICTION_BLOCK}\nnever closed",
+            prediction_block(&Prediction::Full(full)),
+            close_tag(PREDICTION_BLOCK),
+            prediction_block(&Prediction::Short(short)),
+        );
+
+        assert_eq!(
+            parse_prediction_blocks(&transcript),
+            vec![
+                Prediction::Full(FullPrediction {
+                    kind: PREDICTION_FULL.to_string(),
+                    slots: vec![PredictionSlot {
+                        name: "behaviours".to_string(),
+                        entries: vec!["INV-3".to_string()],
+                        tag: PredictionTag::Unsure,
+                    }],
+                }),
+                Prediction::Short(ShortPrediction {
+                    kind: PREDICTION_SHORT.to_string(),
+                    text: "one line".to_string(),
+                    areas: vec![],
+                }),
+            ]
+        );
     }
 }
