@@ -1,6 +1,6 @@
 # The Verification Toolbelt
 
-Date: 2026-09-10 · Status: Design record, brainstorm complete, no code · Revision: 2, after the simplification pass · Scope: The run skill per surface, the driver ladder, the Before / After contract, deterministic fast checks, refine grounding, review re-drive, setup, teach, steering · Sibling: docs/superpowers/specs/2026-09-03-theory-governor-design.md and docs/v0.7/SPEC.md
+Date: 2026-09-10 · Status: Design record, brainstorm complete, no code · Revision: 3, after the simplification pass and the ticket-precision pass · Scope: The run skill per surface, the driver ladder, the Before / After contract, deterministic fast checks, refine grounding, review re-drive, setup, teach, steering · Sibling: docs/superpowers/specs/2026-09-03-theory-governor-design.md and docs/v0.7/SPEC.md
 
 Sources: Lauren Tan, *How I Use Cursor* (2026-05-25), *Loops You Can Trust* (2026-06-24), *The Complete Guide to pstack, Part 1* (2026-08-31), *The Complete Guide to pstack, Part 2* (2026-09-09). The pstack plugin 0.15.1 and the `cursor-team-kit` skills `control-ui`, `control-cli`, and `verify-this`. Claude Code's bundled `run`, `verify`, and `run-skill-generator` skills and its hooks and subagent docs. The Codex docs on skills, subagents, hooks, and MCP. Anthropic, *Effective harnesses for long-running agents* and the `cwc-long-running-agents` repository. Pulumi's token measurements of `agent-browser` against the Playwright MCP. Piotr's notes of 2026-09-10.
 
@@ -53,7 +53,9 @@ Two refusals join them:
 | Fast command | The one command per feature that is the quickest proof it still works. Seconds, not minutes. Exit code is the verdict. |
 | Fast check | The daemon's run of a fast command as a measure task, with an exit-code record. |
 | Skills checkout | The git checkout that holds the run skills. The theory checkout by default. |
-| Before / After line | One line in `## Before / After`: feature, tier, command, before, after. |
+| Acceptance criterion | One falsifiable statement in the refined ticket, with an ID `AC-<n>`, that names the check that proves it. |
+| Trace | The chain from one acceptance criterion to the Before / After line that proves it and the test or drive behind that line. |
+| Before / After line | One line in `## Before / After`: criterion, feature, tier, command, before, after. |
 | State | `pass`, `fail`, or `inconclusive`. Derived from the line and the fast check. |
 | Re-drive | The review agent runs every Before / After command again on the head, and for a bug also on the base. |
 | Lever | A helper script under the skill that proves one fact and exits non-zero on failure. A reviewer can rerun it. |
@@ -76,6 +78,8 @@ The twelve rules of the governor hold. These join them.
 19. Evidence is text. Transcripts, ARIA snapshots, exit codes, and log excerpts travel in the PR body and in comments.
 20. An agent probes for drivers and never installs one. A new driver is a ticket the operator opens.
 21. The daemon inlines skill content into the prompt. It never relies on a harness skill loader, a harness browser integration, or a plugin.
+22. The ticket defines done. Every acceptance criterion is falsifiable and names its check. Every Before / After line names the criterion it proves. A change that no criterion asks for does not ship.
+23. The simplest change that meets every criterion ships, in the style the repository already has. No new abstraction, layer, or dependency without a criterion that needs it. A test that still passes with the change reverted is not a test.
 
 ---
 
@@ -190,15 +194,15 @@ Every agent PR has this body and nothing else. It is a briefing, not a lab noteb
 One or two short paragraphs. The behaviour that changes and for whom.
 
 ## Before / After
-- checkout-submit · browser · `npx playwright test checkout` · before: an empty card is accepted and the API returns 500 · after: the field shows "Card is required" and no request is sent
-- api-orders · http · `curl -s -X POST :4000/orders -d @empty.json` · before: 500, log `NullPointer at Orders.create` · after: 422 `{"error":"card_required"}`
-- poll_p95 · measure · `aif measure` · 12 → 11 ms
+- AC-1 · checkout-submit · browser · `npx playwright test checkout` · before: an empty card is accepted and the API returns 500 · after: the field shows "Card is required" and no request is sent
+- AC-2 · api-orders · http · `curl -s -X POST :4000/orders -d @empty.json` · before: 500, log `NullPointer at Orders.create` · after: 422 `{"error":"card_required"}`
+- AC-3 · poll_p95 · measure · `aif measure` · 12 → 11 ms
 
 ## Blast radius
 One to three sentences. What else the change touches and why it is safe.
 ```
 
-One line per feature. Each line names the feature, the tier, the command, and the observed state before and after. A `measure` line comes from the daemon's own Before and After comment of C28, so the number is a factory number. For a bug, before is the repro on base and after is the same command on head. A transcript longer than the cap goes under its line in a fenced block, cut to the cap, and the full file stays at `.aif/evidence/` in the author's worktree. Screenshots wait for `gh --attach` to reach stable.
+One line per acceptance criterion, more when one criterion needs two surfaces. Each line names the criterion, the feature, the tier, the command, and the observed state before and after. A `measure` line comes from the daemon's own Before and After comment of C28, so the number is a factory number. For a bug, before is the repro on base and after is the same command on head. A transcript longer than the cap goes under its line in a fenced block, cut to the cap, and the full file stays at `.aif/evidence/` in the author's worktree. Screenshots wait for `gh --attach` to reach stable.
 
 Writing rules, from `technical-writing` and `unslop`, as one paragraph in the prompt: short declarative sentences, one thought per sentence, active voice, no long dash, no curly quote, no mid-sentence colon, no `## Summary`, no `## Test plan`, no narration of the work, body under 40 lines before the fenced blocks.
 
@@ -209,12 +213,14 @@ The deterministic check of C11 gains these lines. It costs zero agent tokens and
 | Line | Rule |
 |---|---|
 | Sections | `## Why` and `## Before / After` present. `## How`, a heading that starts with `Implementation`, `## Summary`, and `## Test plan` absent. |
-| Coverage | Every touched area with a run skill has at least one Before / After line. Every line names a feature in the index or a measurer in `verify.toml`. |
+| Trace | Every `AC-<n>` of the linked ticket appears in at least one line. Every line names an `AC-<n>` that exists in the ticket. |
+| Coverage | Every touched area with a run skill has at least one line. Every line names a feature in the index or a measurer in `verify.toml`. |
 | Tier | Every line's tier is at or above the area's floor. |
 | State | No line is `inconclusive`. |
+| Scope | Every changed path is under an owned path of the plan table, under the run skill, or is a test file. A dependency manifest changes only when the ticket names the dependency. |
 | Prose | No long dash, no curly quote, no mid-sentence colon outside code, body under the line cap. pstack's `check-plan.mjs` holds the same three lint rules. |
 
-A failure posts one finding comment and re-queues implement, as C11 does today. A floor failure also opens a theory event.
+A failure posts one finding comment and re-queues implement, as C11 does today. A floor failure also opens a theory event. The trace and scope lines are the structural form of rules 22 and 23: a change without a criterion, or a path outside the plan, never reaches a reviewer.
 
 ### 5.3 Fast checks
 
@@ -233,13 +239,28 @@ Refine moves from the repository checkout to the issue worktree, so an experimen
 | Prototype before ask | Classifies each open question. A question an experiment can answer is not the operator's. The agent runs the experiment in a scratch directory under the worktree, never committed, and records the result. Only a product or preference call goes to `needs-human`. | `## Decisions`: one line per question, the answer, the command. |
 | Repro twice, bug tickets only | Drives the surface to reproduce the defect twice on the base. A third miss goes to `needs-human` with the attempts. | `## Repro`: the exact command, two observed outputs, the exit code. |
 
-The plan table gains one column, `Fast`, next to `Validation`. A chunk names the fast command that proves it, or `new: <feature>` when the chunk must add a feature file.
+The acceptance criteria change shape. Each criterion is one falsifiable line with an ID, in the form of `verify-this`: the condition, the observable result, and the check that proves it.
+
+```
+## Acceptance criteria
+- AC-1 · An empty card field blocks submit and shows "Card is required" · check: checkout-submit drive
+- AC-2 · POST /orders with no card returns 422 and `{"error":"card_required"}` · check: api-orders fast
+- AC-3 · poll_p95 does not worsen · check: measure poll_p95
+```
+
+A criterion that no command can falsify is not a criterion. The refine agent rewrites it or asks, under rule 14, only when no experiment can settle it. A criterion that the ticket text does not ask for is scope creep, and the refine agent drops it.
+
+The plan table gains one column, `Fast`, next to `Validation`. A chunk names the fast command that proves it, or `new: <feature>` when the chunk must add a feature file. Every owned path in the table is a real path or glob, because the body check of 5.2 reads it.
+
+Before implement dispatches, the daemon checks the refined ticket the way it checks a PR: the four sections present, every criterion carries an `AC-<n>` and a `check:`, every check names a feature in the index, a fast command, or a measurer, and the plan table parses. A failure re-queues refine with the finding. This is pstack's `check-plan.mjs` moved into the daemon, and it costs zero agent tokens.
 
 ### 5.5 Implement
 
-The coordinator and its author subagents work as today. Two rules join the prompt.
+The coordinator and its author subagents work as today. Three rules join the prompt.
 
-The coordinator drives every touched feature once through the driver before it opens the PR and writes the Before / After line from what it observed. It runs every fast command and pastes the exit code. It writes no line it did not observe.
+The simplest change. The coordinator reads the conventions of the files it touches before the first edit and follows them. It makes the smallest change that meets every criterion. It adds no abstraction, layer, flag, or dependency that no criterion needs. It deletes dead weight it meets in its own commit. Before each commit it removes narrating comments, guards no criterion asks for, and edits outside the plan. This is pstack's Laziness Protocol, Subtract Before You Add, and `deslop`, as one paragraph.
+
+The coordinator drives every touched feature once through the driver before it opens the PR and writes the Before / After line from what it observed, with the criterion it proves. It runs every fast command and pastes the exit code. It writes no line it did not observe. Every test it adds asserts a literal result through the public path and fails with the change reverted.
 
 The lever rule. When an agent checks the same fact by hand twice, or writes a throwaway script to check it, it adds the script to the run skill in the same PR, with one invocation line in `SKILL.md`. A one-off `grep`, a shell history line, or a test that passes when every dependency returns nothing is not a lever.
 
@@ -252,7 +273,9 @@ The review agent runs on another model in a fresh context. It trusts no Before /
 1. Run every line's command on the head. Compare the observed state to the stated after.
 2. For a `bug` ticket, run the `## Repro` command in the base worktree of C28 and expect the stated before. Then run it on the head and expect the after. Red on base, green on head.
 3. Run every lever the PR adds and get the stated exit code.
-4. Post the reviewer's own Before / After lines as a PR comment, in the same shape.
+4. Run every test the PR adds against the base worktree with only the test files applied. Each must fail there. A test that passes on base tests nothing, and the reviewer deletes it or rewrites it.
+5. Read the diff once for what it does not need. An abstraction, a flag, a guard, or a dependency that no criterion asks for is a finding, and the reviewer removes it. A deviation from the conventions of the surrounding files is a finding, and the reviewer aligns it.
+6. Post the reviewer's own Before / After lines as a PR comment, in the same shape.
 
 A mismatch is a finding. The reviewer repairs the code, or repairs the check when the check was the defect, then re-drives the full list. A bug that does not fail on base is a wrong root cause, and that finding goes to `needs-human` with both outputs. The two outcomes of the review contract stay: `gh pr ready` when every line passes on the reviewer's run, `needs-human` otherwise.
 
@@ -315,7 +338,7 @@ The operator steers without a diff.
 | `rules.md` | One rule every prompt carries. | A theory event answer with rung 3. |
 | Prompt edits | The stage wording. | The Settings view. |
 
-The stance carries four principles as vocabulary, each adapted from pstack by Lauren Tan, and each backed by a structural check rather than a naming rule. An agent names none of them in a PR.
+The stance carries six principles as vocabulary, each adapted from pstack by Lauren Tan, and each backed by a structural check rather than a naming rule. An agent names none of them in a PR.
 
 | Principle | The structure that enforces it |
 |---|---|
@@ -323,6 +346,8 @@ The stance carries four principles as vocabulary, each adapted from pstack by La
 | Build the Lever | The fast command per feature and the daemon's fast check. |
 | Never Block on the Human | Prototype before ask in refine. |
 | Fix Root Causes | Red on base, green on head in review. |
+| Laziness Protocol | The trace and scope lines of the body check, and the reviewer's pass for what the diff does not need. |
+| Test Behavior, Not Implementation | Every added test runs against base in review and must fail there. |
 
 ---
 
@@ -331,7 +356,7 @@ The stance carries four principles as vocabulary, each adapted from pstack by La
 | Document | Today | Change |
 |---|---|---|
 | Design record §5.1, spec C28 | The map names a skill by name. The factory passes only the name. | The factory inlines the skill slice of 4.6 into `{skills}`. |
-| Spec C11, R27 | The check requires `## Why` and forbids `## How`. | The check applies the table of 5.2. |
+| Spec C11, R27 | The check requires `## Why` and forbids `## How`. | The check applies the table of 5.2, and a sibling check runs on the refined ticket before implement. |
 | Spec C28 | Base and head measurements at review admission. | Fast checks of 5.3 join them. |
 | Spec R23 | The area schema. | `min_tier` joins it. |
 | Spec §2 and the refine cwd | Refine runs in the repository checkout. | Refine runs in the issue worktree. |
@@ -345,11 +370,12 @@ Nothing else in C0 to C32 changes.
 
 | Stage or task | Change |
 |---|---|
-| refine | Issue worktree. Restate, Ground, Decisions, Repro. The Fast column. Reads the refine slice. |
-| implement | Drives once, writes Before / After, runs the fast commands, adds levers. The body contract and the writing paragraph. |
-| body check | The table of 5.2. |
+| refine | Issue worktree. Restate, Ground, Decisions, Repro. Criteria with IDs and checks. The Fast column. Reads the refine slice. |
+| ticket check | Deterministic, before implement dispatches. Sections, criteria, checks, plan table. A failure re-queues refine. |
+| implement | The simplest change in the repository's style. Drives once, writes Before / After per criterion, runs the fast commands, adds levers. The body contract and the writing paragraph. |
+| body check | The table of 5.2, with trace and scope. |
 | fast checks | Measure tasks per touched feature at review admission. A fail re-queues implement. |
-| review | Re-drives every line. Red on base, green on head for a bug. Runs levers. Posts its own lines. Repairs drift. |
+| review | Re-drives every line. Red on base, green on head for a bug. Every added test red on base. Runs levers. Removes what no criterion needs. Posts its own lines. Repairs drift. |
 | release | Unchanged. |
 | `verify-skill` tickets | Skip both prediction gates. |
 | audit sweep | One paragraph, one ticket on drift. |
@@ -403,7 +429,7 @@ The exact field names belong to the spec.
 | V1 Skill resolution and the doctor | The `run-<surface>` parser, the feature front matter, the resolution order of 4.1, the lint, `TheoryConfig.skills`, `min_tier` in the area schema, the doctor lines, the AREAS tier mark. | C25 |
 | V2 The setup ticket | Key `v`, the surface prompt, `create_issue` with `to-refine` and `verify-skill`, the body of 6.2, the gate skip for `verify-skill`. | C16, C32, V1 |
 | V3 Slicing and fast checks | The slice rule of 4.6 for the four stages. The cap. Fast checks as measure tasks at review admission, the `exit` unit, the re-queue on fail. Replaces the name fill of C28. | C10, C28, V1 |
-| V4 The contract and the prompts | The body check table of 5.2 in `check_pr`. The refine cwd. The refine, implement, and review prompts rewritten once and pinned. The audit sweep paragraph and the maintain ticket. | C11, C24, V3 |
+| V4 The contract and the prompts | The body check table of 5.2 in `check_pr`, with trace and scope. The refined-ticket check before implement dispatch. The refine cwd. The refine, implement, and review prompts rewritten once and pinned. The audit sweep paragraph and the maintain ticket. | C11, C24, V3 |
 | V5 Teach | `TaskPurpose::Teach`, the prompt, keys `t`, the recall offer, events through `open_event`. | C17, V3 |
 
 V0 can start now. V1 to V3 wait for the trust-loop parsers. V4 rewrites the three prompts once. V5 comes last.
