@@ -59,14 +59,15 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AreaView, AskView, HoldView, InputMode, ModelPath, PauseScope, PromptSource,
-    PromptView, Push, RecordView, SettingsOperation, SettingsResult, SettingsResultStatus,
-    StateInput, StateView, SurfaceView, TheoryAction, TheoryView, TicketAction, TicketDetails,
-    TicketProposal, TicketResult, TicketResultKind, MODEL_COMMIT_REQUEST, PREDICTION_REQUEST,
-    SKILL_TICKET_REQUEST,
+    Action, AreaView, AskView, ChatPurpose, HoldView, InputMode, ModelPath, PauseScope,
+    PromptSource, PromptView, Push, RecordView, SettingsOperation, SettingsResult,
+    SettingsResultStatus, StateInput, StateView, SurfaceView, TheoryAction, TheoryView,
+    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind,
+    MODEL_COMMIT_REQUEST, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
 };
-use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
+use crate::state::{ChatKey, DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::theory::blocks;
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
@@ -74,8 +75,9 @@ use crate::theory::records::{
     self, event_block, no_entries, parse_event_blocks, parse_prediction_blocks, prediction_block,
     record_labels, skips_prediction_gates, Event, FullPrediction, Prediction, RecordKey,
     ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL, MODEL_FILE,
-    MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS, THEORY_FULL_COLOR, THEORY_FULL_LABEL,
-    THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
+    MODEL_PROPOSAL_BLOCK, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS,
+    THEORY_FULL_COLOR, THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL,
+    VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
@@ -468,8 +470,8 @@ pub struct Daemon {
     body_checks: BTreeMap<String, String>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
-    /// Active issue conversations, keyed by repository and issue number.
-    ticket_conversations: BTreeMap<(String, u64), TicketConversationState>,
+    /// Active conversations, keyed by repository and subject.
+    ticket_conversations: BTreeMap<(String, ChatKey), TicketConversationState>,
     /// The final-text candidate of each active ticket turn.
     ticket_turn_text: BTreeMap<String, TicketTurnText>,
 
@@ -654,7 +656,7 @@ impl Daemon {
             .filter(|conversation| config.repos.contains_key(&conversation.repo))
             .map(|conversation| {
                 (
-                    (conversation.repo.clone(), conversation.number),
+                    (conversation.repo.clone(), conversation.key.clone()),
                     conversation,
                 )
             })
@@ -1817,7 +1819,7 @@ impl Daemon {
                     && work.kind == ItemKind::Issue
                     && self
                         .ticket_conversations
-                        .contains_key(&(work.repo.clone(), work.number)))
+                        .contains_key(&(work.repo.clone(), ChatKey::Ticket(work.number))))
             })
             .collect();
         let changed = !ready.is_empty();
@@ -1866,7 +1868,7 @@ impl Daemon {
     fn cancel_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
         let ticket_conversation = self
             .ticket_conversations
-            .contains_key(&(repo.to_string(), number));
+            .contains_key(&(repo.to_string(), ChatKey::Ticket(number)));
         let ids: Vec<String> = self
             .table
             .active()
@@ -3257,12 +3259,11 @@ impl Daemon {
             return;
         };
         task.session_id = None;
-        let ticket_chat = task.purpose == TaskPurpose::TicketChat;
-        let ticket_key = (task.repo.clone(), task.number);
+        let conversation_key = Self::conversation_key(task);
         let marker_task = task.clone();
         self.remove_task_session_marker(&marker_task);
-        if ticket_chat {
-            if let Some(conversation) = self.ticket_conversations.get_mut(&ticket_key) {
+        if let Some(key) = conversation_key {
+            if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
                 conversation.session_id = None;
             }
         }
@@ -3328,8 +3329,9 @@ impl Daemon {
                     return;
                 };
                 task.session_id = Some(session_id.clone());
-                let ticket_key = (task.repo.clone(), task.number);
+                let conversation_key = Self::conversation_key(task);
                 let ticket_chat = task.purpose == TaskPurpose::TicketChat;
+                let alias = task.repo.clone();
                 let marker = self
                     .task_cwd(&task_id)
                     .ok_or_else(|| anyhow!("the task has no worktree"))
@@ -3347,12 +3349,14 @@ impl Daemon {
                     }
                     return;
                 }
-                if ticket_chat {
-                    if let Some(conversation) = self.ticket_conversations.get_mut(&ticket_key) {
+                if let Some(key) = conversation_key {
+                    if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
                         conversation.session_id = Some(session_id);
                     }
-                    if let Some(fresh) = self.snapshot.repos.get(&ticket_key.0).cloned() {
-                        self.reconcile_ticket_conversations(&ticket_key.0, &fresh);
+                }
+                if ticket_chat {
+                    if let Some(fresh) = self.snapshot.repos.get(&alias).cloned() {
+                        self.reconcile_ticket_conversations(&alias, &fresh);
                     }
                 }
                 self.changed = true;
@@ -4074,7 +4078,7 @@ impl Daemon {
                     if let Push::TicketDetails(details) = push {
                         details.proposal = self
                             .ticket_conversations
-                            .get(&(details.repo.clone(), details.issue.number))
+                            .get(&(details.repo.clone(), ChatKey::Ticket(details.issue.number)))
                             .and_then(|conversation| conversation.proposal.clone());
                     }
                 }
@@ -4159,8 +4163,9 @@ impl Daemon {
                 if proposal_succeeded {
                     if let Some((request, repo, number, proposal_id)) = proposal_apply {
                         let mut cleared = false;
-                        if let Some(conversation) =
-                            self.ticket_conversations.get_mut(&(repo.clone(), number))
+                        if let Some(conversation) = self
+                            .ticket_conversations
+                            .get_mut(&(repo.clone(), ChatKey::Ticket(number)))
                         {
                             if conversation
                                 .proposal
@@ -4538,7 +4543,7 @@ impl Daemon {
         self.policies.remove(alias);
         self.pending_stacked.remove(alias);
         self.restore_repos.remove(alias);
-        let conversations: Vec<(String, u64)> = self
+        let conversations: Vec<(String, ChatKey)> = self
             .ticket_conversations
             .keys()
             .filter(|(repo, _)| repo == alias)
@@ -5027,7 +5032,8 @@ impl Daemon {
                     && !Self::is_ticket_creation(task)
                     && !Self::is_ticket_chat(task)
                     && !Self::is_teach(task)
-                    && !Self::is_audit(task) =>
+                    && !Self::is_audit(task)
+                    && !Self::is_bootstrap(task) =>
             {
                 Workspace::Exclusive(WorktreeKey::Issue(task.number))
             }
@@ -6680,6 +6686,11 @@ impl Daemon {
             } => self.accept_full_prediction(&repo, number, prediction),
             TheoryAction::EditModel { request, repo } => self.edit_model(&request, &repo),
             TheoryAction::CommitModel { repo } => self.commit_model(&repo),
+            TheoryAction::Chat {
+                repo, purpose, key, ..
+            } => match purpose {
+                ChatPurpose::Bootstrap => self.bootstrap_chat(&repo, &key),
+            },
         }
     }
 
@@ -7089,29 +7100,32 @@ impl Daemon {
             }
         };
         let (kind, message) = match self.push_model_worktree(&repo) {
-            Ok(PushOutcome::Nothing) => (
+            Ok(outcome) => (
                 TicketResultKind::Success,
-                format!("the model of {alias} did not change"),
-            ),
-            Ok(PushOutcome::Pushed(Some(number))) => (
-                TicketResultKind::Success,
-                format!("pushed the model of {alias} to the model pull request {number}"),
-            ),
-            Ok(PushOutcome::Pushed(None)) => (
-                TicketResultKind::Success,
-                format!("pushed the model of {alias} to its open model pull request"),
-            ),
-            Ok(PushOutcome::Opened(Some(number))) => (
-                TicketResultKind::Success,
-                format!("opened the model pull request {number} of {alias}"),
-            ),
-            Ok(PushOutcome::Opened(None)) => (
-                TicketResultKind::Success,
-                format!("opened the model pull request of {alias}, number unknown"),
+                Self::model_push_message(alias, outcome),
             ),
             Err(error) => (TicketResultKind::Failure, format!("{error:#}")),
         };
         self.report_model(alias, kind, message);
+    }
+
+    /// What one model push left on GitHub, as one operator sentence.
+    fn model_push_message(alias: &str, outcome: PushOutcome) -> String {
+        match outcome {
+            PushOutcome::Nothing => format!("the model of {alias} did not change"),
+            PushOutcome::Pushed(Some(number)) => {
+                format!("pushed the model of {alias} to the model pull request {number}")
+            }
+            PushOutcome::Pushed(None) => {
+                format!("pushed the model of {alias} to its open model pull request")
+            }
+            PushOutcome::Opened(Some(number)) => {
+                format!("opened the model pull request {number} of {alias}")
+            }
+            PushOutcome::Opened(None) => {
+                format!("opened the model pull request of {alias}, number unknown")
+            }
+        }
     }
 
     /// Run the commit, the push, and the pull request of one model
@@ -7405,6 +7419,42 @@ impl Daemon {
         }
     }
 
+    /// Queue or reuse one bootstrap conversation about one area.
+    ///
+    /// The chat runs in the theory checkout, because the model file lives
+    /// there. Its item is the ticket-session item, so no worktree and no
+    /// pipeline sweep claims it, and the area alone names the subject. An
+    /// ungoverned repository keeps its v0.6 behaviour and writes no model,
+    /// so it starts no chat.
+    fn bootstrap_chat(&mut self, alias: &str, area: &str) {
+        if let Err(reason) = self.governed_repo(alias) {
+            self.report_model(alias, TicketResultKind::Failure, reason);
+            return;
+        }
+        let log = self
+            .state_dir
+            .join("logs")
+            .join(format!("{alias}__bootstrap-{area}.jsonl"));
+        let queued = self
+            .table
+            .upsert_bootstrap_chat(alias, area, log, self.now_ms);
+        match queued {
+            Ok(_) => {
+                self.ticket_conversations
+                    .entry((alias.to_string(), ChatKey::Theory(area.to_string())))
+                    .or_insert_with(|| TicketConversationState {
+                        repo: alias.to_string(),
+                        key: ChatKey::Theory(area.to_string()),
+                        session_id: None,
+                        handoff_active: false,
+                        proposal: None,
+                    });
+                self.changed = true;
+            }
+            Err(error) => eprintln!("the bootstrap chat of {alias}/{area}: {error:#}"),
+        }
+    }
+
     /// Queue or reuse one issue conversation.
     fn ticket_chat(&mut self, repo: &str, number: u64) {
         let handoff_active = self
@@ -7414,10 +7464,10 @@ impl Daemon {
             .and_then(|snapshot| snapshot.issues.get(&number))
             .is_some_and(|issue| issue.labels.iter().any(|label| label == "to-refine"));
         self.ticket_conversations
-            .entry((repo.to_string(), number))
+            .entry((repo.to_string(), ChatKey::Ticket(number)))
             .or_insert_with(|| TicketConversationState {
                 repo: repo.to_string(),
-                number,
+                key: ChatKey::Ticket(number),
                 session_id: None,
                 handoff_active,
                 proposal: None,
@@ -7437,14 +7487,16 @@ impl Daemon {
 
     /// Restore, hand off, or end each conversation after GitHub changes.
     fn reconcile_ticket_conversations(&mut self, repo: &str, fresh: &RepoSnapshot) {
-        let keys: Vec<(String, u64)> = self
+        let keys: Vec<(String, ChatKey)> = self
             .ticket_conversations
             .keys()
-            .filter(|(conversation_repo, _)| conversation_repo == repo)
+            .filter(|(conversation_repo, key)| conversation_repo == repo && key.ticket().is_some())
             .cloned()
             .collect();
         for key in keys {
-            let number = key.1;
+            let Some(number) = key.1.ticket() else {
+                continue;
+            };
             let issue = fresh.issues.get(&number).filter(|issue| issue.open);
             let ended = issue.is_none()
                 || issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "refined"));
@@ -7507,8 +7559,11 @@ impl Daemon {
     }
 
     /// Stop one issue conversation and remove its private state.
-    fn end_ticket_conversation(&mut self, key: &(String, u64)) {
-        let id = tasks::ticket_chat_id(&key.0, key.1);
+    fn end_ticket_conversation(&mut self, key: &(String, ChatKey)) {
+        let Some(number) = key.1.ticket() else {
+            return;
+        };
+        let id = tasks::ticket_chat_id(&key.0, number);
         self.ticket_turn_text.remove(&id);
         if self.table.by_id.contains_key(&id) {
             self.cancel_task(&id, false);
@@ -7528,6 +7583,7 @@ impl Daemon {
     fn finish_final_block_turn(&mut self, id: &str) {
         match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
             Some(TaskPurpose::TicketChat) => self.finish_ticket_proposal_turn(id),
+            Some(TaskPurpose::Bootstrap { .. }) => self.finish_model_proposal_turn(id),
             Some(TaskPurpose::Teach(_)) => self.finish_teach_events(id),
             // An audit sweep keeps its text: the sweep reads it at exit.
             Some(TaskPurpose::Audit(_)) => {}
@@ -7650,7 +7706,7 @@ impl Daemon {
         else {
             return;
         };
-        let key = (task.repo.clone(), task.number);
+        let key = (task.repo.clone(), ChatKey::Ticket(task.number));
         let Some(issue) = self
             .snapshot
             .repos
@@ -7681,6 +7737,83 @@ impl Daemon {
                 chat_error: self.config.ticket_chat_model().err(),
             }));
         }
+    }
+
+    /// Apply the model proposal of one finished bootstrap turn.
+    ///
+    /// The block carries the entries of one area. The daemon merges them
+    /// into the model file of the model worktree, validates the whole
+    /// merged file, and runs the commit, the push, and the model pull
+    /// request of the C7 path. A merged model that does not parse is
+    /// refused in the chat, so the agent reads the reason and the entry id
+    /// it must fix, and nothing is committed.
+    fn finish_model_proposal_turn(&mut self, id: &str) {
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        if turn.earlier_marker {
+            return;
+        }
+        let Some(task) = self
+            .table
+            .by_id
+            .get(id)
+            .filter(|task| Self::is_bootstrap(task))
+            .cloned()
+        else {
+            return;
+        };
+        let Ok(body) = blocks::parse_block(MODEL_PROPOSAL_BLOCK, &turn.last) else {
+            return;
+        };
+        let proposal: Model = match serde_json::from_str(&body) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                self.refuse_model_proposal(
+                    &task.repo,
+                    id,
+                    &format!("the block is not one model proposal ({error})"),
+                );
+                return;
+            }
+        };
+        if proposal.entries.is_empty() {
+            self.refuse_model_proposal(&task.repo, id, "the proposal carries no entry");
+            return;
+        }
+        match self.apply_model_proposal(&task.repo, &proposal.entries) {
+            Ok(message) => self.report_model(&task.repo, TicketResultKind::Success, message),
+            Err(reason) => self.refuse_model_proposal(&task.repo, id, &reason),
+        }
+    }
+
+    /// Merge `entries` into the model file and open the model pull request.
+    ///
+    /// The base is the model file of the model worktree, which sits on the
+    /// open model branch, so a second area joins the first instead of
+    /// replacing it. The merged text is validated before it is written,
+    /// which is where a duplicate entry id is caught.
+    fn apply_model_proposal(&mut self, alias: &str, entries: &[Entry]) -> Result<String, String> {
+        let repo = self.governed_repo(alias)?;
+        let worktree = self
+            .prepare_model_worktree(&repo)
+            .map_err(|error| format!("{error:#}"))?;
+        let file = worktree.join(MODEL_FILE);
+        let base = fs::read_to_string(&file)
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        let merged = format!("{}\n\n{}", base.trim_end(), model::render(entries));
+        model::parse(&merged).map_err(|error| format!("{MODEL_FILE}: {error}"))?;
+        fs::write(&file, &merged)
+            .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+        self.push_model_worktree(&repo)
+            .map(|outcome| Self::model_push_message(alias, outcome))
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Tell the chat and the operator why one proposal wrote no model.
+    fn refuse_model_proposal(&mut self, alias: &str, id: &str, reason: &str) {
+        self.chat(id, &format!("AIF refused the model proposal. {reason}"));
+        self.report_model(alias, TicketResultKind::Failure, reason.to_string());
     }
 
     /// Force an early poll of one repository, or of all of them.
@@ -7803,6 +7936,7 @@ impl Daemon {
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
         Some(match self.workspace(task) {
+            Workspace::Shared if Self::is_bootstrap(task) => repo.theory.checkout(&repo.path),
             Workspace::Shared => repo.path.clone(),
             Workspace::Exclusive(WorktreeKey::Issue(number)) => {
                 self.worktrees.issue_path(repo, number)
@@ -7830,6 +7964,25 @@ impl Daemon {
         task.purpose == TaskPurpose::TicketChat
     }
 
+    /// True when the task writes the model of one area with the operator.
+    fn is_bootstrap(task: &Task) -> bool {
+        matches!(task.purpose, TaskPurpose::Bootstrap { .. })
+    }
+
+    /// The conversation one task belongs to, or `None`.
+    ///
+    /// A conversation survives a restart, so the daemon records the session
+    /// identity of every conversation task under this key.
+    fn conversation_key(task: &Task) -> Option<(String, ChatKey)> {
+        match &task.purpose {
+            TaskPurpose::TicketChat => Some((task.repo.clone(), ChatKey::Ticket(task.number))),
+            TaskPurpose::Bootstrap { area } => {
+                Some((task.repo.clone(), ChatKey::Theory(area.clone())))
+            }
+            _ => None,
+        }
+    }
+
     /// True when the task explains one subject to the operator.
     fn is_teach(task: &Task) -> bool {
         matches!(task.purpose, TaskPurpose::Teach(_))
@@ -7850,6 +8003,7 @@ impl Daemon {
         match task.purpose {
             TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
             TaskPurpose::Teach(_) | TaskPurpose::Audit(_) => Some(EVENT_BLOCK),
+            TaskPurpose::Bootstrap { .. } => Some(MODEL_PROPOSAL_BLOCK),
             TaskPurpose::Pipeline | TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
         }
     }
@@ -7864,6 +8018,8 @@ impl Daemon {
             ExecutionRole::TheoryChat
         } else if Self::is_audit(task) {
             ExecutionRole::TheoryAudit
+        } else if Self::is_bootstrap(task) {
+            ExecutionRole::TheoryChat
         } else {
             match task.stage {
                 Stage::Refine => ExecutionRole::Refine,
@@ -8091,6 +8247,15 @@ impl Daemon {
         if let TaskPurpose::Audit(_) = &task.purpose {
             let values = self.audit_values(task, worktree);
             return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
+        }
+        if let TaskPurpose::Bootstrap { area } = &task.purpose {
+            let values = vec![
+                ("repo", task.repo.clone()),
+                ("worktree", worktree.display().to_string()),
+                ("area", area.clone()),
+                ("model", self.model_entries(&task.repo)),
+            ];
+            return prompts::fill_template(prompts::BOOTSTRAP_PROMPT, &values);
         }
         let role = Self::execution_role(task);
         let (name, builtin) = prompts::file_name(role)
@@ -10378,7 +10543,7 @@ mod tests {
             number: 7,
         }));
         rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
-        let key = ("borsuk".to_string(), 7);
+        let key = ("borsuk".to_string(), ChatKey::Ticket(7));
         let conversation = |rig: &Rig| rig.daemon.ticket_conversations[&key].session_id.clone();
         let checkout = rig.repo.clone();
         let marker = |rig: &Rig| {
@@ -14388,6 +14553,236 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // The bootstrap chat
+    // ------------------------------------------------------------------
+
+    /// One boundary entry and one invariant entry, as the agent proposes
+    /// them.
+    const TWO_ENTRIES: &str = concat!(
+        r#"[{"kind":"boundary","id":"B-gh","title":"The gh boundary","#,
+        r#""statement":"Every call leaves through one client.","#,
+        r#""sides":["daemon","github"],"paths":["src/gh.rs"]},"#,
+        r#"{"kind":"invariant","id":"I-one-client","title":"One client","#,
+        r#""statement":"No other module runs gh.","constrains":["B-gh"]}]"#
+    );
+
+    /// One model proposal block that carries `entries`.
+    fn model_proposal(entries: &str) -> String {
+        format!(
+            "{}\n{{\"entries\":{entries}}}\n</aif-model-proposal-v1>",
+            MODEL_PROPOSAL_BLOCK
+        )
+    }
+
+    /// Start the bootstrap chat of the `gh` area on `rig`.
+    fn start_bootstrap(rig: &mut Rig) {
+        rig.act(Action::Theory(TheoryAction::Chat {
+            request: "chat-gh".to_string(),
+            repo: "borsuk".to_string(),
+            purpose: ChatPurpose::Bootstrap,
+            key: "gh".to_string(),
+        }));
+    }
+
+    /// The entry ids of the model file in the model worktree.
+    fn model_ids(dir: &Path) -> Vec<String> {
+        let text = fs::read_to_string(model_wt(dir).join("theory/model.toml"))
+            .expect("the model worktree holds a model file");
+        model::parse(&text)
+            .expect("the merged model validates")
+            .entries
+            .iter()
+            .map(|entry| entry.id().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_bootstrap_key_starts_one_theory_chat_task_of_the_area() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+
+        start_bootstrap(&mut rig);
+
+        let task = rig.task("borsuk/bootstrap-gh");
+        assert_eq!(
+            task.purpose,
+            TaskPurpose::Bootstrap {
+                area: "gh".to_string()
+            }
+        );
+        assert_eq!(Daemon::execution_role(&task), ExecutionRole::TheoryChat);
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, ExecutionRole::TheoryChat);
+        drop(roles);
+        let jobs = rig.jobs.lock().unwrap();
+        assert_eq!(jobs[0].task, "borsuk/bootstrap-gh");
+        assert!(
+            jobs[0].prompt.contains("the area gh"),
+            "the prompt names the area: {}",
+            jobs[0].prompt
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_proposal_writes_the_model_and_opens_the_labelled_pull_request() {
+        let dir = temp_root();
+        let steps: Vec<Step> = vec![model_derive_step("acme/borsuk", "[]")]
+            .into_iter()
+            .chain(fresh_model_steps(&dir, &rig_repo(&dir)))
+            .chain(model_commit_steps(&dir, "acme/borsuk", "[]"))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        start_bootstrap(&mut rig);
+        rig.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+
+        assert_eq!(model_ids(&dir), vec!["B-gh", "I-one-client"]);
+        let calls = rig.exec.calls();
+        let order: Vec<String> = calls
+            .iter()
+            .filter_map(|call| match call.program.as_str() {
+                "git" if call.args.iter().any(|arg| arg == "commit") => Some("commit".to_string()),
+                "git" if call.args.iter().any(|arg| arg == "push") => Some("push".to_string()),
+                "gh" if call.args.first().is_some_and(|arg| arg == "pr")
+                    && call.args.get(1).is_some_and(|arg| arg == "create") =>
+                {
+                    Some("pr create".to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["commit", "push", "pr create"]);
+        let create = calls
+            .iter()
+            .find(|call| call.program == "gh" && call.args.get(1).is_some_and(|a| a == "create"))
+            .expect("the proposal opens one pull request");
+        assert_eq!(create.argv().last().copied(), Some(MODEL_PR_LABEL));
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the proposal must push a Push::TicketResult");
+        };
+        assert_eq!(result.kind, TicketResultKind::Success);
+        assert_eq!(result.message, "opened the model pull request 12 of borsuk");
+    }
+
+    #[test]
+    fn a_bootstrap_proposal_that_repeats_an_id_is_refused_in_the_chat() {
+        let dir = temp_root();
+        let worktree = model_wt(&dir);
+        fs::create_dir_all(worktree.join("theory")).unwrap();
+        let file = worktree.join("theory/model.toml");
+        let held = "[[entry]]\nkind = \"state\"\nid = \"B-gh\"\n\
+                    title = \"Held\"\nstatement = \"The model already holds it.\"\n";
+        fs::write(&file, held).unwrap();
+        let steps = vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":9,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(
+                &rig_repo(&dir),
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(format!("worktree {}\n", worktree.display())),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(&dir)),
+        ];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        start_bootstrap(&mut rig);
+        let session = rig.session(0);
+        rig.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            held,
+            "a refused proposal writes no model"
+        );
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "commit")),
+            "a refused proposal commits nothing"
+        );
+        let sends = session.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1, "the refusal reaches the chat: {sends:?}");
+        assert!(
+            sends[0].contains("B-gh") && sends[0].contains("duplicate entry id"),
+            "the refusal names the id: {}",
+            sends[0]
+        );
+    }
+
+    #[test]
+    fn a_restart_resumes_the_bootstrap_chat_under_its_theory_key() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), Vec::new(), governed);
+            start_bootstrap(&mut first);
+            first.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+            assert_eq!(
+                first.daemon.ticket_conversations
+                    [&("borsuk".to_string(), ChatKey::Theory("gh".to_string()))]
+                    .session_id
+                    .as_deref(),
+                Some("session-bootstrap-gh")
+            );
+        }
+
+        let mut second = Rig::make_in(dir, Vec::new(), governed);
+
+        assert_eq!(
+            second.daemon.ticket_conversations
+                [&("borsuk".to_string(), ChatKey::Theory("gh".to_string()))]
+                .session_id
+                .as_deref(),
+            Some("session-bootstrap-gh"),
+            "the theory key survives the restart"
+        );
+        second.poll(Vec::new(), Vec::new());
+
+        assert_eq!(second.job_count(), 1);
+        let resumed = second.job(0);
+        assert_eq!(resumed.task, "borsuk/bootstrap-gh");
+        assert_eq!(resumed.resume.as_deref(), Some("session-bootstrap-gh"));
+    }
+
+    #[test]
+    fn an_ungoverned_repository_starts_no_bootstrap_chat() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), |_| {});
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        start_bootstrap(&mut rig);
+
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/bootstrap-gh"));
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("a refused chat must push a Push::TicketResult");
+        };
+        assert_eq!(result.message, "the governor of borsuk is off");
+    }
+
     /// The `gh issue list` search of one shadow theory repository.
     fn shadow_search_step(title: &str, out: CmdOut) -> Step {
         let search = format!("{title} in:title");
@@ -16313,7 +16708,7 @@ mod tests {
         assert!(!rig
             .daemon
             .ticket_conversations
-            .contains_key(&("borsuk".to_string(), 7)));
+            .contains_key(&("borsuk".to_string(), ChatKey::Ticket(7))));
         assert_eq!(
             rig.daemon.ticket_controller.last_mutation_ms("borsuk"),
             None
@@ -16844,7 +17239,10 @@ mod tests {
         rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
 
         assert_eq!(session.sends.lock().unwrap().len(), 1);
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .handoff_active
+        );
     }
 
     #[test]
@@ -16904,7 +17302,10 @@ mod tests {
             1,
             "the active refine never blocks the handoff"
         );
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .handoff_active
+        );
     }
 
     #[test]
@@ -17007,7 +17408,7 @@ mod tests {
         });
         rig.event(turn_ended("borsuk/ticket-i7"));
 
-        let proposal = rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+        let proposal = rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
             .proposal
             .as_ref()
             .unwrap();
@@ -17031,7 +17432,7 @@ mod tests {
         });
         rig.event(turn_ended("borsuk/ticket-i7"));
         assert_eq!(
-            rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
                 .proposal
                 .as_ref()
                 .unwrap()
@@ -17054,7 +17455,7 @@ mod tests {
         });
         rig.event(turn_ended("borsuk/ticket-i7"));
         assert_eq!(
-            rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
                 .proposal
                 .as_ref()
                 .unwrap()
@@ -17209,7 +17610,7 @@ mod tests {
         let session = rig.session(0);
         rig.daemon
             .ticket_conversations
-            .get_mut(&("borsuk".to_string(), 7))
+            .get_mut(&("borsuk".to_string(), ChatKey::Ticket(7)))
             .unwrap()
             .proposal = Some(TicketProposal {
             id: "proposal-7".to_string(),
@@ -17239,9 +17640,11 @@ mod tests {
         let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
         assert_eq!(confirmed.title, "Proposed title");
         assert_eq!(confirmed.labels, vec!["ui".to_string()]);
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
-            .proposal
-            .is_none());
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .proposal
+                .is_none()
+        );
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 1);
         assert!(sends[0].contains("proposal"));
@@ -17342,7 +17745,7 @@ mod tests {
         session.fail_send.store(true, Ordering::SeqCst);
         rig.daemon
             .ticket_conversations
-            .get_mut(&("borsuk".to_string(), 7))
+            .get_mut(&("borsuk".to_string(), ChatKey::Ticket(7)))
             .unwrap()
             .proposal = Some(TicketProposal {
             id: "proposal-7".to_string(),
@@ -17374,9 +17777,11 @@ mod tests {
 
         let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
         assert_eq!(confirmed.title, "Proposed title");
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
-            .proposal
-            .is_none());
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .proposal
+                .is_none()
+        );
         let pushes: Vec<Push> = push_rx.try_iter().collect();
         assert!(pushes.iter().any(|push| {
             matches!(
@@ -18041,7 +18446,7 @@ mod tests {
         assert!(rig
             .daemon
             .ticket_conversations
-            .contains_key(&("borsuk".to_string(), 7)));
+            .contains_key(&("borsuk".to_string(), ChatKey::Ticket(7))));
 
         rig.poll(vec![], vec![]);
 

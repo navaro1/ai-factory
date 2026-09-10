@@ -1292,6 +1292,26 @@ pub enum TheoryAction {
         /// The repository alias.
         repo: String,
     },
+    /// Start or reuse one theory conversation.
+    Chat {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// What the conversation is for.
+        purpose: ChatPurpose,
+        /// The subject of the conversation. A bootstrap chat names its
+        /// area.
+        key: String,
+    },
+}
+
+/// What one theory conversation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatPurpose {
+    /// Write the entries of one area the model does not cover.
+    Bootstrap,
 }
 
 /// The model worktree of one repository, as one edit-model reply.
@@ -2487,6 +2507,12 @@ mod tests {
             }),
             Action::Theory(TheoryAction::CommitModel {
                 repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::Chat {
+                request: "chat-gh".to_string(),
+                repo: "borsuk".to_string(),
+                purpose: ChatPurpose::Bootstrap,
+                key: "gh".to_string(),
             }),
             Action::Stop,
         ]

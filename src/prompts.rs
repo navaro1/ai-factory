@@ -702,6 +702,50 @@ Put valid JSON between the markers. Do not quote a block. Do not put a
 block in a code fence. Write no text after the last closing marker.
 "#;
 
+/// The built-in prompt of one bootstrap chat.
+///
+/// The operator dictates a stream of memory about one area, and the agent
+/// turns it into model entries. The agent adds no claim the operator did
+/// not state, because a model the operator did not write is not the
+/// operator's theory. The placeholders are `{repo}`, `{worktree}`,
+/// `{area}`, and `{model}`.
+pub const BOOTSTRAP_PROMPT: &str = r#"You write the model of the area {area}
+in the repository {repo} with the operator. You work in {worktree}, the
+theory checkout. Read the files you need. Change no file.
+
+The model so far
+
+{model}
+
+The operator dictates a stream of memory about the area. The operator is the
+only source. Add no claim the operator did not state. Take no claim from the
+code. Read the code only to name a path or a file the operator points at.
+
+Ask short questions. Ask one question per turn. Ask only what an entry needs.
+An entry needs an id, a kind, a title, and a statement. Say back what you
+understood in one short sentence.
+
+An entry takes one of five kinds. A state names one region of the system. A
+boundary names the line between two regions and the path globs that cross it.
+A transition names a move from one state to another state. An invariant names
+a claim that always holds, and the states or the boundaries it constrains. A
+failure names one way the system breaks through one boundary.
+
+Give each entry a short id the operator recognises. Reuse no id the model so
+far already holds.
+
+The operator ends the interview with the word done. End that turn with one
+block that carries every entry you collected. Write no text after it. A turn
+the operator did not end takes no block.
+
+<aif-model-proposal-v1>
+{"entries":[{"kind":"state","id":"checkout","title":"Checkout","statement":"The buyer pays."}]}
+</aif-model-proposal-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
 /// The body of one run skill maintain ticket, before the daemon fills it.
 ///
 /// The eight steps are section 6.3 of the verification toolbelt design
@@ -1108,6 +1152,31 @@ mod tests {
                 r#"{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}"#
             ),
             "the event block stays literal:\n{filled}"
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_prompt_names_exactly_its_four_placeholders() {
+        assert_eq!(
+            scan_placeholders(BOOTSTRAP_PROMPT),
+            vec!["area", "repo", "worktree", "model"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(BOOTSTRAP_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(BOOTSTRAP_PROMPT, &values).expect("the bootstrap prompt fills");
+        assert!(filled.contains("<area>"));
+        assert!(filled.contains("<model>"));
+        assert!(
+            filled.contains(
+                r#"{"entries":[{"kind":"state","id":"checkout","title":"Checkout","statement":"The buyer pays."}]}"#
+            ),
+            "the proposal block stays literal:\n{filled}"
+        );
+        assert!(
+            filled.contains(crate::theory::records::MODEL_PROPOSAL_BLOCK),
+            "the prompt names the block tag the daemon parses:\n{filled}"
         );
     }
 
