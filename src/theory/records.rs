@@ -841,12 +841,12 @@ impl TheoryRecords {
 }
 
 /// The title of the repository record of one alias.
-fn repo_record_title(alias: &str) -> String {
+pub fn repo_record_title(alias: &str) -> String {
     format!("{alias}/theory")
 }
 
 /// The item number of one shadow issue title, `<alias>#<n>`.
-fn shadow_item(alias: &str, title: &str) -> Option<u64> {
+pub fn shadow_item(alias: &str, title: &str) -> Option<u64> {
     title.strip_prefix(alias)?.strip_prefix('#')?.parse().ok()
 }
 

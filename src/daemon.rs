@@ -112,11 +112,16 @@ fn diff_names(line: &str, entry: &str) -> bool {
     changed && line.contains(entry)
 }
 
-/// The record key of one item of a repository.
+/// The record key one theory row names.
+///
+/// The rows of the repository record carry the number zero.
 fn record_key(kind: ItemKind, number: u64) -> RecordKey {
-    match kind {
-        ItemKind::Issue => RecordKey::Issue(number),
-        ItemKind::Pr => RecordKey::Pr(number),
+    match (kind, number) {
+        // No issue and no pull request carries the number zero, so a
+        // theory row of the repository record travels under it.
+        (_, 0) => RecordKey::Repo,
+        (ItemKind::Issue, number) => RecordKey::Issue(number),
+        (ItemKind::Pr, number) => RecordKey::Pr(number),
     }
 }
 
@@ -1518,6 +1523,10 @@ impl Daemon {
                 continue;
             };
             self.observe_ready_work(&alias, &snapshot);
+            // A shadow label opens or closes a theory row of the record
+            // it lives on, and no code poll has to run first.
+            self.close_theory_records(&alias);
+            self.derive_theory_rows(&alias, &snapshot);
         }
         self.changed = true;
     }
@@ -1701,6 +1710,56 @@ impl Daemon {
         }
     }
 
+    /// The items whose record can open a theory row this poll.
+    ///
+    /// A shadowed alias reads its shadow issues, because its theory
+    /// labels live there. Every other alias reads its own items. The
+    /// repository record joins the list under the number zero in both
+    /// modes, and the item that carries it in code mode drops out, so one
+    /// event on it opens one row.
+    fn theory_row_items<'a>(
+        &'a self,
+        alias: &str,
+        code: &'a RepoSnapshot,
+    ) -> Vec<(ItemKind, u64, &'a str)> {
+        let repo_title = records::repo_record_title(alias);
+        let shadowed = self
+            .config
+            .repos
+            .get(alias)
+            .is_some_and(|repo| repo.theory_repo().is_some());
+        let mut items: Vec<(ItemKind, u64, &str)> = Vec::new();
+        if shadowed {
+            if let Some(shadow) = self.theory_snapshots.get(alias) {
+                for issue in shadow.issues.values() {
+                    let Some(number) = records::shadow_item(alias, &issue.title) else {
+                        continue;
+                    };
+                    let kind = if code.prs.contains_key(&number) {
+                        ItemKind::Pr
+                    } else {
+                        ItemKind::Issue
+                    };
+                    items.push((kind, number, issue.title.as_str()));
+                }
+            }
+        } else {
+            for (number, issue) in &code.issues {
+                if issue.title == repo_title {
+                    continue;
+                }
+                items.push((ItemKind::Issue, *number, issue.title.as_str()));
+            }
+            items.extend(
+                code.prs
+                    .iter()
+                    .map(|(number, pr)| (ItemKind::Pr, *number, pr.title.as_str())),
+            );
+        }
+        items.push((ItemKind::Issue, 0, "the repository record"));
+        items
+    }
+
     /// Remove the theory label of every record whose rows are answered.
     ///
     /// A record loses `delta-open` once every miss and every violation of
@@ -1715,13 +1774,11 @@ impl Daemon {
         let Some(snapshot) = self.snapshot.repos.get(alias) else {
             return;
         };
-        let mut keys: Vec<RecordKey> = snapshot
-            .issues
-            .keys()
-            .copied()
-            .map(RecordKey::Issue)
+        let keys: Vec<RecordKey> = self
+            .theory_row_items(alias, snapshot)
+            .into_iter()
+            .map(|(kind, number, _)| record_key(kind, number))
             .collect();
-        keys.extend(snapshot.prs.keys().copied().map(RecordKey::Pr));
         let mut closed: Vec<(RecordKey, &'static str)> = Vec::new();
         for key in keys {
             let labels = self.theory_records.labels_of(alias, &key);
@@ -1826,16 +1883,9 @@ impl Daemon {
         };
         // The labels come from the theory read model, not from the item,
         // so a shadowed alias derives its rows from the shadow issue.
-        let records: Vec<(ItemKind, u64, &[String], &str)> = fresh
-            .issues
-            .iter()
-            .map(|(number, issue)| (ItemKind::Issue, *number, issue.title.as_str()))
-            .chain(
-                fresh
-                    .prs
-                    .iter()
-                    .map(|(number, pr)| (ItemKind::Pr, *number, pr.title.as_str())),
-            )
+        let records: Vec<(ItemKind, u64, &[String], &str)> = daemon
+            .theory_row_items(repo, fresh)
+            .into_iter()
             .map(|(kind, number, title)| {
                 (
                     kind,
@@ -24333,6 +24383,90 @@ mod tests {
         rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
 
         assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+        assert!(theory_row_ids(&rig).is_empty());
+    }
+
+    /// In shadow mode the sweep and the teach events land on the shadow
+    /// issue `<alias>/theory`, so its `event-open` label must open a
+    /// theory row of the repository record and the answer must close it
+    /// on the shadow issue.
+    #[test]
+    fn a_shadow_repository_record_opens_a_theory_row_for_its_event() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let event = shadow_sweep();
+        let answer = AnswerBlock {
+            cause: Cause::Recall,
+            entry: "B-checkout".to_string(),
+            rung: 1,
+            area: "web-checkout".to_string(),
+            note: String::new(),
+            slot: "event:0".to_string(),
+            answered_ms: 0,
+        };
+        // The theory poller already read every shadow issue, so the
+        // record resolves with no search call.
+        let mut steps = body_theory_steps(&repo);
+        steps.push(shadow_comment_page_step(
+            SHADOW_ROOT,
+            &block_page(&event_block(&event)),
+        ));
+        steps.push(shadow_comment_step(
+            SHADOW_ROOT,
+            &answers::answer_block(&answer),
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                &format!("repos/{SHADOW_REPO}/issues/{SHADOW_ROOT}/labels/{EVENT_OPEN_LABEL}"),
+            ],
+            gh_ok(),
+        ));
+        let mut rig = Rig::make_in(dir, steps, shadow_of_the_rig);
+
+        rig.poll(vec![issue(142, &[])], Vec::new());
+        theory_poll(
+            &mut rig,
+            vec![shadow_issue(
+                SHADOW_ROOT,
+                "borsuk/theory",
+                &[EVENT_OPEN_LABEL],
+            )],
+        );
+
+        assert_eq!(
+            rig.decision("theory:borsuk:i0:event:0").unwrap().kind,
+            DecisionKind::TheoryEvent {
+                kind: ItemKind::Issue,
+                number: 0,
+                slot: "event:0".to_string(),
+                entry: "web-checkout".to_string(),
+                tag: "sweep".to_string(),
+                question: "INV-9 names a path the code removed".to_string(),
+                source: "event".to_string(),
+            },
+            "the repository record opens its row under the number zero"
+        );
+
+        rig.act(theory_answer(
+            "theory:borsuk:i0:event:0",
+            Cause::Recall,
+            "B-checkout",
+            1,
+        ));
+        rig.poll(vec![issue(142, &[])], Vec::new());
+
+        assert_eq!(label_delete_calls(&rig, EVENT_OPEN_LABEL), 1);
+        assert!(
+            posted_bodies(&rig)
+                .iter()
+                .any(|body| body.contains("\"slot\":\"event:0\"")),
+            "the answer posts on the shadow record"
+        );
         assert!(theory_row_ids(&rig).is_empty());
     }
 
