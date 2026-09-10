@@ -15,7 +15,8 @@ use crate::sock::{
     TicketSummary,
 };
 
-use crate::theory::records::{skips_prediction_gates, THEORY_SHORT_LABEL};
+use crate::gates::REFINED;
+use crate::theory::records::{skips_prediction_gates, THEORY_FULL_LABEL, THEORY_SHORT_LABEL};
 
 use super::markdown::{markdown_lines_with_mentions, MentionStatuses};
 use super::session::SessionView;
@@ -24,8 +25,13 @@ use super::theme::THEME;
 /// How often the open focus refreshes its mention statuses.
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// What the chat pane says while the ticket still owes its prediction.
-const CHAT_WAITS: &str = "chat waits for the short prediction";
+/// What the chat pane says while the ticket still owes its short
+/// prediction.
+const CHAT_WAITS_SHORT: &str = "chat waits for the short prediction";
+
+/// What the chat pane says while the refined ticket still owes its full
+/// prediction.
+const CHAT_WAITS_FULL: &str = "chat waits for the full prediction";
 
 /// The active field of the direct editor.
 #[derive(Debug, Clone, Copy, Default)]
@@ -185,16 +191,27 @@ impl Tickets {
         self.focus_key.clone()
     }
 
-    /// True while the focused ticket of a governed repository still owes
-    /// its short prediction.
-    fn awaits_short_prediction(&self, state: &StateView, repo: &str) -> bool {
+    /// Why the chat waits, while the focused ticket of a governed
+    /// repository still owes a prediction.
+    ///
+    /// The operator writes each prediction from memory and from the
+    /// ticket alone, so the lock covers two windows: before the short
+    /// prediction, and again between `refined` and the full prediction.
+    fn awaits_prediction(&self, state: &StateView, repo: &str) -> Option<&'static str> {
         if !state.theory.get(repo).is_some_and(|theory| theory.governor) {
-            return false;
+            return None;
         }
-        let Some(details) = self.details.as_ref() else {
-            return false;
-        };
-        !self.focus_has_label(THEORY_SHORT_LABEL) && !skips_prediction_gates(&details.issue.labels)
+        let details = self.details.as_ref()?;
+        if skips_prediction_gates(&details.issue.labels) {
+            return None;
+        }
+        if !self.focus_has_label(THEORY_SHORT_LABEL) {
+            return Some(CHAT_WAITS_SHORT);
+        }
+        if self.focus_has_label(REFINED) && !self.focus_has_label(THEORY_FULL_LABEL) {
+            return Some(CHAT_WAITS_FULL);
+        }
+        None
     }
 
     /// True when the focused issue carries the label.
@@ -628,11 +645,10 @@ impl Tickets {
                         return None;
                     }
                     let (repo, number) = self.focus_key.clone()?;
-                    // The operator writes the prediction from memory and
-                    // from the raw ticket alone, so no agent may speak
-                    // before it exists.
-                    if self.awaits_short_prediction(state, &repo) {
-                        self.chat_lock = Some(CHAT_WAITS.to_string());
+                    // No agent may speak before the operator's claim
+                    // exists.
+                    if let Some(reason) = self.awaits_prediction(state, &repo) {
+                        self.chat_lock = Some(reason.to_string());
                         return None;
                     }
                     self.chat_lock = None;
@@ -2807,6 +2823,47 @@ mod tests {
         assert!(
             matches!(action, Some(Action::Ticket(TicketAction::Chat { .. }))),
             "the prediction unlocks the chat"
+        );
+    }
+
+    /// A refined ticket that still owes its full prediction locks the
+    /// chat again, and the label unlocks it.
+    #[test]
+    fn c_waits_for_the_full_prediction_in_the_refined_window() {
+        let mut state = state();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Enter));
+        let mut issue_details = details();
+        issue_details.issue.labels = vec![THEORY_SHORT_LABEL.to_string(), REFINED.to_string()];
+        tickets.observe_details(issue_details.clone());
+
+        let action = tickets.handle_key(&state, key(KeyCode::Char('c')));
+
+        assert!(action.is_none(), "the key opens no conversation");
+        let screen = render_focus(&tickets, &state, 120, 24).join("\n");
+        assert!(
+            screen.contains("chat waits for the full prediction"),
+            "the chat pane names the reason:\n{screen}"
+        );
+
+        issue_details
+            .issue
+            .labels
+            .push(THEORY_FULL_LABEL.to_string());
+        tickets.observe_details(issue_details);
+        assert!(
+            matches!(
+                tickets.handle_key(&state, key(KeyCode::Char('c'))),
+                Some(Action::Ticket(TicketAction::Chat { .. }))
+            ),
+            "the full prediction unlocks the chat"
         );
     }
 
