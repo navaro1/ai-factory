@@ -2702,7 +2702,10 @@ impl Daemon {
         let number = task.number;
         match task.stage {
             Stage::Refine => {
-                format!("the refine run ended, but ticket #{number} still carries `to-refine`")
+                format!(
+                    "the refine run ended, but ticket #{number} carries neither \
+`refined` nor `epic`"
+                )
             }
             Stage::Implement => {
                 format!("the implement run ended, but no PR closes ticket #{number}")
@@ -5540,11 +5543,19 @@ fn proposal_marker_text(text: &str) -> bool {
 }
 
 /// True when GitHub shows the completed refine transition.
+///
+/// The stage has two outcomes and either one counts. A shaped ticket
+/// carries `refined`. A parent that the run split into sub-tickets carries
+/// `epic` instead, because `refined` on a parent would start a second
+/// implementation of work the sub-tickets already own.
 fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
     fresh.issues.get(&number).is_some_and(|issue| {
         issue.open
-            && issue.labels.iter().any(|label| label == "refined")
-            && !issue.labels.iter().any(|label| label == "to-refine")
+            && issue
+                .labels
+                .iter()
+                .any(|label| label == gates::REFINED || label == gates::EPIC)
+            && !issue.labels.iter().any(|label| label == gates::TO_REFINE)
     })
 }
 
@@ -13586,6 +13597,57 @@ mod tests {
         assert!(
             rig.decision("human:borsuk:i142").is_some(),
             "the inbox row carries the ticket from here"
+        );
+    }
+
+    /// A refine run that splits the work has the `epic` label as its
+    /// transition. The parent must never carry `refined`, so the label is
+    /// the only proof the daemon can accept, and the run completes on it.
+    #[test]
+    fn a_split_parent_completes_its_refine_on_the_epic_label() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
+        });
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        rig.event(exited("borsuk/refine-i142", true, "code 0"));
+        assert_eq!(
+            rig.task("borsuk/refine-i142").state,
+            TaskState::Running,
+            "the exit alone never completes the task"
+        );
+
+        // The run created the sub-tickets and marked the parent an epic.
+        rig.poll(
+            vec![
+                issue(142, &[gates::EPIC]),
+                issue(143, &["refined", "chunk"]),
+            ],
+            vec![],
+        );
+
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
+    }
+
+    /// The parent of a split holds no implementable work. Its `epic` label
+    /// closes the refine stage, and the absent `refined` label keeps the
+    /// implement gate shut, so no agent ever starts on the parent.
+    #[test]
+    fn a_split_parent_starts_no_implement_run() {
+        let mut rig = Rig::make_with(vec![], |config| {
+            set_role_harness(config, ExecutionRole::Refine, Harness::Opencode);
+        });
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        rig.event(exited("borsuk/refine-i142", true, "code 0"));
+        rig.poll(vec![issue(142, &[gates::EPIC])], vec![]);
+
+        // A second poll would fire any gate the first one opened.
+        rig.poll(vec![issue(142, &[gates::EPIC])], vec![]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "the epic parent starts no implement task: {:?}",
+            rig.daemon.table.by_id.keys().collect::<Vec<_>>()
         );
     }
 

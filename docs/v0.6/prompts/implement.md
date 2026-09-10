@@ -43,7 +43,9 @@ after integration. Do not run several full test suites concurrently. Make the
 test suite pass. Commit the integrated work in small, complete commits.
 
 Open a draft PR with `gh pr create --draft` when the work is done. Put
-`Closes #{number}` in the body. After the command succeeds, run
+`Closes #{number}` in the body. When the ticket body names a parent ticket and
+marks this ticket as the final chunk, add a second `Closes` line for the parent
+number, so the merge closes the parent too. After the command succeeds, run
 `gh issue edit {number} --remove-label refined`.
 
 If the specification is incomplete, or you need a human decision, add the
