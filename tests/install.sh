@@ -9,10 +9,12 @@ trap 'rm -rf -- "${test_root}"' EXIT
 fixture="${test_root}/repo"
 fake_bin="${test_root}/fake-bin"
 test_home="${test_root}/home"
-mkdir -p "${fixture}/docs/v0.5" "${fixture}/docs/v0.6" "${fake_bin}" "${test_home}"
+mkdir -p "${fixture}/docs/v0.5" "${fixture}/docs/v0.6" "${fixture}/docs/v0.8" \
+    "${fake_bin}" "${test_home}"
 cp "${repo}/install.sh" "${fixture}/install.sh"
 cp "${repo}/docs/v0.5/factory.example.toml" "${fixture}/docs/v0.5/"
 cp -R "${repo}/docs/v0.6/prompts" "${fixture}/docs/v0.6/prompts"
+cp -R "${repo}/docs/v0.8/prompts" "${fixture}/docs/v0.8/prompts"
 
 cat >"${fake_bin}/cargo" <<'FAKE_CARGO'
 #!/usr/bin/env bash
@@ -47,7 +49,7 @@ for file in factory.example.toml factory.toml prompts/refine.md \
     }
 done
 
-grep -Fq '| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |' \
+grep -Fq '| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |' \
     "${config_dir}/prompts/refine.md"
 grep -Fq 'start all agents for that wave in one tool turn' \
     "${config_dir}/prompts/implement.md"

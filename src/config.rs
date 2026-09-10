@@ -241,6 +241,30 @@ impl Default for UsageConfig {
     }
 }
 
+/// The `[measure]` table of `factory.toml`.
+///
+/// A measure task runs one shell command, not an agent, so it answers to
+/// its own limit instead of a stage limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureConfig {
+    /// How many measure tasks may run at once, over every repository.
+    #[serde(default = "default_measure_limit")]
+    pub limit: usize,
+}
+
+fn default_measure_limit() -> usize {
+    2
+}
+
+impl Default for MeasureConfig {
+    fn default() -> Self {
+        Self {
+            limit: default_measure_limit(),
+        }
+    }
+}
+
 /// Whether the theory governor runs for one repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -426,6 +450,7 @@ pub struct Config {
     pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
     pub ticket_chat: TicketChatConfig,
     pub usage: UsageConfig,
+    pub measure: MeasureConfig,
 }
 
 impl Config {
@@ -708,6 +733,7 @@ impl Config {
             },
             roles,
             usage: raw.usage,
+            measure: raw.measure,
         })
     }
 
@@ -812,6 +838,8 @@ struct RawConfig {
     repo: BTreeMap<String, RawRepo>,
     #[serde(default)]
     usage: UsageConfig,
+    #[serde(default)]
+    measure: MeasureConfig,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -11,6 +11,7 @@
 use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
+use crate::daemon::FAST_CHECK_FAILED;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView};
 use crate::tasks::TaskState;
@@ -988,10 +989,11 @@ pub(super) fn footer_hints(app: &App) -> String {
     match row {
         Row::Stage { .. } => "+ - limit · p pause · ? help".to_string(),
         Row::Repo { .. } => "+ - lane · n new · p pause · ? help".to_string(),
-        Row::Ticket { index } => match state.tasks.get(index) {
-            Some(task) if matches!(task.state, TaskState::Failed(_)) => {
-                "enter open · x abort · R retry · ? help".to_string()
+        Row::Ticket { index } => match state.tasks.get(index).map(|task| &task.state) {
+            Some(TaskState::Failed(reason)) if reason.starts_with(FAST_CHECK_FAILED) => {
+                format!("{FAST_CHECK_FAILED} · enter open · x abort · R retry · ? help")
             }
+            Some(TaskState::Failed(_)) => "enter open · x abort · R retry · ? help".to_string(),
             _ => "enter open · r refine · x abort · ? help".to_string(),
         },
         Row::Train { .. } => "g release · s policy · ? help".to_string(),
@@ -4904,5 +4906,17 @@ mod tests {
             );
             assert_eq!(footer_hints(&app), expected, "row {row:?}");
         }
+    }
+
+    /// A review a fast check cancelled names the check in its hint.
+    #[test]
+    fn the_hint_of_a_failed_fast_check_names_the_check() {
+        let mut state = sample_view();
+        state.tasks[7].state = TaskState::Failed(format!("{FAST_CHECK_FAILED}: checkout exit 1"));
+        let app = app_with_state_and_row(state, Row::Ticket { index: 7 });
+        let expected = "fast check failed · enter open · x abort · R retry · ? help";
+
+        assert_eq!(footer_hints(&app), expected);
+        assert!(expected.chars().count() <= crate::tui::HINT_CAP);
     }
 }

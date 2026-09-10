@@ -684,10 +684,16 @@ impl StateInput<'_> {
                     limit,
                     overridden: limit != config.stage(stage).limit,
                     running: running[&stage],
+                    // A measure task holds no stage slot, so it counts
+                    // neither as running nor as queued for one.
                     queued: table
                         .by_id
                         .values()
-                        .filter(|task| task.stage == stage && task.state == TaskState::Queued)
+                        .filter(|task| {
+                            task.stage == stage
+                                && task.state == TaskState::Queued
+                                && task.purpose != crate::tasks::TaskPurpose::Measure
+                        })
                         .count(),
                 }
             })
@@ -701,9 +707,17 @@ impl StateInput<'_> {
                 slots: *slots,
             })
             .collect();
+        // A measure task runs a command for a stage, not a stage of its
+        // own. The board draws the task it holds, so it stays out here.
         let tasks = table
             .order
             .iter()
+            .filter(|id| {
+                table
+                    .by_id
+                    .get(*id)
+                    .is_none_or(|task| task.purpose != crate::tasks::TaskPurpose::Measure)
+            })
             .map(|id| {
                 let task = table
                     .by_id
@@ -1200,6 +1214,34 @@ pub struct TicketResult {
     pub conflict: Option<TicketConflict>,
 }
 
+/// One theory command inside [`Action::Theory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "theory_action", rename_all = "snake_case")]
+pub enum TheoryAction {
+    /// Create the run skill ticket of one repository surface.
+    Setup {
+        /// The repository alias.
+        repo: String,
+        /// The surface name the operator typed.
+        surface: String,
+    },
+    /// Explain one subject against the model and the skills.
+    Teach {
+        /// The repository alias.
+        repo: String,
+        /// The subject of the explanation.
+        key: crate::tasks::TeachKey,
+    },
+}
+
+/// The request identity prefix of one run skill ticket creation.
+///
+/// The daemon reports the outcome through [`Push::TicketResult`], which is
+/// the one result channel a GitHub mutation already has. The UI toasts a
+/// result that carries this prefix, because the operator asked for it in
+/// the Theory view and no ticket row waits for it.
+pub const SKILL_TICKET_REQUEST: &str = "skill-ticket:";
+
 /// One ticket command inside [`Action::Ticket`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "ticket_action", rename_all = "snake_case")]
@@ -1482,19 +1524,6 @@ pub enum Push {
     SettingsResult(SettingsResult),
 }
 
-/// One theory command inside [`Action::Theory`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "theory_action", rename_all = "snake_case")]
-pub enum TheoryAction {
-    /// Explain one subject against the model and the skills.
-    Teach {
-        /// The repository alias.
-        repo: String,
-        /// The subject of the explanation.
-        key: crate::tasks::TeachKey,
-    },
-}
-
 /// One command from a UI or from `aif stop` to the daemon.
 ///
 /// Every variant names its target explicitly. The daemon resolves each
@@ -1600,7 +1629,7 @@ pub enum Action {
     },
     /// Perform one ticket review or mutation action.
     Ticket(TicketAction),
-    /// Perform one theory action.
+    /// Perform one Theory view action.
     Theory(TheoryAction),
     /// Save one role edit against an exact file revision.
     SaveSettings {
@@ -2318,6 +2347,10 @@ mod tests {
             Action::TicketCreate {
                 repo: "qubitsok".to_string(),
             },
+            Action::Theory(TheoryAction::Setup {
+                repo: "borsuk".to_string(),
+                surface: "web".to_string(),
+            }),
             Action::Reconcile { repo: None },
             Action::Theory(TheoryAction::Teach {
                 repo: "borsuk".to_string(),
@@ -4082,6 +4115,23 @@ mod tests {
                 3_000,
             )
             .unwrap();
+        // A fast check carries the review stage for its worktree only. It
+        // holds no review slot, so no stage row counts it and no board row
+        // draws it; the build therefore never looks its input mode up.
+        table
+            .upsert_with_id(
+                crate::tasks::ScopedTask {
+                    id: "borsuk/fast-aabbccdd-checkout",
+                    repo: "borsuk",
+                    stage: Stage::Review,
+                    kind: ItemKind::Pr,
+                    number: 5,
+                },
+                PathBuf::from("/state/logs/borsuk__fast-aabbccdd-checkout.jsonl"),
+                3_500,
+            )
+            .unwrap()
+            .purpose = crate::tasks::TaskPurpose::Measure;
 
         let mut decisions = Decisions::new();
         decisions
@@ -4177,6 +4227,20 @@ mod tests {
         assert!(!refine.overridden);
         assert_eq!(refine.running, 0);
         assert_eq!(refine.queued, 1);
+        let review = &view.stages[2];
+        assert_eq!(review.stage, Stage::Review);
+        assert_eq!(review.running, 0);
+        assert_eq!(
+            review.queued, 0,
+            "the queued fast check holds no review slot"
+        );
+        assert_eq!(
+            view.tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["borsuk/implement-i142", "qubitsok/refine-i7"]
+        );
 
         // The lane reservation of borsuk on implement appears.
         assert_eq!(

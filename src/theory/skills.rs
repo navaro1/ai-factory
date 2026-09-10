@@ -511,6 +511,49 @@ fn index_only(paths: &[String], names: &[String], set: &SkillSet) -> String {
     out
 }
 
+/// Which run skill ticket the daemon creates for one surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillTicket {
+    /// The first run skill of a surface that has none.
+    Setup,
+    /// The repair of a run skill that drifted away from the code.
+    Maintain,
+}
+
+/// The words between the verb and the surface of a run skill ticket title.
+const TITLE_MIDDLE: &str = " the run skill for ";
+
+impl SkillTicket {
+    /// The title verb: `Create` or `Maintain`.
+    const fn verb(self) -> &'static str {
+        match self {
+            SkillTicket::Setup => "Create",
+            SkillTicket::Maintain => "Maintain",
+        }
+    }
+
+    /// The ticket title of one repository surface.
+    pub fn title(self, alias: &str, surface: &str) -> String {
+        format!("{}{TITLE_MIDDLE}{alias}/{surface}", self.verb())
+    }
+}
+
+/// The surface name inside one run skill ticket title.
+///
+/// Every other title answers `None`, so the daemon reads a run skill
+/// ticket from its title alone and never stores a second marker.
+pub fn ticket_surface(title: &str) -> Option<&str> {
+    for kind in [SkillTicket::Setup, SkillTicket::Maintain] {
+        let prefix = format!("{}{TITLE_MIDDLE}", kind.verb());
+        let Some(tail) = title.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let (_, surface) = tail.split_once('/')?;
+        return (!surface.is_empty() && !surface.contains('/')).then_some(surface);
+    }
+    None
+}
+
 fn area_of<'a>(area: &str, verify: &'a VerifyMap) -> Option<&'a Area> {
     verify.areas.iter().find(|entry| entry.id == area)
 }
@@ -1146,5 +1189,27 @@ surface: web\ndriver: playwright-cli\ntier: browser\nblind: native dialogs\n---\
             "the feature file survives:\n{out}"
         );
         assert!(out.contains("# Checkout\n\nThe cart pays."), "{out}");
+    }
+
+    #[test]
+    fn a_run_skill_title_round_trips_through_the_surface_reader() {
+        assert_eq!(
+            SkillTicket::Setup.title("borsuk", "web"),
+            "Create the run skill for borsuk/web"
+        );
+        assert_eq!(
+            SkillTicket::Maintain.title("borsuk", "web"),
+            "Maintain the run skill for borsuk/web"
+        );
+        assert_eq!(
+            ticket_surface("Create the run skill for borsuk/web"),
+            Some("web")
+        );
+        assert_eq!(
+            ticket_surface("Maintain the run skill for borsuk/api"),
+            Some("api")
+        );
+        assert_eq!(ticket_surface("Add a checkout button"), None);
+        assert_eq!(ticket_surface("Create the run skill for borsuk"), None);
     }
 }
