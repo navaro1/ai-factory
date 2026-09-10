@@ -108,11 +108,13 @@ impl Model {
     /// The slice of this model over `areas`, in file order.
     ///
     /// Every name is the id of a boundary entry. The slice holds those
-    /// boundaries, the states their sides name, the transitions between
-    /// those states, and every invariant and failure that names one of
-    /// them. It then takes one hop: every boundary those invariants and
-    /// failures touch. A boundary that only shares a side name stays out,
-    /// because a shared region name is not a relation.
+    /// boundaries, the states their sides name, every transition that
+    /// touches one of those states, and every invariant and failure that
+    /// names one of them. It then takes one hop: every boundary those
+    /// invariants and failures touch. A transition out of the area keeps
+    /// its own entry, and the state it leads to stays out. A boundary
+    /// that only shares a side name stays out, because a shared region
+    /// name is not a relation.
     pub fn slice(&self, areas: &[&str]) -> Model {
         let mut names: BTreeSet<&str> = areas.iter().copied().collect();
         for entry in &self.entries {
@@ -416,6 +418,75 @@ fn check_references(entries: &[Entry]) -> Result<(), ModelError> {
     Ok(())
 }
 
+/// The TOML text of `entries`, one `[[entry]]` table each.
+///
+/// The text parses back through [`parse`], so a caller appends it to a
+/// model file and validates the whole file at once. The order of the keys
+/// is the order [`Entry`] declares them.
+pub fn render(entries: &[Entry]) -> String {
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str("[[entry]]\n");
+        push_key(&mut text, "kind", entry.kind_name());
+        push_key(&mut text, "id", entry.id());
+        push_key(&mut text, "title", entry.title());
+        push_key(&mut text, "statement", entry.statement());
+        match entry {
+            Entry::Invariant { constrains, .. } => push_list(&mut text, "constrains", constrains),
+            Entry::State { .. } => {}
+            Entry::Transition { from, to, .. } => {
+                push_key(&mut text, "from", from);
+                push_key(&mut text, "to", to);
+            }
+            Entry::Boundary { sides, paths, .. } => {
+                push_list(&mut text, "sides", sides);
+                push_list(&mut text, "paths", paths);
+            }
+            Entry::Failure { crosses, .. } => push_key(&mut text, "crosses", crosses),
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// Append one `key = "value"` line.
+fn push_key(text: &mut String, key: &str, value: &str) {
+    text.push_str(key);
+    text.push_str(" = ");
+    text.push_str(&quote(value));
+    text.push('\n');
+}
+
+/// Append one `key = ["a", "b"]` line.
+fn push_list(text: &mut String, key: &str, values: &[String]) {
+    let items: Vec<String> = values.iter().map(|value| quote(value)).collect();
+    text.push_str(key);
+    text.push_str(" = [");
+    text.push_str(&items.join(", "));
+    text.push_str("]\n");
+}
+
+/// One TOML basic string, with every reserved character escaped.
+fn quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for one in value.chars() {
+        match one {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 || other as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", other as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +741,31 @@ mod tests {
     }
 
     #[test]
+    fn slice_keeps_an_outbound_transition_and_leaves_the_state_it_leads_to_out() {
+        let text = format!(
+            "{}{}{}{}{}",
+            entry("state", "S-in", ""),
+            entry("state", "S-out", ""),
+            entry("state", "S-far", ""),
+            entry(
+                "boundary",
+                "B-1",
+                "sides = [\"S-in\", \"S-out\"]\npaths = [\"src/one/**\"]"
+            ),
+            entry("transition", "T-1", "from = \"S-out\"\nto = \"S-far\""),
+        );
+        let model = parse(&text).expect("the outbound model must parse");
+
+        let ids = slice_ids(&model, &["B-1"]);
+
+        assert_eq!(ids, ["S-in", "S-out", "B-1", "T-1"]);
+        assert!(
+            !ids.iter().any(|id| id == "S-far"),
+            "the state the transition leads to stays out"
+        );
+    }
+
+    #[test]
     fn slice_over_no_area_is_empty_and_a_failure_carries_its_boundary() {
         let model = two_area_model();
         assert!(slice_ids(&model, &[]).is_empty());
@@ -704,5 +800,66 @@ mod tests {
     fn an_empty_model_parses() {
         let model = parse("").expect("an empty model must parse");
         assert!(model.entries.is_empty());
+    }
+
+    #[test]
+    fn render_writes_entries_that_parse_back_unchanged() {
+        let entries = vec![
+            Entry::State {
+                id: "checkout".to_string(),
+                title: "Checkout".to_string(),
+                statement: "The buyer says \"pay\" and\tthe cart charges.".to_string(),
+            },
+            Entry::Boundary {
+                id: "B-gh".to_string(),
+                title: "The GitHub boundary".to_string(),
+                statement: "Every call leaves through one client.".to_string(),
+                sides: vec!["daemon".to_string(), "github".to_string()],
+                paths: vec!["src/gh.rs".to_string()],
+            },
+            Entry::Invariant {
+                id: "I-one".to_string(),
+                title: "One client".to_string(),
+                statement: "No other module calls gh.".to_string(),
+                constrains: vec!["B-gh".to_string()],
+            },
+            Entry::Transition {
+                id: "T-pay".to_string(),
+                title: "Pay".to_string(),
+                statement: "The cart charges the card.".to_string(),
+                from: "checkout".to_string(),
+                to: "checkout".to_string(),
+            },
+            Entry::Failure {
+                id: "F-timeout".to_string(),
+                title: "Timeout".to_string(),
+                statement: "The call never answers.".to_string(),
+                crosses: "B-gh".to_string(),
+            },
+        ];
+
+        let text = render(&entries);
+
+        assert!(text.starts_with("[[entry]]\nkind = \"state\"\n"), "{text}");
+        let back = parse(&text).expect("rendered entries parse");
+        assert_eq!(back.entries, entries);
+    }
+
+    #[test]
+    fn render_appends_to_a_model_file_that_parses_as_a_whole() {
+        let base = entry("state", "cart", "");
+        let text = format!(
+            "{base}\n{}",
+            render(&[Entry::State {
+                id: "cart".to_string(),
+                title: "Cart".to_string(),
+                statement: "The buyer fills it.".to_string(),
+            }])
+        );
+
+        let error = parse(&text).expect_err("a repeated id is refused");
+
+        assert_eq!(error.entry.as_deref(), Some("cart"));
+        assert_eq!(error.message, "duplicate entry id");
     }
 }

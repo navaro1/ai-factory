@@ -16,7 +16,9 @@ use crate::sock::{
 };
 
 use crate::gates::REFINED;
-use crate::theory::records::{skips_prediction_gates, THEORY_FULL_LABEL, THEORY_SHORT_LABEL};
+use crate::theory::records::{
+    skips_prediction_gates, RecordKey, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
+};
 
 use super::markdown::{markdown_lines_with_mentions, MentionStatuses};
 use super::session::SessionView;
@@ -197,18 +199,22 @@ impl Tickets {
     /// The operator writes each prediction from memory and from the
     /// ticket alone, so the lock covers two windows: before the short
     /// prediction, and again between `refined` and the full prediction.
+    /// Each theory label sits on the theory record, which is the shadow
+    /// issue in shadow mode, so the record view answers for it.
     fn awaits_prediction(&self, state: &StateView, repo: &str) -> Option<&'static str> {
-        if !state.theory.get(repo).is_some_and(|theory| theory.governor) {
-            return None;
-        }
+        let theory = state.theory.get(repo).filter(|theory| theory.governor)?;
         let details = self.details.as_ref()?;
         if skips_prediction_gates(&details.issue.labels) {
             return None;
         }
-        if !self.focus_has_label(THEORY_SHORT_LABEL) {
+        let number = self.focus_key.as_ref()?.1;
+        let key = RecordKey::Issue(number).key_text();
+        let labels = &details.issue.labels;
+        if !theory.record_carries(&key, labels, THEORY_SHORT_LABEL) {
             return Some(CHAT_WAITS_SHORT);
         }
-        if self.focus_has_label(REFINED) && !self.focus_has_label(THEORY_FULL_LABEL) {
+        if self.focus_has_label(REFINED) && !theory.record_carries(&key, labels, THEORY_FULL_LABEL)
+        {
             return Some(CHAT_WAITS_FULL);
         }
         None

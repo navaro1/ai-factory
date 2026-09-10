@@ -18,7 +18,7 @@ use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
 use crate::daemon::FAST_CHECK_FAILED;
-use crate::gates::REFINED;
+use crate::gates::{REFINED, TO_REFINE};
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView, TheoryAction};
 use crate::tasks::TaskState;
@@ -792,10 +792,15 @@ fn send_refine(
 
 /// True while one ticket of a governed repository still owes its short
 /// prediction.
+///
+/// The theory label sits on the theory record, which is the shadow issue
+/// in shadow mode, so the record view answers for it. The gate skip
+/// reads the ticket, because `verify-skill` and `model-pr` label the
+/// ticket itself in both modes.
 fn wants_prediction(state: &StateView, repo: &str, number: u64) -> bool {
-    if !state.theory.get(repo).is_some_and(|theory| theory.governor) {
+    let Some(theory) = state.theory.get(repo).filter(|theory| theory.governor) else {
         return false;
-    }
+    };
     let Some(ticket) = state
         .tickets
         .iter()
@@ -803,17 +808,17 @@ fn wants_prediction(state: &StateView, repo: &str, number: u64) -> bool {
     else {
         return false;
     };
-    !ticket
-        .labels
-        .iter()
-        .any(|label| label == THEORY_SHORT_LABEL)
+    let key = RecordKey::Issue(number).key_text();
+    !theory.record_carries(&key, &ticket.labels, THEORY_SHORT_LABEL)
         && !skips_prediction_gates(&ticket.labels)
 }
 
 /// Handle one key while the short prediction input holds the keyboard.
 ///
-/// Escape closes the input and sends nothing. Enter sends the line; an
-/// empty line closes the input and sends nothing.
+/// Escape closes the input and sends nothing, and so does an empty line.
+/// Enter sends every other line. A line that names areas but makes no
+/// claim closes the input and says why, because a silent close reads
+/// like a lost key press.
 pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSink) {
     let allowed = match key.code {
         KeyCode::Char(_) => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
@@ -838,7 +843,11 @@ pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
             let Some(input) = app.prediction.take() else {
                 return;
             };
+            if input.buffer.trim().is_empty() {
+                return;
+            }
             let Some(prediction) = parse_prediction(&input.buffer) else {
+                app.show_toast(NEEDS_CLAIM);
                 return;
             };
             send_refine(
@@ -854,11 +863,14 @@ pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
     }
 }
 
+/// What the toast says when the typed line carries no claim.
+const NEEDS_CLAIM: &str = "a prediction needs a claim before the area list";
+
 /// Parse one typed line into a short prediction.
 ///
 /// The grammar is the claim, then an optional trailing `[area, area]`
-/// list. A line with no claim yields nothing. An empty area name drops
-/// out of the list.
+/// list. A line that holds only the area list carries no claim and
+/// yields nothing. An empty area name drops out of the list.
 fn parse_prediction(line: &str) -> Option<ShortPrediction> {
     let line = line.trim();
     let mut text = line;
@@ -928,9 +940,14 @@ fn predict_ticket_with(
 
 /// The repository and number of the row that owes a full prediction.
 ///
-/// The row must carry `refined` and lack `theory-full` in a governed
-/// repository. A `model-pr` or `verify-skill` ticket writes no
-/// prediction, and neither does a pull request row.
+/// The row must carry `refined`, lack `to-refine`, and lack
+/// `theory-full` in a governed repository. That is the implement gate of
+/// the same ticket, so the key offers the prediction exactly where it
+/// unblocks the work. A ticket a refine agent still reshapes carries
+/// `to-refine` and takes the pause key instead. A `model-pr` or
+/// `verify-skill` ticket writes no prediction, and neither does a pull
+/// request row. The theory label sits on the theory record, so a shadow
+/// repository reads it from the record view instead of the ticket.
 fn full_prediction_target(app: &App) -> Option<(String, u64)> {
     let state = app.state.as_ref()?;
     let Row::Ticket { index } = selected_row(app)? else {
@@ -952,7 +969,13 @@ fn full_prediction_target(app: &App) -> Option<(String, u64)> {
         .iter()
         .find(|ticket| ticket.repo == task.repo && ticket.number == task.number)?;
     let carries = |label: &str| ticket.labels.iter().any(|one| one == label);
-    if skips_prediction_gates(&ticket.labels) || !carries(REFINED) || carries(THEORY_FULL_LABEL) {
+    let theory = state.theory.get(&task.repo)?;
+    let key = RecordKey::Issue(task.number).key_text();
+    if skips_prediction_gates(&ticket.labels)
+        || !carries(REFINED)
+        || carries(TO_REFINE)
+        || theory.record_carries(&key, &ticket.labels, THEORY_FULL_LABEL)
+    {
         return None;
     }
     Some((task.repo.clone(), task.number))
@@ -4555,7 +4578,12 @@ mod tests {
     /// The render moment of the prediction tests.
     const NOW_MS: u64 = 1_000_000;
 
-    use crate::gates::{AWAITS_SHORT_HINT, MODEL_ERROR_HINT, TO_REFINE};
+    /// One press of the enter key.
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    use crate::gates::{AWAITS_SHORT_HINT, MODEL_ERROR_HINT};
 
     /// One state whose `borsuk` repository is governed and holds ticket
     /// 140 with `labels`.
@@ -4644,11 +4672,7 @@ mod tests {
         for character in "block the empty card [web-checkout, api-orders]".chars() {
             typing_key(&mut app, pressed(character), &mut sink);
         }
-        typing_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &mut sink,
-        );
+        typing_key(&mut app, enter(), &mut sink);
 
         assert_eq!(
             sink.0,
@@ -4664,6 +4688,35 @@ mod tests {
             }]
         );
         assert!(app.prediction.is_none(), "the input closes after the send");
+    }
+
+    /// A line that names areas but makes no claim closes the input and
+    /// says why, and an empty line closes it quietly.
+    #[test]
+    fn a_prediction_line_with_no_claim_says_why_and_sends_nothing() {
+        let mut app = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('r'), &mut sink);
+        for character in "[web-checkout]".chars() {
+            typing_key(&mut app, pressed(character), &mut sink);
+        }
+        typing_key(&mut app, enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "the claimless line sends nothing");
+        assert!(app.prediction.is_none(), "the input closes");
+        assert_eq!(
+            app.visible_toast(),
+            Some("a prediction needs a claim before the area list")
+        );
+
+        let mut quiet = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut quiet, pressed('r'), &mut sink);
+        typing_key(&mut quiet, enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "the empty line sends nothing");
+        assert!(quiet.prediction.is_none(), "the input closes");
+        assert_eq!(quiet.visible_toast(), None, "an empty line says nothing");
     }
 
     /// Escape closes the input and sends nothing.
@@ -4685,6 +4738,45 @@ mod tests {
     // The full prediction
     // ------------------------------------------------------------------
 
+    /// In shadow mode the theory labels sit on the shadow issue, so the
+    /// code ticket keeps only its pipeline labels and the record view
+    /// decides both prediction keys.
+    #[test]
+    fn the_record_labels_decide_the_prediction_keys_in_shadow_mode() {
+        let mut app = refined_app(&[REFINED]);
+        let key = RecordKey::Issue(140).key_text();
+        let record = |app: &mut App, labels: &[&str]| {
+            let state = app.state.as_mut().expect("the state");
+            let theory = state.theory.get_mut("borsuk").expect("the repository");
+            theory.records.get_mut(&key).expect("the record").labels =
+                labels.iter().map(|label| label.to_string()).collect();
+        };
+
+        record(&mut app, &[]);
+        let state = app.state.as_ref().expect("the state");
+        assert!(
+            wants_prediction(state, "borsuk", 140),
+            "a record without theory-short still owes the short prediction"
+        );
+        assert_eq!(
+            full_prediction_target(&app),
+            Some(("borsuk".to_string(), 140)),
+            "a record without theory-full owes the full prediction"
+        );
+
+        record(&mut app, &[THEORY_SHORT_LABEL, THEORY_FULL_LABEL]);
+        let state = app.state.as_ref().expect("the state");
+        assert!(
+            !wants_prediction(state, "borsuk", 140),
+            "the shadow label answers the short prediction"
+        );
+        assert_eq!(
+            full_prediction_target(&app),
+            None,
+            "the shadow label answers the full prediction"
+        );
+    }
+
     /// The model of the full prediction tests: one boundary named
     /// `web-checkout` and one invariant over it.
     fn full_model() -> crate::theory::model::Model {
@@ -4699,6 +4791,9 @@ mod tests {
 
     /// The sample app whose ticket 140 is refined and governed, with the
     /// short prediction of `web-checkout` on its record.
+    ///
+    /// The repository runs in code mode, so the record labels repeat the
+    /// ticket labels, the way the daemon stamps them.
     fn refined_app(labels: &[&str]) -> App {
         let mut state = governed_view(labels, "", Vec::new());
         let theory = state.theory.get_mut("borsuk").expect("the repository");
@@ -4712,7 +4807,8 @@ mod tests {
                     areas: vec!["web-checkout".to_string()],
                 }),
                 full: None,
-                delta: None,
+                labels: labels.iter().map(|label| label.to_string()).collect(),
+                ..crate::sock::RecordView::default()
             },
         );
         App {
@@ -4841,6 +4937,7 @@ mod tests {
         for labels in [
             vec![REFINED, THEORY_FULL_LABEL],
             vec![REFINED, "verify-skill"],
+            vec![REFINED, TO_REFINE],
             vec![TO_REFINE],
         ] {
             let mut app = refined_app(&labels);
@@ -4879,24 +4976,58 @@ mod tests {
         );
     }
 
-    /// The implement lane draws its own holds, and the refine lane draws
-    /// only its own.
+    /// The character column one line of the board starts `needle` at.
+    fn column_of(board: &str, needle: &str) -> usize {
+        board
+            .lines()
+            .find_map(|line| line.find(needle).map(|at| line[..at].chars().count()))
+            .unwrap_or_else(|| panic!("the board draws {needle}:\n{board}"))
+    }
+
+    /// Each lane draws the holds of its own stage. The refine hold sits
+    /// in the refine column and the implement hold in the implement
+    /// column, so a hold never lands in the wrong lane.
     #[test]
     fn each_lane_draws_the_holds_of_its_own_stage() {
         let mut state = governed_view(
             &[REFINED],
             "",
-            vec![crate::sock::HoldView {
-                number: 140,
-                reason: crate::gates::AWAITS_FULL_HINT.to_string(),
-                stage: Stage::Implement,
-            }],
+            vec![
+                crate::sock::HoldView {
+                    number: 140,
+                    reason: crate::gates::AWAITS_FULL_HINT.to_string(),
+                    stage: Stage::Implement,
+                },
+                crate::sock::HoldView {
+                    number: 141,
+                    reason: AWAITS_SHORT_HINT.to_string(),
+                    stage: Stage::Refine,
+                },
+            ],
         );
         state.theory.get_mut("borsuk").unwrap().model = full_model();
         let board = render_board(state, 200, 30, NOW_MS);
+
+        let header = board
+            .lines()
+            .find(|line| line.contains("refine") && line.contains("implement"))
+            .unwrap_or_else(|| panic!("the four lanes share one row:\n{board}"));
+        let refine_at = header[..header.find("refine").unwrap()].chars().count();
+        let implement_at = header[..header.find("implement").unwrap()].chars().count();
+        let review_at = header[..header.find("review").unwrap()].chars().count();
+
+        let short_at = column_of(&board, "borsuk #141 awaits short prediction");
         assert!(
-            board.contains("borsuk #140 awaits full prediction"),
-            "the implement lane names the hold:\n{board}"
+            (refine_at..implement_at).contains(&short_at),
+            "the short hold sits in the refine lane at {short_at}, \
+             which spans {refine_at}..{implement_at}:\n{board}"
+        );
+
+        let full_at = column_of(&board, "borsuk #140 awaits full prediction");
+        assert!(
+            (implement_at..review_at).contains(&full_at),
+            "the full hold sits in the implement lane at {full_at}, \
+             which spans {implement_at}..{review_at}:\n{board}"
         );
     }
 
