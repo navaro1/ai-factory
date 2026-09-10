@@ -6523,12 +6523,15 @@ impl Daemon {
 
     /// Check one full prediction against the model.
     ///
-    /// The `other-areas` slot names areas, so it runs the area check that
-    /// the short prediction ran and refuses an area with no entries
-    /// first. That slot may name none, because a change that reaches no
-    /// other area is an answer. Every other slot names model entries, and
-    /// an id the model does not carry refuses the whole prediction.
+    /// The shape check runs first, because a message no template wrote
+    /// reaches this action too. The `other-areas` slot names areas, so it
+    /// runs the area check that the short prediction ran and refuses an
+    /// area with no entries. That slot may name none, because a change
+    /// that reaches no other area is an answer. Every other slot names
+    /// model entries, and an id the model does not carry refuses the
+    /// whole prediction.
     fn check_full(&self, alias: &str, prediction: &FullPrediction) -> Result<()> {
+        records::check_full_shape(prediction).map_err(|reason| anyhow!(reason))?;
         let areas: Vec<String> = prediction
             .slots
             .iter()
@@ -23785,6 +23788,39 @@ mod tests {
         );
         assert_eq!(rig.job_count(), 0, "the implement gate yields no work");
         assert!(!rig.daemon.table.by_id.contains_key("borsuk/implement-i142"));
+    }
+
+    /// A prediction whose shape no template wrote is refused before any
+    /// post, and the reason names the broken part.
+    #[test]
+    fn a_full_prediction_with_a_broken_shape_is_refused_before_any_post() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let before = gh_argv(&rig).len();
+
+        let mut wrong_kind = full_prediction(&["web-checkout"]);
+        wrong_kind.kind = records::PREDICTION_SHORT.to_string();
+        rig.act(predict_with(wrong_kind));
+
+        assert_eq!(gh_argv(&rig).len(), before, "the refusal writes nothing");
+        assert_eq!(
+            last_result(&rx).message,
+            "the prediction kind is short, not full"
+        );
+
+        let mut missing = full_prediction(&["web-checkout"]);
+        missing.slots.remove(0);
+        rig.act(predict_with(missing));
+
+        assert_eq!(gh_argv(&rig).len(), before, "the refusal writes nothing");
+        assert_eq!(last_result(&rx).message, "slot behaviours is missing");
     }
 
     /// An entry id the model does not carry refuses the whole prediction

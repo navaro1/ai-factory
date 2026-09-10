@@ -18,7 +18,7 @@ use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
 use crate::daemon::FAST_CHECK_FAILED;
-use crate::gates::REFINED;
+use crate::gates::{REFINED, TO_REFINE};
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView, TheoryAction};
 use crate::tasks::TaskState;
@@ -937,9 +937,13 @@ fn predict_ticket_with(
 
 /// The repository and number of the row that owes a full prediction.
 ///
-/// The row must carry `refined` and lack `theory-full` in a governed
-/// repository. A `model-pr` or `verify-skill` ticket writes no
-/// prediction, and neither does a pull request row.
+/// The row must carry `refined`, lack `to-refine`, and lack
+/// `theory-full` in a governed repository. That is the implement gate of
+/// the same ticket, so the key offers the prediction exactly where it
+/// unblocks the work. A ticket a refine agent still reshapes carries
+/// `to-refine` and takes the pause key instead. A `model-pr` or
+/// `verify-skill` ticket writes no prediction, and neither does a pull
+/// request row.
 fn full_prediction_target(app: &App) -> Option<(String, u64)> {
     let state = app.state.as_ref()?;
     let Row::Ticket { index } = selected_row(app)? else {
@@ -961,7 +965,11 @@ fn full_prediction_target(app: &App) -> Option<(String, u64)> {
         .iter()
         .find(|ticket| ticket.repo == task.repo && ticket.number == task.number)?;
     let carries = |label: &str| ticket.labels.iter().any(|one| one == label);
-    if skips_prediction_gates(&ticket.labels) || !carries(REFINED) || carries(THEORY_FULL_LABEL) {
+    if skips_prediction_gates(&ticket.labels)
+        || !carries(REFINED)
+        || carries(TO_REFINE)
+        || carries(THEORY_FULL_LABEL)
+    {
         return None;
     }
     Some((task.repo.clone(), task.number))
@@ -4542,7 +4550,7 @@ mod tests {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
     }
 
-    use crate::gates::{AWAITS_SHORT_HINT, MODEL_ERROR_HINT, TO_REFINE};
+    use crate::gates::{AWAITS_SHORT_HINT, MODEL_ERROR_HINT};
 
     /// One state whose `borsuk` repository is governed and holds ticket
     /// 140 with `labels`.
@@ -4852,6 +4860,7 @@ mod tests {
         for labels in [
             vec![REFINED, THEORY_FULL_LABEL],
             vec![REFINED, "verify-skill"],
+            vec![REFINED, TO_REFINE],
             vec![TO_REFINE],
         ] {
             let mut app = refined_app(&labels);
@@ -4890,24 +4899,58 @@ mod tests {
         );
     }
 
-    /// The implement lane draws its own holds, and the refine lane draws
-    /// only its own.
+    /// The character column one line of the board starts `needle` at.
+    fn column_of(board: &str, needle: &str) -> usize {
+        board
+            .lines()
+            .find_map(|line| line.find(needle).map(|at| line[..at].chars().count()))
+            .unwrap_or_else(|| panic!("the board draws {needle}:\n{board}"))
+    }
+
+    /// Each lane draws the holds of its own stage. The refine hold sits
+    /// in the refine column and the implement hold in the implement
+    /// column, so a hold never lands in the wrong lane.
     #[test]
     fn each_lane_draws_the_holds_of_its_own_stage() {
         let mut state = governed_view(
             &[REFINED],
             "",
-            vec![crate::sock::HoldView {
-                number: 140,
-                reason: crate::gates::AWAITS_FULL_HINT.to_string(),
-                stage: Stage::Implement,
-            }],
+            vec![
+                crate::sock::HoldView {
+                    number: 140,
+                    reason: crate::gates::AWAITS_FULL_HINT.to_string(),
+                    stage: Stage::Implement,
+                },
+                crate::sock::HoldView {
+                    number: 141,
+                    reason: AWAITS_SHORT_HINT.to_string(),
+                    stage: Stage::Refine,
+                },
+            ],
         );
         state.theory.get_mut("borsuk").unwrap().model = full_model();
         let board = render_board(state, 200, 30, NOW_MS);
+
+        let header = board
+            .lines()
+            .find(|line| line.contains("refine") && line.contains("implement"))
+            .unwrap_or_else(|| panic!("the four lanes share one row:\n{board}"));
+        let refine_at = header[..header.find("refine").unwrap()].chars().count();
+        let implement_at = header[..header.find("implement").unwrap()].chars().count();
+        let review_at = header[..header.find("review").unwrap()].chars().count();
+
+        let short_at = column_of(&board, "borsuk #141 awaits short prediction");
         assert!(
-            board.contains("borsuk #140 awaits full prediction"),
-            "the implement lane names the hold:\n{board}"
+            (refine_at..implement_at).contains(&short_at),
+            "the short hold sits in the refine lane at {short_at}, \
+             which spans {refine_at}..{implement_at}:\n{board}"
+        );
+
+        let full_at = column_of(&board, "borsuk #140 awaits full prediction");
+        assert!(
+            (implement_at..review_at).contains(&full_at),
+            "the full hold sits in the implement lane at {full_at}, \
+             which spans {implement_at}..{review_at}:\n{board}"
         );
     }
 
