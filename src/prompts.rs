@@ -243,7 +243,7 @@ block in this form. Keep the JSON on one line:
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Ticket #{number}: {title}
+Ticket #{number}, {title}
 
 {body}
 "#;
@@ -265,6 +265,27 @@ answer settles the question. Act on it, and never ask that question again.
 Your goal is a complete change that meets every acceptance criterion with the
 shortest safe delivery time. Follow the repository instructions and keep the
 requested scope. Implement the ticket on the current branch.
+
+# The theory slices
+
+Read the two blocks below before your first edit. They carry the theory model
+and the run skills of the areas the ticket touches, and they are empty when
+the governor is off.
+
+{model}
+
+{skills}
+
+# The simplest change
+
+Read the conventions of every file you touch, before you edit it. Follow
+them. Make the smallest change that meets every acceptance criterion. Add no
+abstraction, layer, flag, or dependency that no criterion needs. Delete the
+dead weight you meet, in its own commit. Before each commit, strip your
+narrating comments, every guard no criterion asks for, and every edit outside
+the plan.
+
+# The execution plan
 
 Use the ticket implementation plan as the execution schedule. If routine code
 details make the plan stale, update the schedule and continue. If the ticket
@@ -293,6 +314,64 @@ Run focused validation after each chunk. Run the required full validation once
 after integration. Do not run several full test suites concurrently. Make the
 test suite pass. Commit the integrated work in small, complete commits.
 
+# The proof
+
+Drive every feature you touched once through its run skill, before you open
+the PR. Write one Before / After line per acceptance criterion, from what you
+observed. Write no line you did not observe. Run every fast command of those
+features and paste its exit code under the line.
+
+# The lever rule
+
+When you check the same fact by hand twice, or write a throwaway script to
+check it, add that script to the run skill in the same PR. Give it one
+invocation line in `SKILL.md`, or name it as the `fast` command of a feature
+file. Commit the lever on its own. A reviewer must be able to rerun it. A
+one-off `grep`, a line of shell history, and a test that passes when every
+dependency returns nothing are not levers.
+
+# Tests
+
+Every test you add asserts a literal result through the public path of the
+change. Every test you add fails with the change reverted. A test that still
+passes with the change reverted proves nothing. Delete it, or rewrite it.
+
+# The PR body
+
+The body holds `## Why`, `## Before / After`, and `## Blast radius`, and
+nothing else.
+
+`## Why` holds one or two short paragraphs. Name the behaviour that changes,
+and for whom. `## Blast radius` holds one to three sentences. Name what else
+the change touches, and why it is safe.
+
+`## Before / After` holds one line per acceptance criterion. Two surfaces
+prove one criterion with two lines. The grammar is this line.
+
+- AC-<n> · <feature or measurer> · <tier or measure> · <command> · before: <observed> · after: <observed>
+
+The separator is one middle dot with one space on each side. The tier is
+`browser`, `dom`, `http`, `terminal`, `none`, or `measure` for a measurer
+line, and it names how far your drive reached. These two lines show the
+shape.
+
+- AC-1 · checkout-submit · browser · `npx playwright test checkout` · before: an empty card is accepted and the API returns 500 · after: the field shows "Card is required" and the page sends no request
+- AC-2 · api-orders · http · `curl -s -X POST :4000/orders -d @empty.json` · before: 500 and the log line `NullPointer at Orders.create` · after: 422 and the body `{"error":"card_required"}`
+
+Write short declarative sentences, one thought per sentence, in the active
+voice. Narrate no work. The body carries no `## Summary` section and no
+`## Test plan` section. It carries at most 40 lines of prose outside the
+fenced blocks. It carries no long dash, no curly quote, and no colon inside a
+sentence. A transcript goes in a fenced block under its own line, cut to 30
+lines, and the full file stays in `.aif/evidence/` in this worktree.
+
+Every path your commits change belongs to an owned path of the plan table, to
+a run skill directory, or to a test file. A dependency manifest changes only
+when the ticket names the dependency. The factory reads this body, refuses a
+body that breaks one of these rules, and sends the ticket back to you.
+
+# The PR
+
 Open a draft PR with `gh pr create --draft` when the work is done. Put
 `Closes #{number}` in the body. When the ticket body names a parent ticket and
 marks this ticket as the final chunk, add a second `Closes` line for the parent
@@ -308,17 +387,18 @@ on one line:
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Report one line at the end: what you did, and the PR number.
+Report one line at the end. Name what you did, and the PR number.
 
-Ticket #{number}: {title}
+Ticket #{number}, {title}
 
 {body}
 "#;
 
 /// The built-in prompt of a review run.
 pub const REVIEW_PROMPT: &str = r#"You review PR #{number} of {repo}
-({owner_repo}). You work in {worktree}, your own git worktree. Never create
-another git worktree; work only in this one.
+({owner_repo}). You work in {worktree}, your own git worktree. Except for
+the base worktree this prompt names, never create another git worktree; work
+only in this one.
 
 Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a
@@ -329,11 +409,11 @@ Before any other step, read the newest comments of the PR with `gh`. An
 operator answer to a question from an earlier run arrives there. Such an
 answer settles the question. Act on it, and never ask that question again.
 
-PR #{number}: {title}
+PR #{number}, {title}
 
 {body}
 
-Tickets this PR closes: {tickets}
+The tickets this PR closes are {tickets}
 
 You are the last agent on this change. You repair every finding yourself. You
 never hand a finding back to the author. The PR must leave your run ready for
@@ -353,6 +433,51 @@ Before your first edit, prove that this worktree holds the PR head. Compare
 `git rev-parse HEAD`. When the two differ, run
 `git fetch origin pull/{number}/head` and then `git reset --hard FETCH_HEAD`.
 
+# The theory slices
+
+The two blocks below carry the theory model and the run skills of the areas
+this diff touches, and they are empty when the governor is off.
+
+{model}
+
+{skills}
+
+# The base worktree
+
+Create the base worktree once, and only when the re-drive below asks for it.
+Run `git worktree add --detach .aif/base $(git merge-base origin/main HEAD)`
+inside this worktree. Read the default branch of the repository first, and
+use its name in place of `main`. The path `.aif/` never reaches a commit.
+Remove the base worktree with `git worktree remove --force .aif/base` before
+you push.
+
+# The re-drive
+
+Trust no Before / After line until you drive it yourself.
+
+1. Run the command of every Before / After line on the head. Compare what you
+   observe with the after text of the line.
+2. For a ticket with the `bug` label, run the command of the `## Repro`
+   section in the base worktree, and expect the before text. Then run it on
+   the head, and expect the after text. Red on base, green on head.
+3. Run every lever the PR adds, and expect the exit code the PR states.
+4. Run every test the PR adds against the base worktree, with
+   only the test files applied. Each one must fail there. A test that passes
+   on base tests nothing. Delete it, or rewrite it, and say so.
+5. Read the diff once for what it does not need. An abstraction, a layer, a
+   flag, a guard, or a dependency that no criterion needs is a finding.
+   Remove it. A deviation from the conventions of the surrounding files is a
+   finding. Align it.
+6. Repair every run skill drift you meet during a drive. A dead path or a
+   dead handle in a `SKILL.md` or a feature file is a finding of this run.
+
+A mismatch is a finding. Repair the code, or repair the check when the check
+was the defect, then drive the full list again. A bug that does not fail in
+the base worktree is a wrong root cause. Take the human path with both
+outputs.
+
+# The repairs
+
 Fix every finding in this worktree. Add the missing tests. Keep the scope of
 the linked tickets. Run the full validation of the repository and make it
 pass. Commit the repairs in small, complete commits.
@@ -365,24 +490,28 @@ gate in one command line:
 
 Never pass `--force`. Never merge the PR.
 
-Record the outcome with `gh pr comment {number}`. Name the findings, the
-repairs, and the validation result. GitHub refuses a formal review of your own
-PR, so this comment is the record.
+# The record
+
+Record the outcome with `gh pr comment {number}`. Write your own Before /
+After lines, in the shape the PR body uses, from what you observed on your
+own run. Name the findings, the repairs, and the validation result. GitHub
+refuses a formal review of your own PR, so this comment is the record.
 
 When the PR needs no repair, post the record and run `gh pr ready {number}`.
 
 Take the human path when the PR comes from a fork, when a finding needs a human
-decision, when the repair leaves the scope of the linked tickets, or when the
-push fails. On that path, add the `needs-human` label to the PR with `gh`, write
-the question into a comment, leave the draft, and stop. Do not guess. When the
-decision is a choice between named answers, end the comment with one strict
-block in this form. Keep the JSON on one line:
+decision, when the repair leaves the scope of the linked tickets, when a bug
+does not reproduce in the base worktree, or when the push fails. On that path,
+add the `needs-human` label to the PR with `gh`, write the question into a
+comment, leave the draft, and stop. Do not guess. When the decision is a choice
+between named answers, end the comment with one strict block in this form. Keep
+the JSON on one line:
 <aif-ask-v1>
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Report one line at the end: the review verdict, and the number of commits you
-pushed.
+Report one line at the end. Name the review verdict, and the number of commits
+you pushed.
 "#;
 
 /// The built-in prompt of a release run.
@@ -1303,6 +1432,47 @@ mod tests {
             REVIEW_PROMPT,
             include_str!("../docs/v0.8/prompts/review.md")
         );
+    }
+
+    #[test]
+    fn the_implement_prompt_carries_the_contract_and_the_simplest_change() {
+        for required in [
+            "## Before / After",
+            "smallest change",
+            "fails with the change reverted",
+            "{model}",
+            "{skills}",
+        ] {
+            assert!(
+                IMPLEMENT_PROMPT.contains(required),
+                "the implement prompt must carry {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_carries_the_re_drive() {
+        for required in [
+            "base worktree",
+            "only the test files",
+            "no criterion needs",
+            "{model}",
+            "{skills}",
+        ] {
+            assert!(
+                REVIEW_PROMPT.contains(required),
+                "the review prompt must carry {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rewritten_prompts_pass_the_prose_rules_they_ask_for() {
+        for (name, prompt) in [("implement", IMPLEMENT_PROMPT), ("review", REVIEW_PROMPT)] {
+            crate::theory::contract::lint_prose(prompt).unwrap_or_else(|finding| {
+                panic!("the {name} prompt breaks a prose rule: {finding}")
+            });
+        }
     }
 
     #[test]

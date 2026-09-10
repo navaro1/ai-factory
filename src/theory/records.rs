@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::contract::{self, ContractContext, Finding};
+
 /// The label that marks a ticket with an accepted short prediction.
 pub const THEORY_SHORT_LABEL: &str = "theory-short";
 /// The label that marks a ticket with an accepted full prediction.
@@ -35,6 +37,36 @@ pub const EVENT_BLOCK: &str = "<aif-event-v1>";
 pub const MEASURE_BLOCK: &str = "<aif-measure-v1>";
 /// The opening tag of one answer block.
 pub const ANSWER_BLOCK: &str = "<aif-answer-v1>";
+
+/// The theory files only a model branch may change.
+pub const MODEL_FILES: [&str; 3] = ["theory/model.toml", "theory/verify.toml", "theory/rules.md"];
+
+/// Check the body and the diff of one governed pull request.
+///
+/// A branch that is not the model branch may not change a theory file.
+/// Every other rule is the Before / After contract of
+/// [`contract::check_body_lines`], and the changed paths of `ctx` are the
+/// same list both rules read. The first broken rule wins.
+pub fn check_pr(body: &str, branch: &str, ctx: &ContractContext<'_>) -> Result<(), Finding> {
+    if !is_model_branch(branch) {
+        for path in &ctx.changed_paths {
+            if let Some(file) = MODEL_FILES.iter().find(|file| path == *file) {
+                return Err(Finding::plain(format!("{file} changed off a model branch")));
+            }
+        }
+    }
+    contract::check_body_lines(body, ctx)
+}
+
+/// True when one branch is a model branch, in the form
+/// `aif/<alias>/model-<n>`.
+fn is_model_branch(branch: &str) -> bool {
+    let mut parts = branch.split('/');
+    parts.next() == Some("aif")
+        && parts.next().is_some_and(|alias| !alias.is_empty())
+        && parts.next().is_some_and(|last| last.starts_with("model-"))
+        && parts.next().is_none()
+}
 
 /// The item whose theory record the daemon talks to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,5 +235,47 @@ mod tests {
                 surface: None,
             }]
         );
+    }
+
+    /// The context of one pull request that changes the model file.
+    fn model_context(paths: &[&str]) -> ContractContext<'static> {
+        ContractContext {
+            criteria: Vec::new(),
+            features: Vec::new(),
+            areas: Vec::new(),
+            owned_paths: vec!["theory/**".to_string()],
+            changed_paths: paths.iter().map(|path| path.to_string()).collect(),
+            manifests: &contract::MANIFESTS,
+            ticket_names_dependency: false,
+        }
+    }
+
+    /// The smallest body the Before / After contract accepts.
+    const EMPTY_CONTRACT: &str = "## Why\n\n## Before / After\n";
+
+    #[test]
+    fn check_pr_refuses_a_model_file_off_a_model_branch() {
+        let ctx = model_context(&["theory/model.toml"]);
+        let finding = check_pr(EMPTY_CONTRACT, "aif/borsuk/issue-142", &ctx)
+            .expect_err("the model file needs the model branch");
+        assert_eq!(
+            finding.reason,
+            "theory/model.toml changed off a model branch"
+        );
+    }
+
+    #[test]
+    fn check_pr_accepts_a_model_file_on_the_model_branch() {
+        let ctx = model_context(&["theory/model.toml"]);
+        check_pr(EMPTY_CONTRACT, "aif/borsuk/model-a1b2c3d4", &ctx)
+            .expect("the model branch owns the model file");
+    }
+
+    #[test]
+    fn check_pr_runs_the_body_rules_after_the_model_rule() {
+        let ctx = model_context(&["theory/rules.md"]);
+        let finding = check_pr("## Why\n", "aif/borsuk/model-1", &ctx)
+            .expect_err("the body carries no Before / After section");
+        assert_eq!(finding.reason, "section Before / After missing");
     }
 }

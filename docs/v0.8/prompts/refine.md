@@ -200,6 +200,6 @@ block in this form. Keep the JSON on one line:
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Ticket #{number}: {title}
+Ticket #{number}, {title}
 
 {body}
