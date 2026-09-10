@@ -6022,8 +6022,8 @@ impl Daemon {
     ///
     /// Refine and implement slice over every area of `verify.toml`,
     /// because predictions do not exist yet. Review slices over the areas
-    /// of the PR diff. A repository whose theory did not read slices to an
-    /// empty block, so a broken model never blocks a dispatch.
+    /// of the PR diff. A repository whose theory did not read renders an
+    /// empty block.
     fn skills_slice(&self, task: &Task, worktree: &Path) -> String {
         let Some(cache) = self.theory_models.get(&task.repo) else {
             return String::new();

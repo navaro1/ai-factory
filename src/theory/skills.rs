@@ -366,11 +366,12 @@ pub enum SliceStage {
 
 /// Inline the skills of `areas` into one prompt block.
 ///
-/// The stage picks the shape of requirement R9. Past the cap of two
-/// surfaces or six feature files the slice carries the indexes, one
-/// marker, and the paths of the files a full slice would have inlined,
-/// instead of the files themselves. A set with no surface for the areas
-/// renders empty.
+/// The stage picks the shape of requirement R9. A stage that inlines
+/// skill files degrades past the surface cap, and a stage that inlines
+/// feature files degrades past the feature cap. Refine never degrades.
+/// The degraded slice carries the indexes, one marker, and the paths of
+/// the files a full slice would have inlined, instead of the files
+/// themselves. A set with no surface for the areas renders empty.
 pub fn slice(stage: SliceStage, areas: &[&str], verify: &VerifyMap, set: &SkillSet) -> String {
     let mut names: Vec<String> = Vec::new();
     for area in areas {
@@ -387,7 +388,14 @@ pub fn slice(stage: SliceStage, areas: &[&str], verify: &VerifyMap, set: &SkillS
         }
     }
     let paths = slice_paths(stage, &names, &features);
-    if names.len() > SLICE_SURFACE_CAP || features.len() > SLICE_FEATURE_CAP {
+    let over = match stage {
+        SliceStage::Refine { .. } => false,
+        SliceStage::Implement => {
+            names.len() > SLICE_SURFACE_CAP || features.len() > SLICE_FEATURE_CAP
+        }
+        SliceStage::Teach => features.len() > SLICE_FEATURE_CAP,
+    };
+    if over {
         return index_only(&paths, &names, set);
     }
     let mut out = String::new();
@@ -403,14 +411,15 @@ pub fn slice(stage: SliceStage, areas: &[&str], verify: &VerifyMap, set: &SkillS
                     continue;
                 };
                 push_file(&mut out, &skill_path(name));
-                if let Some(index) = &skill.index {
-                    out.push_str(index.trim_end());
-                    out.push_str("\n\n");
-                }
                 for section in wanted {
                     if let Some(body) = skill.sections.get(*section) {
                         out.push_str(&format!("## {section}\n{body}\n\n"));
                     }
+                }
+                if let Some(index) = &skill.index {
+                    push_file(&mut out, &index_path(name));
+                    out.push_str(index.trim_end());
+                    out.push_str("\n\n");
                 }
             }
         }
@@ -451,6 +460,11 @@ fn feature_path(surface: &str, id: &str) -> String {
     format!("{SKILLS_DIR}run-{surface}/features/{id}.md")
 }
 
+/// The path of one surface feature index, relative to the skills checkout.
+fn index_path(surface: &str) -> String {
+    format!("{SKILLS_DIR}run-{surface}/features/README.md")
+}
+
 /// Open one inlined file with its path as the heading.
 fn push_file(out: &mut String, path: &str) {
     out.push_str("### ");
@@ -485,6 +499,7 @@ fn index_only(paths: &[String], names: &[String], set: &SkillSet) -> String {
             .and_then(|skill| skill.index.as_ref())
         {
             out.push('\n');
+            push_file(&mut out, &index_path(name));
             out.push_str(index.trim_end());
             out.push('\n');
         }
@@ -1027,5 +1042,109 @@ surface: web\ndriver: playwright-cli\ntier: browser\nblind: native dialogs\n---\
             "{out}"
         );
         assert!(!out.contains("# Checkout"), "no feature body:\n{out}");
+    }
+
+    #[test]
+    fn a_refine_slice_past_the_feature_cap_still_carries_the_sections() {
+        let paths: Vec<String> = (1..=7)
+            .map(|n| format!(".claude/skills/run-web/features/f{n}.md"))
+            .collect();
+        let mut files: Vec<(&str, &str)> = vec![
+            (".claude/skills/run-web/SKILL.md", DRIVE_SKILL),
+            (".claude/skills/run-web/features/README.md", WEB_INDEX),
+        ];
+        files.extend(paths.iter().map(|path| (path.as_str(), FEATURE)));
+        let set = SkillSet::from_files(files);
+
+        let refine = slice(
+            SliceStage::Refine { bug: false },
+            &["web-checkout"],
+            &map(""),
+            &set,
+        );
+
+        assert!(
+            !refine.contains("<!-- skills:"),
+            "refine never degrades:\n{refine}"
+        );
+        assert!(
+            refine.contains("## Run\nnpm run dev on port 4000"),
+            "{refine}"
+        );
+        assert!(refine.contains("## Fast\nnpx playwright test"), "{refine}");
+        assert!(
+            refine.contains("### .claude/skills/run-web/features/README.md"),
+            "the index under its own path:\n{refine}"
+        );
+        assert!(
+            refine.contains("- checkout: the cart pays"),
+            "the index:\n{refine}"
+        );
+        assert!(!refine.contains("# Checkout"), "no feature file:\n{refine}");
+    }
+
+    #[test]
+    fn teach_carries_the_feature_files_of_three_surfaces_but_no_skill_body() {
+        let text = concat!(
+            "[[area]]\nid = \"a\"\nboundary = \"B-checkout\"\nstatement = \"s\"\n",
+            "[[area]]\nid = \"b\"\nboundary = \"B-checkout\"\nstatement = \"s\"\n",
+            "[[area]]\nid = \"c\"\nboundary = \"B-checkout\"\nstatement = \"s\"\n",
+        );
+        let verify = VerifyMap::parse(text, &fixture_model()).expect("the fixture map must parse");
+        let web = FEATURE.replace("area: web-checkout", "area: a");
+        let set = SkillSet::from_files([
+            (".claude/skills/run-web/SKILL.md", DRIVE_SKILL),
+            (
+                ".claude/skills/run-api/features/orders.md",
+                "---\narea: b\n---\n# Orders\n\nThe order lands.\n",
+            ),
+            (
+                ".claude/skills/run-cli/features/shell.md",
+                "---\narea: c\n---\n# Shell\n\nThe shell runs.\n",
+            ),
+            (".claude/skills/run-web/features/checkout.md", web.as_str()),
+        ]);
+
+        let out = slice(SliceStage::Teach, &["a", "b", "c"], &verify, &set);
+
+        assert!(
+            !out.contains("<!-- skills:"),
+            "teach does not degrade:\n{out}"
+        );
+        assert!(
+            out.contains("### .claude/skills/run-web/features/checkout.md"),
+            "the web feature file:\n{out}"
+        );
+        assert!(
+            out.contains("### .claude/skills/run-api/features/orders.md"),
+            "{out}"
+        );
+        assert!(out.contains("# Orders"), "{out}");
+        assert!(out.contains("# Shell"), "{out}");
+        assert!(
+            !out.contains("### .claude/skills/run-web/SKILL.md"),
+            "no skill file:\n{out}"
+        );
+        assert!(!out.contains("# Run web"), "no skill body:\n{out}");
+    }
+
+    #[test]
+    fn a_broken_skill_file_keeps_the_feature_files_of_its_surface() {
+        let set = SkillSet::from_files([
+            (".claude/skills/run-web/SKILL.md", "no front matter"),
+            (".claude/skills/run-web/features/checkout.md", FEATURE),
+        ]);
+
+        let out = slice(SliceStage::Implement, &["web-checkout"], &map(""), &set);
+
+        assert!(
+            !out.contains("### .claude/skills/run-web/SKILL.md"),
+            "no skill body past a broken file:\n{out}"
+        );
+        assert!(
+            out.contains("### .claude/skills/run-web/features/checkout.md"),
+            "the feature file survives:\n{out}"
+        );
+        assert!(out.contains("# Checkout\n\nThe cart pays."), "{out}");
     }
 }
