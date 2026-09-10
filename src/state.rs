@@ -50,6 +50,54 @@ struct LaneEntry {
     slots: usize,
 }
 
+/// The immutable binding of one task: the role it started with and, from
+/// C10 on, the model commit it is pinned to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TaskBindingFile")]
+pub struct TaskBinding {
+    /// The resolved role settings of the first run.
+    pub role: ResolvedRoleSettings,
+    /// The model commit the task pins to. `None` until a prediction names
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_commit: Option<String>,
+}
+
+impl From<TaskBindingFile> for TaskBinding {
+    fn from(file: TaskBindingFile) -> Self {
+        match file {
+            TaskBindingFile::Bound { role, model_commit } => TaskBinding { role, model_commit },
+            TaskBindingFile::Bare(role) => TaskBinding {
+                role,
+                model_commit: None,
+            },
+        }
+    }
+}
+
+/// The read shape of one role binding in `state.json`.
+///
+/// A file written before C5 holds the resolved settings bare. A file
+/// written after wraps them and adds the model commit. `TaskBinding`
+/// always writes the wrapped shape; `TaskBindingFile` exists for the read
+/// only. The untagged order tries the wrapped shape first. A bare value
+/// fails it, because its `role` field holds a role name, not an object.
+/// The bare value then loads as `Bare`, with `model_commit = None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TaskBindingFile {
+    /// The wrapped shape, with the optional model commit.
+    Bound {
+        /// The resolved role settings of the first run.
+        role: ResolvedRoleSettings,
+        /// The model commit the task pins to.
+        #[serde(default)]
+        model_commit: Option<String>,
+    },
+    /// The bare shape of the older file, without the model commit.
+    Bare(ResolvedRoleSettings),
+}
+
 /// One persisted lane pause mark.
 ///
 /// A JSON map cannot key on a pair, so the `(stage, repo)` lane marks are
@@ -145,7 +193,7 @@ struct StateFile {
     ticket_conversations: Vec<TicketConversationState>,
     /// Immutable role bindings, by stable task identity.
     #[serde(default)]
-    role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    role_bindings: BTreeMap<String, TaskBinding>,
     /// The runtime work state of the last drive.
     #[serde(default)]
     runtime: RuntimeState,
@@ -168,7 +216,7 @@ pub struct DaemonState {
     /// Active issue conversations.
     pub ticket_conversations: Vec<TicketConversationState>,
     /// Immutable role bindings, by stable task identity.
-    pub role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    pub role_bindings: BTreeMap<String, TaskBinding>,
     /// The runtime work state: pause marks, tasks, queued chats, review
     /// ticket sets, release batches, and stuck rows.
     pub runtime: RuntimeState,
@@ -295,7 +343,7 @@ fn invalid_state(file: &StateFile) -> Option<String> {
     }
     for (task, binding) in &file.role_bindings {
         if let Err(error) = crate::config::validate_persisted_settings(
-            &binding.settings,
+            &binding.role.settings,
             &format!("role binding {task}"),
         ) {
             return Some(error.to_string());
@@ -799,36 +847,39 @@ mod tests {
     fn a_full_role_binding_survives_a_restart() {
         let dir = temp_dir("role-binding");
         let path = dir.join("state.json");
-        let binding = ResolvedRoleSettings {
-            role: ExecutionRole::Implement,
-            source: SettingsSource::Repository {
-                alias: "borsuk".to_string(),
+        let binding = TaskBinding {
+            role: ResolvedRoleSettings {
+                role: ExecutionRole::Implement,
+                source: SettingsSource::Repository {
+                    alias: "borsuk".to_string(),
+                },
+                tag_route: Some(TagRouteBinding {
+                    key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                    matches: vec![TagRouteMatch {
+                        kind: ItemKind::Issue,
+                        number: 142,
+                        label: "complexity:high".to_string(),
+                    }],
+                }),
+                settings: RoleSettings {
+                    harness: Harness::Codex,
+                    program: "codex-custom".to_string(),
+                    model: "gpt-test".to_string(),
+                    effort: Some("high".to_string()),
+                    extra_args: vec!["--color=never".to_string()],
+                    agent: None,
+                    profile: Some("factory".to_string()),
+                    permission_mode: None,
+                    permission_handler: None,
+                    tools: Vec::new(),
+                    disallowed_tools: Vec::new(),
+                    strict_mcp: None,
+                    auto_approve: None,
+                    approval_policy: Some("never".to_string()),
+                    sandbox: Some("workspace-write".to_string()),
+                },
             },
-            tag_route: Some(TagRouteBinding {
-                key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
-                matches: vec![TagRouteMatch {
-                    kind: ItemKind::Issue,
-                    number: 142,
-                    label: "complexity:high".to_string(),
-                }],
-            }),
-            settings: RoleSettings {
-                harness: Harness::Codex,
-                program: "codex-custom".to_string(),
-                model: "gpt-test".to_string(),
-                effort: Some("high".to_string()),
-                extra_args: vec!["--color=never".to_string()],
-                agent: None,
-                profile: Some("factory".to_string()),
-                permission_mode: None,
-                permission_handler: None,
-                tools: Vec::new(),
-                disallowed_tools: Vec::new(),
-                strict_mcp: None,
-                auto_approve: None,
-                approval_policy: Some("never".to_string()),
-                sandbox: Some("workspace-write".to_string()),
-            },
+            model_commit: Some("c0ffee00".to_string()),
         };
         let mut state = DaemonState::default();
         state
@@ -850,7 +901,10 @@ mod tests {
     fn an_old_role_binding_without_tag_route_evidence_still_loads() {
         let dir = temp_dir("old-role-binding");
         let path = dir.join("state.json");
-        let binding = valid_binding();
+        let binding = TaskBinding {
+            role: valid_binding(),
+            model_commit: None,
+        };
         let mut state = DaemonState::default();
         state
             .role_bindings
@@ -863,6 +917,28 @@ mod tests {
             DaemonState::load(&path).role_bindings["borsuk/review-p5"],
             binding
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_state_file_with_a_bare_role_value_still_loads() {
+        let dir = temp_dir("bare-role-binding");
+        let path = dir.join("state.json");
+        // The shape a daemon wrote before C5: the resolved settings sit
+        // bare in the map, with no wrapper and no model commit.
+        let bare = serde_json::to_value(valid_binding()).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "role_bindings": { "borsuk/review-p5": bare }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let binding = &DaemonState::load(&path).role_bindings["borsuk/review-p5"];
+        assert_eq!(binding.model_commit, None);
+        assert_eq!(binding.role, valid_binding());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -885,9 +961,15 @@ mod tests {
         let dir = temp_dir("corrupt-role-binding");
         let path = dir.join("state.json");
         let mut state = DaemonState::default();
-        let mut binding = valid_binding();
-        binding.settings.model.clear();
-        state.role_bindings.insert("task".to_string(), binding);
+        let mut role = valid_binding();
+        role.settings.model.clear();
+        state.role_bindings.insert(
+            "task".to_string(),
+            TaskBinding {
+                role,
+                model_commit: None,
+            },
+        );
         state.stage_limits.insert(Stage::Review, 9);
         state.save(&path).unwrap();
         assert_eq!(DaemonState::load(&path), DaemonState::default());
@@ -899,9 +981,15 @@ mod tests {
         let dir = temp_dir("unsafe-role-binding");
         let path = dir.join("state.json");
         let mut state = DaemonState::default();
-        let mut binding = valid_binding();
-        binding.settings.extra_args = vec!["--yolo".to_string()];
-        state.role_bindings.insert("task".to_string(), binding);
+        let mut role = valid_binding();
+        role.settings.extra_args = vec!["--yolo".to_string()];
+        state.role_bindings.insert(
+            "task".to_string(),
+            TaskBinding {
+                role,
+                model_commit: None,
+            },
+        );
         state.save(&path).unwrap();
         assert_eq!(DaemonState::load(&path), DaemonState::default());
         let _ = fs::remove_dir_all(dir);

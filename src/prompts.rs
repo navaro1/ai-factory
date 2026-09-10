@@ -850,14 +850,12 @@ pub struct Template {
     pub from_file: bool,
 }
 
-/// Read the template of one role.
+/// Read the template file `name` in the prompts directory.
 ///
-/// The prompt file wins when it exists. An absent file yields the built-in.
-/// An unreadable file is an error that names the path. A role with no
-/// template is an error that names the role.
-pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
-    let path = path(prompts_dir, role)?;
-    let builtin = builtin(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
+/// The file wins when it exists. An absent file yields the `builtin` text.
+/// An unreadable file is an error that names the path.
+pub fn load_named(prompts_dir: &Path, name: &str, builtin: &str) -> Result<Template> {
+    let path = prompts_dir.join(name);
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Template {
             text,
@@ -869,6 +867,16 @@ pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
         }),
         Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
     }
+}
+
+/// Read the template of one role.
+///
+/// The prompt file wins when it exists. An absent file yields the built-in.
+/// An unreadable file is an error that names the path. A role with no
+/// template is an error that names the role.
+pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
+    let builtin = builtin(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
+    load_named(prompts_dir, name_of(role)?, builtin)
 }
 
 /// Check one template against the placeholder set of its role.
