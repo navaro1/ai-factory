@@ -7,7 +7,7 @@
 //! [`TheoryRecords`] is the read model of one poll: the labels of every
 //! record, the open marker count, and the predictions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,9 @@ use crate::model::{RepoSnapshot, Snapshot};
 
 /// The label that marks a ticket with an accepted short prediction.
 pub const THEORY_SHORT_LABEL: &str = "theory-short";
+
+/// The color GitHub renders `theory-short` with, as six hex digits.
+pub const THEORY_SHORT_COLOR: &str = "c5def5";
 /// The label that marks a ticket with an accepted full prediction.
 pub const THEORY_FULL_LABEL: &str = "theory-full";
 /// The label that marks a record with an open delta.
@@ -89,6 +92,49 @@ pub enum RecordKey {
     Pr(u64),
     /// The record of the whole repository.
     Repo,
+}
+
+impl RecordKey {
+    /// The text this key carries in [`TheoryView::records`], for example
+    /// `issue-142`, `pr-5`, or `repo`.
+    ///
+    /// [`TheoryView::records`]: crate::sock::TheoryView::records
+    pub fn key_text(&self) -> String {
+        match self {
+            Self::Issue(number) => format!("issue-{number}"),
+            Self::Pr(number) => format!("pr-{number}"),
+            Self::Repo => "repo".to_string(),
+        }
+    }
+}
+
+/// The theory labels whose first sight asks for the record comments.
+pub const RECORD_LABELS: [&str; 4] = [
+    THEORY_SHORT_LABEL,
+    THEORY_FULL_LABEL,
+    DELTA_OPEN_LABEL,
+    EVENT_OPEN_LABEL,
+];
+
+/// The theory labels of one label list, in [`RECORD_LABELS`] order.
+pub fn record_labels(labels: &[String]) -> Vec<String> {
+    RECORD_LABELS
+        .into_iter()
+        .filter(|wanted| labels.iter().any(|label| label == wanted))
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when the labels of one item skip both prediction gates.
+///
+/// A `model-pr` changes the model itself, and a `verify-skill` ticket
+/// changes no application behaviour, so neither one carries a prediction.
+/// Every other check still runs for both: the ticket check, the body
+/// check, the fast checks, and the review.
+pub fn skips_prediction_gates(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|label| label == MODEL_PR_LABEL || label == VERIFY_SKILL_LABEL)
 }
 
 /// One theory event, as one `<aif-event-v1>` block holds it.
@@ -280,6 +326,10 @@ pub struct TheoryRecords {
     repos: BTreeMap<String, Vec<String>>,
     /// The open marker count of each governed alias.
     open: BTreeMap<String, usize>,
+    /// The aliases whose governor is on.
+    governed: BTreeSet<String>,
+    /// The governed aliases whose model or verification map did not parse.
+    model_errors: BTreeSet<String>,
 }
 
 impl TheoryRecords {
@@ -301,6 +351,7 @@ impl TheoryRecords {
             if !repo.theory.governor.is_on() {
                 continue;
             }
+            records.governed.insert(alias.clone());
             let shadowed = repo
                 .theory
                 .theory
@@ -368,6 +419,32 @@ impl TheoryRecords {
                 .unwrap_or(&[]),
             RecordKey::Repo => self.repos.get(alias).map(Vec::as_slice).unwrap_or(&[]),
         }
+    }
+
+    /// True when the governor of one alias is on.
+    pub fn is_governed(&self, alias: &str) -> bool {
+        self.governed.contains(alias)
+    }
+
+    /// Mark the model of one alias broken, or clear the mark.
+    ///
+    /// The model lives in the daemon cache, not in the snapshot, so the
+    /// caller folds its state in after the derive. A governed item holds
+    /// while the mark stands, because a broken model can validate
+    /// nothing. An item that [`skips_prediction_gates`] names passes
+    /// first and never reads the mark, so a `model-pr` still moves while
+    /// the model is broken.
+    pub fn set_model_error(&mut self, alias: &str, broken: bool) {
+        if broken {
+            self.model_errors.insert(alias.to_string());
+        } else {
+            self.model_errors.remove(alias);
+        }
+    }
+
+    /// True when the model of one alias did not parse.
+    pub fn model_error(&self, alias: &str) -> bool {
+        self.model_errors.contains(alias)
     }
 
     /// The count of records labelled `delta-open` or `event-open` of one
