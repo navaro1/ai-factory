@@ -39,6 +39,9 @@ pub const MODEL_PR_COLOR: &str = "1d76db";
 /// The color GitHub renders `event-open` with, as six hex digits.
 pub const EVENT_OPEN_COLOR: &str = "d4c5f9";
 
+/// The color GitHub renders `delta-open` with, as six hex digits.
+pub const DELTA_OPEN_COLOR: &str = "fbca04";
+
 /// The label that marks a run skill ticket and its pull request.
 pub const VERIFY_SKILL_LABEL: &str = "verify-skill";
 
@@ -51,6 +54,8 @@ pub const PREDICTION_BLOCK: &str = "<aif-prediction-v1>";
 pub const EVENT_BLOCK: &str = "<aif-event-v1>";
 /// The opening tag of one measure block.
 pub const MEASURE_BLOCK: &str = "<aif-measure-v1>";
+/// The opening tag of one delta block.
+pub const DELTA_BLOCK: &str = "<aif-delta-v1>";
 /// The opening tag of one answer block.
 pub const ANSWER_BLOCK: &str = "<aif-answer-v1>";
 /// The opening tag of one model proposal block.
@@ -537,6 +542,114 @@ pub fn parse_full(text: &str, model: &Model) -> Result<FullPrediction, String> {
         kind: PREDICTION_FULL.to_string(),
         slots,
     })
+}
+
+/// What one slot of a delta reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeltaOutcome {
+    /// The change stayed inside the entries the slot named.
+    Hit,
+    /// The change reached past them.
+    Miss,
+}
+
+impl DeltaOutcome {
+    /// The word the block writes for this outcome.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+        }
+    }
+}
+
+/// One slot of one delta block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaSlot {
+    /// The slot name; one of [`PREDICTION_SLOT_NAMES`].
+    pub id: String,
+    /// What the review found for the slot.
+    pub outcome: DeltaOutcome,
+    /// The confidence tag of the slot.
+    ///
+    /// The review writes no tag. The daemon copies the tag of the full
+    /// prediction in before it posts the block, so a body without one
+    /// reads `unsure`.
+    #[serde(default = "unsure_tag")]
+    pub tag: PredictionTag,
+}
+
+/// The tag of a slot whose body carries none.
+fn unsure_tag() -> PredictionTag {
+    PredictionTag::Unsure
+}
+
+/// One model rule the change broke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaViolation {
+    /// The model entry the change broke.
+    pub entry: String,
+    /// What the review found, in one line.
+    pub finding: String,
+}
+
+/// One delta, as one `<aif-delta-v1>` block holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaBlock {
+    /// The outcome of each slot of the full prediction.
+    pub slots: Vec<DeltaSlot>,
+    /// The model entry ids the change reached.
+    #[serde(default)]
+    pub touched: Vec<String>,
+    /// The model rules the change broke.
+    #[serde(default)]
+    pub violations: Vec<DeltaViolation>,
+    /// The one question the review asks the operator.
+    #[serde(default)]
+    pub question: String,
+}
+
+/// The outcome name of one slot, one of `sure-hit`, `sure-miss`,
+/// `unsure-hit`, and `unsure-miss`.
+pub fn slot_outcome(slot: &DeltaSlot) -> String {
+    format!("{}-{}", slot.tag.name(), slot.outcome.word())
+}
+
+/// Render one delta as a complete `<aif-delta-v1>` block.
+pub fn delta_block(delta: &DeltaBlock) -> String {
+    let body = serde_json::to_string(delta).expect("a delta serializes");
+    let close = close_tag(DELTA_BLOCK);
+    format!("{DELTA_BLOCK}\n{body}\n{close}")
+}
+
+/// Parse one block body into a delta; `None` for any other body.
+///
+/// A body with no slot at all reports nothing, so it is refused. A slot
+/// id that names no slot of [`PREDICTION_SLOT_NAMES`] refuses the whole
+/// body too, because the daemon cannot map an unknown slot to a
+/// prediction tag.
+pub fn parse_delta(body: &str) -> Option<DeltaBlock> {
+    let delta = serde_json::from_str::<DeltaBlock>(body).ok()?;
+    if delta.slots.is_empty() {
+        return None;
+    }
+    delta
+        .slots
+        .iter()
+        .all(|slot| PREDICTION_SLOT_NAMES.iter().any(|name| *name == slot.id))
+        .then_some(delta)
+}
+
+/// Parse every complete `<aif-delta-v1>` block of one text.
+///
+/// A block whose body does not parse as a delta, and a block with no
+/// closing tag, is skipped. The order of the blocks is kept.
+pub fn parse_delta_blocks(text: &str) -> Vec<DeltaBlock> {
+    scan_block_bodies(text, DELTA_BLOCK)
+        .into_iter()
+        .filter_map(parse_delta)
+        .collect()
 }
 
 /// Check the shape of one full prediction that arrived over the wire.
@@ -1458,5 +1571,81 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    /// One delta whose `invariants` slot missed.
+    fn one_miss() -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![
+                DeltaSlot {
+                    id: "behaviours".to_string(),
+                    outcome: DeltaOutcome::Hit,
+                    tag: PredictionTag::Sure,
+                },
+                DeltaSlot {
+                    id: "invariants".to_string(),
+                    outcome: DeltaOutcome::Miss,
+                    tag: PredictionTag::Sure,
+                },
+            ],
+            touched: vec!["INV-3".to_string()],
+            violations: vec![DeltaViolation {
+                entry: "INV-3".to_string(),
+                finding: "the retry crosses the boundary".to_string(),
+            }],
+            question: "Does the cart keep the token?".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_delta_block_round_trips_through_its_tag() {
+        let delta = one_miss();
+        let text = format!("The diff reads well.\n\n{}", delta_block(&delta));
+
+        assert_eq!(parse_delta_blocks(&text), vec![delta]);
+    }
+
+    #[test]
+    fn a_slot_without_a_tag_reads_unsure() {
+        let body = r#"{"slots":[{"id":"states","outcome":"miss"}]}"#;
+
+        let delta = parse_delta(body).expect("a body without a tag parses");
+
+        assert_eq!(delta.slots[0].tag, PredictionTag::Unsure);
+        assert_eq!(delta.slots[0].outcome, DeltaOutcome::Miss);
+        assert!(delta.touched.is_empty());
+        assert!(delta.violations.is_empty());
+        assert_eq!(delta.question, "");
+    }
+
+    #[test]
+    fn parse_delta_refuses_an_unknown_slot_id_and_an_empty_slot_list() {
+        for body in [
+            r#"{"slots":[{"id":"bananas","outcome":"hit"}]}"#,
+            r#"{"slots":[]}"#,
+        ] {
+            assert_eq!(parse_delta(body), None, "body: {body}");
+            assert_eq!(
+                parse_delta_blocks(&format!("{DELTA_BLOCK}\n{body}\n</aif-delta-v1>")),
+                Vec::new(),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_outcome_names_the_four_outcomes() {
+        let mut slot = DeltaSlot {
+            id: "invariants".to_string(),
+            outcome: DeltaOutcome::Hit,
+            tag: PredictionTag::Sure,
+        };
+        assert_eq!(slot_outcome(&slot), "sure-hit");
+        slot.outcome = DeltaOutcome::Miss;
+        assert_eq!(slot_outcome(&slot), "sure-miss");
+        slot.tag = PredictionTag::Unsure;
+        assert_eq!(slot_outcome(&slot), "unsure-miss");
+        slot.outcome = DeltaOutcome::Hit;
+        assert_eq!(slot_outcome(&slot), "unsure-hit");
     }
 }
