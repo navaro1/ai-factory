@@ -8744,7 +8744,7 @@ impl Daemon {
     /// model slice of that area's boundary holds the entry.
     fn card_teaches(&self, repo: &str, card: &CardView, key: &TeachKey) -> bool {
         match key {
-            TeachKey::Pr(number) => card.number == Some(*number),
+            TeachKey::Pr(number) | TeachKey::Delta(number) => card.number == Some(*number),
             TeachKey::Area(id) => {
                 let Some(entry) = card.entry.as_deref() else {
                     return false;
