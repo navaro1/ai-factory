@@ -353,7 +353,8 @@ pub struct Daemon {
     /// The ticket-check failure count of each issue. The count bounds the
     /// refine re-queue of a failing ticket: at `MAX_ATTEMPTS` the failure
     /// asks for a human instead of `to-refine`. The map is runtime only:
-    /// a restart re-derives it from the labels.
+    /// the `needs-human` label re-derives the bound, and the count
+    /// restarts at zero.
     ticket_check_failures: BTreeMap<(String, u64), u32>,
     /// The finished pipeline runs that wait for GitHub to confirm their
     /// stage transition, with the moment each one gives up. The map is
@@ -2026,6 +2027,12 @@ impl Daemon {
                 continue;
             }
             if work.stage == Stage::Implement && work.kind == ItemKind::Issue {
+                // A capped ticket holds its admission: the `needs-human`
+                // label re-derives the attempt bound after a restart, and
+                // no task exists for the ticket until the label goes.
+                if self.admission_held(&work.repo, work.number) {
+                    continue;
+                }
                 // The C9 prediction gate of the v0.8 spec sits here; V7
                 // runs the ticket check in its place.
                 match self.run_ticket_check(&work.repo, work.number) {
@@ -2082,6 +2089,23 @@ impl Daemon {
         }
     }
 
+    /// True when the implement admission of a governed ticket is held
+    /// because the daemon already asked a human for it.
+    fn admission_held(&self, alias: &str, number: u64) -> bool {
+        let governed = self
+            .config
+            .repos
+            .get(alias)
+            .is_some_and(|config| config.theory.governor.is_on());
+        governed
+            && self
+                .snapshot
+                .repos
+                .get(alias)
+                .and_then(|snapshot| snapshot.issues.get(&number))
+                .is_some_and(|issue| issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+    }
+
     /// Check the contract of one ticket that the implement gate admits.
     ///
     /// The check runs only for a governed repository whose theory parses,
@@ -2089,9 +2113,9 @@ impl Daemon {
     /// task of a ticket is already out through the quiet skip of
     /// [`Daemon::admit_ready`]. A theory that did not parse leaves the
     /// ticket to the operator, because the Theory view already reports
-    /// the parse error. A ticket that already carries
-    /// [`NEEDS_HUMAN_LABEL`] is left alone, so a restart re-derives the
-    /// attempt bound from the labels.
+    /// the parse error. The admission of a ticket that carries
+    /// [`NEEDS_HUMAN_LABEL`] is held in [`Daemon::admit_ready`] before
+    /// the check runs.
     fn run_ticket_check(&self, alias: &str, number: u64) -> Result<(), contract::Finding> {
         let Some(config) = self.config.repos.get(alias) else {
             return Ok(());
@@ -2112,9 +2136,6 @@ impl Daemon {
             .get(alias)
             .is_some_and(|links| !links.prs_of(number).is_empty())
         {
-            return Ok(());
-        }
-        if issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL) {
             return Ok(());
         }
         let Some(cache) = self.theory_models.get(alias) else {
@@ -2148,7 +2169,7 @@ impl Daemon {
     /// daemon counts the failed checks itself, and at `MAX_ATTEMPTS` it
     /// asks for a human instead of `to-refine`, which leaves the refine
     /// gate no edge to fire on. A restart drops the counter, and the
-    /// `needs-human` label of the capped ticket makes the check skip.
+    /// `needs-human` label of the capped ticket holds the admission.
     fn handle_ticket_finding(&mut self, alias: &str, number: u64, finding: &contract::Finding) {
         eprintln!("the ticket check of {alias}#{number} failed: {finding}");
         let text = format!("ticket: {finding}");
@@ -21698,17 +21719,15 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
     }
 
-    /// A ticket that already carries `needs-human` gets no finding
-    /// comment and no label after a restart; the check skips it and the
-    /// admission proceeds.
+    /// A ticket that already carries `needs-human` holds its admission
+    /// after a restart: no check, no finding comment, no label, and no
+    /// implement task.
     #[test]
     fn a_needs_human_ticket_is_left_alone_after_a_restart() {
         let dir = temp_root();
         let repo = rig_repo(&dir);
-        let gitdir = rig_gitdir(&dir);
         let body = unchecked_ticket_body();
         let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
-        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
         steps.extend(commit_steps(&repo, "aaa111"));
         let mut rig = Rig::make_in(dir, steps, governed);
 
@@ -21719,13 +21738,16 @@ surface: api\ndriver: curl\ntier: http\n---\n\
 
         assert_eq!(
             rig.job_count(),
-            1,
-            "the label skips only the check, not the admission"
+            0,
+            "the needs-human label holds the admission"
         );
-        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "no implement task exists for the held ticket"
+        );
         assert!(
             rig.exec.calls().iter().all(|call| call.program != "gh"),
-            "the check posts no comment and no label"
+            "the hold posts no comment and no label"
         );
     }
 
