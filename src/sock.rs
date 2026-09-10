@@ -2589,6 +2589,10 @@ mod tests {
                 repo: "borsuk".to_string(),
                 key: crate::tasks::TeachKey::Pr(7),
             }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Delta(142),
+            }),
             Action::Theory(TheoryAction::Sweep {
                 repo: "borsuk".to_string(),
             }),

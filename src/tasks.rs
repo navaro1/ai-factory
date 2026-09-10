@@ -65,14 +65,18 @@ pub enum TeachKey {
     Pr(u64),
     /// One area of the verification map.
     Area(String),
+    /// The delta of one pull request.
+    Delta(u64),
 }
 
 impl TeachKey {
-    /// The id fragment of one key: `pr-7` or `area-web-checkout`.
+    /// The id fragment of one key: `pr-7`, `area-web-checkout`, or
+    /// `delta-142`.
     pub fn slug(&self) -> String {
         match self {
             TeachKey::Pr(number) => format!("pr-{number}"),
             TeachKey::Area(id) => format!("area-{id}"),
+            TeachKey::Delta(number) => format!("delta-{number}"),
         }
     }
 }
@@ -661,11 +665,15 @@ mod tests {
     }
 
     #[test]
-    fn a_teach_id_names_the_pull_request_or_the_area() {
+    fn a_teach_id_names_the_pull_request_the_area_or_the_delta() {
         assert_eq!(teach_id("borsuk", &TeachKey::Pr(7)), "borsuk/teach-pr-7");
         assert_eq!(
             teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
             "borsuk/teach-area-web-checkout"
+        );
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Delta(142)),
+            "borsuk/teach-delta-142"
         );
     }
 
