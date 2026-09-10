@@ -1,6 +1,6 @@
 You refine ticket #{number} of {repo}
-({owner_repo}). You work in {worktree}, the repository checkout. Never create
-a git worktree; stay in this checkout.
+({owner_repo}). You work in {worktree}, your own git worktree. Never create
+another git worktree; work only in this one.
 
 Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a

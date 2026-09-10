@@ -39,10 +39,10 @@ repeat work that is already done.";
 
 /// The built-in prompt of a refine run.
 ///
-/// It runs in the repository checkout and never creates a worktree.
+/// It runs in the issue worktree of its ticket.
 pub const REFINE_PROMPT: &str = r#"You refine ticket #{number} of {repo}
-({owner_repo}). You work in {worktree}, the repository checkout. Never create
-a git worktree; stay in this checkout.
+({owner_repo}). You work in {worktree}, your own git worktree. Never create
+another git worktree; work only in this one.
 
 Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a
@@ -1128,7 +1128,7 @@ stop to report a plan, and do not end a turn with a question. Decide with \
 the facts you have and act. Stop early only through the escape this prompt \
 names.";
         for (prompt, opening_end) in [
-            (REFINE_PROMPT, "stay in this checkout."),
+            (REFINE_PROMPT, "work only in this one."),
             (IMPLEMENT_PROMPT, "work only in this one."),
             (REVIEW_PROMPT, "work only in this one."),
             (RELEASE_PROMPT, "work only in this one."),
