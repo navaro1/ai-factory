@@ -1237,7 +1237,41 @@ pub enum TheoryAction {
         /// The repository alias.
         repo: String,
     },
+    /// Ask for the model worktree, so the UI can edit `theory/model.toml`.
+    ///
+    /// The daemon answers with one [`Push::ModelPath`] that carries the
+    /// same `request`, so only the UI that asked opens an editor.
+    EditModel {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+    },
+    /// Commit, push, and open the model pull request of one repository.
+    CommitModel {
+        /// The repository alias.
+        repo: String,
+    },
 }
+
+/// The model worktree of one repository, as one edit-model reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPath {
+    /// The request identity from the UI.
+    pub request: String,
+    /// The repository alias.
+    pub repo: String,
+    /// The model worktree path. `theory/model.toml` lives under it.
+    pub path: PathBuf,
+}
+
+/// The request identity prefix of one model commit.
+///
+/// The daemon reports the outcome through [`Push::TicketResult`], the one
+/// result channel a GitHub mutation already has. The UI toasts a result
+/// that carries this prefix, because the operator asked for it in the
+/// Theory view and no ticket row waits for it.
+pub const MODEL_COMMIT_REQUEST: &str = "model-commit:";
 
 /// The request identity prefix of one run skill ticket creation.
 ///
@@ -1527,6 +1561,8 @@ pub enum Push {
     Ask(AskView),
     /// One settings save or reload result.
     SettingsResult(SettingsResult),
+    /// The model worktree path of one edit-model request.
+    ModelPath(ModelPath),
 }
 
 /// One command from a UI or from `aif stop` to the daemon.
@@ -2369,6 +2405,13 @@ mod tests {
             Action::Theory(TheoryAction::Sweep {
                 repo: "borsuk".to_string(),
             }),
+            Action::Theory(TheoryAction::EditModel {
+                request: "edit-model-1".to_string(),
+                repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::CommitModel {
+                repo: "borsuk".to_string(),
+            }),
             Action::Stop,
         ]
     }
@@ -2842,6 +2885,23 @@ mod tests {
         };
 
         assert!(matches!(pushes.next(), Some(Ok(Push::State(_)))));
+    }
+
+    #[test]
+    fn a_model_path_push_round_trips_and_carries_the_request() {
+        let push = Push::ModelPath(ModelPath {
+            request: "edit-model-1".to_string(),
+            repo: "borsuk".to_string(),
+            path: PathBuf::from("/state/worktrees/borsuk/model"),
+        });
+
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert_eq!(
+            text,
+            "{\"type\":\"model_path\",\"request\":\"edit-model-1\",\"repo\":\"borsuk\",\"path\":\"/state/worktrees/borsuk/model\"}"
+        );
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 
     #[test]

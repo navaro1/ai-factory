@@ -425,6 +425,15 @@ pub struct RepoConfig {
 }
 
 impl RepoConfig {
+    /// The `owner/name` of the theory repository, when the operator named
+    /// one. Absent means code mode: the code repository holds the theory.
+    pub fn theory_repo(&self) -> Option<&str> {
+        self.theory
+            .theory
+            .as_ref()
+            .and_then(|theory| theory.repo.as_deref())
+    }
+
     /// The checkout that holds `.claude/skills/`: the skills path when the
     /// operator set one, else the theory checkout.
     pub fn skills_checkout(&self) -> PathBuf {
