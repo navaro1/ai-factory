@@ -16,7 +16,7 @@ refine ──▶ implement ──▶ review ──▶ release
 
 | Stage | Default harness and model | Result |
 |---|---|---|
-| refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. |
+| refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
 | review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
@@ -26,6 +26,18 @@ the pull requests in order.
 
 Labels drive the flow: `to-refine`, `refined`, `needs-human`, and
 `release-stacked`. Add the label `to-refine` to an issue to start the work.
+
+A refine run has two outcomes. It shapes one issue, which then carries
+`refined`. Or it splits the plan into one sub-issue per chunk. Each sub-issue
+carries `refined` and `chunk`, and the parent carries `epic`. A parent never
+carries `refined`, so no agent implements it. A sub-issue of a later wave names
+its blockers with a `Blocked by #N` line, and the factory holds it until those
+sub-issues close. The final chunk closes the parent when its pull request
+merges, so no parent stays open after its work ships.
+
+The refine run also rates each implemented issue with the labels
+`complexity:<level>` and `review-complexity:<level>`. The factory reads them to
+select the model of the implement stage and of the review stage.
 
 The review stage ends in one of two ways. The agent finds nothing and marks
 the pull request ready for review. Or the agent repairs every finding, pushes,
@@ -676,7 +688,7 @@ change would therefore never start again. Each stage has one result:
 
 | Stage | What the daemon checks |
 |---|---|
-| Refine | The ticket carries the `refined` label. |
+| Refine | The ticket carries the `refined` label, or the `epic` label after a split. |
 | Implement | A pull request closes the ticket. |
 | Review | The pull request left the draft state. |
 | Release | Every pull request of the batch is merged. |

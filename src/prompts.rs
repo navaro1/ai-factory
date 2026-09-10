@@ -76,14 +76,97 @@ The implementation plan must use this table:
 
 Create separate chunks only when the split reduces delivery time. Make each
 chunk large enough to justify coordination. Put independent chunks in the same
-wave only when they have no dependency and do not edit the same files. Assign
-shared files and final integration to one coordinator chunk. Put a shared
-interface or data contract before chunks that depend on it. State the final
-integration order and final validation. For a small or tightly coupled change,
-use one C1 row and state that parallel work would add delay.
+wave only when they have no dependency and do not edit the same files. Put at
+most three chunks in one wave. Assign shared files and final integration to one
+coordinator chunk. The coordinator chunk is the last chunk, and it is alone in
+the last wave. Put a shared interface or data contract before chunks that
+depend on it. State the final integration order and final validation. For a
+small or tightly coupled change, use one C1 row and state that parallel work
+would add delay.
 
 Edit the ticket body with `gh`. Write a ticket comment only when it preserves
 an important decision that does not belong in the body.
+
+# Labels
+
+A label must exist before you use it. Create each label you need, and ignore
+the error that reports an existing label:
+
+`gh label create <name> --color <hex> --description <text> 2>/dev/null || true`
+
+Give two complexity labels to every ticket that an agent implements. The
+factory reads them to select the model of the implement stage and of the
+review stage. The scale is `low`, `medium`, `high`, and `very-high`. The
+implementation label is `complexity:<level>`. The review label is
+`review-complexity:<level>`. Rate the size and the risk of that one ticket,
+not of the whole feature. An absent label means `medium`, so state the level
+even when you choose medium.
+
+# One chunk
+
+When the plan holds one chunk, the ticket stays one ticket. Run
+`gh issue edit {number} --remove-label to-refine --add-label refined` and add
+the two complexity labels in the same command. Report one line that says the
+ticket is refined.
+
+# Several chunks
+
+When the plan holds two or more chunks, create one sub-ticket for each chunk
+with `gh issue create`. Ticket #{number} becomes the parent. The parent holds
+the shared specification. No agent implements the parent.
+
+Create the sub-tickets in wave order. Then you know the number of every
+earlier chunk when you write a dependency.
+
+The body of a sub-ticket must hold these sections:
+
+- Parent: #{number}
+- Problem
+- Agreed approach
+- Acceptance criteria
+- Implementation plan, as the table above, with one C1 row for this chunk
+- Owned files or paths
+- Validation
+
+A sub-ticket must stand alone. Copy every fact the chunk needs from the
+parent. The agent that implements the chunk reads the sub-ticket only.
+
+When a chunk depends on an earlier chunk, add one line `Blocked by #A and #B`
+to the body of the sub-ticket. Name every earlier chunk it needs. The factory
+holds the sub-ticket until those tickets close.
+
+Give each sub-ticket the `refined` label, the `chunk` label, one
+`complexity:<level>` label, and one `review-complexity:<level>` label. Never
+give a sub-ticket the `to-refine` label.
+
+The last sub-ticket is the coordinator. Add this line to its body:
+
+- Final chunk. Also close the parent: add a second `Closes #{number}` line to
+  the PR body.
+
+Then edit the parent:
+
+- Add a `## Chunks` section. Write one task list line for each sub-ticket, in
+  the form `- [ ] #A short goal`.
+- Add a `## Definition of done` section. State that the parent closes when the
+  PR of the final chunk merges.
+- Run `gh issue edit {number} --remove-label to-refine --add-label epic`.
+
+Never give the parent the `refined` label. That label starts a second
+implementation of work the sub-tickets already own, and it leaves the parent
+open forever.
+
+Report one line that says the ticket is refined, and name the sub-tickets.
+
+# A second run on the same parent
+
+A parent carries the `epic` label and a `## Chunks` section. When you refine
+such a ticket again, do not create the sub-tickets a second time. Read the
+sub-tickets the section names. Update the body and the labels of each open
+one. Create a sub-ticket only for a chunk that has none. Close a sub-ticket
+that the new plan drops, and state the reason in a comment.
+
+# A human decision
 
 When you need a human decision, add the `needs-human` label to the ticket with
 `gh` and state the question in a comment. Stop after the label is on. When the
@@ -92,11 +175,6 @@ block in this form. Keep the JSON on one line:
 <aif-ask-v1>
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
-
-When the specification is complete, run
-`gh issue edit {number} --remove-label to-refine --add-label refined`.
-Run this command only after the ticket body is complete. Then report one line
-that says the ticket is refined.
 
 Ticket #{number}: {title}
 
@@ -149,7 +227,9 @@ after integration. Do not run several full test suites concurrently. Make the
 test suite pass. Commit the integrated work in small, complete commits.
 
 Open a draft PR with `gh pr create --draft` when the work is done. Put
-`Closes #{number}` in the body. After the command succeeds, run
+`Closes #{number}` in the body. When the ticket body names a parent ticket and
+marks this ticket as the final chunk, add a second `Closes` line for the parent
+number, so the merge closes the parent too. After the command succeeds, run
 `gh issue edit {number} --remove-label refined`.
 
 If the specification is incomplete, or you need a human decision, add the
@@ -946,6 +1026,56 @@ mod tests {
         ] {
             assert!(prompt.contains(required), "missing: {required}");
         }
+    }
+
+    #[test]
+    fn the_refine_prompt_splits_chunks_into_labelled_sub_tickets() {
+        let prompt = REFINE_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for required in [
+            // A split creates one sub-ticket per chunk.
+            "create one sub-ticket for each chunk with `gh issue create`",
+            "Create the sub-tickets in wave order",
+            "A sub-ticket must stand alone",
+            // The routing labels the tag routes read.
+            "`complexity:<level>`",
+            "`review-complexity:<level>`",
+            "Give each sub-ticket the `refined` label, the `chunk` label",
+            "Never give a sub-ticket the `to-refine` label",
+            // A missing label would fail `gh issue create`.
+            "gh label create <name>",
+            // The wave order rides on the blocker parser of the gates module.
+            "Blocked by #A and #B",
+            // The parent never enters the implement stage, and it closes
+            // when the final chunk merges. Both rules keep it from going
+            // stale as an open ticket no agent ever finishes.
+            "No agent implements the parent",
+            "Never give the parent the `refined` label",
+            "--remove-label to-refine --add-label epic",
+            "add a second `Closes #{number}` line to the PR body",
+            "the parent closes when the PR of the final chunk merges",
+            // A second refine run must not duplicate the sub-tickets.
+            "do not create the sub-tickets a second time",
+        ] {
+            assert!(prompt.contains(required), "missing: {required}");
+        }
+    }
+
+    /// The parent of a split ticket closes through the PR of its final
+    /// chunk, so the implement prompt must carry that rule.
+    #[test]
+    fn the_implement_prompt_closes_the_parent_of_a_final_chunk() {
+        let prompt = IMPLEMENT_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(prompt.contains(
+            "When the ticket body names a parent ticket and marks this ticket \
+as the final chunk, add a second `Closes` line for the parent number, so the \
+merge closes the parent too."
+        ));
     }
 
     #[test]

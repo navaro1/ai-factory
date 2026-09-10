@@ -24,6 +24,15 @@ pub const TO_REFINE: &str = "to-refine";
 /// The label that marks a shaped issue as ready to implement.
 pub const REFINED: &str = "refined";
 
+/// The label that marks a parent whose chunks became sub-tickets.
+///
+/// A refine run has two outcomes. It shapes one ticket and adds
+/// [`REFINED`], or it splits the work and adds this label to the parent.
+/// A parent never carries [`REFINED`], so [`implement_ready`] stays false
+/// on it and only the sub-tickets reach the implement stage. The parent
+/// closes when the PR of the final chunk merges.
+pub const EPIC: &str = "epic";
+
 /// The label that asks a human to decide something on GitHub.
 pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
 
@@ -390,6 +399,25 @@ mod tests {
         let mut closed = issue(1, &["refined"]);
         closed.open = false;
         assert!(!implement_ready(&closed));
+    }
+
+    /// The parent of a split carries `epic` and never `refined`, so the
+    /// implement gate stays shut on it while its sub-tickets run.
+    #[test]
+    fn an_epic_parent_never_opens_the_implement_gate() {
+        let snap = repo(
+            vec![issue(1, &[EPIC]), issue(2, &[REFINED, "chunk"])],
+            vec![],
+        );
+        assert!(!implement_ready(&snap.issues[&1]));
+        assert!(
+            !refine_ready(&snap.issues[&1]),
+            "the parent is not refined again"
+        );
+        assert!(
+            implement_ready(&snap.issues[&2]),
+            "the sub-ticket carries the work"
+        );
     }
 
     /// The gate answers one question: did the ticket enter the stage? An
