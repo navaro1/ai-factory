@@ -119,6 +119,8 @@ enum Msg {
     Ask(crate::sock::AskView),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
+    /// The model worktree path of one edit-model request.
+    ModelPath(crate::sock::ModelPath),
     /// The parsed `opencode models` probe result of this shell start.
     HarnessModels(Result<Vec<String>, String>),
     /// The socket reader reached the daemon.
@@ -1171,6 +1173,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::ModelPath(view)) => {
+                                        if tx.send(Msg::ModelPath(view)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Err(error) => {
                                         if error.downcast_ref::<WireProtocolMismatch>().is_some() {
                                             if tx.send(Msg::Fatal(format!("{error:#}"))).is_err() {
@@ -1283,6 +1290,9 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
             if result
                 .request
                 .starts_with(crate::sock::SKILL_TICKET_REQUEST)
+                || result
+                    .request
+                    .starts_with(crate::sock::MODEL_COMMIT_REQUEST)
             {
                 app.show_toast(&result.message);
             } else {
@@ -1296,6 +1306,19 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::SettingsResult(result) => {
             app.settings.observe_result(result);
+            Ok(true)
+        }
+        Msg::ModelPath(view) => {
+            // The editor owns the real terminal, so it runs on the shell
+            // thread and never inside the socket reader.
+            let outcome = app.theory.observe_model_path(&view, editor::edit_file);
+            match outcome {
+                theory::Outcome::Send(action, toast) => {
+                    emit(app, sink, *action, toast);
+                }
+                theory::Outcome::Reject(reason) => app.show_toast(&reason),
+                theory::Outcome::None | theory::Outcome::Pass => {}
+            }
             Ok(true)
         }
         Msg::HarnessModels(result) => {
@@ -3130,6 +3153,61 @@ mod tests {
         let screen = render_to_string(&mut app);
         assert!(screen.contains("t teach"), "{screen}");
         assert!(screen.contains("\u{25b8} web-checkout"), "{screen}");
+    }
+
+    #[test]
+    fn e_sends_the_edit_model_action_and_the_model_result_toasts() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('e')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        let [Action::Theory(crate::sock::TheoryAction::EditModel { request, repo })] =
+            sink.0.as_slice()
+        else {
+            panic!("e must send one edit-model action, sent {:?}", sink.0);
+        };
+        assert!(!request.is_empty(), "the request carries an identity");
+        assert_eq!(repo, "borsuk");
+        assert_eq!(app.visible_toast(), Some("opening the model of borsuk"));
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::TicketResult(crate::sock::TicketResult {
+                request: "model-commit:borsuk".to_string(),
+                repo: "borsuk".to_string(),
+                number: 0,
+                kind: crate::sock::TicketResultKind::Success,
+                message: "opened the model pull request 12 of borsuk".to_string(),
+                issue: None,
+                conflict: None,
+            })]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.visible_toast(),
+            Some("opened the model pull request 12 of borsuk")
+        );
+        assert!(render_to_string(&mut app).contains("e model"));
     }
 
     #[test]

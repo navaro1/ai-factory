@@ -609,6 +609,57 @@ impl<'a> GhClient<'a> {
     }
 }
 
+/// The number and head branch of the open pull request of `owner_repo`
+/// whose head branch starts with `prefix`.
+///
+/// The daemon derives the open model branch this way, and the doctor asks
+/// the same question before it removes a model worktree. No caller stores
+/// the branch name. The first match of the listing wins.
+pub fn open_pr_with_head_prefix(
+    exec: &dyn Exec,
+    owner_repo: &str,
+    prefix: &str,
+) -> Result<Option<(u64, String)>> {
+    let out = exec
+        .run(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--repo",
+                owner_repo,
+                "--state",
+                "open",
+                "--json",
+                "number,headRefName",
+            ],
+            None,
+        )
+        .context("gh pr list failed to run")?;
+    if out.status != 0 {
+        bail!(
+            "gh pr list exited with status {}: {}",
+            out.status,
+            out.stderr.trim()
+        );
+    }
+    let rows: Vec<Value> =
+        serde_json::from_str(&out.stdout).context("gh pr list returned a broken body")?;
+    for row in rows {
+        let Some(head) = row.get("headRefName").and_then(Value::as_str) else {
+            continue;
+        };
+        if !head.starts_with(prefix) {
+            continue;
+        }
+        let Some(number) = row.get("number").and_then(Value::as_u64) else {
+            continue;
+        };
+        return Ok(Some((number, head.to_string())));
+    }
+    Ok(None)
+}
+
 /// The raw status fields of one mentioned GitHub object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MentionFields {

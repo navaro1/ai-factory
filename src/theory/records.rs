@@ -20,6 +20,9 @@ pub const EVENT_OPEN_LABEL: &str = "event-open";
 /// The label that marks a pull request that changes the model.
 pub const MODEL_PR_LABEL: &str = "model-pr";
 
+/// The color GitHub renders `model-pr` with, as six hex digits.
+pub const MODEL_PR_COLOR: &str = "1d76db";
+
 /// The color GitHub renders `event-open` with, as six hex digits.
 pub const EVENT_OPEN_COLOR: &str = "d4c5f9";
 
@@ -38,8 +41,11 @@ pub const MEASURE_BLOCK: &str = "<aif-measure-v1>";
 /// The opening tag of one answer block.
 pub const ANSWER_BLOCK: &str = "<aif-answer-v1>";
 
+/// The model file of one repository, relative to the theory checkout.
+pub const MODEL_FILE: &str = "theory/model.toml";
+
 /// The theory files only a model branch may change.
-pub const MODEL_FILES: [&str; 3] = ["theory/model.toml", "theory/verify.toml", "theory/rules.md"];
+pub const MODEL_FILES: [&str; 3] = [MODEL_FILE, "theory/verify.toml", "theory/rules.md"];
 
 /// Check the body and the diff of one governed pull request.
 ///
