@@ -812,8 +812,10 @@ fn wants_prediction(state: &StateView, repo: &str, number: u64) -> bool {
 
 /// Handle one key while the short prediction input holds the keyboard.
 ///
-/// Escape closes the input and sends nothing. Enter sends the line; an
-/// empty line closes the input and sends nothing.
+/// Escape closes the input and sends nothing, and so does an empty line.
+/// Enter sends every other line. A line that names areas but makes no
+/// claim closes the input and says why, because a silent close reads
+/// like a lost key press.
 pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSink) {
     let allowed = match key.code {
         KeyCode::Char(_) => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
@@ -838,7 +840,11 @@ pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
             let Some(input) = app.prediction.take() else {
                 return;
             };
+            if input.buffer.trim().is_empty() {
+                return;
+            }
             let Some(prediction) = parse_prediction(&input.buffer) else {
+                app.show_toast(NEEDS_CLAIM);
                 return;
             };
             send_refine(
@@ -854,11 +860,14 @@ pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
     }
 }
 
+/// What the toast says when the typed line carries no claim.
+const NEEDS_CLAIM: &str = "a prediction needs a claim before the area list";
+
 /// Parse one typed line into a short prediction.
 ///
 /// The grammar is the claim, then an optional trailing `[area, area]`
-/// list. A line with no claim yields nothing. An empty area name drops
-/// out of the list.
+/// list. A line that holds only the area list carries no claim and
+/// yields nothing. An empty area name drops out of the list.
 fn parse_prediction(line: &str) -> Option<ShortPrediction> {
     let line = line.trim();
     let mut text = line;
@@ -4528,6 +4537,11 @@ mod tests {
     /// The render moment of the prediction tests.
     const NOW_MS: u64 = 1_000_000;
 
+    /// One press of the enter key.
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
     use crate::gates::{AWAITS_SHORT_HINT, MODEL_ERROR_HINT, TO_REFINE};
 
     /// One state whose `borsuk` repository is governed and holds ticket
@@ -4617,11 +4631,7 @@ mod tests {
         for character in "block the empty card [web-checkout, api-orders]".chars() {
             typing_key(&mut app, pressed(character), &mut sink);
         }
-        typing_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &mut sink,
-        );
+        typing_key(&mut app, enter(), &mut sink);
 
         assert_eq!(
             sink.0,
@@ -4637,6 +4647,35 @@ mod tests {
             }]
         );
         assert!(app.prediction.is_none(), "the input closes after the send");
+    }
+
+    /// A line that names areas but makes no claim closes the input and
+    /// says why, and an empty line closes it quietly.
+    #[test]
+    fn a_prediction_line_with_no_claim_says_why_and_sends_nothing() {
+        let mut app = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('r'), &mut sink);
+        for character in "[web-checkout]".chars() {
+            typing_key(&mut app, pressed(character), &mut sink);
+        }
+        typing_key(&mut app, enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "the claimless line sends nothing");
+        assert!(app.prediction.is_none(), "the input closes");
+        assert_eq!(
+            app.visible_toast(),
+            Some("a prediction needs a claim before the area list")
+        );
+
+        let mut quiet = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut quiet, pressed('r'), &mut sink);
+        typing_key(&mut quiet, enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "the empty line sends nothing");
+        assert!(quiet.prediction.is_none(), "the input closes");
+        assert_eq!(quiet.visible_toast(), None, "an empty line says nothing");
     }
 
     /// Escape closes the input and sends nothing.

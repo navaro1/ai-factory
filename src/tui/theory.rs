@@ -5,8 +5,13 @@
 //! area reaches, then the HOLDS panel with the items the governor holds.
 //! The operator moves the cursor with `j` and `k`. On a repository row
 //! `v` asks for the run skill of one surface. On an area row `t` asks the
-//! agent to teach that area.
+//! agent to teach that area. On a repository row `e` opens
+//! `theory/model.toml` in the operator's editor.
 
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -14,11 +19,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::sock::{Action, AreaView, HoldView, StateView, TheoryAction, TheoryView};
+use crate::sock::{Action, AreaView, HoldView, ModelPath, StateView, TheoryAction, TheoryView};
 use crate::tasks::TeachKey;
-use crate::theory::records::names_empty_area;
+use crate::theory::model;
+use crate::theory::records::{names_empty_area, MODEL_FILE};
 use crate::theory::verify::Tier;
 
+use super::editor::EditorOutcome;
 use super::theme::THEME;
 
 /// The separator of the header strip and the area rows.
@@ -84,6 +91,11 @@ pub(super) struct Theory {
     marked: Option<Stop>,
     /// The surface name typed so far, while the input is open.
     input: Option<String>,
+    /// The identity of the edit-model request this UI sent.
+    ///
+    /// The daemon pushes the reply to every connected UI, so only the UI
+    /// that holds the matching identity opens an editor.
+    pending_edit: Option<String>,
 }
 
 impl Theory {
@@ -110,7 +122,9 @@ impl Theory {
     pub(super) fn footer_hints(&self) -> String {
         match &self.input {
             Some(buffer) => format!("surface: {buffer}_{DOT}enter send{DOT}esc cancel"),
-            None => format!("1-6 view{DOT}j/k row{DOT}v run skill{DOT}t teach{DOT}esc home"),
+            None => {
+                format!("1-6 view{DOT}j/k row{DOT}v run skill{DOT}t teach{DOT}e model{DOT}esc home")
+            }
         }
     }
 
@@ -135,6 +149,7 @@ impl Theory {
                 Outcome::None
             }
             KeyCode::Char('t') => self.send_teach(state),
+            KeyCode::Char('e') => self.send_edit_model(state),
             _ => Outcome::Pass,
         }
     }
@@ -214,6 +229,61 @@ impl Theory {
             })),
             toast,
         )
+    }
+
+    /// Ask the daemon for the model worktree of the marked repository.
+    ///
+    /// An area row names one area, not the repository model, so it sends
+    /// nothing. The identity of the request stays here until the reply
+    /// arrives.
+    fn send_edit_model(&mut self, state: &StateView) -> Outcome {
+        let Some(Stop::Repo(repo)) = self.at(state) else {
+            return Outcome::None;
+        };
+        let request = uuid::Uuid::new_v4().to_string();
+        self.pending_edit = Some(request.clone());
+        let toast = format!("opening the model of {repo}");
+        Outcome::Send(
+            Box::new(Action::Theory(TheoryAction::EditModel { request, repo })),
+            toast,
+        )
+    }
+
+    /// Edit the model of one repository and ask the daemon to commit it.
+    ///
+    /// A reply this UI did not ask for does nothing. `edit` runs the
+    /// operator's editor over `theory/model.toml` in the worktree the
+    /// daemon prepared. A file that does not parse sends nothing and
+    /// reports the entry and the reason.
+    pub(super) fn observe_model_path(
+        &mut self,
+        view: &ModelPath,
+        edit: impl FnOnce(&Path) -> Result<EditorOutcome>,
+    ) -> Outcome {
+        if self.pending_edit.as_deref() != Some(view.request.as_str()) {
+            return Outcome::None;
+        }
+        self.pending_edit = None;
+        let file = view.path.join(MODEL_FILE);
+        match edit(&file) {
+            Err(error) => Outcome::Reject(format!("cannot edit {}: {error:#}", file.display())),
+            Ok(EditorOutcome::Failed(reason)) => Outcome::Reject(reason),
+            Ok(EditorOutcome::Unchanged) => {
+                Outcome::Reject(format!("the model of {} did not change", view.repo))
+            }
+            Ok(EditorOutcome::Saved) => match fs::read_to_string(&file) {
+                Err(error) => Outcome::Reject(format!("cannot read {}: {error}", file.display())),
+                Ok(text) => match model::parse(&text) {
+                    Err(error) => Outcome::Reject(format!("{MODEL_FILE}: {error}")),
+                    Ok(_) => Outcome::Send(
+                        Box::new(Action::Theory(TheoryAction::CommitModel {
+                            repo: view.repo.clone(),
+                        })),
+                        format!("asked to commit the model of {}", view.repo),
+                    ),
+                },
+            },
+        }
     }
 
     /// Move the mark by `delta` rows, without wrapping.
@@ -773,6 +843,175 @@ mod tests {
             pane.handle_key(&state, press(KeyCode::Enter)),
             Outcome::Send(_, _)
         ));
+    }
+
+    // --- The edit-model flow. ---
+
+    /// A fresh temporary directory for one test.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aif-theory-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write an executable POSIX shell script into `dir`.
+    fn script(dir: &Path, body: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("editor");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        drop(file);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    /// The model worktree of one test, with `theory/model.toml` in it.
+    fn model_worktree(dir: &Path, text: &str) -> std::path::PathBuf {
+        let worktree = dir.join("model");
+        fs::create_dir_all(worktree.join("theory")).unwrap();
+        fs::write(worktree.join(MODEL_FILE), text).unwrap();
+        worktree
+    }
+
+    /// An editor closure that runs the fake editor `body` over one file.
+    ///
+    /// The test writes its fake editor and executes it at once, so the
+    /// exec can lose against the write-count release of the just-closed
+    /// file and report `Text file busy` for a few microseconds. Production
+    /// never executes a file it just wrote, so the retry lives here.
+    fn fake_editor(dir: &Path, body: &str) -> impl FnOnce(&Path) -> Result<EditorOutcome> {
+        let editor = vec![script(dir, body).to_string_lossy().into_owned()];
+        move |file: &Path| {
+            for _ in 0..100 {
+                match super::super::editor::edit_file_with(file, &editor, || Ok(()), || Ok(())) {
+                    Ok(EditorOutcome::Failed(reason)) if reason.contains("Text file busy") => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    outcome => return outcome,
+                }
+            }
+            panic!("the fake editor did not start after 100 attempts");
+        }
+    }
+
+    /// Press `e` on the marked row and return the request it minted.
+    fn press_edit(pane: &mut Theory, state: &StateView) -> ModelPath {
+        let Outcome::Send(action, toast) = pane.handle_key(state, press(KeyCode::Char('e'))) else {
+            panic!("e on a repository row must send the edit-model action");
+        };
+        assert_eq!(toast, "opening the model of borsuk");
+        let Action::Theory(TheoryAction::EditModel { request, repo }) = *action else {
+            panic!("e must send TheoryAction::EditModel");
+        };
+        ModelPath {
+            request,
+            repo,
+            path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn an_editor_that_saves_a_valid_model_sends_the_commit_action() {
+        let dir = temp_dir("model-saved");
+        let worktree = model_worktree(&dir, "# Write one [[entry]] table per model entry.\n");
+        let state = view(vec![area("web-checkout", Tier::None, Tier::None, false)], 0);
+        let mut pane = Theory::default();
+        let mut reply = press_edit(&mut pane, &state);
+        reply.path = worktree;
+        let editor = fake_editor(
+            &dir,
+            "#!/bin/sh\nprintf '[[entry]]\\nid = \"pay\"\\nkind = \"state\"\\n             title = \"Pay\"\\nstatement = \"The buyer pays.\"\\n' > \"$1\"\n",
+        );
+
+        let outcome = pane.observe_model_path(&reply, editor);
+
+        assert_eq!(
+            outcome,
+            Outcome::Send(
+                Box::new(Action::Theory(TheoryAction::CommitModel {
+                    repo: "borsuk".to_string(),
+                })),
+                "asked to commit the model of borsuk".to_string()
+            )
+        );
+        assert!(
+            pane.footer_hints().contains("e model"),
+            "footer was: {}",
+            pane.footer_hints()
+        );
+    }
+
+    #[test]
+    fn an_editor_that_breaks_the_model_reports_the_entry_and_sends_nothing() {
+        let dir = temp_dir("model-broken");
+        let worktree = model_worktree(&dir, "# Write one [[entry]] table per model entry.\n");
+        let state = view(Vec::new(), 0);
+        let mut pane = Theory::default();
+        let mut reply = press_edit(&mut pane, &state);
+        reply.path = worktree;
+        let editor = fake_editor(
+            &dir,
+            "#!/bin/sh\nprintf '[[entry]]\\nid = \"pay\"\\nkind = \"state\"\\n' > \"$1\"\n",
+        );
+
+        let outcome = pane.observe_model_path(&reply, editor);
+
+        assert_eq!(
+            outcome,
+            Outcome::Reject("theory/model.toml: pay: title is required".to_string()),
+            "a broken model names the entry and the reason"
+        );
+    }
+
+    #[test]
+    fn a_failed_editor_and_a_reply_this_ui_never_asked_for_send_nothing() {
+        let dir = temp_dir("model-failed");
+        let worktree = model_worktree(&dir, "# Write one [[entry]] table per model entry.\n");
+        let state = view(Vec::new(), 0);
+        let mut pane = Theory::default();
+        let mut reply = press_edit(&mut pane, &state);
+        reply.path = worktree.clone();
+
+        // Another UI asked for its own edit, so this reply opens no editor.
+        let stranger = ModelPath {
+            request: "someone-else".to_string(),
+            repo: "borsuk".to_string(),
+            path: worktree.clone(),
+        };
+        assert_eq!(
+            pane.observe_model_path(&stranger, |_| panic!("no editor may run")),
+            Outcome::None
+        );
+
+        let outcome = pane.observe_model_path(&reply, fake_editor(&dir, "#!/bin/sh\nexit 1\n"));
+
+        assert!(
+            matches!(&outcome, Outcome::Reject(reason) if reason.contains("exit")),
+            "a failed editor reports its reason, was {outcome:?}"
+        );
+        // The reply is spent, so a second copy of it opens no editor.
+        assert_eq!(
+            pane.observe_model_path(&reply, |_| panic!("no editor may run")),
+            Outcome::None
+        );
+    }
+
+    #[test]
+    fn e_on_an_area_row_sends_nothing() {
+        let state = view(vec![area("web-checkout", Tier::None, Tier::None, false)], 0);
+        let mut pane = Theory::default();
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('e'))),
+            Outcome::None,
+            "an area row names no repository model"
+        );
     }
 
     #[test]
