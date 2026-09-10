@@ -139,8 +139,9 @@ do not exist:
 
 The installer never overwrites a file that exists. The installer keeps an
 installed prompt file. After an upgrade, copy the new prompt files from
-`docs/v0.6/prompts/` by hand, or edit each prompt in the Settings view.
-Edit `~/.config/aif/factory.toml` and set the path of every repository.
+`docs/v0.8/prompts/` and `docs/v0.6/prompts/` by hand, or edit each prompt
+in the Settings view. Edit `~/.config/aif/factory.toml` and set the path of
+every repository.
 
 ## Configure
 
@@ -333,7 +334,7 @@ rows, and the tasks that ran at the stop come back.
 repository checkout:
 
 ```sh
-cp docs/v0.6/prompts/*.md ~/.config/aif/prompts/
+cp docs/v0.8/prompts/*.md docs/v0.6/prompts/*.md ~/.config/aif/prompts/
 ```
 
 The copy replaces your edits to the installed prompt files.

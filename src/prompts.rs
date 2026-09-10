@@ -4,7 +4,8 @@
 //! changes touch one file. A file `prompts/<name>.md` in the config
 //! directory overrides the built-in default; [`file_name`] gives the name
 //! of each role and [`ROLES`] lists the roles that have one. The docs
-//! directory `docs/v0.6/prompts/` holds a reference copy of each template,
+//! directory `docs/v0.8/prompts/` holds a reference copy of each stage
+//! template, and `docs/v0.6/prompts/` holds the two ticket templates,
 //! pinned byte for byte by a test.
 //!
 //! The daemon reads the prompt file of a role each time a task of that role
@@ -54,7 +55,8 @@ operator answer to a question from an earlier run arrives there. Such an
 answer settles the question. Act on it, and never ask that question again.
 
 Your goal is a complete, testable specification that minimizes delivery time.
-Do not implement the change.
+Do not implement the change. The refine stage commits nothing and leaves no
+file behind in the worktree. The implement stage inherits the branch.
 
 Read the ticket, the repository instructions, the relevant code, and its
 dependencies. Confirm that the ticket is still valid. Keep the requested scope.
@@ -62,17 +64,83 @@ Use parallel tool calls for independent reads. Use subagents only for sizeable,
 independent research. Use at most three subagents. Do not use a subagent for
 routine reads or for a second review.
 
-The ticket body must contain these sections:
+# The theory slices
+
+The factory fills the two blocks below from the theory governor of the
+repository. The model entries carry the theory model of the repository. The
+run skills carry the drive recipes, the fast commands, and the feature index
+of the areas the ticket touches. Read both blocks before you write the
+sections. Empty blocks mean the governor is off, and the ticket then defines
+the surface on its own.
+
+{model}
+
+{skills}
+
+# The ticket body
+
+Rewrite the body of ticket #{number} with `gh` into the sections below, in
+this order. Write a ticket comment only when it preserves an important
+decision that does not belong in the body.
 
 - Problem
-- Agreed approach
+- Grounding
+- Decisions
+- Repro, for a ticket with the `bug` label
 - Acceptance criteria
 - Implementation plan
 
+`## Problem` opens with the request restated in your own words, one
+paragraph. Write the restatement before you read code.
+
+`## Grounding` states the mechanism, the history, and the paths of the
+change. Cite the code you read and the `git log` and `gh pr list` output of
+the paths the ticket touches.
+
+`## Decisions` holds one line per open question, its answer, and the command
+that answered it. A question an experiment can answer is not the operator's.
+Run the experiment in a scratch directory under the worktree, never
+committed, and record the result.
+Remove the scratch directory before you finish. Only a product or preference
+call earns `needs-human`.
+
+`## Repro` belongs to a ticket with the `bug` label only. Drive the surface
+on the base until the defect reproduces twice. Write the exact command, the
+two observed outputs, and the exit code. A third miss goes to `needs-human`
+with the attempts.
+
+`## Acceptance criteria` holds one falsifiable line per criterion, in this
+grammar.
+
+- AC-<n> · <falsifiable statement> · check: <target>
+
+The target is `<feature> drive`, `<feature> fast`, or `measure <id>`. The
+drive target asks for a full drive of the feature. The fast target runs the
+fast command of the feature file. The measure target runs a measurer of
+`theory/verify.toml`. When the `{skills}` block is empty, no run skill
+exists yet. Use `measure <id>` when the theory map has a measurer.
+Otherwise name the target `<feature> fast`, and write `new: <feature>` in
+the Fast column of the chunk that adds the feature file. These lines show
+the shape.
+
+- AC-1 · An empty card field blocks submit and shows "Card is required" · check: checkout-submit drive
+- AC-2 · POST /orders with no card returns 422 and `{"error":"card_required"}` · check: api-orders fast
+- AC-3 · poll_p95 does not worsen · check: measure poll_p95
+
+A criterion names the condition, the observable result, and the check. A
+criterion that no command can falsify is not a criterion. Rewrite it, or
+take it to a human decision when no experiment can settle it. A criterion
+that the ticket text does not ask for is scope creep. Drop it.
+
+# The implementation plan
+
 The implementation plan must use this table:
 
-| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |
-|---|---|---|---|---|---|
+| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |
+|---|---|---|---|---|---|---|
+
+The Fast column names the fast command that proves the chunk, or
+`new: <feature>` when the chunk must add a feature file.
 
 Create separate chunks only when the split reduces delivery time. Make each
 chunk large enough to justify coordination. Put independent chunks in the same
@@ -83,9 +151,6 @@ the last wave. Put a shared interface or data contract before chunks that
 depend on it. State the final integration order and final validation. For a
 small or tightly coupled change, use one C1 row and state that parallel work
 would add delay.
-
-Edit the ticket body with `gh`. Write a ticket comment only when it preserves
-an important decision that does not belong in the body.
 
 # Labels
 
@@ -122,7 +187,9 @@ The body of a sub-ticket must hold these sections:
 
 - Parent: #{number}
 - Problem
-- Agreed approach
+- Grounding
+- Decisions
+- Repro, when the parent carries the `bug` label
 - Acceptance criteria
 - Implementation plan, as the table above, with one C1 row for this chunk
 - Owned files or paths
@@ -984,15 +1051,15 @@ mod tests {
     fn the_docs_copies_match_the_consts_byte_for_byte() {
         assert_eq!(
             REFINE_PROMPT,
-            include_str!("../docs/v0.6/prompts/refine.md")
+            include_str!("../docs/v0.8/prompts/refine.md")
         );
         assert_eq!(
             IMPLEMENT_PROMPT,
-            include_str!("../docs/v0.6/prompts/implement.md")
+            include_str!("../docs/v0.8/prompts/implement.md")
         );
         assert_eq!(
             RELEASE_PROMPT,
-            include_str!("../docs/v0.6/prompts/release.md")
+            include_str!("../docs/v0.8/prompts/release.md")
         );
         assert_eq!(
             TICKET_PROMPT,
@@ -1004,7 +1071,7 @@ mod tests {
         );
         assert_eq!(
             REVIEW_PROMPT,
-            include_str!("../docs/v0.6/prompts/review.md")
+            include_str!("../docs/v0.8/prompts/review.md")
         );
     }
 
@@ -1025,7 +1092,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         for required in [
-            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |",
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |",
             "Put independent chunks in the same",
             "do not edit the same files",
             "Assign shared files and final integration to one coordinator chunk",
@@ -1034,6 +1101,32 @@ mod tests {
         ] {
             assert!(prompt.contains(required), "missing: {required}");
         }
+    }
+
+    /// Requirement R13. The refined ticket carries the R13 sections before
+    /// the plan table, one falsifiable line per criterion, and no wording
+    /// the v0.7 acceptance section used.
+    #[test]
+    fn the_refine_prompt_defines_the_criteria_contract() {
+        for required in [
+            "## Problem",
+            "## Grounding",
+            "## Decisions",
+            "## Repro",
+            "## Acceptance criteria",
+            "- AC-<n> · <falsifiable statement> · check: <target>",
+            "`<feature> drive`",
+            "`<feature> fast`",
+            "`measure <id>`",
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |",
+            "`new: <feature>`",
+        ] {
+            assert!(REFINE_PROMPT.contains(required), "missing: {required}");
+        }
+        assert!(
+            !REFINE_PROMPT.contains("Agreed approach"),
+            "the v0.7 acceptance wording must not return"
+        );
     }
 
     #[test]
