@@ -100,8 +100,9 @@ the paths the ticket touches.
 `## Decisions` holds one line per open question, its answer, and the command
 that answered it. A question an experiment can answer is not the operator's.
 Run the experiment in a scratch directory under the worktree, never
-committed, and record the result. Only a product or preference call earns
-`needs-human`.
+committed, and record the result.
+Remove the scratch directory before you finish. Only a product or preference
+call earns `needs-human`.
 
 `## Repro` belongs to a ticket with the `bug` label only. Drive the surface
 on the base until the defect reproduces twice. Write the exact command, the
@@ -116,13 +117,18 @@ grammar.
 The target is `<feature> drive`, `<feature> fast`, or `measure <id>`. The
 drive target asks for a full drive of the feature. The fast target runs the
 fast command of the feature file. The measure target runs a measurer of
-`theory/verify.toml`. These lines show the shape.
+`theory/verify.toml`. When the `{skills}` block is empty, no run skill
+exists yet. Use `measure <id>` when the theory map has a measurer.
+Otherwise name the target `<feature> fast`, and write `new: <feature>` in
+the Fast column of the chunk that adds the feature file. These lines show
+the shape.
 
 - AC-1 · An empty card field blocks submit and shows "Card is required" · check: checkout-submit drive
 - AC-2 · POST /orders with no card returns 422 and `{"error":"card_required"}` · check: api-orders fast
 - AC-3 · poll_p95 does not worsen · check: measure poll_p95
 
-A criterion that no command can falsify is not a criterion. Rewrite it, or
+A criterion names the condition, the observable result, and the check. A
+criterion that no command can falsify is not a criterion. Rewrite it, or
 take it to a human decision when no experiment can settle it. A criterion
 that the ticket text does not ask for is scope creep. Drop it.
 
