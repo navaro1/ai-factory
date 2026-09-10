@@ -39,6 +39,15 @@ use super::theme::THEME;
 /// The separator of the header strip and the area rows.
 const DOT: &str = " · ";
 
+/// The filled block of the window gauge, one per open record.
+const WINDOW_MARK: char = '\u{25ae}';
+
+/// The empty block of the window gauge, one per free record.
+const WINDOW_ROOM: char = '\u{25af}';
+
+/// The mark between the window gauge and the pause word.
+const PAUSE_MARK: char = '\u{25b8}';
+
 /// What one key did in the Theory view.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Outcome {
@@ -528,6 +537,20 @@ fn strip(view: &TheoryView) -> Line<'static> {
             ),
             Style::default().fg(THEME.text),
         ));
+        if view.window.1 > 0 {
+            spans.push(Span::styled(DOT, THEME.dim()));
+            spans.push(Span::styled(
+                window_gauge(view.window),
+                Style::default().fg(THEME.text),
+            ));
+            if view.window.0 >= view.window.1 {
+                spans.push(Span::styled(DOT, THEME.dim()));
+                spans.push(Span::styled(
+                    format!("IMPLEMENT {PAUSE_MARK} PAUSED"),
+                    Style::default().fg(THEME.warn),
+                ));
+            }
+        }
     } else {
         spans.push(Span::styled(
             view.error.clone(),
@@ -535,6 +558,21 @@ fn strip(view: &TheoryView) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// The window gauge of one repository: one filled block per open record
+/// up to the cap, empty blocks for the rest, then the count.
+fn window_gauge(window: (usize, usize)) -> String {
+    let (open, cap) = window;
+    let mut gauge = String::from("WINDOW ");
+    for _ in 0..open.min(cap) {
+        gauge.push(WINDOW_MARK);
+    }
+    for _ in open..cap {
+        gauge.push(WINDOW_ROOM);
+    }
+    gauge.push_str(&format!(" {open}/{cap}"));
+    gauge
 }
 
 /// One row of the AREAS panel: the area id and its tier mark.
@@ -691,6 +729,7 @@ mod tests {
                 holds: Vec::new(),
                 records: BTreeMap::new(),
                 deltas: Vec::new(),
+                window: (0, 0),
             },
         );
         StateView {
@@ -727,7 +766,13 @@ mod tests {
     }
 
     fn render_with(state: &StateView, view: &mut Theory) -> String {
-        let backend = TestBackend::new(70, 16);
+        render_at(state, view, 70)
+    }
+
+    /// The render at a width the strip under test needs. A full window
+    /// strip outgrows the default 70 columns.
+    fn render_at(state: &StateView, view: &mut Theory, width: u16) -> String {
+        let backend = TestBackend::new(width, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, f.area(), state, view)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -890,6 +935,30 @@ mod tests {
         );
     }
 
+    /// The strip draws the window gauge after the counts, and the pause
+    /// word when the open records reach the cap.
+    #[test]
+    fn the_strip_draws_the_window_gauge_and_the_pause_when_full() {
+        let mut state = view(Vec::new(), 0);
+        state.theory.get_mut("borsuk").unwrap().window = (3, 3);
+
+        let text = render_at(&state, &mut Theory::default(), 90);
+
+        assert!(
+            text.contains("WINDOW \u{25ae}\u{25ae}\u{25ae} 3/3 · IMPLEMENT \u{25b8} PAUSED"),
+            "screen was:\n{text}"
+        );
+
+        // Room in the window draws the open gauge and no pause word.
+        state.theory.get_mut("borsuk").unwrap().window = (1, 3);
+        let text = render_at(&state, &mut Theory::default(), 90);
+        assert!(
+            text.contains("WINDOW \u{25ae}\u{25af}\u{25af} 1/3"),
+            "screen was:\n{text}"
+        );
+        assert!(!text.contains("PAUSED"), "screen was:\n{text}");
+    }
+
     #[test]
     fn a_floor_above_reach_and_a_lint_finding_both_mark_the_row() {
         let state = view(
@@ -1010,6 +1079,7 @@ mod tests {
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
             binding: None,
+            hold: None,
         }
     }
 

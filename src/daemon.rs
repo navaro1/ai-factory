@@ -223,6 +223,9 @@ pub const FAST_TIMEOUT_S: u64 = 120;
 /// The opening words of the finding one failed fast check posts.
 pub const FAST_CHECK_FAILED: &str = "fast check failed";
 
+/// The hold text of an implement task the theory window refuses.
+pub const WINDOW_FULL_HOLD: &str = "window full";
+
 /// The kind of the theory event one broken floor opens.
 pub const FLOOR_EVENT: &str = "floor";
 
@@ -1229,8 +1232,14 @@ impl Daemon {
                 return;
             }
         };
+        let window = self.window_map();
         for task in &mut view.tasks {
             task.queued_messages = self.pending_chats.get(&task.id).map_or(0, Vec::len);
+            if task.state == TaskState::Queued
+                && sched::window_full(&window, task.stage, &task.repo)
+            {
+                task.hold = Some(WINDOW_FULL_HOLD.to_string());
+            }
         }
         if let Some(pusher) = self.pusher.as_ref() {
             pusher(view);
@@ -1602,6 +1611,30 @@ impl Daemon {
         self.theory_records = records;
     }
 
+    /// The open record count and the window cap of every governed
+    /// repository, keyed by alias.
+    ///
+    /// The scheduler reads the map and refuses the implement tasks of a
+    /// repository whose open count reaches its cap. A repository with
+    /// the governor off is never in the map, so the window never holds
+    /// it, and v0.6 behaviour holds unchanged.
+    fn window_map(&self) -> BTreeMap<String, (usize, usize)> {
+        self.config
+            .repos
+            .values()
+            .filter(|repo| self.theory_records.is_governed(&repo.alias))
+            .map(|repo| {
+                (
+                    repo.alias.clone(),
+                    (
+                        self.theory_records.open_count(&repo.alias),
+                        repo.theory.window,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// Fetch the comments of every record of one repository that shows a
     /// theory label the daemon has not read yet.
     ///
@@ -1809,6 +1842,10 @@ impl Daemon {
         if !governed {
             return view;
         }
+        view.window = (
+            self.theory_records.open_count(repo),
+            self.config.repos[repo].theory.window,
+        );
         let empty_map = VerifyMap::default();
         let mut map = &empty_map;
         if let Some(cache) = self.theory_models.get(repo) {
@@ -2853,6 +2890,7 @@ impl Daemon {
                     &self.limits,
                     &self.paused,
                     &self.table,
+                    &self.window_map(),
                     task.stage,
                     &task.repo,
                     &task.id,
@@ -2989,6 +3027,7 @@ impl Daemon {
                     &self.limits,
                     &self.paused,
                     &self.table,
+                    &self.window_map(),
                     task.stage,
                     &task.repo,
                     &task.id,
@@ -25691,6 +25730,92 @@ mod tests {
         assert_eq!(rig.job_count(), 1, "the label opens the gate");
         assert_eq!(rig.job(0).task, "borsuk/implement-i142");
         assert!(theory_of(&rig).holds.is_empty(), "the hold goes away");
+    }
+
+    /// Three open records sit at the window cap of a governed repository:
+    /// the dispatch starts no implement task, the task stays queued with
+    /// the hold on the view, and the strip carries the gauge.
+    #[test]
+    fn a_full_window_holds_the_implement_task_and_names_the_reason() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.push(comment_page_step(201, "[]"));
+        steps.push(comment_page_step(202, "[]"));
+        steps.push(comment_page_step(203, "[]"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+        // The V7 ticket check runs before the dispatch, so the body must
+        // pass it and the window stays the only hold.
+        let body = unchecked_ticket_body().replace(
+            "- AC-2 \u{b7} Orders rejects an empty card \u{b7} check: api-orders fast\n",
+            "",
+        );
+
+        rig.poll(
+            vec![
+                issue_with_body(
+                    142,
+                    &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                    &body,
+                ),
+                issue(201, &[DELTA_OPEN_LABEL]),
+                issue(202, &[DELTA_OPEN_LABEL]),
+                issue(203, &[DELTA_OPEN_LABEL]),
+            ],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 0, "the window holds the implement task");
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Queued,
+            "the task waits instead of starting"
+        );
+        let view = last_view(&push_rx);
+        assert_eq!(
+            pushed_task(&view, "borsuk/implement-i142").hold.as_deref(),
+            Some(WINDOW_FULL_HOLD),
+            "the view names the hold on the task"
+        );
+        assert_eq!(
+            theory_of(&rig).window,
+            (3, 3),
+            "the strip carries the open count and the cap"
+        );
+    }
+
+    /// The window is a governor behaviour: the map holds the open count
+    /// and the cap of governed repositories only.
+    #[test]
+    fn the_window_map_holds_governed_repositories_only() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            governed(config);
+            let mut cold = config.repos["borsuk"].clone();
+            cold.alias = "qubitsok".to_string();
+            cold.theory.governor = Governor::Off;
+            config.repos.insert("qubitsok".to_string(), cold);
+        });
+
+        rig.poll(vec![issue(142, &[DELTA_OPEN_LABEL])], vec![]);
+
+        let map = rig.daemon.window_map();
+        assert_eq!(
+            map.get("borsuk"),
+            Some(&(1, 3)),
+            "the pair is the open count and the cap"
+        );
+        assert!(
+            !map.contains_key("qubitsok"),
+            "a repository with the governor off is never in the map"
+        );
     }
 
     /// The full prediction is a governor behaviour, so a repository with
