@@ -226,6 +226,23 @@ pub struct DeltaView {
     pub question: String,
 }
 
+impl TheoryView {
+    /// True when the theory record of one item carries `label`.
+    ///
+    /// `key` is [`RecordKey::key_text`] and `item` the labels of the code
+    /// item. A record the daemon read answers for itself, because in
+    /// shadow mode the theory labels sit on the shadow issue. An item
+    /// with no record read yet answers from its own labels.
+    ///
+    /// [`RecordKey::key_text`]: crate::theory::records::RecordKey::key_text
+    pub fn record_carries(&self, key: &str, item: &[String], label: &str) -> bool {
+        match self.records.get(key) {
+            Some(record) => record.labels.iter().any(|one| one == label),
+            None => item.iter().any(|one| one == label),
+        }
+    }
+}
+
 /// One item the governor holds out of a stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoldView {
@@ -260,6 +277,13 @@ pub struct RecordView {
     /// The last delta of the record.
     #[serde(default)]
     pub delta: Option<DeltaBlock>,
+    /// The labels of the record itself.
+    ///
+    /// In shadow mode the theory labels live on the shadow issue, not on
+    /// the code ticket, so the interface reads them here. In code mode
+    /// they repeat the item labels.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// One row of the AREAS panel.
@@ -2931,6 +2955,7 @@ mod tests {
                             }],
                             question: "Does the cart keep the token?".to_string(),
                         }),
+                        labels: vec![crate::theory::records::DELTA_OPEN_LABEL.to_string()],
                     },
                 )]),
                 areas: vec![AreaView {

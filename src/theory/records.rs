@@ -154,6 +154,21 @@ impl RecordKey {
             Self::Repo => "repo".to_string(),
         }
     }
+
+    /// The key one [`key_text`] names, or `None` for any other text.
+    ///
+    /// [`key_text`]: RecordKey::key_text
+    pub fn parse(text: &str) -> Option<RecordKey> {
+        if text == "repo" {
+            return Some(Self::Repo);
+        }
+        if let Some(number) = text.strip_prefix("issue-") {
+            return number.parse().ok().map(Self::Issue);
+        }
+        text.strip_prefix("pr-")
+            .and_then(|number| number.parse().ok())
+            .map(Self::Pr)
+    }
 }
 
 /// The theory labels whose first sight asks for the record comments.

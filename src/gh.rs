@@ -397,16 +397,29 @@ impl<'a> GhClient<'a> {
     /// the rows to its theory records; the method maps only what the row
     /// shares.
     pub fn fetch_record_rows(&mut self, owner_repo: &str, since: &str) -> Result<Vec<RecordRow>> {
-        let url = format!("repos/{owner_repo}/issues?state=all&since={since}&per_page={PAGE_SIZE}");
-        let args = ["api", "-i", "-X", "GET", url.as_str()];
-        let out = self
-            .exec
-            .run("gh", &args, None)
-            .context("gh api failed to run")?;
-        let response = checked_response(&out)?;
-        let values: Vec<Value> = serde_json::from_str(&response.body)
-            .context("gh api returned a broken record list body")?;
-        values.iter().map(record_row_from_value).collect()
+        let mut rows = Vec::new();
+        let mut page: u64 = 1;
+        loop {
+            let url = format!(
+                "repos/{owner_repo}/issues?state=all&since={since}&per_page={PAGE_SIZE}&page={page}"
+            );
+            let args = ["api", "-i", "-X", "GET", url.as_str()];
+            let out = self
+                .exec
+                .run("gh", &args, None)
+                .context("gh api failed to run")?;
+            let response = checked_response(&out)?;
+            let values: Vec<Value> = serde_json::from_str(&response.body)
+                .context("gh api returned a broken record list body")?;
+            for value in &values {
+                rows.push(record_row_from_value(value)?);
+            }
+            // A full page whose head names `rel="next"` has one more.
+            if values.len() < PAGE_SIZE || !response.link_next {
+                return Ok(rows);
+            }
+            page += 1;
+        }
     }
 
     /// Post one comment on an issue or pull request.
@@ -2130,6 +2143,67 @@ mod tests {
                 "repos/acme/borsuk/issues/9/comments?per_page=100&page=1"
             ]
         );
+    }
+
+    #[test]
+    fn fetch_record_rows_walks_a_link_next_page_and_merges_in_order() {
+        let next_link = "link: <https://api.github.com/repositories/1/issues?page=2>\
+             ; rel=\"next\", <https://api.github.com/repositories/1/issues?page=2>\
+             ; rel=\"last\"";
+        let full = format!(
+            "[{}]",
+            (0..100)
+                .map(|index| {
+                    format!(
+                        "{{\"number\":{index},\"state\":\"open\",\
+                         \"labels\":[{{\"name\":\"ladder-1\"}}]}}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c1\"", next_link],
+                    &full,
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=2",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c2\""],
+                    "[{\"number\":100,\"state\":\"open\",\"pull_request\":{},\
+                     \"labels\":[{\"name\":\"ladder-2\"}]}]",
+                )),
+            );
+        let mut client = GhClient::new(&exec);
+        let rows = client
+            .fetch_record_rows("acme/borsuk", "2026-08-11T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows[0].number, 0);
+        assert_eq!(rows[99].number, 99);
+        assert_eq!(rows[100].number, 100);
+        assert!(rows[100].pull_request);
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 2);
     }
 
     #[test]
