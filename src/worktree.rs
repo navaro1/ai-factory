@@ -516,18 +516,27 @@ impl WorktreeManager {
         )
     }
 
-    /// Remove the model worktree of one repository and delete its branch.
+    /// Remove the model worktree of one repository and delete `branch`.
     ///
     /// The proof contract matches [`WorktreeManager::remove_issue`]. The
-    /// branch comes from the worktree itself, because the model branch is
-    /// derived and never stored.
-    pub fn remove_model(&self, exec: &dyn Exec, repo: &RepoConfig, proof: Cleanable) -> Result<()> {
+    /// model branch is derived and never stored, so the caller reads it
+    /// with [`WorktreeManager::current_branch`] first.
+    pub fn remove_model(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        branch: &str,
+        proof: Cleanable,
+    ) -> Result<()> {
         match proof {
             Cleanable::MergedOrClosed => {}
         }
-        let path = self.model_path(repo);
-        let branch = self.current_branch(exec, &path)?;
-        self.remove_from(exec, &repo.theory.checkout(&repo.path), &path, &branch)
+        self.remove_from(
+            exec,
+            &repo.theory.checkout(&repo.path),
+            &self.model_path(repo),
+            branch,
+        )
     }
 
     /// Remove the worktree at `path` and delete `branch` in `source`.

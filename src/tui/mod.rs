@@ -1311,14 +1311,7 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         Msg::ModelPath(view) => {
             // The editor owns the real terminal, so it runs on the shell
             // thread and never inside the socket reader.
-            let outcome = app.theory.observe_model_path(&view, editor::edit_file);
-            match outcome {
-                theory::Outcome::Send(action, toast) => {
-                    emit(app, sink, *action, toast);
-                }
-                theory::Outcome::Reject(reason) => app.show_toast(&reason),
-                theory::Outcome::None | theory::Outcome::Pass => {}
-            }
+            apply_model_path(app, sink, &view, editor::edit_file);
             Ok(true)
         }
         Msg::HarnessModels(result) => {
@@ -1336,6 +1329,26 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         Msg::Fatal(reason) => Err(anyhow!(reason)),
         Msg::Input(reason) => Err(anyhow!("terminal input stopped: {reason}")),
         Msg::Resize => Ok(true),
+    }
+}
+
+/// Apply one model worktree reply.
+///
+/// `edit` runs the operator's editor over the model file. What it produces
+/// either crosses to the daemon as one action or lands on a toast, so a
+/// refusal is never silent.
+fn apply_model_path(
+    app: &mut App,
+    sink: &mut impl ActionSink,
+    view: &crate::sock::ModelPath,
+    edit: impl FnOnce(&std::path::Path) -> Result<editor::EditorOutcome>,
+) {
+    match app.theory.observe_model_path(view, edit) {
+        theory::Outcome::Send(action, toast) => {
+            emit(app, sink, *action, toast);
+        }
+        theory::Outcome::Reject(reason) => app.show_toast(&reason),
+        theory::Outcome::None | theory::Outcome::Pass => {}
     }
 }
 
@@ -3208,6 +3221,47 @@ mod tests {
             Some("opened the model pull request 12 of borsuk")
         );
         assert!(render_to_string(&mut app).contains("e model"));
+    }
+
+    #[test]
+    fn a_refused_model_edit_reaches_the_toast_and_sends_no_action() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('e')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        let [Action::Theory(crate::sock::TheoryAction::EditModel { request, .. })] =
+            sink.0.as_slice()
+        else {
+            panic!("e must send one edit-model action");
+        };
+        let reply = crate::sock::ModelPath {
+            request: request.clone(),
+            repo: "borsuk".to_string(),
+            path: std::path::PathBuf::from("/state/worktrees/borsuk/model"),
+        };
+
+        apply_model_path(&mut app, &mut sink, &reply, |_| {
+            Ok(editor::EditorOutcome::Failed(
+                "the editor exited with 1".to_string(),
+            ))
+        });
+
+        assert_eq!(app.visible_toast(), Some("the editor exited with 1"));
+        assert_eq!(sink.0.len(), 1, "a refused edit sends no second action");
     }
 
     #[test]

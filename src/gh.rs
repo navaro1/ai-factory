@@ -16,6 +16,9 @@ use crate::sock::RepoLabel;
 /// The page size every list request asks for.
 const PAGE_SIZE: usize = 100;
 
+/// How many open pull requests one `gh pr list` call asks for.
+pub const PR_LIST_LIMIT: &str = "200";
+
 /// The server refused the call and named a wait in its `Retry-After` head.
 ///
 /// `GhClient` returns this error instead of sleeping; the caller decides when
@@ -615,6 +618,10 @@ impl<'a> GhClient<'a> {
 /// The daemon derives the open model branch this way, and the doctor asks
 /// the same question before it removes a model worktree. No caller stores
 /// the branch name. The first match of the listing wins.
+///
+/// `gh pr list` answers 30 pull requests without a limit, so the call asks
+/// for [`PR_LIST_LIMIT`] of them and a busy repository still shows its
+/// model branch.
 pub fn open_pr_with_head_prefix(
     exec: &dyn Exec,
     owner_repo: &str,
@@ -630,6 +637,8 @@ pub fn open_pr_with_head_prefix(
                 owner_repo,
                 "--state",
                 "open",
+                "--limit",
+                PR_LIST_LIMIT,
                 "--json",
                 "number,headRefName",
             ],
@@ -2237,5 +2246,64 @@ mod tests {
             .create_issue("acme/borsuk", "Direct title", "Direct body", &[])
             .unwrap();
         assert_eq!(issue.number, 12);
+    }
+
+    #[test]
+    fn the_head_prefix_search_asks_for_a_bounded_open_listing() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "pr",
+                "list",
+                "--repo",
+                "acme/borsuk",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,headRefName",
+            ]),
+            CmdOut::ok(
+                r#"[{"number":4,"headRefName":"aif/borsuk/issue-9"},
+                    {"number":9,"headRefName":"aif/borsuk/model-a1b2c3d4"},
+                    {"number":11,"headRefName":"aif/borsuk/model-bbbbbbbb"}]"#,
+            ),
+        );
+
+        let found = open_pr_with_head_prefix(&exec, "acme/borsuk", "aif/borsuk/model-").unwrap();
+
+        assert_eq!(found, Some((9, "aif/borsuk/model-a1b2c3d4".to_string())));
+    }
+
+    #[test]
+    fn a_listing_without_a_model_head_finds_none() {
+        let exec = ScriptExec::new().expect(
+            |call: &Call| call.program == "gh",
+            CmdOut::ok(r#"[{"number":4,"headRefName":"aif/borsuk/issue-9"}]"#),
+        );
+
+        let found = open_pr_with_head_prefix(&exec, "acme/borsuk", "aif/borsuk/model-").unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_failed_head_prefix_search_names_the_status() {
+        let exec = ScriptExec::new().expect(
+            |call: &Call| call.program == "gh",
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no such repository\n".to_string(),
+            },
+        );
+
+        let error = open_pr_with_head_prefix(&exec, "acme/borsuk", "aif/borsuk/model-")
+            .expect_err("a failed listing must not look empty");
+
+        assert!(
+            error.to_string().contains("no such repository"),
+            "error was: {error:#}"
+        );
     }
 }

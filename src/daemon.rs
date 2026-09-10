@@ -79,7 +79,7 @@ use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
-use crate::worktree::{self, WorktreeKind, WorktreeManager, TRAIN_DIR};
+use crate::worktree::{self, Cleanable, WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// How many diff lines one teach subject carries at most.
 const TEACH_DIFF_LINES: usize = 400;
@@ -133,14 +133,17 @@ struct WorktreePush<'a> {
 }
 
 /// What one [`Daemon::push_worktree`] run left on GitHub.
+///
+/// A number is absent when `gh` answered without one. The push still
+/// happened, so the outcome reports the fact and drops the number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PushOutcome {
     /// Nothing was staged, so nothing was committed or pushed.
     Nothing,
-    /// The push landed on the branch of this open pull request.
-    Pushed(u64),
-    /// The push opened this pull request.
-    Opened(u64),
+    /// The push landed on the branch of an open pull request.
+    Pushed(Option<u64>),
+    /// The push opened a pull request.
+    Opened(Option<u64>),
 }
 
 /// The repository that holds the model pull request of `repo`.
@@ -216,13 +219,13 @@ pub const FLOOR_EVENT: &str = "floor";
 const CANCELLED_REASON: &str = "cancelled";
 
 /// The commit message of every model edit.
-pub const MODEL_COMMIT_MESSAGE: &str = "Update the model";
+const MODEL_COMMIT_MESSAGE: &str = "Update the model";
 
 /// The first `theory/model.toml` of a repository that has no `theory/`.
 ///
 /// The operator edits this file, so it holds one comment line and nothing
 /// else. An empty model parses, so the editor bridge validates it.
-pub const MODEL_TEMPLATE: &str = "# Write one [[entry]] table per model entry.\n";
+const MODEL_TEMPLATE: &str = "# Write one [[entry]] table per model entry.\n";
 
 /// Which id form one batch of measure tasks takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6521,11 +6524,9 @@ impl Daemon {
         let found: Vec<serde_json::Value> =
             serde_json::from_str(&open.stdout).context("gh pr list returned a broken body")?;
         if let Some(first) = found.first() {
-            let number = first
-                .get("number")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default();
-            return Ok(PushOutcome::Pushed(number));
+            return Ok(PushOutcome::Pushed(
+                first.get("number").and_then(serde_json::Value::as_u64),
+            ));
         }
         let gh = GhClient::new(&*self.exec);
         for (name, color) in plan.labels {
@@ -6555,9 +6556,7 @@ impl Daemon {
                 created.stderr.trim()
             );
         }
-        Ok(PushOutcome::Opened(
-            pr_number_from_output(&created.stdout).unwrap_or_default(),
-        ))
+        Ok(PushOutcome::Opened(pr_number_from_output(&created.stdout)))
     }
 
     /// Cut the model worktree of one repository and tell the UI where it
@@ -6595,13 +6594,16 @@ impl Daemon {
     /// else a fresh `aif/<alias>/model-<uuid8>`. The daemon derives it per
     /// call and stores it nowhere. A checkout that holds no
     /// [`MODEL_FILE`] gets [`MODEL_TEMPLATE`], so the operator always
-    /// opens a file that exists.
+    /// opens a file that exists. A worktree that sits on another branch is
+    /// stale, because its model pull request merged or closed, so the call
+    /// removes it and cuts it again on the derived branch.
     fn prepare_model_worktree(&self, repo: &RepoConfig) -> Result<PathBuf> {
         let prefix = WorktreeManager::model_branch_prefix(repo);
         let branch = match gh::open_pr_with_head_prefix(&*self.exec, model_repo(repo), &prefix)? {
             Some((_, head)) => head,
             None => WorktreeManager::new_model_branch(repo),
         };
+        self.drop_stale_model_worktree(repo, &branch)?;
         let path = self.worktrees.ensure_model(&*self.exec, repo, &branch)?;
         let file = path.join(MODEL_FILE);
         if !file.exists() {
@@ -6613,6 +6615,28 @@ impl Daemon {
                 .with_context(|| format!("cannot write {}", file.display()))?;
         }
         Ok(path)
+    }
+
+    /// Remove the model worktree when it holds a branch other than
+    /// `branch`.
+    ///
+    /// A worktree whose head git cannot read stays, because
+    /// [`WorktreeManager::ensure_model`] recovers it. The removal proof is
+    /// the derivation itself: the branch the worktree holds carries no
+    /// open model pull request.
+    fn drop_stale_model_worktree(&self, repo: &RepoConfig, branch: &str) -> Result<()> {
+        let path = self.worktrees.model_path(repo);
+        if !path.exists() {
+            return Ok(());
+        }
+        let Ok(held) = self.worktrees.current_branch(&*self.exec, &path) else {
+            return Ok(());
+        };
+        if held == branch {
+            return Ok(());
+        }
+        self.worktrees
+            .remove_model(&*self.exec, repo, &held, Cleanable::MergedOrClosed)
     }
 
     /// Commit, push, and open the model pull request of one repository.
@@ -6632,13 +6656,21 @@ impl Daemon {
                 TicketResultKind::Success,
                 format!("the model of {alias} did not change"),
             ),
-            Ok(PushOutcome::Pushed(number)) => (
+            Ok(PushOutcome::Pushed(Some(number))) => (
                 TicketResultKind::Success,
                 format!("pushed the model of {alias} to the model pull request {number}"),
             ),
-            Ok(PushOutcome::Opened(number)) => (
+            Ok(PushOutcome::Pushed(None)) => (
+                TicketResultKind::Success,
+                format!("pushed the model of {alias} to its open model pull request"),
+            ),
+            Ok(PushOutcome::Opened(Some(number))) => (
                 TicketResultKind::Success,
                 format!("opened the model pull request {number} of {alias}"),
+            ),
+            Ok(PushOutcome::Opened(None)) => (
+                TicketResultKind::Success,
+                format!("opened the model pull request of {alias}, number unknown"),
             ),
             Err(error) => (TicketResultKind::Failure, format!("{error:#}")),
         };
@@ -13338,6 +13370,8 @@ mod tests {
                 owner_repo,
                 "--state",
                 "open",
+                "--limit",
+                "200",
                 "--json",
                 "number,headRefName",
             ],
@@ -13584,7 +13618,7 @@ mod tests {
 
         let outcome = rig.daemon.push_model_worktree(&repo).unwrap();
 
-        assert_eq!(outcome, PushOutcome::Pushed(9));
+        assert_eq!(outcome, PushOutcome::Pushed(Some(9)));
         let calls = rig.exec.calls();
         assert!(
             calls
@@ -13689,6 +13723,180 @@ mod tests {
             panic!("the commit must push a Push::TicketResult");
         };
         assert_eq!(result.message, "the model of borsuk did not change");
+    }
+
+    #[test]
+    fn a_merged_model_branch_is_cut_again_on_the_derived_branch() {
+        let dir = temp_root();
+        let repo_path = rig_repo(&dir);
+        let worktree = model_wt(&dir);
+        fs::create_dir_all(&worktree).unwrap();
+        let wt_text = worktree.to_string_lossy().into_owned();
+        let steps = vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":9,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok("aif/borsuk/model-old11111\n"),
+            ),
+            git_step(
+                &repo_path,
+                &["worktree", "remove", "--force", wt_text.as_str()],
+                CmdOut::ok(""),
+            ),
+            git_step(
+                &repo_path,
+                &["branch", "-D", "aif/borsuk/model-old11111"],
+                CmdOut::ok(""),
+            ),
+            // Git no longer lists the worktree, so the create path runs.
+            git_step(
+                &repo_path,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(""),
+            ),
+            git_step(&repo_path, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                &repo_path,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/aif/borsuk/model-a1b2c3d4",
+                ],
+                CmdOut::ok("sha\n"),
+            ),
+            git_step(
+                &repo_path,
+                &["worktree", "add", wt_text.as_str(), RIG_MODEL_BRANCH],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(&dir)),
+        ];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+
+        let calls = rig.exec.calls();
+        assert!(
+            calls.iter().any(|call| call.program == "git"
+                && call
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["worktree", "remove"])),
+            "the stale worktree goes; calls were {calls:?}"
+        );
+        let added = calls
+            .iter()
+            .rev()
+            .find(|call| {
+                call.program == "git"
+                    && call.args.windows(2).any(|pair| pair == ["worktree", "add"])
+            })
+            .expect("the worktree is cut again");
+        assert_eq!(
+            added.args.last().map(String::as_str),
+            Some(RIG_MODEL_BRANCH)
+        );
+    }
+
+    #[test]
+    fn a_failed_pull_request_listing_refuses_the_edit_and_cuts_nothing() {
+        let dir = temp_root();
+        let steps = vec![gh_step(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                "acme/borsuk",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,headRefName",
+            ],
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no such repository\n".to_string(),
+            },
+        )];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.windows(2).any(|pair| pair == ["worktree", "add"])),
+            "a failed listing cuts no worktree"
+        );
+        assert!(!model_wt(&dir).exists(), "no model worktree appears");
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("a failed listing must push a Push::TicketResult");
+        };
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert!(
+            result.message.contains("no such repository"),
+            "message was: {}",
+            result.message
+        );
+        assert!(rx.try_recv().is_err(), "one failure push and no more");
+    }
+
+    #[test]
+    fn a_created_pull_request_without_a_number_still_reports_the_open_request() {
+        let dir = temp_root();
+        let mut steps = model_commit_steps(&dir, "acme/borsuk", "[]");
+        let last = steps.len() - 1;
+        steps[last] = gh_step(
+            &[
+                "pr",
+                "create",
+                "--repo",
+                "acme/borsuk",
+                "--head",
+                RIG_MODEL_BRANCH,
+                "--title",
+                "Update the model of borsuk",
+                "--body",
+                "The theory model of borsuk.",
+                "--label",
+                "model-pr",
+            ],
+            CmdOut::ok("Warning: 1 uncommitted change\n"),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::CommitModel {
+            repo: "borsuk".to_string(),
+        }));
+
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the commit must push a Push::TicketResult");
+        };
+        assert_eq!(result.kind, TicketResultKind::Success);
+        assert_eq!(
+            result.message,
+            "opened the model pull request of borsuk, number unknown"
+        );
     }
 
     #[test]

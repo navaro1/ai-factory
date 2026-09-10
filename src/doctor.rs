@@ -345,7 +345,15 @@ pub fn clean(env: &DoctorEnv, yes: bool, confirm: &mut dyn FnMut() -> Result<boo
             WorktreeKind::Skills => {
                 manager.remove_skills(env.exec, repo, number, Cleanable::MergedOrClosed)
             }
-            WorktreeKind::Model => manager.remove_model(env.exec, repo, Cleanable::MergedOrClosed),
+            // The model branch is derived, so the worktree itself names
+            // the branch the removal deletes.
+            WorktreeKind::Model => {
+                manager
+                    .current_branch(env.exec, &removal.path)
+                    .and_then(|branch| {
+                        manager.remove_model(env.exec, repo, &branch, Cleanable::MergedOrClosed)
+                    })
+            }
         };
         match removal_result {
             Ok(()) => println!("removed {}", removal.path.display()),
@@ -3157,6 +3165,8 @@ mod tests {
             "acme/borsuk",
             "--state",
             "open",
+            "--limit",
+            "200",
             "--json",
             "number,headRefName",
         ]);
@@ -3232,6 +3242,83 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["worktree", "remove"])),
             "no worktree removal may run while the model PR is open"
+        );
+        fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn clean_removes_the_model_worktree_once_no_model_pull_request_is_open() {
+        let fx = fixture();
+        let repo_text = fx.repo_path.to_string_lossy().into_owned();
+        let model = item_path(&fx.state_dir, "acme", WorktreeKind::Model, None);
+        fs::create_dir_all(&model).expect("the model worktree dir must be creatable");
+        let model_text = model.to_string_lossy().into_owned();
+        let head_argv = git_args(&["-C", &model_text, "rev-parse", "--abbrev-ref", "HEAD"]);
+        let removal_argv = git_args(&[
+            "-C",
+            &repo_text,
+            "worktree",
+            "remove",
+            "--force",
+            &model_text,
+        ]);
+        let branch_argv = git_args(&["-C", &repo_text, "branch", "-D", "aif/acme/model-a1b2c3d4"]);
+        let script = repo_answers(ScriptExec::new(), &fx.repo_path)
+            .expect(
+                gh_get("repos/acme/borsuk/issues/7"),
+                issue_answer(7, "open"),
+            )
+            .expect(
+                gh_get("repos/acme/borsuk/issues/8"),
+                issue_answer(8, "open"),
+            )
+            .expect(model_pr_list(), CmdOut::ok("[]"))
+            .expect(
+                move |call| call.program == "git" && call.args == head_argv,
+                CmdOut::ok("aif/acme/model-a1b2c3d4\n"),
+            )
+            .expect(
+                move |call| call.program == "git" && call.args == removal_argv,
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |call| call.program == "git" && call.args == branch_argv,
+                CmdOut::ok(""),
+            );
+        let exec = RemovingExec {
+            script,
+            remove_path: model.clone(),
+        };
+        let env = fixture_env(&fx, &exec);
+
+        let code = clean(&env, true, &mut || Ok(false)).expect("the clean must succeed");
+
+        assert_eq!(code, 0);
+        assert!(!model.exists(), "no open model PR frees the worktree");
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists());
+        let removals: Vec<Vec<String>> = exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "git"
+                    && call
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["worktree", "remove"])
+            })
+            .map(|call| call.args.clone())
+            .collect();
+        assert_eq!(
+            removals,
+            vec![git_args(&[
+                "-C",
+                &repo_text,
+                "worktree",
+                "remove",
+                "--force",
+                &model_text,
+            ])],
+            "the model worktree is the one removal"
         );
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
