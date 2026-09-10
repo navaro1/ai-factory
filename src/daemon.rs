@@ -6467,11 +6467,21 @@ impl Daemon {
 
     /// Check that every named area names entries of the model.
     ///
-    /// An area is an area of `theory/verify.toml` or a boundary of the
-    /// model. A name that is neither describes nothing the delta can
-    /// measure, so the prediction is refused whole. A model that did not
-    /// parse refuses every area.
+    /// Two namespaces answer. An area of `theory/verify.toml` names its
+    /// own id, and a boundary of the model names its entry id. Both
+    /// reach the same place: an area carries one boundary, and the
+    /// boundary carries the path globs, so the slice of C10 and the
+    /// delta both read the area's boundary and its paths. A name in
+    /// neither namespace describes nothing either one can measure, so
+    /// the prediction is refused whole.
+    ///
+    /// A prediction that names no area at all is refused too. It claims
+    /// a change of nothing, and the delta would have no place to land. A
+    /// model that did not parse refuses every area.
     fn check_areas(&self, alias: &str, areas: &[String]) -> Result<()> {
+        if areas.is_empty() {
+            bail!("a prediction names at least one area");
+        }
         let cache = self
             .theory_models
             .get(alias)
@@ -23477,6 +23487,183 @@ mod tests {
                 number: 142,
                 reason: "model error".to_string(),
             }]
+        );
+    }
+
+    /// A prediction that names no area claims a change of nothing, so
+    /// the daemon writes nothing and says why.
+    #[test]
+    fn a_prediction_that_names_no_area_writes_nothing_and_says_why() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(refine_with(Some(short_prediction(&[]))));
+
+        assert!(gh_argv(&rig).is_empty(), "the refusal writes nothing");
+        let result = last_result(&rx);
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(result.message, "a prediction names at least one area");
+    }
+
+    /// An area name reaches the model through either namespace: the area
+    /// id of the map, or the boundary id the area carries.
+    #[test]
+    fn a_prediction_may_name_a_boundary_of_the_model_instead_of_an_area() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let prediction = short_prediction(&["B-checkout"]);
+        let body = format!(
+            "body={}",
+            prediction_block(&Prediction::Short(prediction.clone()))
+        );
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=theory-short",
+                    "-f",
+                    "color=c5def5",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"theory-short\",\"color\":\"c5def5\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=theory-short",
+                ],
+                gh_ok(),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=to-refine",
+                ],
+                gh_ok(),
+            ),
+        ]);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        rig.act(refine_with(Some(prediction)));
+
+        assert_eq!(
+            gh_argv(&rig).len(),
+            4,
+            "the boundary id passes the area check"
+        );
+        assert_eq!(theory_of(&rig).holds[0].reason, gates::AWAITS_SHORT_HINT);
+    }
+
+    /// A record whose theory label set changed is read once more, because
+    /// the new label names a block the daemon has not seen.
+    #[test]
+    fn a_new_theory_label_on_a_record_fetches_its_comments_again() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(comment_page_step(
+            142,
+            &short_prediction_page("the checkout blocks an empty card", &["web-checkout"]),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &[THEORY_SHORT_LABEL])], vec![]);
+        assert_eq!(gh_argv(&rig).len(), 1);
+        assert!(theory_of(&rig).records["issue-142"].short.is_none());
+
+        rig.poll(
+            vec![issue(142, &[THEORY_SHORT_LABEL, "delta-open"])],
+            vec![],
+        );
+
+        assert_eq!(
+            gh_argv(&rig).len(),
+            2,
+            "the new label reads the record again"
+        );
+        assert_eq!(
+            theory_of(&rig).records["issue-142"]
+                .short
+                .as_ref()
+                .map(|short| short.areas.clone()),
+            Some(vec!["web-checkout".to_string()])
+        );
+    }
+
+    /// A comment fetch that fails leaves the record blocks unknown and
+    /// stops nothing: the same poll still admits the refine work.
+    #[test]
+    fn a_failed_first_sight_fetch_leaves_the_poll_running() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/142/comments?per_page=100",
+            ],
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "gh: could not reach github.com".to_string(),
+            },
+        ));
+        steps.extend(fresh_issue_steps(
+            &repo,
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &["to-refine", THEORY_SHORT_LABEL])], vec![]);
+
+        assert!(
+            !theory_of(&rig).records.contains_key("issue-142"),
+            "a failed read ships no blocks"
+        );
+        assert_eq!(
+            rig.job(0).task,
+            "borsuk/refine-i142",
+            "the gate still fires"
         );
     }
 

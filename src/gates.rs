@@ -64,9 +64,11 @@ pub struct ReadyWork {
 ///
 /// Two items pass without a prediction. A `model-pr` or a `verify-skill`
 /// item changes no application behaviour, and
-/// [`skips_prediction_gates`] names both. A repository whose model did
-/// not parse holds every governed item instead, because a broken model
-/// can validate no area.
+/// [`skips_prediction_gates`] names both. The skip wins over every later
+/// rule, so a `model-pr` still refines while the model is broken; the
+/// model pull request is how the operator repairs it. Every other
+/// governed item holds while the model does not parse, because a broken
+/// model can validate no area.
 pub fn refine_ready(issue: &Issue, alias: &str, records: &TheoryRecords) -> bool {
     if !issue.open || !has_label(&issue.labels, TO_REFINE) {
         return false;
@@ -494,6 +496,28 @@ mod tests {
         assert!(
             refine_ready(&skipped, "borsuk", &records_of("on", &skipped, false)),
             "a verify-skill ticket needs no prediction"
+        );
+
+        // The skip wins over the model error. The model pull request is
+        // how the operator repairs a broken model, so it may not wait for
+        // that model to parse.
+        let model_pr = issue(1, &[TO_REFINE, "model-pr"]);
+        assert!(
+            refine_ready(&model_pr, "borsuk", &records_of("on", &model_pr, true)),
+            "a model-pr moves while the model is broken"
+        );
+        assert_eq!(
+            refine_hold(&model_pr, "borsuk", &records_of("on", &model_pr, true)),
+            None,
+            "a skipped ticket is never held"
+        );
+        assert_eq!(
+            refine_hold(&ready, "borsuk", &records_of("on", &ready, true)),
+            Some(MODEL_ERROR_HINT)
+        );
+        assert_eq!(
+            refine_hold(&waiting, "borsuk", &records_of("on", &waiting, false)),
+            Some(AWAITS_SHORT_HINT)
         );
     }
 

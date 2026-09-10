@@ -429,9 +429,11 @@ impl TheoryRecords {
     /// Mark the model of one alias broken, or clear the mark.
     ///
     /// The model lives in the daemon cache, not in the snapshot, so the
-    /// caller folds its state in after the derive. Every gate of a
-    /// governed item holds while the mark stands, because a broken model
-    /// can validate nothing.
+    /// caller folds its state in after the derive. A governed item holds
+    /// while the mark stands, because a broken model can validate
+    /// nothing. An item that [`skips_prediction_gates`] names passes
+    /// first and never reads the mark, so a `model-pr` still moves while
+    /// the model is broken.
     pub fn set_model_error(&mut self, alias: &str, broken: bool) {
         if broken {
             self.model_errors.insert(alias.to_string());
