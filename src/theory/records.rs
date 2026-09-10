@@ -440,11 +440,19 @@ struct RawSlot {
 /// Parse one edited template into a full prediction.
 ///
 /// Every error names the slot and what broke in it, because the operator
-/// fixes one slot at a time. The `other-areas` slot names areas, so the
-/// daemon validates it against the areas and this parse lets it through.
+/// fixes one slot at a time. The first four slots take entries of their
+/// own kind, and an id may appear in one slot only. The `other-areas`
+/// slot names areas, so the daemon validates it against the areas and
+/// this parse lets its names through.
 pub fn parse_full(text: &str, model: &Model) -> Result<FullPrediction, String> {
     let raw: BTreeMap<String, RawSlot> =
         toml::from_str(text).map_err(|error| format!("invalid TOML: {error}"))?;
+    for name in raw.keys() {
+        if !PREDICTION_SLOT_NAMES.contains(&name.as_str()) {
+            return Err(format!("unknown slot {name}"));
+        }
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut slots = Vec::with_capacity(PREDICTION_SLOT_NAMES.len());
     for (slot, name) in PREDICTION_SLOT_NAMES.iter().enumerate() {
         let Some(table) = raw.get(*name) else {
@@ -455,11 +463,21 @@ pub fn parse_full(text: &str, model: &Model) -> Result<FullPrediction, String> {
             "unsure" => PredictionTag::Unsure,
             other => return Err(format!("slot {name}: unknown tag {other}")),
         };
-        if slot != OTHER_AREAS_SLOT {
-            for id in &table.entries {
-                if !model.entries.iter().any(|entry| entry.id() == id) {
+        for id in &table.entries {
+            if slot != OTHER_AREAS_SLOT {
+                let Some(entry) = model.entries.iter().find(|entry| entry.id() == id) else {
                     return Err(format!("slot {name}: unknown entry {id}"));
+                };
+                let wanted = SLOT_KINDS[slot];
+                if entry.kind_name() != wanted {
+                    return Err(format!(
+                        "slot {name}: the kind of {id} is {}, not {wanted}",
+                        entry.kind_name()
+                    ));
                 }
+            }
+            if !seen.insert(id) {
+                return Err(format!("slot {name}: duplicate entry {id}"));
             }
         }
         slots.push(PredictionSlot {
@@ -472,6 +490,35 @@ pub fn parse_full(text: &str, model: &Model) -> Result<FullPrediction, String> {
         kind: PREDICTION_FULL.to_string(),
         slots,
     })
+}
+
+/// Check the shape of one full prediction that arrived over the wire.
+///
+/// [`parse_full`] builds the shape, so this catches a message that no
+/// template wrote: a wrong kind, a missing slot, a slot the prediction
+/// does not own, and a slot it names twice. The daemon runs it before it
+/// writes anything.
+pub fn check_full_shape(prediction: &FullPrediction) -> Result<(), String> {
+    if prediction.kind != PREDICTION_FULL {
+        return Err(format!(
+            "the prediction kind is {}, not {PREDICTION_FULL}",
+            prediction.kind
+        ));
+    }
+    for name in PREDICTION_SLOT_NAMES {
+        if !prediction.slots.iter().any(|slot| slot.name == name) {
+            return Err(format!("slot {name} is missing"));
+        }
+    }
+    for slot in &prediction.slots {
+        if !PREDICTION_SLOT_NAMES.contains(&slot.name.as_str()) {
+            return Err(format!("unknown slot {}", slot.name));
+        }
+    }
+    if prediction.slots.len() != PREDICTION_SLOT_NAMES.len() {
+        return Err("the prediction names one slot twice".to_string());
+    }
+    Ok(())
 }
 
 /// The theory read model of one poll: the labels of every record.
@@ -734,29 +781,117 @@ mod tests {
     fn parse_full_names_the_slot_and_what_broke_in_it() {
         let model = prediction_model();
         let template = full_template(&daemon_area(), &model);
-
-        let unknown_entry = template.replace(
-            "[invariants]\nentries = []",
-            "[invariants]\nentries = [\"nope\"]",
-        );
-        assert_eq!(
-            parse_full(&unknown_entry, &model),
-            Err("slot invariants: unknown entry nope".to_string())
-        );
-
-        let unknown_tag = template.replace(
-            "[states]\nentries = []\ntag = \"unsure\"",
-            "[states]\nentries = []\ntag = \"maybe\"",
-        );
-        assert_eq!(
-            parse_full(&unknown_tag, &model),
-            Err("slot states: unknown tag maybe".to_string())
-        );
+        let rows: [(&str, &str, &str); 6] = [
+            (
+                "[invariants]\nentries = []",
+                "[invariants]\nentries = [\"nope\"]",
+                "slot invariants: unknown entry nope",
+            ),
+            (
+                "[invariants]\nentries = []",
+                "[invariants]\nentries = [\"idle\"]",
+                "slot invariants: the kind of idle is state, not invariant",
+            ),
+            (
+                "[behaviours]\nentries = []",
+                "[behaviours]\nentries = [\"poll-storm\"]",
+                "slot behaviours: the kind of poll-storm is failure, not transition",
+            ),
+            (
+                "[states]\nentries = []",
+                "[states]\nentries = [\"idle\", \"idle\"]",
+                "slot states: duplicate entry idle",
+            ),
+            (
+                "[states]\nentries = []\ntag = \"unsure\"",
+                "[states]\nentries = []\ntag = \"maybe\"",
+                "slot states: unknown tag maybe",
+            ),
+            (
+                "[other-areas]\n",
+                "[notes]\nentries = []\ntag = \"sure\"\n[other-areas]\n",
+                "unknown slot notes",
+            ),
+        ];
+        for (from, to, reason) in rows {
+            let broken = template.replace(from, to);
+            assert_ne!(broken, template, "the edit changed nothing: {to}");
+            assert_eq!(parse_full(&broken, &model), Err(reason.to_string()));
+        }
 
         let missing = template.replace("[failure-modes]\nentries = []\ntag = \"unsure\"\n", "");
         assert_eq!(
             parse_full(&missing, &model),
             Err("slot failure-modes is missing".to_string())
+        );
+    }
+
+    /// An id may sit in one slot only, even across two slots.
+    #[test]
+    fn parse_full_refuses_the_same_id_in_two_slots() {
+        let model = prediction_model();
+        let text = full_template(&daemon_area(), &model)
+            .replace("[states]\nentries = []", "[states]\nentries = [\"idle\"]")
+            .replace(
+                "[other-areas]\nentries = []",
+                "[other-areas]\nentries = [\"idle\"]",
+            );
+        assert_eq!(
+            parse_full(&text, &model),
+            Err("slot other-areas: duplicate entry idle".to_string())
+        );
+    }
+
+    /// The shape check guards the wire against a message no template
+    /// wrote.
+    #[test]
+    fn check_full_shape_names_every_broken_shape() {
+        let model = prediction_model();
+        let good = parse_full(&full_template(&daemon_area(), &model), &model).unwrap();
+        assert_eq!(check_full_shape(&good), Ok(()));
+
+        let mut short = good.clone();
+        short.kind = PREDICTION_SHORT.to_string();
+        assert_eq!(
+            check_full_shape(&short),
+            Err("the prediction kind is short, not full".to_string())
+        );
+
+        let mut missing = good.clone();
+        missing.slots.remove(2);
+        assert_eq!(
+            check_full_shape(&missing),
+            Err("slot invariants is missing".to_string())
+        );
+
+        let mut unknown = good.clone();
+        unknown.slots[1].name = "notes".to_string();
+        assert_eq!(
+            check_full_shape(&unknown),
+            Err("slot states is missing".to_string()),
+            "a renamed slot reads as the missing one"
+        );
+
+        let mut extra = good.clone();
+        extra.slots.push(PredictionSlot {
+            name: "notes".to_string(),
+            entries: Vec::new(),
+            tag: PredictionTag::Sure,
+        });
+        assert_eq!(
+            check_full_shape(&extra),
+            Err("unknown slot notes".to_string())
+        );
+
+        let mut twice = good;
+        twice.slots.push(PredictionSlot {
+            name: "states".to_string(),
+            entries: Vec::new(),
+            tag: PredictionTag::Sure,
+        });
+        assert_eq!(
+            check_full_shape(&twice),
+            Err("the prediction names one slot twice".to_string())
         );
     }
 

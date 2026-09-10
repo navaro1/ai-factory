@@ -144,9 +144,10 @@ pub struct TheoryView {
     pub error: String,
     /// The parsed model, empty when the model did not parse.
     ///
-    /// The Theory view counts its entries, and the full prediction
-    /// template reads its relations, so the view carries the model
-    /// itself instead of a flattened copy of it.
+    /// This field replaces the flat `entries` view of C1. The full
+    /// prediction template runs in the interface and reads the relations
+    /// of each entry, and only the model carries them. The Theory view
+    /// still counts `model.entries` for its header strip.
     #[serde(default)]
     pub model: Model,
     /// The areas of the verification map, in file order.
