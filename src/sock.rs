@@ -2052,6 +2052,11 @@ fn attach_client(
                     break;
                 }
             }
+            // Unregister before `writer` drops. The drop of the subscriber
+            // shuts the socket down, so the final flush inside `BufWriter`
+            // fails at once. In the other order that flush meets a stalled
+            // socket and parks for a second whole timeout. Keep this call
+            // last in the closure.
             unregister(&registry, id);
         });
     }
