@@ -127,6 +127,9 @@ pub const FAST_TIMEOUT_S: u64 = 120;
 /// The opening words of the finding one failed fast check posts.
 pub const FAST_CHECK_FAILED: &str = "fast check failed";
 
+/// The reason a plain abort writes into the failed state of one task.
+const CANCELLED_REASON: &str = "cancelled";
+
 /// Which id form one batch of measure tasks takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeasureKind {
@@ -320,6 +323,13 @@ pub struct Daemon {
     measure_jobs: BTreeMap<String, MeasureJob>,
     /// The fast checks each admitted review task waits for.
     fast_runs: BTreeMap<String, FastRun>,
+    /// The record each finished fast check reported, by fast task id.
+    ///
+    /// The id names the tree and the feature, so a review the gate admits
+    /// again on an unchanged head reads the result the tree already has
+    /// instead of running the command once more. An entry lives as long as
+    /// its task row: [`Daemon::retire_task`] drops both together.
+    fast_results: BTreeMap<String, Record>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
     /// Active issue conversations, keyed by repository and issue number.
@@ -673,6 +683,7 @@ impl Daemon {
             theory_skills: BTreeMap::new(),
             measure_jobs: BTreeMap::new(),
             fast_runs: BTreeMap::new(),
+            fast_results: BTreeMap::new(),
             theory_views: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
@@ -1661,6 +1672,9 @@ impl Daemon {
         self.confirming.remove(id);
         self.review_tickets.remove(id);
         self.release_batches.remove(id);
+        self.measure_jobs.remove(id);
+        self.fast_runs.remove(id);
+        self.fast_results.remove(id);
         self.pending_chats.remove(id);
         self.ticket_turn_text.remove(id);
         self.paused.tasks.remove(id);
@@ -1736,7 +1750,9 @@ impl Daemon {
             .by_id
             .values()
             .filter(|task| task.repo == repo && task.state.is_terminal())
-            .filter(|task| task.purpose == TaskPurpose::Pipeline)
+            // A ticket session carries item number 0 and outlives every
+            // item. A measure task names a real item and leaves with it.
+            .filter(|task| matches!(task.purpose, TaskPurpose::Pipeline | TaskPurpose::Measure))
             .filter(|task| !self.train_needs_task(task))
             .filter(|task| match task.kind {
                 ItemKind::Issue => fresh
@@ -1779,6 +1795,10 @@ impl Daemon {
                         && !(task.state == TaskState::Running
                             && implementation_transitioned(fresh, &links, task.number))
                 }
+                // A fast check carries the review stage of its pull
+                // request, so it leaves the gate with the review. That is
+                // wanted: a check of a merged or closed pull request
+                // proves nothing and its records reach no review.
                 Stage::Review => {
                     fresh
                         .prs
@@ -5161,9 +5181,9 @@ impl Daemon {
     /// Queue one measure task per measurer of `mode`.
     ///
     /// The tree hash of `worktree` names each task, so the same tree never
-    /// runs the same command twice: a task id the table already holds is
-    /// left alone and stays out of the returned list. The returned ids are
-    /// the tasks this call created, in measurer order.
+    /// runs the same command twice: a task the table already holds keeps
+    /// its run and its record. The returned ids name every task of the
+    /// batch, created or already there, in measurer order.
     #[cfg_attr(not(test), allow(dead_code))]
     fn queue_measure(
         &mut self,
@@ -5236,9 +5256,21 @@ impl Daemon {
                     measure::measure_id(alias, &tree, &measurer.area, &measurer.id)
                 }
             };
-            // The tree already ran this command, so its record stands.
-            if self.table.by_id.contains_key(&id) {
-                continue;
+            match self.table.by_id.get(&id) {
+                // A task of the same tree still runs this command and
+                // will report for it.
+                Some(task) if !task.state.is_terminal() => {
+                    ids.push(id);
+                    continue;
+                }
+                // The tree ran this command and its record stands.
+                Some(_) if self.fast_results.contains_key(&id) => {
+                    ids.push(id);
+                    continue;
+                }
+                // A finished task with no record was cancelled before it
+                // reported, so the command runs again.
+                _ => {}
             }
             let log = self.measure_log_path(&id);
             let spec = tasks::ScopedTask {
@@ -5304,7 +5336,7 @@ impl Daemon {
         let Some(repo_cfg) = self.config.repos.get(alias).cloned() else {
             return;
         };
-        if !repo_cfg.theory.governor.is_on() {
+        if !repo_cfg.theory.governor.is_on() || !self.has_fast_feature(alias) {
             return;
         }
         let worktree = match self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number) {
@@ -5318,11 +5350,35 @@ impl Daemon {
         if features.is_empty() {
             return;
         }
+        // A remembered record without its task row can never be checked
+        // against the table again, so it goes when the row goes.
+        self.fast_results
+            .retain(|id, _| self.table.by_id.contains_key(id));
         let ids = self.queue_fast(alias, &RecordKey::Pr(number), &worktree, &features);
-        if !ids.is_empty() {
-            self.fast_runs
-                .insert(review_task.to_string(), FastRun::new(ids));
+        if ids.is_empty() {
+            return;
         }
+        let mut run = FastRun::new(ids);
+        for id in &run.tasks {
+            if let Some(record) = self.fast_results.get(id) {
+                run.records.insert(id.clone(), record.clone());
+            }
+        }
+        self.fast_runs.insert(review_task.to_string(), run);
+        // Every check of this tree may have run already, and then the
+        // remembered records decide now instead of at the next exit.
+        self.finish_fast_run(review_task);
+    }
+
+    /// True when one repository has a feature that names a fast command.
+    ///
+    /// No diff can produce a check without one, so the admission answers
+    /// this before it prepares the head worktree.
+    fn has_fast_feature(&self, alias: &str) -> bool {
+        self.theory_skills
+            .get(alias)
+            .and_then(|cache| cache.skills.as_ref().ok())
+            .is_some_and(|set| set.features.iter().any(|feature| feature.fast.is_some()))
     }
 
     /// The features of every area the head diff touches, in area order.
@@ -5453,6 +5509,8 @@ impl Daemon {
     /// posts the finding on the theory record, and queues the implement
     /// task of every linked ticket again.
     fn settle_fast_run(&mut self, fast_task: &str, record: Record) {
+        self.fast_results
+            .insert(fast_task.to_string(), record.clone());
         let Some(review) = self
             .fast_runs
             .iter_mut()
@@ -5464,18 +5522,26 @@ impl Daemon {
         else {
             return;
         };
-        let Some(run) = self.fast_runs.get(&review) else {
+        self.finish_fast_run(&review);
+    }
+
+    /// Act on one fast run once every check of it reported.
+    ///
+    /// A run that is still short of a record waits. A run whose records
+    /// all read 0 releases the review by itself.
+    fn finish_fast_run(&mut self, review: &str) {
+        let Some(run) = self.fast_runs.get(review) else {
             return;
         };
         if !run.finished() {
             return;
         }
         let failure = run.failure().cloned();
-        self.fast_runs.remove(&review);
+        self.fast_runs.remove(review);
         let Some(failure) = failure else {
             return;
         };
-        let Some(task) = self.table.by_id.get(&review).cloned() else {
+        let Some(task) = self.table.by_id.get(review).cloned() else {
             return;
         };
         // The operator can abort the review while its checks still run. A
@@ -5490,34 +5556,10 @@ impl Daemon {
         {
             eprintln!("the fast check finding of {review}: {error:#}");
         }
-        self.cancel_for_fast_check(&review, &finding);
+        // The reason is the finding, so the pipeline row names the check
+        // that stopped the review instead of a bare abort.
+        self.cancel_task_with_reason(review, false, &finding);
         self.requeue_implement(&task.repo, task.number);
-    }
-
-    /// Cancel one review task because a fast check failed.
-    ///
-    /// The reason is the finding, so the pipeline row names the check that
-    /// stopped the review instead of a bare abort.
-    fn cancel_for_fast_check(&mut self, id: &str, reason: &str) {
-        self.stop_session(id, "cannot stop the session during the fast check");
-        self.confirming.remove(id);
-        self.pending_chats.remove(id);
-        if self
-            .table
-            .by_id
-            .get(id)
-            .is_some_and(|task| !task.state.is_terminal())
-        {
-            if let Err(error) =
-                self.table
-                    .transition(id, TaskState::Failed(reason.to_string()), self.now_ms)
-            {
-                eprintln!("the fast check of {id}: {error:#}");
-                return;
-            }
-        }
-        self.decisions.drop_for_task(id);
-        self.changed = true;
     }
 
     /// Queue the implement task of every ticket one pull request closes.
@@ -5786,6 +5828,14 @@ impl Daemon {
     /// A human abort with queued chat keeps the messages and session marker.
     /// It returns the task to `Queued` for `resume_pending_chats`.
     fn cancel_task(&mut self, id: &str, deliver_pending_chat: bool) {
+        self.cancel_task_with_reason(id, deliver_pending_chat, CANCELLED_REASON);
+    }
+
+    /// Cancel one task and name the reason its failed state carries.
+    ///
+    /// The board reads that reason, so a cancel with a cause says the
+    /// cause instead of the bare word every abort uses.
+    fn cancel_task_with_reason(&mut self, id: &str, deliver_pending_chat: bool, reason: &str) {
         let task = self.table.by_id.get(id).cloned();
         self.stop_session(id, "cannot stop the session during the abort");
         self.confirming.remove(id);
@@ -5799,7 +5849,10 @@ impl Daemon {
             .get(id)
             .is_some_and(|task| !task.state.is_terminal());
         if active {
-            if let Err(e) = self.table.cancel(id, self.now_ms) {
+            if let Err(e) =
+                self.table
+                    .transition(id, TaskState::Failed(reason.to_string()), self.now_ms)
+            {
                 eprintln!("the abort of {id}: {e:#}");
             }
         }
@@ -17579,8 +17632,22 @@ mod tests {
         format!("---\narea: {area}\nfast: {fast}\n---\n# Feature\n")
     }
 
+    /// One feature file of an area that names no fast command.
+    fn feature_file_without_fast(area: &str) -> String {
+        format!("---\narea: {area}\n---\n# Feature\n")
+    }
+
     /// The git steps of the governed theory read of the fast-check tests.
     fn fast_theory_steps(repo: &Path) -> Vec<Step> {
+        fast_theory_steps_with(
+            repo,
+            &feature_file("web-checkout", "cargo test --test cli"),
+            &feature_file("api-orders", "cargo test --test api"),
+        )
+    }
+
+    /// The git steps of one governed theory read with the given features.
+    fn fast_theory_steps_with(repo: &Path, checkout: &str, orders: &str) -> Vec<Step> {
         vec![
             git_step(
                 repo,
@@ -17615,12 +17682,12 @@ mod tests {
             git_step(
                 repo,
                 &["show", "ccc333:.claude/skills/run-web/features/checkout.md"],
-                CmdOut::ok(feature_file("web-checkout", "cargo test --test cli")),
+                CmdOut::ok(checkout.to_string()),
             ),
             git_step(
                 repo,
                 &["show", "ccc333:.claude/skills/run-web/features/orders.md"],
-                CmdOut::ok(feature_file("api-orders", "cargo test --test api")),
+                CmdOut::ok(orders.to_string()),
             ),
         ]
     }
@@ -17700,6 +17767,33 @@ mod tests {
         diff: &str,
     ) -> Vec<Step> {
         let mut steps = fast_pr_worktree_steps(repo, worktree, number, gitdir);
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps.push(git_step(
+            worktree,
+            &["rev-parse", "HEAD^{tree}"],
+            CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
+        ));
+        steps
+    }
+
+    /// The git steps of one admission that reuses the head worktree.
+    fn fast_admission_steps_on_reuse(
+        repo: &Path,
+        worktree: &Path,
+        number: u64,
+        gitdir: &Path,
+        diff: &str,
+    ) -> Vec<Step> {
+        let mut steps = reuse_pr_steps(repo, worktree, number, gitdir);
         steps.push(git_step(
             repo,
             &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
@@ -18101,6 +18195,175 @@ mod tests {
 
         assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
         assert!(block.contains("incomparable: timeout"), "block: {block}");
+    }
+
+    #[test]
+    fn a_re_admitted_review_on_the_same_head_reads_the_failed_result_again() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        // The needs-human label closes the review gate. The answer
+        // removes it and the gate opens again on the same head.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(fast_admission_steps_on_reuse(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        rig.event(exited(&orders, true, "exit 0"));
+        let after_first = rig.job_count();
+        assert_eq!(after_first, 2, "the two checks ran and no review did");
+
+        // A person takes the pull request and hands it back. The gate
+        // closes and opens again on the same head, so nothing but the
+        // remembered result can stop the second review.
+        let mut waiting = unlinked_pr(7);
+        waiting.labels = vec![NEEDS_HUMAN_LABEL.to_string()];
+        rig.set_now(T0 + 1);
+        rig.poll(vec![], vec![waiting]);
+        rig.set_now(T0 + 2);
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 1".to_string()),
+            "the tree already failed its check, so the review is refused again"
+        );
+        assert_eq!(rig.task(&checkout).state, TaskState::Done);
+        assert_eq!(
+            rig.job_count(),
+            after_first,
+            "the remembered result runs no command and dispatches no review"
+        );
+        assert_eq!(
+            findings(&rig, "fast check failed: checkout exit 1"),
+            2,
+            "each admission posts the finding of the tree it measured"
+        );
+    }
+
+    /// How many `gh api` comment calls carried `body=<text>`.
+    fn findings(rig: &Rig, text: &str) -> usize {
+        let field = format!("body={text}");
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh" && call.args.contains(&field))
+            .count()
+    }
+
+    #[test]
+    fn a_repository_without_a_fast_command_runs_no_git_call_at_admission() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps_with(
+            &rig_repo(&dir),
+            &feature_file_without_fast("web-checkout"),
+            &feature_file_without_fast("api-orders"),
+        );
+        // The only worktree the poll prepares is the one the review runs
+        // in. A git call at admission would meet no scripted step.
+        steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert!(
+            !rig.daemon
+                .table
+                .order
+                .iter()
+                .any(|id| id.contains("/fast-")),
+            "no feature names a fast command, so no check exists"
+        );
+        assert_eq!(
+            git_calls(&rig, "diff"),
+            0,
+            "the admission reads no diff, so it prepares no head worktree"
+        );
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_diff_that_touches_no_area_queues_no_fast_task_and_releases_the_review() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("docs/notes.md\n"),
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert!(
+            !rig.daemon
+                .table
+                .order
+                .iter()
+                .any(|id| id.contains("/fast-")),
+            "the diff touches no area, so the tree hash is never read"
+        );
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
     }
 
     /// A rig whose state views land on a channel.

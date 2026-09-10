@@ -143,10 +143,13 @@ pub fn parse_lines(text: &str) -> Vec<Record> {
 }
 
 /// The permissive input shape of one record line.
+///
+/// The value arrives as any JSON value, so a value that is not a number
+/// names itself in the reason instead of failing the whole line.
 #[derive(Debug, Default, Deserialize)]
 struct RawRecord {
     id: Option<String>,
-    value: Option<f64>,
+    value: Option<serde_json::Value>,
     unit: Option<String>,
     direction: Option<String>,
 }
@@ -156,8 +159,11 @@ fn parse_line(line: &str) -> Record {
         return Record::incomparable("", "the line is not a measure record");
     };
     let id = raw.id.unwrap_or_default();
-    let Some(value) = raw.value else {
+    let Some(raw_value) = raw.value else {
         return Record::incomparable(&id, "the record has no value");
+    };
+    let Some(value) = raw_value.as_f64() else {
+        return Record::incomparable(&id, format!("value {raw_value} is not a number"));
     };
     let Some(text) = raw.direction else {
         return Record::incomparable(&id, "the record has no direction");
@@ -259,11 +265,12 @@ mod tests {
             "{\"id\":\"hits\",\"value\":3,\"unit\":\"n\"}\n",
             "\n",
             "{\"id\":\"rate\",\"value\":1,\"unit\":\"n\",\"direction\":\"sideways\"}\n",
+            "{\"id\":\"span\",\"value\":\"12ms\",\"unit\":\"ms\",\"direction\":\"lower\"}\n",
         );
 
         let records = parse_lines(text);
 
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 5);
         assert_eq!(
             records[0],
             Record::value("poll_p95", 12.5, "ms", Direction::Lower)
@@ -279,6 +286,10 @@ mod tests {
         assert_eq!(
             records[3],
             Record::incomparable("rate", "unknown direction \"sideways\"")
+        );
+        assert_eq!(
+            records[4],
+            Record::incomparable("span", "value \"12ms\" is not a number")
         );
         assert!(parse_lines("").is_empty());
     }

@@ -684,10 +684,16 @@ impl StateInput<'_> {
                     limit,
                     overridden: limit != config.stage(stage).limit,
                     running: running[&stage],
+                    // A measure task holds no stage slot, so it counts
+                    // neither as running nor as queued for one.
                     queued: table
                         .by_id
                         .values()
-                        .filter(|task| task.stage == stage && task.state == TaskState::Queued)
+                        .filter(|task| {
+                            task.stage == stage
+                                && task.state == TaskState::Queued
+                                && task.purpose != crate::tasks::TaskPurpose::Measure
+                        })
                         .count(),
                 }
             })
@@ -4067,6 +4073,23 @@ mod tests {
                 3_000,
             )
             .unwrap();
+        // A fast check carries the review stage for its worktree only. It
+        // holds no review slot, so no stage row counts it and no board row
+        // draws it; the build therefore never looks its input mode up.
+        table
+            .upsert_with_id(
+                crate::tasks::ScopedTask {
+                    id: "borsuk/fast-aabbccdd-checkout",
+                    repo: "borsuk",
+                    stage: Stage::Review,
+                    kind: ItemKind::Pr,
+                    number: 5,
+                },
+                PathBuf::from("/state/logs/borsuk__fast-aabbccdd-checkout.jsonl"),
+                3_500,
+            )
+            .unwrap()
+            .purpose = crate::tasks::TaskPurpose::Measure;
 
         let mut decisions = Decisions::new();
         decisions
@@ -4162,6 +4185,20 @@ mod tests {
         assert!(!refine.overridden);
         assert_eq!(refine.running, 0);
         assert_eq!(refine.queued, 1);
+        let review = &view.stages[2];
+        assert_eq!(review.stage, Stage::Review);
+        assert_eq!(review.running, 0);
+        assert_eq!(
+            review.queued, 0,
+            "the queued fast check holds no review slot"
+        );
+        assert_eq!(
+            view.tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["borsuk/implement-i142", "qubitsok/refine-i7"]
+        );
 
         // The lane reservation of borsuk on implement appears.
         assert_eq!(
