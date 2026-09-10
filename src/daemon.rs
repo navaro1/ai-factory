@@ -1948,6 +1948,18 @@ impl Daemon {
                         matches!(&row.kind, DecisionKind::Stuck { task, .. } if task == &candidate_id)
                     });
                 if !existing.state.is_terminal() || stuck_holds {
+                    // A restart keeps the review task and drops its fast
+                    // checks, because a measure task lives in memory only.
+                    // The empty gate memory opens the gate once more after
+                    // the restart, and the checks of the held review are
+                    // queued here instead of at a fresh admission.
+                    if work.stage == Stage::Review
+                        && work.kind == ItemKind::Pr
+                        && existing.state == TaskState::Queued
+                        && !self.fast_runs.contains_key(&candidate_id)
+                    {
+                        fast_checks.push((work.repo.clone(), work.number, candidate_id));
+                    }
                     continue;
                 }
             }
@@ -18364,6 +18376,72 @@ mod tests {
         );
         assert_eq!(rig.job_count(), 1);
         assert_eq!(rig.job(0).task, "borsuk/review-p7");
+    }
+
+    #[test]
+    fn a_restored_review_gets_the_fast_checks_of_its_head_again() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut first = Rig::make_in(dir.clone(), steps, governed);
+        first.poll(vec![], vec![unlinked_pr(7)]);
+        assert_eq!(first.task("borsuk/review-p7").state, TaskState::Queued);
+        drop(first);
+
+        // The restart drops every measure task and every fast run. The
+        // review comes back queued and the gate memory comes back empty.
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps_on_reuse(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut second = Rig::make_in(dir, steps, governed);
+
+        second.poll(vec![], vec![unlinked_pr(7)]);
+
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+        assert_eq!(
+            second
+                .daemon
+                .table
+                .order
+                .iter()
+                .filter(|id| id.contains("/fast-"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![checkout.clone(), orders],
+            "the restored review queues the checks of its head again"
+        );
+        assert_eq!(
+            second.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the review waits for the fresh checks"
+        );
+        assert_eq!(second.job_count(), 1);
+        assert_eq!(second.job(0).task, checkout);
     }
 
     /// A rig whose state views land on a channel.
