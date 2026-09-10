@@ -235,6 +235,12 @@ pub enum Inbound {
 struct TicketTurnText {
     /// The last complete assistant text event of the turn.
     last: String,
+    /// Every assistant text event of the turn, in order.
+    ///
+    /// A ticket proposal reads `last` alone, because only the final block
+    /// counts. A teach turn reads this, because it may end with one block
+    /// per contradiction and each block may arrive in its own event.
+    all: String,
     /// True when an earlier event contained proposal marker text.
     earlier_marker: bool,
 }
@@ -3051,6 +3057,8 @@ impl Daemon {
                     if proposal_marker_text(&turn.last) {
                         turn.earlier_marker = true;
                     }
+                    turn.all.push_str(&text);
+                    turn.all.push('\n');
                     turn.last = text;
                 }
                 // The runner also tees this into the task log.
@@ -6286,6 +6294,7 @@ impl Daemon {
         let log = self.log_path(repo, Stage::Refine, ItemKind::Issue, TICKET_NUMBER);
         let replaces_task = self.table.by_id.values().any(|task| {
             task.repo == repo
+                && Self::is_ticket_creation(task)
                 && task.stage == Stage::Refine
                 && task.kind == ItemKind::Issue
                 && task.number == TICKET_NUMBER
@@ -6478,17 +6487,15 @@ impl Daemon {
 
     /// Open one theory event per block of one finished teach turn.
     ///
-    /// The record is the pull request for a pull request subject, and the
-    /// repository for an area subject. A turn with no block opens nothing,
-    /// and a failed post goes to standard error only, because the teach
-    /// task itself succeeded.
+    /// The scan reads every assistant text event of the turn, because the
+    /// agent may put each block in its own event. The record is the pull
+    /// request for a pull request subject, and the repository for an area
+    /// subject. A turn with no block opens nothing, and a failed post goes
+    /// to standard error only, because the teach task itself succeeded.
     fn finish_teach_events(&mut self, id: &str) {
         let Some(turn) = self.ticket_turn_text.remove(id) else {
             return;
         };
-        if turn.earlier_marker {
-            return;
-        }
         let Some(task) = self.table.by_id.get(id).cloned() else {
             return;
         };
@@ -6499,7 +6506,7 @@ impl Daemon {
             TeachKey::Pr(number) => RecordKey::Pr(*number),
             TeachKey::Area(_) => RecordKey::Repo,
         };
-        for event in parse_event_blocks(&turn.last) {
+        for event in parse_event_blocks(&turn.all) {
             if let Err(error) = self.open_event(&task.repo, &record, &event) {
                 eprintln!("task {id}: cannot open the theory event: {error:#}");
             }
@@ -6713,7 +6720,9 @@ impl Daemon {
     /// The block tag one task must end its turn with, or `None`.
     ///
     /// A task with a tag buffers its assistant text, so the daemon reads
-    /// the last complete event of the turn and nothing earlier.
+    /// the blocks of the turn back. Only the presence of a tag is read
+    /// today, because each purpose parses its own blocks; the tag itself
+    /// is here for the later chunks that select a parser by it.
     fn wants_final_block(task: &Task) -> Option<&'static str> {
         match task.purpose {
             TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
@@ -6945,7 +6954,7 @@ impl Daemon {
                 .ok_or_else(|| anyhow!("the measure task {} carries no command", task.id));
         }
         if let TaskPurpose::Teach(key) = &task.purpose {
-            let values = self.teach_values(task, key, repo_cfg, worktree);
+            let values = self.teach_values(task, key, repo_cfg, worktree)?;
             return prompts::fill_template(prompts::TEACH_PROMPT, &values);
         }
         let role = Self::execution_role(task);
@@ -7148,84 +7157,75 @@ impl Daemon {
 
     /// The placeholder values of one teach task.
     ///
-    /// A repository whose theory did not read, and a subject the daemon
-    /// cannot resolve, render their blocks empty. The teach turn still
-    /// starts, because an explanation of the code alone still helps.
+    /// A pull request subject the daemon cannot read is an error that
+    /// fails the dispatch, because an explanation of a diff that is not
+    /// there teaches nothing. A repository whose theory did not read
+    /// renders its model and skills blocks empty, and the turn still runs.
     fn teach_values(
         &self,
         task: &Task,
         key: &TeachKey,
         repo_cfg: &RepoConfig,
         worktree: &Path,
-    ) -> Vec<(&'static str, String)> {
+    ) -> Result<Vec<(&'static str, String)>> {
         let (subject, paths) = match key {
-            TeachKey::Pr(number) => self.teach_pr_subject(task, repo_cfg, *number, worktree),
+            TeachKey::Pr(number) => self.teach_pr_subject(repo_cfg, *number, worktree)?,
             TeachKey::Area(id) => (self.teach_area_subject(task, id), self.area_paths(task, id)),
         };
-        vec![
+        Ok(vec![
             ("repo", task.repo.clone()),
             ("worktree", worktree.display().to_string()),
             ("subject", subject),
             ("history", self.teach_history(repo_cfg, worktree, &paths)),
             ("model", self.model_entries(&task.repo)),
             ("skills", self.teach_skills(task, key, &paths)),
-        ]
+        ])
     }
 
-    /// The diff of one merged pull request and the paths it changed.
+    /// The diff of one pull request and the paths it changed.
     ///
-    /// The range is `<merge base>...<head>`, so git picks the merge base
-    /// itself. A diff past [`TEACH_DIFF_LINES`] ends with one marker line
-    /// that counts what stayed out.
+    /// The range is `<base>...<head>` over the two commits GitHub records,
+    /// never the current default branch. A merged pull request has its
+    /// head in the default branch already, so a range against that branch
+    /// would render an empty diff. A diff past [`TEACH_DIFF_LINES`] ends
+    /// with one marker line that counts what stayed out.
     fn teach_pr_subject(
         &self,
-        task: &Task,
         repo_cfg: &RepoConfig,
         number: u64,
         worktree: &Path,
-    ) -> (String, Vec<String>) {
-        let empty = (String::new(), Vec::new());
-        let Some(head) = self.teach_pr_head(task, repo_cfg, number) else {
-            return empty;
-        };
-        let Ok(base) = self
-            .worktrees
-            .default_base(self.exec.as_ref(), worktree)
-            .map_err(|error| eprintln!("the teach subject of {}: {error:#}", task.id))
-        else {
-            return empty;
-        };
+    ) -> Result<(String, Vec<String>)> {
+        let (base, head) = self.teach_pr_range(repo_cfg, number)?;
         let range = format!("{base}...{head}");
-        let paths = match worktree::git(
-            self.exec.as_ref(),
-            worktree,
-            &["diff", "--name-only", &range],
-        ) {
-            Ok(out) if out.status == 0 => out.stdout.lines().map(str::to_string).collect(),
-            _ => Vec::new(),
-        };
-        let diff = match worktree::git(self.exec.as_ref(), worktree, &["diff", &range]) {
-            Ok(out) if out.status == 0 => cap_diff(&out.stdout),
-            _ => String::new(),
-        };
-        (diff, paths)
+        let names = self.teach_git(worktree, &["diff", "--name-only", &range])?;
+        let diff = self.teach_git(worktree, &["diff", &range])?;
+        let paths = names
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        Ok((cap_diff(&diff), paths))
     }
 
-    /// The head commit of one pull request, from the snapshot or GitHub.
-    ///
-    /// A merged pull request left the snapshot, so the daemon asks GitHub
-    /// for the head it merged.
-    fn teach_pr_head(&self, task: &Task, repo_cfg: &RepoConfig, number: u64) -> Option<String> {
-        let cached = self
-            .snapshot
-            .repos
-            .get(&task.repo)
-            .and_then(|snapshot| snapshot.prs.get(&number))
-            .map(|pull| pull.head_sha.clone())
-            .filter(|sha| !sha.is_empty());
-        if let Some(head) = cached {
-            return Some(head);
+    /// Run one git command of a teach subject, or report why it failed.
+    fn teach_git(&self, worktree: &Path, args: &[&str]) -> Result<String> {
+        let out = worktree::git(self.exec.as_ref(), worktree, args)
+            .with_context(|| format!("git {} failed to run", args.join(" ")))?;
+        if out.status != 0 {
+            bail!(
+                "git {} exited with status {}: {}",
+                args.join(" "),
+                out.status,
+                out.stderr.trim()
+            );
         }
+        Ok(out.stdout)
+    }
+
+    /// The base and head commits of one pull request, as GitHub records
+    /// them.
+    fn teach_pr_range(&self, repo_cfg: &RepoConfig, number: u64) -> Result<(String, String)> {
         let number = number.to_string();
         let args = [
             "pr",
@@ -7234,17 +7234,29 @@ impl Daemon {
             "--repo",
             repo_cfg.owner_repo.as_str(),
             "--json",
-            "headRefOid",
+            "baseRefOid,headRefOid",
         ];
-        let out = self.exec.run("gh", &args, None).ok()?;
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh pr view failed to run")?;
         if out.status != 0 {
-            return None;
+            bail!(
+                "gh pr view exited with status {}: {}",
+                out.status,
+                out.stderr.trim()
+            );
         }
-        serde_json::from_str::<serde_json::Value>(&out.stdout)
-            .ok()?
-            .get("headRefOid")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
+        let body: serde_json::Value =
+            serde_json::from_str(&out.stdout).context("gh pr view returned a broken body")?;
+        let field = |name: &str| {
+            body.get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("gh pr view returned no {name} for pull request {number}"))
+        };
+        Ok((field("baseRefOid")?, field("headRefOid")?))
     }
 
     /// The statement of one area and the model entries of its boundary.
@@ -21261,11 +21273,12 @@ surface: api\ndriver: curl\ntier: http\n---\n\
     // ------------------------------------------------------------------
 
     /// The scripted history calls of one teach task over `web/**`.
-    fn teach_history_steps(repo: &Path) -> Vec<Step> {
+    fn teach_history_steps(repo: &Path, path: &str) -> Vec<Step> {
+        let owned = path.to_string();
         vec![
             git_step(
                 repo,
-                &["log", "--oneline", "-20", "--", "web/**"],
+                &["log", "--oneline", "-20", "--", path],
                 CmdOut::ok("aaa1111 add the pay button\nbbb2222 move the cart\n"),
             ),
             gh_step(
@@ -21277,7 +21290,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                     "--state",
                     "merged",
                     "--search",
-                    "web/**",
+                    owned.as_str(),
                     "--limit",
                     "10",
                     "--json",
@@ -21301,7 +21314,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let dir = temp_root();
         let repo = dir.join("repo");
         let mut steps = slice_steps(&repo, "aaa111");
-        steps.extend(teach_history_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/**"));
         let mut rig = Rig::make_in(dir, steps, governed);
         rig.poll(Vec::new(), Vec::new());
 
@@ -21383,6 +21396,17 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         ]
     }
 
+    /// Every theory event the rig posted, in call order.
+    fn opened_events(rig: &Rig) -> Vec<Event> {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .filter_map(|call| call.args.iter().find(|arg| arg.starts_with("body=")))
+            .flat_map(|field| parse_event_blocks(field.strip_prefix("body=").unwrap_or(field)))
+            .collect()
+    }
+
     /// One teach event of the `web-checkout` area.
     fn teach_event(text: &str) -> Event {
         Event {
@@ -21400,6 +21424,117 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         one
     }
 
+    /// The diff of the scripted pull request 7 of the teach tests.
+    const TEACH_PR_DIFF: &str = concat!(
+        "diff --git a/web/pay.ts b/web/pay.ts\n",
+        "@@ -1 +1,2 @@\n",
+        "+const retries = 3;\n",
+    );
+
+    /// The scripted pull request read and diff of one teach subject.
+    fn teach_pr_steps(repo: &Path) -> Vec<Step> {
+        vec![
+            gh_step(
+                &[
+                    "pr",
+                    "view",
+                    "7",
+                    "--repo",
+                    "acme/borsuk",
+                    "--json",
+                    "baseRefOid,headRefOid",
+                ],
+                CmdOut::ok(r#"{"baseRefOid":"base111","headRefOid":"head222"}"#),
+            ),
+            git_step(
+                repo,
+                &["diff", "--name-only", "base111...head222"],
+                CmdOut::ok("web/pay.ts\n"),
+            ),
+            git_step(
+                repo,
+                &["diff", "base111...head222"],
+                CmdOut::ok(TEACH_PR_DIFF),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_pull_request_teach_diffs_the_recorded_base_and_head() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Pr(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-pr-7");
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff of the recorded range:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "- aaa1111 add the pay button\n- bbb2222 move the cart\n- #7 checkout rework"
+            ),
+            "two commit lines and one pull request line:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("### .claude/skills/run-web/features/checkout.md"),
+            "the feature file of the area the diff touches:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_teach_dispatch_fails_when_github_cannot_name_the_pull_request() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(gh_step(
+            &[
+                "pr",
+                "view",
+                "7",
+                "--repo",
+                "acme/borsuk",
+                "--json",
+                "baseRefOid,headRefOid",
+            ],
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no pull request found".to_string(),
+            },
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Pr(7),
+        }));
+
+        assert_eq!(rig.job_count(), 0, "no agent runs without the subject");
+        // The failure re-queues the task for its next attempt, and the
+        // reason reaches the operator through the task log.
+        let task = rig.task("borsuk/teach-pr-7");
+        assert_eq!(task.attempt, 2, "the failed dispatch counted an attempt");
+        let log = fs::read_to_string(&task.log_path).expect("the dispatch failure logs");
+        assert!(
+            log.contains("gh pr view exited with status 1"),
+            "log: {log}"
+        );
+    }
+
     #[test]
     fn a_teach_turn_opens_one_event_per_block() {
         let dir = temp_root();
@@ -21407,7 +21542,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let first = teach_event("The code retries, and the model forbids a retry.");
         let second = teach_event("The boundary lists no cart path.");
         let mut steps = slice_steps(&repo, "aaa111");
-        steps.extend(teach_history_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/**"));
         steps.extend(open_event_steps(&first));
         steps.extend(open_event_steps(&second));
         let mut rig = Rig::make_in(dir, steps, governed);
@@ -21426,15 +21561,46 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rig.event(turn_ended(id));
         rig.event(exited(id, true, ""));
 
-        let bodies: Vec<Event> = rig
-            .exec
-            .calls()
-            .iter()
-            .filter(|call| call.program == "gh")
-            .filter_map(|call| call.args.iter().find(|arg| arg.starts_with("body=")))
-            .flat_map(|field| parse_event_blocks(field.strip_prefix("body=").unwrap_or(field)))
-            .collect();
-        assert_eq!(bodies, vec![first, second], "one event per block");
+        assert_eq!(
+            opened_events(&rig),
+            vec![first, second],
+            "one event per block"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_teach_turn_opens_a_block_that_arrives_in_its_own_text_event() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let first = teach_event("The code retries, and the model forbids a retry.");
+        let second = teach_event("The boundary lists no cart path.");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_history_steps(&repo, "web/**"));
+        steps.extend(open_event_steps(&first));
+        steps.extend(open_event_steps(&second));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(teach_area("web-checkout"));
+        let id = "borsuk/teach-area-web-checkout";
+
+        // One block per text event, with prose before them.
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The checkout posts the cart, then the api charges it.".to_string(),
+        });
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&first),
+        });
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&second),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![first, second]);
         assert_eq!(rig.task(id).state, TaskState::Done);
     }
 
@@ -21443,7 +21609,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let dir = temp_root();
         let repo = dir.join("repo");
         let mut steps = slice_steps(&repo, "aaa111");
-        steps.extend(teach_history_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/**"));
         let mut rig = Rig::make_in(dir, steps, governed);
         rig.poll(vec![theory_issue()], Vec::new());
         rig.act(teach_area("web-checkout"));

@@ -1004,9 +1004,9 @@ pub(super) fn footer_hints(app: &App) -> String {
                 .find(|train| train.repo == repo)
                 .is_some_and(|train| train.queue.contains(&pr) && !train.batch.contains(&pr));
             if stackable {
-                "space stack · enter details · ? help".to_string()
+                "space stack · t teach · enter details · ? help".to_string()
             } else {
-                "enter details · p pause · ? help".to_string()
+                "t teach · enter details · p pause · ? help".to_string()
             }
         }
     }
@@ -4888,14 +4888,14 @@ mod tests {
                     repo: "borsuk".to_string(),
                     pr: 7,
                 },
-                "space stack · enter details · ? help",
+                "space stack · t teach · enter details · ? help",
             ),
             (
                 Row::ReleasePr {
                     repo: "borsuk".to_string(),
                     pr: 5,
                 },
-                "enter details · p pause · ? help",
+                "t teach · enter details · p pause · ? help",
             ),
         ];
         for (row, expected) in cases {
