@@ -340,6 +340,9 @@ pub fn clean(env: &DoctorEnv, yes: bool, confirm: &mut dyn FnMut() -> Result<boo
             WorktreeKind::Pr => {
                 manager.remove_pr(env.exec, repo, removal.number, Cleanable::MergedOrClosed)
             }
+            WorktreeKind::Skills => {
+                manager.remove_skills(env.exec, repo, removal.number, Cleanable::MergedOrClosed)
+            }
         };
         match removal_result {
             Ok(()) => println!("removed {}", removal.path.display()),
@@ -360,7 +363,7 @@ pub fn clean(env: &DoctorEnv, yes: bool, confirm: &mut dyn FnMut() -> Result<boo
 struct Removal {
     /// The repository alias.
     alias: String,
-    /// The worktree kind: ticket or PR.
+    /// The worktree kind: ticket, PR, or run skill.
     kind: WorktreeKind,
     /// The item number of the worktree.
     number: u64,
@@ -1536,7 +1539,9 @@ impl WorktreeState {
     ///
     /// A ticket worktree is dead when its ticket closes or its PR merged.
     /// A PR worktree is dead when its PR merged or closed: the review it
-    /// served is over either way.
+    /// served is over either way. A skills worktree serves one run skill
+    /// ticket and its number is that ticket, so it is dead once the ticket
+    /// is closed.
     fn is_cleanable(self, kind: WorktreeKind) -> bool {
         match kind {
             WorktreeKind::Issue => {
@@ -1545,6 +1550,7 @@ impl WorktreeState {
             WorktreeKind::Pr => {
                 matches!(self, WorktreeState::PullMerged | WorktreeState::PullClosed)
             }
+            WorktreeKind::Skills => matches!(self, WorktreeState::IssueClosed),
         }
     }
 
