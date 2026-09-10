@@ -33,7 +33,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{
     self, Config, ExecutionRole, Harness, ReleasePolicy, RepoConfig, ResolvedRoleSettings,
-    SettingsEdit, SettingsSource,
+    RoleSettings, SettingsEdit, SettingsSource,
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{Exec, RealExec};
@@ -53,8 +53,8 @@ use crate::routing::{
 #[cfg(test)]
 use crate::runner::Runner;
 use crate::runner::{
-    capabilities, AllowedPermission, Answer, DefaultRunnerFactory, Job, RunEvent, RunnerFactory,
-    Session,
+    capabilities, script, AllowedPermission, Answer, Capabilities, DefaultRunnerFactory, Job,
+    RunEvent, RunnerFactory, Session,
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
@@ -64,10 +64,11 @@ use crate::sock::{
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
+use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Model};
 use crate::theory::records::{event_block, Event, RecordKey, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL};
-use crate::theory::skills::{self, SkillSet};
-use crate::theory::verify::VerifyMap;
+use crate::theory::skills::{self, Feature, SkillSet};
+use crate::theory::verify::{Measurer, Mode, VerifyMap};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
@@ -120,6 +121,21 @@ pub const TICKET_NUMBER: u64 = 0;
 /// The directory of the run skills inside the skills checkout.
 pub const SKILLS_DIR: &str = ".claude/skills/";
 
+/// The seconds one fast check may run, per rule N4.
+pub const FAST_TIMEOUT_S: u64 = 120;
+
+/// The opening words of the finding one failed fast check posts.
+pub const FAST_CHECK_FAILED: &str = "fast check failed";
+
+/// Which id form one batch of measure tasks takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasureKind {
+    /// One measurer of one area: `<alias>/measure-<tree8>-<area>-<id>`.
+    Measurer,
+    /// One fast check of one feature: `<alias>/fast-<tree8>-<feature>`.
+    Fast,
+}
+
 /// The release policy that never fires on its own.
 static MANUAL_POLICY: ReleasePolicy = ReleasePolicy::Manual;
 
@@ -134,6 +150,21 @@ struct ModelCache {
     model: Result<Model, String>,
     /// The parsed verification map. A missing file is an empty map.
     verify: Result<VerifyMap, String>,
+}
+
+/// What one queued measure task runs.
+///
+/// The task table holds no command, so the daemon keeps it here until the
+/// dispatch renders it and the exit reads it back. The map is runtime
+/// only: a restart drops every measure task and the next review admission
+/// queues fresh ones.
+struct MeasureJob {
+    /// The shell command the script runner runs.
+    command: String,
+    /// The seconds the command may take.
+    timeout_s: u64,
+    /// The record id a failed or timed-out run reports under.
+    record: String,
 }
 
 /// The run skills of one repository, at one skills checkout commit.
@@ -285,6 +316,10 @@ pub struct Daemon {
     /// The ticket set of each review task, pinned at admit time. The
     /// supersede check compares it against the fresh poll.
     review_tickets: BTreeMap<String, BTreeSet<u64>>,
+    /// The command and the deadline of each queued measure task.
+    measure_jobs: BTreeMap<String, MeasureJob>,
+    /// The fast checks each admitted review task waits for.
+    fast_runs: BTreeMap<String, FastRun>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
     /// Active issue conversations, keyed by repository and issue number.
@@ -497,6 +532,12 @@ impl Daemon {
             if !config.repos.contains_key(&task.repo) {
                 continue;
             }
+            // A measure task carries its command in memory only, so a
+            // restart drops it and the next review admission queues it
+            // again against the head it finds then.
+            if task.purpose == TaskPurpose::Measure {
+                continue;
+            }
             if task.state == TaskState::Running {
                 task.state = TaskState::Queued;
                 task.updated_ms = restored_at;
@@ -630,6 +671,8 @@ impl Daemon {
             links: BTreeMap::new(),
             theory_models: BTreeMap::new(),
             theory_skills: BTreeMap::new(),
+            measure_jobs: BTreeMap::new(),
+            fast_runs: BTreeMap::new(),
             theory_views: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
@@ -1825,6 +1868,7 @@ impl Daemon {
     /// Move gated ready work into the task table and the train queues.
     fn admit_ready(&mut self) {
         let ready = std::mem::take(&mut self.pending_ready);
+        let mut fast_checks: Vec<(String, u64, String)> = Vec::new();
         for work in ready {
             if work.stage == Stage::Release {
                 if let Some(train) = self.trains.get_mut(&work.repo) {
@@ -1912,7 +1956,11 @@ impl Daemon {
                     }
                     if work.stage == Stage::Review {
                         task.head_sha = work.head_sha.clone();
-                        self.review_tickets.insert(task.id.clone(), review_tickets);
+                        let id = task.id.clone();
+                        self.review_tickets.insert(id.clone(), review_tickets);
+                        if work.kind == ItemKind::Pr {
+                            fast_checks.push((work.repo.clone(), work.number, id));
+                        }
                     }
                     self.changed = true;
                 }
@@ -1923,6 +1971,9 @@ impl Daemon {
                     );
                 }
             }
+        }
+        for (repo, number, review) in fast_checks {
+            self.start_fast_checks(&repo, number, &review);
         }
     }
 
@@ -2198,6 +2249,7 @@ impl Daemon {
                     task.stage,
                     &task.repo,
                     &task.id,
+                    task.purpose,
                 ),
                 Verdict::Yes
             ) {
@@ -2333,6 +2385,7 @@ impl Daemon {
                     task.stage,
                     &task.repo,
                     &task.id,
+                    task.purpose,
                 ),
                 Verdict::Yes
             ) {
@@ -2366,16 +2419,22 @@ impl Daemon {
                         && prior.number == task.number
                 }
                 Stage::Review => {
-                    prior.repo == task.repo
+                    (prior.repo == task.repo
                         && prior.stage == Stage::Implement
+                        && prior.purpose == TaskPurpose::Pipeline
                         && self
                             .review_tickets
                             .get(&task.id)
-                            .is_some_and(|tickets| tickets.contains(&prior.number))
+                            .is_some_and(|tickets| tickets.contains(&prior.number)))
+                        || self
+                            .fast_runs
+                            .get(&task.id)
+                            .is_some_and(|run| run.tasks.contains(&prior.id))
                 }
                 Stage::Release => {
                     prior.repo == task.repo
                         && prior.stage == Stage::Review
+                        && prior.purpose == TaskPurpose::Pipeline
                         && self
                             .release_batches
                             .get(&task.id)
@@ -2563,7 +2622,9 @@ impl Daemon {
         // memory cost the stage limit exists to bound. A parked session
         // that no queued message waits for yields its slot to this task,
         // and the check retries once.
-        if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
+        if task.purpose != TaskPurpose::Measure
+            && self.live_sessions(task.stage) >= self.limits.limit(task.stage)
+        {
             self.free_live_slot(task.stage, &task.id);
             if self.live_sessions(task.stage) >= self.limits.limit(task.stage) {
                 return Ok(false);
@@ -2642,7 +2703,11 @@ impl Daemon {
     /// Both fresh dispatches and chat resumes of parked tasks come through
     /// here; a resume carries the session id to continue.
     fn launch_task(&mut self, task: &Task, prompt: String, resume: Option<String>) -> Result<()> {
-        let role = self.bind_task_role(task)?;
+        let role = if task.purpose == TaskPurpose::Measure {
+            Self::measure_role()
+        } else {
+            self.bind_task_role(task)?
+        };
         let settings = &role.settings;
         let cwd = self
             .task_cwd(&task.id)
@@ -2665,8 +2730,12 @@ impl Daemon {
                 .get(&task.id)
                 .cloned()
                 .unwrap_or_default(),
+            timeout_s: self
+                .measure_jobs
+                .get(&task.id)
+                .map(|measure| measure.timeout_s),
         };
-        let mut runner = self.runner_factory.build(&role);
+        let mut runner = self.runner_factory.build(&role, task.purpose);
         let session = runner.start(&job, self.run_tx.clone())?;
         self.sessions.insert(task.id.clone(), session);
         self.last_event_ms.insert(task.id.clone(), self.now_ms);
@@ -3000,6 +3069,12 @@ impl Daemon {
             return;
         }
         if task.state == TaskState::AwaitingUser {
+            return;
+        }
+        // A measure task reports a result, not a success: the exit code is
+        // the record, so no exit of one fails the task.
+        if task.purpose == TaskPurpose::Measure {
+            self.finish_measure(&task, detail);
             return;
         }
         if self.task_capabilities(&task).live_input {
@@ -5079,6 +5154,429 @@ impl Daemon {
         gh.post_comment(&repo.owner_repo, number, text)
     }
 
+    // ------------------------------------------------------------------
+    // Measure tasks and fast checks
+    // ------------------------------------------------------------------
+
+    /// Queue one measure task per measurer of `mode`.
+    ///
+    /// The tree hash of `worktree` names each task, so the same tree never
+    /// runs the same command twice: a task id the table already holds is
+    /// left alone and stays out of the returned list. The returned ids are
+    /// the tasks this call created, in measurer order.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn queue_measure(
+        &mut self,
+        alias: &str,
+        key: &RecordKey,
+        worktree: &Path,
+        measurers: &[Measurer],
+        mode: Mode,
+    ) -> Vec<String> {
+        self.queue_measure_tasks(alias, key, worktree, measurers, mode, MeasureKind::Measurer)
+    }
+
+    /// Queue one fast check per feature that names a fast command.
+    ///
+    /// Each feature becomes one synthetic measurer: the fast command, the
+    /// `pr` mode, and the fixed fast deadline of rule N4.
+    fn queue_fast(
+        &mut self,
+        alias: &str,
+        key: &RecordKey,
+        worktree: &Path,
+        features: &[Feature],
+    ) -> Vec<String> {
+        let measurers: Vec<Measurer> = features
+            .iter()
+            .filter_map(|feature| {
+                feature.fast.as_ref().map(|command| Measurer {
+                    id: feature.id.clone(),
+                    area: feature.area.clone(),
+                    command: command.clone(),
+                    mode: Mode::Pr,
+                    timeout_s: FAST_TIMEOUT_S,
+                })
+            })
+            .collect();
+        self.queue_measure_tasks(
+            alias,
+            key,
+            worktree,
+            &measurers,
+            Mode::Pr,
+            MeasureKind::Fast,
+        )
+    }
+
+    /// Queue the measure tasks of one batch under the id form of `kind`.
+    fn queue_measure_tasks(
+        &mut self,
+        alias: &str,
+        key: &RecordKey,
+        worktree: &Path,
+        measurers: &[Measurer],
+        mode: Mode,
+        kind: MeasureKind,
+    ) -> Vec<String> {
+        let Some(tree) = self.tree_hash(worktree) else {
+            eprintln!("the measure tasks of {alias}: cannot read the tree of the worktree");
+            return Vec::new();
+        };
+        let (item_kind, number, stage) = match key {
+            RecordKey::Issue(number) => (ItemKind::Issue, *number, Stage::Implement),
+            RecordKey::Pr(number) => (ItemKind::Pr, *number, Stage::Review),
+            RecordKey::Repo => return Vec::new(),
+        };
+        let mut ids = Vec::new();
+        for measurer in measurers.iter().filter(|entry| entry.mode == mode) {
+            let id = match kind {
+                MeasureKind::Fast => measure::fast_id(alias, &tree, &measurer.id),
+                MeasureKind::Measurer => {
+                    measure::measure_id(alias, &tree, &measurer.area, &measurer.id)
+                }
+            };
+            // The tree already ran this command, so its record stands.
+            if self.table.by_id.contains_key(&id) {
+                continue;
+            }
+            let log = self.measure_log_path(&id);
+            let spec = tasks::ScopedTask {
+                id: &id,
+                repo: alias,
+                stage,
+                kind: item_kind,
+                number,
+            };
+            match self.table.upsert_with_id(spec, log, self.now_ms) {
+                Ok(task) => task.purpose = TaskPurpose::Measure,
+                Err(error) => {
+                    eprintln!("the measure task {id}: {error:#}");
+                    continue;
+                }
+            }
+            self.measure_jobs.insert(
+                id.clone(),
+                MeasureJob {
+                    command: measurer.command.clone(),
+                    timeout_s: measurer.timeout_s,
+                    record: measurer.id.clone(),
+                },
+            );
+            self.changed = true;
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// The first eight characters of the tree one worktree has checked out.
+    fn tree_hash(&self, worktree: &Path) -> Option<String> {
+        let out =
+            worktree::git(self.exec.as_ref(), worktree, &["rev-parse", "HEAD^{tree}"]).ok()?;
+        if out.status != 0 {
+            return None;
+        }
+        let tree: String = out
+            .stdout
+            .trim()
+            .chars()
+            .take(measure::TREE_CHARS)
+            .collect();
+        (tree.len() == measure::TREE_CHARS).then_some(tree)
+    }
+
+    /// The log file of one measure task.
+    fn measure_log_path(&self, id: &str) -> PathBuf {
+        self.state_dir
+            .join("logs")
+            .join(format!("{}.jsonl", id.replace('/', "__")))
+    }
+
+    /// Queue one fast check per touched feature of one governed pull
+    /// request, and hold the review until every one of them ends.
+    ///
+    /// The head worktree is the ground truth of a fast check, so the diff,
+    /// the tree hash, and every command read it. A repository with the
+    /// governor off, an unreadable worktree, and a diff that touches no
+    /// area with a fast command all queue nothing, and the review then runs
+    /// as it ran before the governor.
+    fn start_fast_checks(&mut self, alias: &str, number: u64, review_task: &str) {
+        let Some(repo_cfg) = self.config.repos.get(alias).cloned() else {
+            return;
+        };
+        if !repo_cfg.theory.governor.is_on() {
+            return;
+        }
+        let worktree = match self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("the fast checks of {alias} pull request {number}: {error:#}");
+                return;
+            }
+        };
+        let features = self.touched_features(alias, &repo_cfg.path, &worktree);
+        if features.is_empty() {
+            return;
+        }
+        let ids = self.queue_fast(alias, &RecordKey::Pr(number), &worktree, &features);
+        if !ids.is_empty() {
+            self.fast_runs
+                .insert(review_task.to_string(), FastRun::new(ids));
+        }
+    }
+
+    /// The features of every area the head diff touches, in area order.
+    ///
+    /// Only a feature with a fast command can become a check, and a
+    /// feature bound to two touched areas becomes one check.
+    fn touched_features(&self, alias: &str, repo_path: &Path, worktree: &Path) -> Vec<Feature> {
+        let Some(cache) = self.theory_models.get(alias) else {
+            return Vec::new();
+        };
+        let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
+            return Vec::new();
+        };
+        let Some(Ok(set)) = self.theory_skills.get(alias).map(|cache| &cache.skills) else {
+            return Vec::new();
+        };
+        let paths = self.diff_paths(repo_path, worktree);
+        let touched: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut features: Vec<Feature> = Vec::new();
+        for area in map.areas_for_paths(model, &touched) {
+            for feature in skills::resolve(area, map, set) {
+                if feature.fast.is_some() && !features.iter().any(|seen| seen.id == feature.id) {
+                    features.push(feature.clone());
+                }
+            }
+        }
+        features
+    }
+
+    /// The paths the head of one worktree changes against the default base.
+    fn diff_paths(&self, repo_path: &Path, worktree: &Path) -> Vec<String> {
+        let Ok(base) = self.worktrees.default_base(self.exec.as_ref(), repo_path) else {
+            return Vec::new();
+        };
+        let range = format!("{base}...HEAD");
+        let Ok(out) = worktree::git(
+            self.exec.as_ref(),
+            worktree,
+            &["diff", "--name-only", range.as_str()],
+        ) else {
+            return Vec::new();
+        };
+        if out.status != 0 {
+            return Vec::new();
+        }
+        out.stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Apply the exit of one measure task.
+    ///
+    /// The exit code is the result, whatever it is: the records ship as one
+    /// `<aif-measure-v1>` comment on the theory record and the task ends
+    /// `Done`, so a failing command opens no stuck row and spends no retry.
+    fn finish_measure(&mut self, task: &Task, detail: &str) {
+        let job = self.measure_jobs.remove(&task.id);
+        let records = self.measure_records(task, job.as_ref(), script::exit_code(detail));
+        let key = match task.kind {
+            ItemKind::Issue => RecordKey::Issue(task.number),
+            ItemKind::Pr => RecordKey::Pr(task.number),
+        };
+        if let Err(error) = self.post_record_comment(&task.repo, &key, &measure::block(&records)) {
+            eprintln!("the measure records of {}: {error:#}", task.id);
+        }
+        if let Err(error) = self
+            .table
+            .transition(&task.id, TaskState::Done, self.now_ms)
+        {
+            eprintln!("task {}: {error:#}", task.id);
+        }
+        self.changed = true;
+        if measure::fast_feature(&task.id).is_some() {
+            if let Some(record) = records.first().cloned() {
+                self.settle_fast_run(&task.id, record);
+            }
+        }
+    }
+
+    /// The records of one finished measure run.
+    ///
+    /// A fast check reports its exit code. A measurer that exited 0 reports
+    /// the lines it printed; any other end reports one incomparable record
+    /// that names the reason.
+    fn measure_records(
+        &self,
+        task: &Task,
+        job: Option<&MeasureJob>,
+        code: Option<i32>,
+    ) -> Vec<Record> {
+        if let Some(feature) = measure::fast_feature(&task.id) {
+            return vec![measure::exit_record(
+                feature,
+                code.unwrap_or(script::SIGNAL_EXIT),
+            )];
+        }
+        let id = job.map_or("", |job| job.record.as_str());
+        match code {
+            Some(0) => measure::parse_lines(&self.measure_stdout(task)),
+            Some(script::TIMEOUT_EXIT) => vec![Record::incomparable(id, "timeout")],
+            Some(other) => vec![Record::incomparable(id, format!("exit {other}"))],
+            None => vec![Record::incomparable(id, "the run reported no exit code")],
+        }
+    }
+
+    /// The standard output of one finished measure run.
+    ///
+    /// The runner tees standard output byte for byte and prefixes every
+    /// standard error line, so dropping the prefixed lines and the daemon's
+    /// own notes leaves what the measurer printed.
+    fn measure_stdout(&self, task: &Task) -> String {
+        let Ok(text) = fs::read_to_string(&task.log_path) else {
+            return String::new();
+        };
+        text.lines()
+            .filter(|line| !line.starts_with("stderr ") && !line.starts_with("aif: "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Record one fast result and act when the last check of a run ends.
+    ///
+    /// Every check that reported 0 releases the review by itself: the run
+    /// no longer holds it. One check with another value cancels the review,
+    /// posts the finding on the theory record, and queues the implement
+    /// task of every linked ticket again.
+    fn settle_fast_run(&mut self, fast_task: &str, record: Record) {
+        let Some(review) = self
+            .fast_runs
+            .iter_mut()
+            .find(|(_, run)| run.tasks.iter().any(|id| id == fast_task))
+            .map(|(review, run)| {
+                run.records.insert(fast_task.to_string(), record);
+                review.clone()
+            })
+        else {
+            return;
+        };
+        let Some(run) = self.fast_runs.get(&review) else {
+            return;
+        };
+        if !run.finished() {
+            return;
+        }
+        let failure = run.failure().cloned();
+        self.fast_runs.remove(&review);
+        let Some(failure) = failure else {
+            return;
+        };
+        let Some(task) = self.table.by_id.get(&review).cloned() else {
+            return;
+        };
+        // The operator can abort the review while its checks still run. A
+        // review that already ended takes no finding and needs no cancel.
+        if task.state.is_terminal() {
+            return;
+        }
+        let exit = failure.value.unwrap_or_default().round() as i64;
+        let finding = format!("{FAST_CHECK_FAILED}: {} exit {exit}", failure.id);
+        if let Err(error) =
+            self.post_record_comment(&task.repo, &RecordKey::Pr(task.number), &finding)
+        {
+            eprintln!("the fast check finding of {review}: {error:#}");
+        }
+        self.cancel_for_fast_check(&review, &finding);
+        self.requeue_implement(&task.repo, task.number);
+    }
+
+    /// Cancel one review task because a fast check failed.
+    ///
+    /// The reason is the finding, so the pipeline row names the check that
+    /// stopped the review instead of a bare abort.
+    fn cancel_for_fast_check(&mut self, id: &str, reason: &str) {
+        self.stop_session(id, "cannot stop the session during the fast check");
+        self.confirming.remove(id);
+        self.pending_chats.remove(id);
+        if self
+            .table
+            .by_id
+            .get(id)
+            .is_some_and(|task| !task.state.is_terminal())
+        {
+            if let Err(error) =
+                self.table
+                    .transition(id, TaskState::Failed(reason.to_string()), self.now_ms)
+            {
+                eprintln!("the fast check of {id}: {error:#}");
+                return;
+            }
+        }
+        self.decisions.drop_for_task(id);
+        self.changed = true;
+    }
+
+    /// Queue the implement task of every ticket one pull request closes.
+    fn requeue_implement(&mut self, repo: &str, number: u64) {
+        let tickets = self
+            .links
+            .get(repo)
+            .map(|links| links.tickets_of(number))
+            .unwrap_or_default();
+        for ticket in tickets {
+            let log = self.log_path(repo, Stage::Implement, ItemKind::Issue, ticket);
+            match self.table.upsert_queued(
+                repo,
+                Stage::Implement,
+                ItemKind::Issue,
+                ticket,
+                log,
+                self.now_ms,
+            ) {
+                Ok(task) => {
+                    let id = task.id.clone();
+                    self.role_bindings.remove(&id);
+                    self.changed = true;
+                }
+                Err(error) => eprintln!("the fast check of {repo} issue {ticket}: {error:#}"),
+            }
+        }
+    }
+
+    /// The synthetic role of one measure task.
+    ///
+    /// A measure task runs a shell command, so no configured role applies
+    /// to it. The value names the shell as its program and never reaches a
+    /// harness: [`RunnerFactory::build`] reads the purpose first.
+    fn measure_role() -> ResolvedRoleSettings {
+        ResolvedRoleSettings {
+            role: ExecutionRole::Review,
+            source: SettingsSource::BuiltIn,
+            tag_route: None,
+            settings: RoleSettings {
+                harness: Harness::Opencode,
+                program: "sh".to_string(),
+                model: "sh".to_string(),
+                effort: None,
+                extra_args: Vec::new(),
+                agent: None,
+                profile: None,
+                permission_mode: None,
+                permission_handler: None,
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                strict_mcp: None,
+                auto_approve: None,
+                approval_policy: None,
+                sandbox: None,
+            },
+        }
+    }
+
     /// Resolve the theory record of one item to its `(owner_repo, number)`.
     ///
     /// In code mode, with no `theory.repo`, an issue or a pull request is
@@ -5591,16 +6089,15 @@ impl Daemon {
     /// blocks, yields, or passed the idle limit, so the count stays a true
     /// bound on the stage's live processes.
     fn live_sessions(&self, stage: Stage) -> usize {
-        let active = self
-            .sessions
-            .keys()
-            .filter(|id| {
-                self.table
-                    .by_id
-                    .get(*id)
-                    .is_some_and(|task| task.stage == stage)
-            })
-            .count();
+        let active =
+            self.sessions
+                .keys()
+                .filter(|id| {
+                    self.table.by_id.get(*id).is_some_and(|task| {
+                        task.stage == stage && task.purpose != TaskPurpose::Measure
+                    })
+                })
+                .count();
         let stopping = self
             .stopping_sessions
             .values()
@@ -5821,7 +6318,17 @@ impl Daemon {
     }
 
     /// Return the runtime actions of the task's resolved harness.
+    ///
+    /// A measure task runs a shell command under a synthetic role, so it
+    /// steers nothing and resumes nothing.
     fn task_capabilities(&self, task: &Task) -> crate::runner::Capabilities {
+        if task.purpose == TaskPurpose::Measure {
+            return Capabilities {
+                live_input: false,
+                resume: false,
+                permission_responses: false,
+            };
+        }
         self.resolved_task_role(task)
             .map(|role| capabilities(role.settings.harness))
             .unwrap_or(crate::runner::Capabilities {
@@ -5865,6 +6372,13 @@ impl Daemon {
         repo_cfg: &RepoConfig,
         worktree: &Path,
     ) -> Result<String> {
+        if task.purpose == TaskPurpose::Measure {
+            return self
+                .measure_jobs
+                .get(&task.id)
+                .map(|measure| measure.command.clone())
+                .ok_or_else(|| anyhow!("the measure task {} carries no command", task.id));
+        }
         let role = Self::execution_role(task);
         let template = self.prompt_template(role)?;
         // A crash between the write and the rename can leave a blank file.
@@ -6599,11 +7113,13 @@ mod tests {
         jobs: Arc<Mutex<Vec<Job>>>,
         sessions: Arc<Mutex<Vec<SessionHandle>>>,
         roles: Arc<Mutex<Vec<ResolvedRoleSettings>>>,
+        purposes: Arc<Mutex<Vec<TaskPurpose>>>,
     }
 
     impl RunnerFactory for FakeRunnerFactory {
-        fn build(&self, role: &ResolvedRoleSettings) -> Box<dyn Runner> {
+        fn build(&self, role: &ResolvedRoleSettings, purpose: TaskPurpose) -> Box<dyn Runner> {
             self.roles.lock().unwrap().push(role.clone());
+            self.purposes.lock().unwrap().push(purpose);
             Box::new(FakeRunner::new(self.jobs.clone(), self.sessions.clone()))
         }
     }
@@ -6727,6 +7243,7 @@ mod tests {
                 model: Some("m".to_string()),
             },
             usage: crate::config::UsageConfig::default(),
+            measure: crate::config::MeasureConfig::default(),
         }
     }
 
@@ -6847,6 +7364,7 @@ mod tests {
         jobs: Arc<Mutex<Vec<Job>>>,
         sessions: Arc<Mutex<Vec<SessionHandle>>>,
         roles: Arc<Mutex<Vec<ResolvedRoleSettings>>>,
+        purposes: Arc<Mutex<Vec<TaskPurpose>>>,
         wake_rx: Receiver<()>,
         t: Arc<Mutex<u64>>,
         repo: PathBuf,
@@ -6894,6 +7412,7 @@ mod tests {
             let jobs = Arc::new(Mutex::new(Vec::new()));
             let sessions = Arc::new(Mutex::new(Vec::new()));
             let roles = Arc::new(Mutex::new(Vec::new()));
+            let purposes = Arc::new(Mutex::new(Vec::new()));
             let (poll_tx, poll_rx) = mpsc::channel::<DaemonMsg>();
             let (wake_tx, wake_rx) = mpsc::channel::<()>();
             let mut wake = BTreeMap::new();
@@ -6904,6 +7423,7 @@ mod tests {
                 jobs: jobs.clone(),
                 sessions: sessions.clone(),
                 roles: roles.clone(),
+                purposes: purposes.clone(),
             });
             let mut daemon = Daemon::with_runner_factory(
                 config,
@@ -6930,6 +7450,7 @@ mod tests {
                 jobs,
                 sessions,
                 roles,
+                purposes,
                 wake_rx,
                 t,
                 repo: dir.join("repo"),
@@ -11956,6 +12477,7 @@ mod tests {
                 jobs,
                 sessions,
                 roles,
+                purposes: Arc::new(Mutex::new(Vec::new())),
             }),
             false,
         );
@@ -17033,6 +17555,553 @@ mod tests {
     // ------------------------------------------------------------------
     // State push
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Fast checks at review admission
+    // ------------------------------------------------------------------
+
+    /// The tree the fast-check worktree has checked out.
+    const FAST_TREE_SHA: &str = "aabbccdd11223344556677889900aabbccddeeff";
+
+    /// The first eight characters of [`FAST_TREE_SHA`], as a task id
+    /// carries them.
+    const FAST_TREE: &str = "aabbccdd";
+
+    /// The skills tree of the fast-check tests: one surface, two features.
+    const FAST_SKILLS_TREE: &str = concat!(
+        ".claude/skills/run-web/SKILL.md\n",
+        ".claude/skills/run-web/features/checkout.md\n",
+        ".claude/skills/run-web/features/orders.md\n",
+    );
+
+    /// One feature file that binds an area to a fast command.
+    fn feature_file(area: &str, fast: &str) -> String {
+        format!("---\narea: {area}\nfast: {fast}\n---\n# Feature\n")
+    }
+
+    /// The git steps of the governed theory read of the fast-check tests.
+    fn fast_theory_steps(repo: &Path) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("ccc333\n"),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:theory/model.toml"],
+                CmdOut::ok(THEORY_MODEL),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:theory/verify.toml"],
+                CmdOut::ok(THEORY_VERIFY),
+            ),
+            git_step(
+                repo,
+                &["ls-tree", "-r", "--name-only", "ccc333", SKILLS_DIR],
+                CmdOut::ok(FAST_SKILLS_TREE),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/SKILL.md"],
+                CmdOut::ok(run_skill("browser")),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/features/checkout.md"],
+                CmdOut::ok(feature_file("web-checkout", "cargo test --test cli")),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/features/orders.md"],
+                CmdOut::ok(feature_file("api-orders", "cargo test --test api")),
+            ),
+        ]
+    }
+
+    /// The git steps of a fresh PR worktree cut from `origin/main`.
+    fn fast_pr_worktree_steps(
+        repo: &Path,
+        worktree: &Path,
+        number: u64,
+        gitdir: &Path,
+    ) -> Vec<Step> {
+        let reference = format!("refs/heads/aif/borsuk/pr-{number}");
+        let branch = format!("aif/borsuk/pr-{number}");
+        let pull_ref = format!("pull/{number}/head");
+        let wt_text = worktree.to_string_lossy().into_owned();
+        vec![
+            git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                repo,
+                &["rev-parse", "--verify", "--quiet", reference.as_str()],
+                refused(),
+            ),
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch.as_str(),
+                    wt_text.as_str(),
+                    "refs/remotes/origin/main",
+                ],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(worktree, gitdir),
+            git_step(
+                worktree,
+                &["fetch", "origin", pull_ref.as_str()],
+                CmdOut::ok(""),
+            ),
+            git_step(worktree, &["reset", "--hard", "FETCH_HEAD"], CmdOut::ok("")),
+        ]
+    }
+
+    /// The git steps of a reused PR worktree.
+    fn reuse_pr_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
+        let listed = format!("worktree {}\n", worktree.display());
+        let pull_ref = format!("pull/{number}/head");
+        vec![
+            git_step(
+                repo,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(listed),
+            ),
+            common_dir_step(worktree, gitdir),
+            git_step(
+                worktree,
+                &["fetch", "origin", pull_ref.as_str()],
+                CmdOut::ok(""),
+            ),
+            git_step(worktree, &["reset", "--hard", "FETCH_HEAD"], CmdOut::ok("")),
+        ]
+    }
+
+    /// The git steps the admission of one governed review runs: the head
+    /// worktree, the diff against the default base, and the tree hash.
+    fn fast_admission_steps(
+        repo: &Path,
+        worktree: &Path,
+        number: u64,
+        gitdir: &Path,
+        diff: &str,
+    ) -> Vec<Step> {
+        let mut steps = fast_pr_worktree_steps(repo, worktree, number, gitdir);
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps.push(git_step(
+            worktree,
+            &["rev-parse", "HEAD^{tree}"],
+            CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
+        ));
+        steps
+    }
+
+    /// One `gh api` comment step on the theory record of pull request 7.
+    fn record_comment_step(body: &str) -> Step {
+        let field = format!("body={body}");
+        gh_step(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/comments",
+                "-f",
+                field.as_str(),
+            ],
+            CmdOut::ok(""),
+        )
+    }
+
+    /// The `<aif-measure-v1>` comment step of one fast record.
+    fn fast_record_step(feature: &str, exit: i32) -> Step {
+        record_comment_step(&measure::block(&[measure::exit_record(feature, exit)]))
+    }
+
+    /// One unlinked draft pull request, so no implement task holds its
+    /// review and the fast checks are the only gate.
+    fn unlinked_pr(number: u64) -> Pr {
+        let mut pull = pr(number, true, &[]);
+        pull.head_ref = "feature/landing".to_string();
+        pull.body = String::new();
+        pull
+    }
+
+    /// One draft pull request whose branch and body close ticket 142.
+    fn linked_draft(number: u64) -> Pr {
+        let mut pull = pr(number, true, &[]);
+        pull.head_ref = "aif/borsuk/issue-142".to_string();
+        pull.body = "Closes #142".to_string();
+        pull
+    }
+
+    #[test]
+    fn a_governed_review_admission_queues_one_fast_task_per_touched_feature() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+        assert_eq!(
+            rig.daemon
+                .table
+                .order
+                .iter()
+                .filter(|id| id.contains("/fast-"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![checkout.clone(), orders.clone()],
+        );
+        assert_eq!(rig.task(&checkout).purpose, TaskPurpose::Measure);
+        assert_eq!(rig.task(&checkout).state, TaskState::Running);
+        assert_eq!(rig.task(&orders).state, TaskState::Queued);
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the review waits for both fast checks"
+        );
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "one worktree runs one command at a time"
+        );
+        assert_eq!(rig.job(0).task, checkout);
+        assert_eq!(rig.job(0).prompt, "cargo test --test cli");
+        assert_eq!(rig.job(0).cwd, worktree);
+        assert_eq!(rig.job(0).timeout_s, Some(FAST_TIMEOUT_S));
+        assert_eq!(
+            rig.purposes.lock().unwrap().as_slice(),
+            &[TaskPurpose::Measure]
+        );
+        // A measure task is a check of a stage, not a stage of its own, so
+        // the board draws the review it holds and not the check.
+        let view = last_view(&push_rx);
+        assert_eq!(
+            view.tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["borsuk/review-p7"]
+        );
+    }
+
+    #[test]
+    fn two_fast_checks_that_exit_zero_release_the_review() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 0));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        rig.event(exited(&checkout, true, "exit 0"));
+
+        assert_eq!(rig.task(&checkout).state, TaskState::Done);
+        assert_eq!(
+            rig.job(1).task,
+            orders,
+            "the second check takes the worktree"
+        );
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Queued);
+
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(rig.task(&orders).state, TaskState::Done);
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).task, "borsuk/review-p7");
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+    }
+
+    #[test]
+    fn a_fast_check_that_exits_one_cancels_the_review_and_queues_the_implement() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![issue(142, &[])], vec![linked_draft(7)]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 1".to_string())
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(rig.job_count(), 3);
+        assert_eq!(rig.job(2).task, "borsuk/implement-i142");
+        assert!(
+            !rig.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.task == "borsuk/review-p7"),
+            "a failed fast check dispatches no review"
+        );
+    }
+
+    #[test]
+    fn a_fast_check_that_passes_its_deadline_records_124_and_fails_the_check() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/checkout.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 124));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 124"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![issue(142, &[])], vec![linked_draft(7)]);
+        // The script runner reports a deadline as exit 124, whatever the
+        // command did; the daemon reads the code and never the clock.
+        rig.event(exited(&checkout, false, &script::exit_detail(124)));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 124".to_string())
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+    }
+
+    #[test]
+    fn an_ungoverned_review_admission_queues_no_fast_task() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let steps = fresh_pr_steps(&rig_repo(&dir), &worktree, 7, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert!(
+            !rig.daemon
+                .table
+                .order
+                .iter()
+                .any(|id| id.contains("/fast-")),
+            "the governor is off, so v0.6 admission holds"
+        );
+        assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+    }
+
+    #[test]
+    fn queue_measure_names_the_area_and_ships_the_records_of_the_run() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let line = "{\"id\":\"poll_p95\",\"value\":12,\"unit\":\"ms\",\"direction\":\"lower\"}";
+        let block = measure::block(&measure::parse_lines(line));
+        let steps = vec![
+            git_step(
+                &worktree,
+                &["rev-parse", "HEAD^{tree}"],
+                CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
+            ),
+            record_comment_step(&block),
+        ];
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let measurers = vec![
+            Measurer {
+                id: "poll_p95".to_string(),
+                area: "web-checkout".to_string(),
+                command: "aif bench".to_string(),
+                mode: Mode::Pr,
+                timeout_s: 30,
+            },
+            Measurer {
+                id: "slow".to_string(),
+                area: "web-checkout".to_string(),
+                command: "aif bench --full".to_string(),
+                mode: Mode::Full,
+                timeout_s: 30,
+            },
+        ];
+
+        let ids =
+            rig.daemon
+                .queue_measure("borsuk", &RecordKey::Pr(7), &worktree, &measurers, Mode::Pr);
+
+        assert_eq!(
+            ids,
+            vec![format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95")],
+            "only the measurers of the mode run"
+        );
+        assert_eq!(rig.task(&ids[0]).purpose, TaskPurpose::Measure);
+        assert_eq!(rig.task(&ids[0]).state, TaskState::Queued);
+        rig.daemon
+            .table
+            .transition(&ids[0], TaskState::Running, T0)
+            .unwrap();
+        let task = rig.task(&ids[0]);
+        std::fs::create_dir_all(task.log_path.parent().unwrap()).unwrap();
+        std::fs::write(&task.log_path, format!("{line}\nstderr noise\n")).unwrap();
+
+        rig.daemon.finish_measure(&task, "exit 0");
+
+        assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
+        assert_eq!(rig.exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_measurer_that_fails_ships_one_incomparable_record() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let block = measure::block(&[measure::Record::incomparable("poll_p95", "timeout")]);
+        let steps = vec![
+            git_step(
+                &worktree,
+                &["rev-parse", "HEAD^{tree}"],
+                CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
+            ),
+            record_comment_step(&block),
+        ];
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let measurers = vec![Measurer {
+            id: "poll_p95".to_string(),
+            area: "web-checkout".to_string(),
+            command: "aif bench".to_string(),
+            mode: Mode::Pr,
+            timeout_s: 30,
+        }];
+        let ids =
+            rig.daemon
+                .queue_measure("borsuk", &RecordKey::Pr(7), &worktree, &measurers, Mode::Pr);
+        rig.daemon
+            .table
+            .transition(&ids[0], TaskState::Running, T0)
+            .unwrap();
+        let task = rig.task(&ids[0]);
+
+        rig.daemon.finish_measure(&task, &script::exit_detail(124));
+
+        assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
+        assert!(block.contains("incomparable: timeout"), "block: {block}");
+    }
 
     /// A rig whose state views land on a channel.
     fn pushed_rig(steps: Vec<Step>) -> (Rig, Receiver<StateView>) {

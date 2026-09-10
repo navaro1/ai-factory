@@ -419,6 +419,7 @@ impl ClaudeRunner {
         let (cmd_tx, cmd_rx) = channel::<WorkerMsg>();
         let (proc_tx, proc_rx) = channel::<ProcEvent>();
         let spec = RunSpec {
+            own_group: false,
             task: job.task.clone(),
             cwd: job.cwd.clone(),
             program: self.settings.program.clone(),
@@ -1048,6 +1049,7 @@ not json at all
             yolo,
             allowed_tools: None,
             allowed_permissions: Vec::new(),
+            timeout_s: None,
         }
     }
 

@@ -701,9 +701,17 @@ impl StateInput<'_> {
                 slots: *slots,
             })
             .collect();
+        // A measure task runs a command for a stage, not a stage of its
+        // own. The board draws the task it holds, so it stays out here.
         let tasks = table
             .order
             .iter()
+            .filter(|id| {
+                table
+                    .by_id
+                    .get(*id)
+                    .is_none_or(|task| task.purpose != crate::tasks::TaskPurpose::Measure)
+            })
             .map(|id| {
                 let task = table
                     .by_id

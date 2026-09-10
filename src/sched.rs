@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::config::Config;
 use crate::model::Stage;
-use crate::tasks::{TaskState, TaskTable};
+use crate::tasks::{TaskPurpose, TaskState, TaskTable};
 
 /// A task id, as [`TaskTable`] keys it.
 pub type TaskId = String;
@@ -25,6 +25,8 @@ pub struct Limits {
     /// How many slots of one stage stay reserved for one repository, even
     /// when that repository has nothing to run.
     pub lanes: BTreeMap<(Stage, String), usize>,
+    /// How many measure tasks may run at once, over every repository.
+    pub measure: usize,
 }
 
 impl Limits {
@@ -44,7 +46,11 @@ impl Limits {
                 lanes.insert((*lane_stage, repo.alias.clone()), *count);
             }
         }
-        Limits { stage, lanes }
+        Limits {
+            stage,
+            lanes,
+            measure: config.measure.limit,
+        }
     }
 
     /// The limit of one stage.
@@ -163,9 +169,17 @@ pub fn can_start(
     stage: Stage,
     repo: &str,
     task: &str,
+    purpose: TaskPurpose,
 ) -> Verdict {
     if paused.blocks_task(stage, repo, task) {
         return Verdict::No(Reason::Paused);
+    }
+    if purpose == TaskPurpose::Measure {
+        return if table.running_measure() >= limits.measure {
+            Verdict::No(Reason::StageFull)
+        } else {
+            Verdict::Yes
+        };
     }
     capacity_verdict(limits, table, stage, repo)
 }
@@ -211,7 +225,15 @@ pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Opt
             continue;
         }
         if matches!(
-            can_start(limits, paused, table, task.stage, &task.repo, &task.id),
+            can_start(
+                limits,
+                paused,
+                table,
+                task.stage,
+                &task.repo,
+                &task.id,
+                task.purpose,
+            ),
             Verdict::Yes
         ) {
             return Some(task.id.clone());
@@ -262,6 +284,7 @@ mod tests {
                 .iter()
                 .map(|(stage, repo, count)| ((*stage, repo.to_string()), *count))
                 .collect(),
+            measure: 2,
         }
     }
 
@@ -270,7 +293,7 @@ mod tests {
         limits(&[(Stage::Implement, 3)], &[])
     }
 
-    /// Check capacity with a task that has no exact pause state.
+    /// Check capacity with a pipeline task that has no exact pause state.
     fn can_start(
         limits: &Limits,
         paused: &Paused,
@@ -278,7 +301,15 @@ mod tests {
         stage: Stage,
         repo: &str,
     ) -> Verdict {
-        super::can_start(limits, paused, table, stage, repo, "test-task")
+        super::can_start(
+            limits,
+            paused,
+            table,
+            stage,
+            repo,
+            "test-task",
+            TaskPurpose::Pipeline,
+        )
     }
 
     /// A table with one queued implement task per `(repo, number)`.
@@ -669,6 +700,67 @@ mod tests {
         assert_eq!(limits.reserve(Stage::Implement, "borsuk"), 1);
         assert_eq!(limits.reserve(Stage::Implement, "qubitsok"), 0);
         assert_eq!(limits.reserve(Stage::Review, "borsuk"), 0);
+    }
+
+    /// The `[measure]` limit caps the measure tasks and nothing else.
+    #[test]
+    fn the_measure_limit_caps_measure_tasks_alone() {
+        let text = concat!(
+            "schema_version = 1\n",
+            "[stage.refine]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[stage.implement]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 3\n",
+            "[stage.review]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 3\n",
+            "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[ticket.create]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[measure]\nlimit = 2\n",
+            "[repo.borsuk]\npath = \"/tmp/b\"\n",
+        );
+        let limits = Limits::from_config(&Config::parse(text).unwrap());
+        assert_eq!(limits.measure, 2);
+
+        let mut table = TaskTable::new();
+        let mut ids = Vec::new();
+        for number in 1..=3u64 {
+            let id = format!("borsuk/fast-aabbccdd-f{number}");
+            let task = table
+                .upsert_with_id(
+                    crate::tasks::ScopedTask {
+                        id: &id,
+                        repo: "borsuk",
+                        stage: Stage::Review,
+                        kind: ItemKind::Pr,
+                        number: 7,
+                    },
+                    PathBuf::from("log"),
+                    NOW,
+                )
+                .unwrap();
+            task.purpose = TaskPurpose::Measure;
+            ids.push(id);
+        }
+        let measure = |table: &TaskTable, id: &str| {
+            super::can_start(
+                &limits,
+                &Paused::default(),
+                table,
+                Stage::Review,
+                "borsuk",
+                id,
+                TaskPurpose::Measure,
+            )
+        };
+
+        assert_eq!(measure(&table, &ids[0]), Verdict::Yes);
+        start(&mut table, &ids[0]);
+        start(&mut table, &ids[1]);
+
+        assert_eq!(measure(&table, &ids[2]), Verdict::No(Reason::StageFull));
+        assert_eq!(
+            can_start(&limits, &Paused::default(), &table, Stage::Review, "borsuk"),
+            Verdict::Yes,
+            "two running measure tasks hold no review slot"
+        );
     }
 
     /// Only queued tasks dispatch.

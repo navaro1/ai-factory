@@ -68,6 +68,8 @@ pub enum TaskPurpose {
     TicketCreate,
     /// A read-only conversation about one open issue.
     TicketChat,
+    /// One measurer or fast check: a shell command, not an agent.
+    Measure,
 }
 
 /// One stage of one item in one repository.
@@ -423,16 +425,26 @@ impl TaskTable {
     /// The number of running tasks of each stage.
     ///
     /// Queued, awaiting, and terminal tasks do not use a scheduler slot.
-    /// Every stage appears, with 0 when nothing runs.
+    /// Every stage appears, with 0 when nothing runs. A measure task
+    /// carries a stage for its worktree only and answers to the `measure`
+    /// limit, so it counts nowhere here.
     pub fn counts_by_stage(&self) -> BTreeMap<Stage, usize> {
         let mut counts: BTreeMap<Stage, usize> =
             Stage::ALL.iter().map(|stage| (*stage, 0)).collect();
         for task in self.by_id.values() {
-            if task.state == TaskState::Running {
+            if task.state == TaskState::Running && task.purpose != TaskPurpose::Measure {
                 *counts.entry(task.stage).or_insert(0) += 1;
             }
         }
         counts
+    }
+
+    /// The number of running measure tasks.
+    pub fn running_measure(&self) -> usize {
+        self.by_id
+            .values()
+            .filter(|task| task.state == TaskState::Running && task.purpose == TaskPurpose::Measure)
+            .count()
     }
 
     /// The number of running tasks per repository and stage.
@@ -449,7 +461,7 @@ impl TaskTable {
             }
         }
         for task in self.by_id.values() {
-            if task.state == TaskState::Running {
+            if task.state == TaskState::Running && task.purpose != TaskPurpose::Measure {
                 *counts.entry((task.repo.clone(), task.stage)).or_default() += 1;
             }
         }

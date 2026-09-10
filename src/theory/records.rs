@@ -99,7 +99,7 @@ pub fn parse_event_blocks(text: &str) -> Vec<Event> {
 
 /// The closing tag of one opening tag: `<aif-event-v1>` closes as
 /// `</aif-event-v1>`.
-fn close_tag(open: &str) -> String {
+pub fn close_tag(open: &str) -> String {
     format!("</{}>", open.trim_start_matches('<').trim_end_matches('>'))
 }
 
