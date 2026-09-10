@@ -41,7 +41,7 @@ use crate::gates::{
     self, implement_ready, review_ready, unmet_blockers, GateTracker, ReadyWork, NEEDS_HUMAN_LABEL,
     TO_REFINE,
 };
-use crate::gh::GhClient;
+use crate::gh::{self, GhClient};
 use crate::links::Links;
 use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
@@ -59,30 +59,29 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AreaView, AskView, EntryView, HoldView, InputMode, PauseScope, PromptSource,
+    Action, AreaView, AskView, EntryView, HoldView, InputMode, ModelPath, PauseScope, PromptSource,
     PromptView, Push, RecordView, SettingsOperation, SettingsResult, SettingsResultStatus,
     StateInput, StateView, SurfaceView, TheoryAction, TheoryView, TicketAction, TicketDetails,
-    TicketProposal, TicketResult, TicketResultKind, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
+    TicketProposal, TicketResult, TicketResultKind, MODEL_COMMIT_REQUEST, PREDICTION_REQUEST,
+    SKILL_TICKET_REQUEST,
 };
 use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
-#[cfg(test)]
-use crate::theory::records::MODEL_PR_LABEL;
 use crate::theory::records::{
     self, event_block, parse_event_blocks, parse_prediction_blocks, prediction_block,
     record_labels, skips_prediction_gates, Event, Prediction, RecordKey, ShortPrediction,
-    TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL, THEORY_SHORT_COLOR,
-    THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
+    TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL, MODEL_FILE, MODEL_PR_COLOR,
+    MODEL_PR_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
-use crate::worktree::{self, WorktreeKind, WorktreeManager, TRAIN_DIR};
+use crate::worktree::{self, Cleanable, WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// How many diff lines one teach subject carries at most.
 const TEACH_DIFF_LINES: usize = 400;
@@ -109,6 +108,60 @@ struct SkillTarget {
     surface: String,
     /// The ticket title, which becomes the pull request title.
     title: String,
+}
+
+/// One commit, push, and pull request of a worktree the daemon owns.
+///
+/// [`Daemon::push_worktree`] runs the plan. The skills worktree and the
+/// model worktree differ only in these fields.
+struct WorktreePush<'a> {
+    /// The worktree that holds the change.
+    worktree: &'a Path,
+    /// The branch the push creates or updates.
+    branch: &'a str,
+    /// The complete `git add` argument list.
+    add: &'a [&'a str],
+    /// The commit message.
+    message: &'a str,
+    /// The `owner/name` the pull request opens on.
+    owner_repo: &'a str,
+    /// The pull request title.
+    title: &'a str,
+    /// The pull request body.
+    body: &'a str,
+    /// The labels a created pull request carries, each as its name and
+    /// the six hex digits GitHub renders it with.
+    labels: &'a [(&'a str, &'a str)],
+}
+
+/// What one [`Daemon::push_worktree`] run left on GitHub.
+///
+/// A number is absent when `gh` answered without one. The push still
+/// happened, so the outcome reports the fact and drops the number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushOutcome {
+    /// Nothing was staged, so nothing was committed or pushed.
+    Nothing,
+    /// The push landed on the branch of an open pull request.
+    Pushed(Option<u64>),
+    /// The push opened a pull request.
+    Opened(Option<u64>),
+}
+
+/// The repository that holds the model pull request of `repo`.
+///
+/// Shadow mode opens it on the theory repository, so the code repository
+/// never carries a theory file. Code mode opens it on the code repository.
+fn model_repo(repo: &RepoConfig) -> &str {
+    repo.theory_repo().unwrap_or(&repo.owner_repo)
+}
+
+/// The pull request number at the end of the URL `gh pr create` prints.
+fn pr_number_from_output(text: &str) -> Option<u64> {
+    text.lines()
+        .rev()
+        .filter_map(|line| line.trim().rsplit('/').next())
+        .find_map(|last| last.parse::<u64>().ok())
 }
 
 /// How long a parked session stays alive without activity before the reaper
@@ -166,6 +219,15 @@ pub const FLOOR_EVENT: &str = "floor";
 
 /// The reason a plain abort writes into the failed state of one task.
 const CANCELLED_REASON: &str = "cancelled";
+
+/// The commit message of every model edit.
+const MODEL_COMMIT_MESSAGE: &str = "Update the model";
+
+/// The first `theory/model.toml` of a repository that has no `theory/`.
+///
+/// The operator edits this file, so it holds one comment line and nothing
+/// else. An empty model parses, so the editor bridge validates it.
+const MODEL_TEMPLATE: &str = "# Write one [[entry]] table per model entry.\n";
 
 /// Which id form one batch of measure tasks takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6499,6 +6561,8 @@ impl Daemon {
             TheoryAction::Setup { repo, surface } => self.setup_skill_ticket(&repo, &surface),
             TheoryAction::Teach { repo, key } => self.teach(&repo, key),
             TheoryAction::Sweep { repo } => self.sweep(&repo),
+            TheoryAction::EditModel { request, repo } => self.edit_model(&request, &repo),
+            TheoryAction::CommitModel { repo } => self.commit_model(&repo),
         }
     }
 
@@ -6630,21 +6694,13 @@ impl Daemon {
     /// repository never holds a skill file.
     fn skills_dir(&self, repo: &RepoConfig, surface: &str, number: u64) -> String {
         let leaf = format!(".claude/skills/run-{surface}/");
-        match Self::theory_repo_of(repo) {
+        match repo.theory_repo() {
             None => leaf,
             Some(_) => format!(
                 "{}/{leaf}",
                 self.worktrees.skills_path(repo, number).display()
             ),
         }
-    }
-
-    /// The `owner/name` of the theory repository, or `None` in code mode.
-    fn theory_repo_of(repo: &RepoConfig) -> Option<&str> {
-        repo.theory
-            .theory
-            .as_ref()
-            .and_then(|theory| theory.repo.as_deref())
     }
 
     /// What one shadow-mode run skill implement task writes to the theory
@@ -6662,7 +6718,7 @@ impl Daemon {
         {
             return None;
         }
-        let theory_repo = Self::theory_repo_of(repo)?;
+        let theory_repo = repo.theory_repo()?;
         let issue = self
             .snapshot
             .repos
@@ -6724,32 +6780,59 @@ impl Daemon {
     ) -> Result<()> {
         let worktree = self.worktrees.skills_path(repo, number);
         let branch = WorktreeManager::skills_branch(repo, number);
-        self.git_ok_in(&worktree, &["add", "-A", ".claude/skills"])?;
+        let message = format!("Add the run skill for {}/{}", repo.alias, target.surface);
+        let body = format!(
+            "The run skill of {}/{}. Ticket {}#{number}.",
+            repo.alias, target.surface, repo.owner_repo
+        );
+        self.push_worktree(&WorktreePush {
+            worktree: &worktree,
+            branch: &branch,
+            add: &["add", "-A", ".claude/skills"],
+            message: &message,
+            owner_repo: &target.theory_repo,
+            title: &target.title,
+            body: &body,
+            labels: &[],
+        })?;
+        Ok(())
+    }
+
+    /// Commit, push, and open the pull request of one worktree the daemon
+    /// owns.
+    ///
+    /// The daemon owns the git history of these worktrees, so an agent or
+    /// the operator's editor only writes files there. A worktree with
+    /// nothing staged commits nothing. A branch that already carries an
+    /// open pull request pushes to it and opens no second one. Every label
+    /// of a created pull request exists first, so a repository that never
+    /// saw the label still gets its pull request.
+    fn push_worktree(&self, plan: &WorktreePush<'_>) -> Result<PushOutcome> {
+        self.git_ok_in(plan.worktree, plan.add)?;
         // `git diff --cached --quiet` exits 0 with an empty index, so a run
-        // that wrote no skill file commits nothing.
+        // that wrote no file commits nothing.
         if self
-            .git_in(&worktree, &["diff", "--cached", "--quiet"])?
+            .git_in(plan.worktree, &["diff", "--cached", "--quiet"])?
             .status
             == 0
         {
-            return Ok(());
+            return Ok(PushOutcome::Nothing);
         }
-        let message = format!("Add the run skill for {}/{}", repo.alias, target.surface);
-        self.git_ok_in(&worktree, &["commit", "-m", message.as_str()])?;
-        self.git_ok_in(&worktree, &["push", "-u", "origin", branch.as_str()])?;
+        self.git_ok_in(plan.worktree, &["commit", "-m", plan.message])?;
+        self.git_ok_in(plan.worktree, &["push", "-u", "origin", plan.branch])?;
         let open = self.exec.run(
             "gh",
             &[
                 "pr",
                 "list",
                 "--repo",
-                target.theory_repo.as_str(),
+                plan.owner_repo,
                 "--head",
-                branch.as_str(),
+                plan.branch,
                 "--json",
                 "number",
             ],
-            Some(&worktree),
+            Some(plan.worktree),
         )?;
         if open.status != 0 {
             bail!(
@@ -6760,29 +6843,32 @@ impl Daemon {
         }
         let found: Vec<serde_json::Value> =
             serde_json::from_str(&open.stdout).context("gh pr list returned a broken body")?;
-        if !found.is_empty() {
-            return Ok(());
+        if let Some(first) = found.first() {
+            return Ok(PushOutcome::Pushed(
+                first.get("number").and_then(serde_json::Value::as_u64),
+            ));
         }
-        let body = format!(
-            "The run skill of {}/{}. Ticket {}#{number}.",
-            repo.alias, target.surface, repo.owner_repo
-        );
-        let created = self.exec.run(
-            "gh",
-            &[
-                "pr",
-                "create",
-                "--repo",
-                target.theory_repo.as_str(),
-                "--head",
-                branch.as_str(),
-                "--title",
-                target.title.as_str(),
-                "--body",
-                body.as_str(),
-            ],
-            Some(&worktree),
-        )?;
+        let gh = GhClient::new(&*self.exec);
+        for (name, color) in plan.labels {
+            gh.create_label_if_missing(plan.owner_repo, name, color)?;
+        }
+        let mut args: Vec<&str> = vec![
+            "pr",
+            "create",
+            "--repo",
+            plan.owner_repo,
+            "--head",
+            plan.branch,
+            "--title",
+            plan.title,
+            "--body",
+            plan.body,
+        ];
+        for (name, _) in plan.labels {
+            args.push("--label");
+            args.push(name);
+        }
+        let created = self.exec.run("gh", &args, Some(plan.worktree))?;
         if created.status != 0 {
             bail!(
                 "gh pr create exited with status {}: {}",
@@ -6790,7 +6876,178 @@ impl Daemon {
                 created.stderr.trim()
             );
         }
-        Ok(())
+        Ok(PushOutcome::Opened(pr_number_from_output(&created.stdout)))
+    }
+
+    /// Cut the model worktree of one repository and tell the UI where it
+    /// is.
+    ///
+    /// The reply carries the `request` the UI sent, so only the UI that
+    /// asked opens an editor. A failure reports a toast instead, because
+    /// no editor may open on a worktree that does not exist.
+    fn edit_model(&mut self, request: &str, alias: &str) {
+        let repo = match self.governed_repo(alias) {
+            Ok(repo) => repo,
+            Err(reason) => {
+                self.report_model(alias, TicketResultKind::Failure, reason);
+                return;
+            }
+        };
+        match self.prepare_model_worktree(&repo) {
+            Ok(path) => {
+                if let Some(pusher) = self.ticket_pusher.as_ref() {
+                    pusher(Push::ModelPath(ModelPath {
+                        request: request.to_string(),
+                        repo: alias.to_string(),
+                        path,
+                    }));
+                }
+            }
+            Err(error) => self.report_model(alias, TicketResultKind::Failure, format!("{error:#}")),
+        }
+    }
+
+    /// Return the model worktree of one repository on the open model
+    /// branch.
+    ///
+    /// The open model branch is the head of the open model pull request,
+    /// else a fresh `aif/<alias>/model-<uuid8>`. The daemon derives it per
+    /// call and stores it nowhere. A checkout that holds no
+    /// [`MODEL_FILE`] gets [`MODEL_TEMPLATE`], so the operator always
+    /// opens a file that exists. A worktree that sits on another branch is
+    /// stale, because its model pull request merged or closed, so the call
+    /// removes it and cuts it again on the derived branch.
+    fn prepare_model_worktree(&self, repo: &RepoConfig) -> Result<PathBuf> {
+        let prefix = WorktreeManager::model_branch_prefix(repo);
+        let branch = match gh::open_pr_with_head_prefix(&*self.exec, model_repo(repo), &prefix)? {
+            Some((_, head)) => head,
+            None => WorktreeManager::new_model_branch(repo),
+        };
+        self.drop_stale_model_worktree(repo, &branch)?;
+        let path = self.worktrees.ensure_model(&*self.exec, repo, &branch)?;
+        let file = path.join(MODEL_FILE);
+        if !file.exists() {
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            fs::write(&file, MODEL_TEMPLATE)
+                .with_context(|| format!("cannot write {}", file.display()))?;
+        }
+        Ok(path)
+    }
+
+    /// Remove the model worktree when it holds a branch other than
+    /// `branch`.
+    ///
+    /// A worktree whose head git cannot read stays, because
+    /// [`WorktreeManager::ensure_model`] recovers it. The removal proof is
+    /// the derivation itself: the branch the worktree holds carries no
+    /// open model pull request.
+    fn drop_stale_model_worktree(&self, repo: &RepoConfig, branch: &str) -> Result<()> {
+        let path = self.worktrees.model_path(repo);
+        if !path.exists() {
+            return Ok(());
+        }
+        let Ok(held) = self.worktrees.current_branch(&*self.exec, &path) else {
+            return Ok(());
+        };
+        if held == branch {
+            return Ok(());
+        }
+        self.worktrees
+            .remove_model(&*self.exec, repo, &held, Cleanable::MergedOrClosed)
+    }
+
+    /// Commit, push, and open the model pull request of one repository.
+    ///
+    /// A second edit while the model pull request is open pushes to the
+    /// same branch and opens no second pull request.
+    fn commit_model(&mut self, alias: &str) {
+        let repo = match self.governed_repo(alias) {
+            Ok(repo) => repo,
+            Err(reason) => {
+                self.report_model(alias, TicketResultKind::Failure, reason);
+                return;
+            }
+        };
+        let (kind, message) = match self.push_model_worktree(&repo) {
+            Ok(PushOutcome::Nothing) => (
+                TicketResultKind::Success,
+                format!("the model of {alias} did not change"),
+            ),
+            Ok(PushOutcome::Pushed(Some(number))) => (
+                TicketResultKind::Success,
+                format!("pushed the model of {alias} to the model pull request {number}"),
+            ),
+            Ok(PushOutcome::Pushed(None)) => (
+                TicketResultKind::Success,
+                format!("pushed the model of {alias} to its open model pull request"),
+            ),
+            Ok(PushOutcome::Opened(Some(number))) => (
+                TicketResultKind::Success,
+                format!("opened the model pull request {number} of {alias}"),
+            ),
+            Ok(PushOutcome::Opened(None)) => (
+                TicketResultKind::Success,
+                format!("opened the model pull request of {alias}, number unknown"),
+            ),
+            Err(error) => (TicketResultKind::Failure, format!("{error:#}")),
+        };
+        self.report_model(alias, kind, message);
+    }
+
+    /// Run the commit, the push, and the pull request of one model
+    /// worktree.
+    ///
+    /// The branch comes from the worktree itself, so the answer matches the
+    /// branch the operator just edited, whatever GitHub reports meanwhile.
+    fn push_model_worktree(&self, repo: &RepoConfig) -> Result<PushOutcome> {
+        let worktree = self.worktrees.model_path(repo);
+        let branch = self.worktrees.current_branch(&*self.exec, &worktree)?;
+        let title = format!("Update the model of {}", repo.alias);
+        let body = format!("The theory model of {}.", repo.alias);
+        self.push_worktree(&WorktreePush {
+            worktree: &worktree,
+            branch: &branch,
+            add: &["add", MODEL_FILE],
+            message: MODEL_COMMIT_MESSAGE,
+            owner_repo: model_repo(repo),
+            title: &title,
+            body: &body,
+            labels: &[(MODEL_PR_LABEL, MODEL_PR_COLOR)],
+        })
+    }
+
+    /// The governed repository one model action names, or the reason it
+    /// takes no action.
+    ///
+    /// The model belongs to the governor, so a repository with the
+    /// governor off keeps its v0.6 behaviour and edits nothing.
+    fn governed_repo(&self, alias: &str) -> Result<RepoConfig, String> {
+        let Some(repo) = self.config.repos.get(alias).cloned() else {
+            return Err(format!("no repository {alias} is configured"));
+        };
+        if repo.theory.governor != Governor::On {
+            return Err(format!("the governor of {alias} is off"));
+        }
+        Ok(repo)
+    }
+
+    /// Send one model result to every interface as a toast.
+    fn report_model(&self, alias: &str, kind: TicketResultKind, message: String) {
+        let Some(pusher) = self.ticket_pusher.as_ref() else {
+            return;
+        };
+        pusher(Push::TicketResult(TicketResult {
+            request: format!("{MODEL_COMMIT_REQUEST}{alias}"),
+            repo: alias.to_string(),
+            number: 0,
+            kind,
+            message,
+            issue: None,
+            conflict: None,
+        }));
     }
 
     /// Run one git command in `dir` and return its output.
@@ -8529,6 +8786,36 @@ mod tests {
         full.extend(args.iter().map(|a| a.to_string()));
         (
             Box::new(move |call: &Call| call.program == "git" && call.args == full),
+            out,
+        )
+    }
+
+    /// A step whose arguments may end in `*`, which matches any suffix.
+    ///
+    /// A fresh model branch carries an identity the daemon mints, so a step
+    /// that names the branch cannot be an exact string. `dir` prepends the
+    /// `-C <dir>` pair of a git call.
+    fn glob_step(program: &str, dir: Option<&Path>, args: &[&str], out: CmdOut) -> Step {
+        let program = program.to_string();
+        let lead: Vec<String> = match dir {
+            Some(dir) => vec!["-C".to_string(), dir.to_string_lossy().into_owned()],
+            None => Vec::new(),
+        };
+        let want: Vec<String> = lead
+            .into_iter()
+            .chain(args.iter().map(|a| a.to_string()))
+            .collect();
+        (
+            Box::new(move |call: &Call| {
+                call.program == program
+                    && call.args.len() == want.len()
+                    && call.args.iter().zip(want.iter()).all(|(got, want)| {
+                        match want.strip_suffix('*') {
+                            Some(prefix) => got.starts_with(prefix),
+                            None => got == want,
+                        }
+                    })
+            }),
             out,
         )
     }
@@ -13402,6 +13689,586 @@ mod tests {
                 .any(|call| call.args.get(1).is_some_and(|arg| arg == "create")),
             "the open pull request stops the create"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The edit-model flow
+    // ------------------------------------------------------------------
+
+    /// The model worktree path of the rig repository.
+    fn model_wt(dir: &Path) -> PathBuf {
+        dir.join("state")
+            .join("worktrees")
+            .join("borsuk")
+            .join("model")
+    }
+
+    /// The branch a scripted model worktree reports for its head.
+    const RIG_MODEL_BRANCH: &str = "aif/borsuk/model-a1b2c3d4";
+
+    /// The `gh pr list` step that derives the open model branch.
+    fn model_derive_step(owner_repo: &str, out: &str) -> Step {
+        gh_step(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                owner_repo,
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,headRefName",
+            ],
+            CmdOut::ok(out),
+        )
+    }
+
+    /// The six git calls of a fresh model worktree cut from `source`.
+    fn fresh_model_steps(dir: &Path, source: &Path) -> Vec<Step> {
+        let worktree = model_wt(dir);
+        let wt_text = worktree.to_string_lossy().into_owned();
+        vec![
+            git_step(source, &["worktree", "prune"], CmdOut::ok("")),
+            glob_step(
+                "git",
+                Some(source),
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/aif/borsuk/model-*",
+                ],
+                refused(),
+            ),
+            git_step(
+                source,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                refused(),
+            ),
+            glob_step(
+                "git",
+                Some(source),
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "aif/borsuk/model-*",
+                    wt_text.as_str(),
+                    "HEAD",
+                ],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(dir)),
+        ]
+    }
+
+    /// The commit, push, and pull request calls of one model edit.
+    ///
+    /// `open_prs` is the `gh pr list --head` answer, so an open model pull
+    /// request stops the create step.
+    fn model_commit_steps(dir: &Path, owner_repo: &str, open_prs: &str) -> Vec<Step> {
+        let worktree = model_wt(dir);
+        let label_url = format!("repos/{owner_repo}/labels");
+        vec![
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(&worktree, &["add", "theory/model.toml"], CmdOut::ok("")),
+            git_step(&worktree, &["diff", "--cached", "--quiet"], refused()),
+            git_step(
+                &worktree,
+                &["commit", "-m", "Update the model"],
+                CmdOut::ok(""),
+            ),
+            git_step(
+                &worktree,
+                &["push", "-u", "origin", RIG_MODEL_BRANCH],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    owner_repo,
+                    "--head",
+                    RIG_MODEL_BRANCH,
+                    "--json",
+                    "number",
+                ],
+                CmdOut::ok(open_prs),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    label_url.as_str(),
+                    "-f",
+                    "name=model-pr",
+                    "-f",
+                    "color=1d76db",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"model-pr\",\"color\":\"1d76db\"}"),
+            ),
+            gh_step(
+                &[
+                    "pr",
+                    "create",
+                    "--repo",
+                    owner_repo,
+                    "--head",
+                    RIG_MODEL_BRANCH,
+                    "--title",
+                    "Update the model of borsuk",
+                    "--body",
+                    "The theory model of borsuk.",
+                    "--label",
+                    "model-pr",
+                ],
+                CmdOut::ok(format!("https://github.com/{owner_repo}/pull/12\n")),
+            ),
+        ]
+    }
+
+    /// One valid model file, as the operator's editor leaves it.
+    const EDITED_MODEL: &str = "[[entry]]\nid = \"checkout\"\nkind = \"state\"\n\
+                                title = \"Checkout\"\nstatement = \"The buyer pays.\"\n";
+
+    #[test]
+    fn a_model_edit_commits_pushes_and_opens_the_labelled_pull_request() {
+        let dir = temp_root();
+        let steps: Vec<Step> = vec![model_derive_step("acme/borsuk", "[]")]
+            .into_iter()
+            .chain(fresh_model_steps(&dir, &rig_repo(&dir)))
+            .chain(model_commit_steps(&dir, "acme/borsuk", "[]"))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+        // The operator's editor writes the file the daemon prepared.
+        fs::write(model_wt(&dir).join("theory/model.toml"), EDITED_MODEL).unwrap();
+        rig.act(Action::Theory(TheoryAction::CommitModel {
+            repo: "borsuk".to_string(),
+        }));
+
+        let calls = rig.exec.calls();
+        let order: Vec<String> = calls
+            .iter()
+            .filter_map(|call| match call.program.as_str() {
+                "git" if call.args.iter().any(|arg| arg == "commit") => Some("commit".to_string()),
+                "git" if call.args.iter().any(|arg| arg == "push") => Some("push".to_string()),
+                "gh" if call.args.first().is_some_and(|arg| arg == "pr")
+                    && call.args.get(1).is_some_and(|arg| arg == "create") =>
+                {
+                    Some("pr create".to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["commit", "push", "pr create"]);
+        let create = calls
+            .iter()
+            .find(|call| call.program == "gh" && call.args.get(1).is_some_and(|a| a == "create"))
+            .expect("the model edit opens one pull request");
+        assert_eq!(
+            create.argv(),
+            vec![
+                "pr",
+                "create",
+                "--repo",
+                "acme/borsuk",
+                "--head",
+                RIG_MODEL_BRANCH,
+                "--title",
+                "Update the model of borsuk",
+                "--body",
+                "The theory model of borsuk.",
+                "--label",
+                "model-pr",
+            ]
+        );
+
+        let Push::ModelPath(view) = rx.try_recv().unwrap() else {
+            panic!("the edit request must push a Push::ModelPath");
+        };
+        assert_eq!(view.request, "edit-1");
+        assert_eq!(view.repo, "borsuk");
+        assert_eq!(view.path, model_wt(&dir));
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the commit must push a Push::TicketResult");
+        };
+        assert_eq!(result.request, "model-commit:borsuk");
+        assert_eq!(result.message, "opened the model pull request 12 of borsuk");
+    }
+
+    #[test]
+    fn a_repository_without_a_theory_directory_starts_from_the_model_template() {
+        let dir = temp_root();
+        let steps: Vec<Step> = vec![model_derive_step("acme/borsuk", "[]")]
+            .into_iter()
+            .chain(fresh_model_steps(&dir, &rig_repo(&dir)))
+            .chain(model_commit_steps(&dir, "acme/borsuk", "[]"))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let file = model_wt(&dir).join("theory/model.toml");
+        assert!(!file.exists(), "the worktree starts without a theory");
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "# Write one [[entry]] table per model entry.\n"
+        );
+        assert!(model::parse(&fs::read_to_string(&file).unwrap()).is_ok());
+
+        // The template alone still opens the first model pull request.
+        fs::write(&file, EDITED_MODEL).unwrap();
+        rig.act(Action::Theory(TheoryAction::CommitModel {
+            repo: "borsuk".to_string(),
+        }));
+
+        assert!(
+            rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.program == "gh"
+                    && call.args.get(1).is_some_and(|arg| arg == "create")),
+            "the first model edit opens a pull request"
+        );
+    }
+
+    #[test]
+    fn a_second_model_edit_pushes_to_the_same_branch_and_opens_no_pull_request() {
+        let dir = temp_root();
+        let steps: Vec<Step> = model_commit_steps(&dir, "acme/borsuk", "[{\"number\":9}]")
+            .into_iter()
+            .take(6)
+            .collect();
+        let rig = Rig::make_in(dir.clone(), steps, governed);
+        let repo = rig.daemon.config.repos["borsuk"].clone();
+
+        let outcome = rig.daemon.push_model_worktree(&repo).unwrap();
+
+        assert_eq!(outcome, PushOutcome::Pushed(Some(9)));
+        let calls = rig.exec.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "push")),
+            "the second edit still pushes"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.args.get(1).is_some_and(|arg| arg == "create")),
+            "the open model pull request stops the create"
+        );
+    }
+
+    #[test]
+    fn a_shadow_model_edit_cuts_the_worktree_from_the_theory_checkout() {
+        let dir = temp_root();
+        let theory = PathBuf::from("theory-checkout");
+        let steps: Vec<Step> = vec![model_derive_step(
+            "acme/borsuk-theory",
+            "[{\"number\":9,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+        )]
+        .into_iter()
+        .chain(vec![
+            git_step(&theory, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                &theory,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/aif/borsuk/model-a1b2c3d4",
+                ],
+                CmdOut::ok("sha\n"),
+            ),
+            git_step(
+                &theory,
+                &[
+                    "worktree",
+                    "add",
+                    model_wt(&dir).to_string_lossy().as_ref(),
+                    RIG_MODEL_BRANCH,
+                ],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(&model_wt(&dir), &rig_gitdir(&dir)),
+        ])
+        .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, shadow_governed);
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+
+        // The open model pull request supplies the branch, so no fresh
+        // identity is minted and the code repository sees no call.
+        let calls = rig.exec.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.program == "git"
+                    && call.args.iter().any(|arg| arg == RIG_MODEL_BRANCH)),
+            "the derived branch is the open head; calls were {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.program == "gh"
+                && call
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--repo".to_string(), "acme/borsuk".to_string()])),
+            "no gh call targets the code repository"
+        );
+        assert!(model_wt(&dir).join("theory/model.toml").exists());
+    }
+
+    #[test]
+    fn a_model_worktree_with_nothing_staged_commits_nothing() {
+        let dir = temp_root();
+        let worktree = model_wt(&dir);
+        let steps = vec![
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(&worktree, &["add", "theory/model.toml"], CmdOut::ok("")),
+            git_step(&worktree, &["diff", "--cached", "--quiet"], CmdOut::ok("")),
+        ];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::CommitModel {
+            repo: "borsuk".to_string(),
+        }));
+
+        assert_eq!(rig.exec.calls().len(), 3, "the empty index stops the run");
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the commit must push a Push::TicketResult");
+        };
+        assert_eq!(result.message, "the model of borsuk did not change");
+    }
+
+    #[test]
+    fn a_merged_model_branch_is_cut_again_on_the_derived_branch() {
+        let dir = temp_root();
+        let repo_path = rig_repo(&dir);
+        let worktree = model_wt(&dir);
+        fs::create_dir_all(&worktree).unwrap();
+        let wt_text = worktree.to_string_lossy().into_owned();
+        let steps = vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":9,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok("aif/borsuk/model-old11111\n"),
+            ),
+            git_step(
+                &repo_path,
+                &["worktree", "remove", "--force", wt_text.as_str()],
+                CmdOut::ok(""),
+            ),
+            git_step(
+                &repo_path,
+                &["branch", "-D", "aif/borsuk/model-old11111"],
+                CmdOut::ok(""),
+            ),
+            // Git no longer lists the worktree, so the create path runs.
+            git_step(
+                &repo_path,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(""),
+            ),
+            git_step(&repo_path, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                &repo_path,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/aif/borsuk/model-a1b2c3d4",
+                ],
+                CmdOut::ok("sha\n"),
+            ),
+            git_step(
+                &repo_path,
+                &["worktree", "add", wt_text.as_str(), RIG_MODEL_BRANCH],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(&dir)),
+        ];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+
+        let calls = rig.exec.calls();
+        assert!(
+            calls.iter().any(|call| call.program == "git"
+                && call
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["worktree", "remove"])),
+            "the stale worktree goes; calls were {calls:?}"
+        );
+        let added = calls
+            .iter()
+            .rev()
+            .find(|call| {
+                call.program == "git"
+                    && call.args.windows(2).any(|pair| pair == ["worktree", "add"])
+            })
+            .expect("the worktree is cut again");
+        assert_eq!(
+            added.args.last().map(String::as_str),
+            Some(RIG_MODEL_BRANCH)
+        );
+    }
+
+    #[test]
+    fn a_failed_pull_request_listing_refuses_the_edit_and_cuts_nothing() {
+        let dir = temp_root();
+        let steps = vec![gh_step(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                "acme/borsuk",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,headRefName",
+            ],
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no such repository\n".to_string(),
+            },
+        )];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.windows(2).any(|pair| pair == ["worktree", "add"])),
+            "a failed listing cuts no worktree"
+        );
+        assert!(!model_wt(&dir).exists(), "no model worktree appears");
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("a failed listing must push a Push::TicketResult");
+        };
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert!(
+            result.message.contains("no such repository"),
+            "message was: {}",
+            result.message
+        );
+        assert!(rx.try_recv().is_err(), "one failure push and no more");
+    }
+
+    #[test]
+    fn a_created_pull_request_without_a_number_still_reports_the_open_request() {
+        let dir = temp_root();
+        let mut steps = model_commit_steps(&dir, "acme/borsuk", "[]");
+        let last = steps.len() - 1;
+        steps[last] = gh_step(
+            &[
+                "pr",
+                "create",
+                "--repo",
+                "acme/borsuk",
+                "--head",
+                RIG_MODEL_BRANCH,
+                "--title",
+                "Update the model of borsuk",
+                "--body",
+                "The theory model of borsuk.",
+                "--label",
+                "model-pr",
+            ],
+            CmdOut::ok("Warning: 1 uncommitted change\n"),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::CommitModel {
+            repo: "borsuk".to_string(),
+        }));
+
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the commit must push a Push::TicketResult");
+        };
+        assert_eq!(result.kind, TicketResultKind::Success);
+        assert_eq!(
+            result.message,
+            "opened the model pull request of borsuk, number unknown"
+        );
+    }
+
+    #[test]
+    fn an_ungoverned_repository_runs_no_model_action() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), |_| {});
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::EditModel {
+            request: "edit-1".to_string(),
+            repo: "borsuk".to_string(),
+        }));
+        rig.act(Action::Theory(TheoryAction::CommitModel {
+            repo: "borsuk".to_string(),
+        }));
+
+        assert!(rig.exec.calls().is_empty(), "the governor is off");
+        for _ in 0..2 {
+            let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+                panic!("a refused model action must push a Push::TicketResult");
+            };
+            assert_eq!(result.kind, TicketResultKind::Failure);
+            assert_eq!(result.message, "the governor of borsuk is off");
+        }
     }
 
     /// The `gh issue list` search of one shadow theory repository.

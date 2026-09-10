@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use aif::config::{parse_owner_repo, Config, ExecutionRole, Harness, RepoConfig};
 use aif::exec::Exec;
+use aif::gh;
 use aif::routing::{model_family, ComplexityLevel, TagRouteKey, TagRouteStage};
 use aif::sched::{self, Limits};
 use aif::sock::{Client, PauseScope, PausedView, Push};
@@ -277,7 +278,7 @@ pub fn clean(env: &DoctorEnv, yes: bool, confirm: &mut dyn FnMut() -> Result<boo
             }
         };
         for (kind, number, _) in worktrees {
-            match worktree_state(env.exec, owner, number) {
+            match worktree_item_state(env.exec, repo, owner, number) {
                 Ok(state) if state.is_cleanable(kind) => removals.push(Removal {
                     alias: repo.alias.clone(),
                     kind,
@@ -333,15 +334,25 @@ pub fn clean(env: &DoctorEnv, yes: bool, confirm: &mut dyn FnMut() -> Result<boo
             failures += 1;
             continue;
         };
+        let number = removal.number.unwrap_or_default();
         let removal_result = match removal.kind {
             WorktreeKind::Issue => {
-                manager.remove_issue(env.exec, repo, removal.number, Cleanable::MergedOrClosed)
+                manager.remove_issue(env.exec, repo, number, Cleanable::MergedOrClosed)
             }
             WorktreeKind::Pr => {
-                manager.remove_pr(env.exec, repo, removal.number, Cleanable::MergedOrClosed)
+                manager.remove_pr(env.exec, repo, number, Cleanable::MergedOrClosed)
             }
             WorktreeKind::Skills => {
-                manager.remove_skills(env.exec, repo, removal.number, Cleanable::MergedOrClosed)
+                manager.remove_skills(env.exec, repo, number, Cleanable::MergedOrClosed)
+            }
+            // The model branch is derived, so the worktree itself names
+            // the branch the removal deletes.
+            WorktreeKind::Model => {
+                manager
+                    .current_branch(env.exec, &removal.path)
+                    .and_then(|branch| {
+                        manager.remove_model(env.exec, repo, &branch, Cleanable::MergedOrClosed)
+                    })
             }
         };
         match removal_result {
@@ -365,8 +376,8 @@ struct Removal {
     alias: String,
     /// The worktree kind: ticket, PR, or run skill.
     kind: WorktreeKind,
-    /// The item number of the worktree.
-    number: u64,
+    /// The item number of the worktree. The model worktree has none.
+    number: Option<u64>,
     /// The worktree path, for the printout.
     path: PathBuf,
 }
@@ -1022,7 +1033,8 @@ fn paused_check(client: &Client) -> Check {
                 | Push::TicketLabels(_)
                 | Push::TicketResult(_)
                 | Push::Ask(_)
-                | Push::SettingsResult(_),
+                | Push::SettingsResult(_)
+                | Push::ModelPath(_),
             )) => {}
             Some(Err(error)) => return no_state_check(error),
             None => {
@@ -1475,7 +1487,7 @@ fn read_verify_map(checkout: &Path) -> VerifyMap {
 /// source of the directory names. Other entries, such as a train worktree,
 /// are skipped. A missing directory yields nothing. Other read errors
 /// propagate.
-fn item_worktrees(dir: &Path) -> Result<Vec<(WorktreeKind, u64, PathBuf)>> {
+fn item_worktrees(dir: &Path) -> Result<Vec<(WorktreeKind, Option<u64>, PathBuf)>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1498,13 +1510,19 @@ fn item_worktrees(dir: &Path) -> Result<Vec<(WorktreeKind, u64, PathBuf)>> {
             continue;
         };
         for kind in WORKTREE_KINDS {
+            if !kind.numbered() {
+                if name == kind.prefix() {
+                    out.push((kind, None, entry.path()));
+                }
+                continue;
+            }
             let Some(number) = name.strip_prefix(kind.prefix()) else {
                 continue;
             };
             let Ok(number) = number.parse::<u64>() else {
                 continue;
             };
-            out.push((kind, number, entry.path()));
+            out.push((kind, Some(number), entry.path()));
         }
     }
     out.sort_by_key(|(kind, number, _)| (*kind, *number));
@@ -1512,11 +1530,22 @@ fn item_worktrees(dir: &Path) -> Result<Vec<(WorktreeKind, u64, PathBuf)>> {
 }
 
 /// The worktree path of one item, from the manager's directory names.
-fn item_path(state_dir: &Path, alias: &str, kind: WorktreeKind, number: u64) -> PathBuf {
+///
+/// An unnumbered kind, such as the model worktree, names its directory
+/// with the prefix alone.
+fn item_path(state_dir: &Path, alias: &str, kind: WorktreeKind, number: Option<u64>) -> PathBuf {
     state_dir
         .join("worktrees")
         .join(alias)
-        .join(format!("{}{number}", kind.prefix()))
+        .join(dir_name(kind, number))
+}
+
+/// The directory name of one worktree: `issue-7`, or `model`.
+fn dir_name(kind: WorktreeKind, number: Option<u64>) -> String {
+    match number {
+        Some(number) => format!("{}{number}", kind.prefix()),
+        None => kind.prefix().to_string(),
+    }
 }
 
 /// The GitHub state that controls one worktree.
@@ -1532,6 +1561,10 @@ enum WorktreeState {
     PullClosed,
     /// A pull request is merged.
     PullMerged,
+    /// A model pull request is open on a model branch.
+    ModelOpen(u64),
+    /// No model pull request is open.
+    ModelIdle,
 }
 
 impl WorktreeState {
@@ -1541,7 +1574,8 @@ impl WorktreeState {
     /// A PR worktree is dead when its PR merged or closed: the review it
     /// served is over either way. A skills worktree serves one run skill
     /// ticket and its number is that ticket, so it is dead once the ticket
-    /// is closed.
+    /// is closed. A model worktree is dead once no model pull request is
+    /// open, because the daemon cuts the next one from a fresh branch.
     fn is_cleanable(self, kind: WorktreeKind) -> bool {
         match kind {
             WorktreeKind::Issue => {
@@ -1551,11 +1585,13 @@ impl WorktreeState {
                 matches!(self, WorktreeState::PullMerged | WorktreeState::PullClosed)
             }
             WorktreeKind::Skills => matches!(self, WorktreeState::IssueClosed),
+            WorktreeKind::Model => matches!(self, WorktreeState::ModelIdle),
         }
     }
 
     /// Describe the state for the report and the clean preview.
-    fn detail(self, number: u64) -> String {
+    fn detail(self, number: Option<u64>) -> String {
+        let number = number.unwrap_or_default();
         match self {
             WorktreeState::IssueOpen => format!("ticket {number} is open"),
             WorktreeState::IssueClosed => format!("ticket {number} is closed"),
@@ -1564,6 +1600,32 @@ impl WorktreeState {
                 format!("PR {number} is closed without a merge")
             }
             WorktreeState::PullMerged => format!("PR {number} is merged"),
+            WorktreeState::ModelOpen(pr) => format!("model PR {pr} is open"),
+            WorktreeState::ModelIdle => "no model PR is open".to_string(),
+        }
+    }
+}
+
+/// Read the GitHub state that controls one worktree.
+///
+/// A numbered worktree asks for its own issue or pull request. The model
+/// worktree asks whether a model pull request is open, because its branch
+/// is derived and never stored.
+fn worktree_item_state(
+    exec: &dyn Exec,
+    repo: &RepoConfig,
+    owner_repo: &str,
+    number: Option<u64>,
+) -> Result<WorktreeState> {
+    match number {
+        Some(number) => worktree_state(exec, owner_repo, number),
+        None => {
+            let target = repo.theory_repo().unwrap_or(owner_repo);
+            let prefix = WorktreeManager::model_branch_prefix(repo);
+            match gh::open_pr_with_head_prefix(exec, target, &prefix)? {
+                Some((number, _)) => Ok(WorktreeState::ModelOpen(number)),
+                None => Ok(WorktreeState::ModelIdle),
+            }
         }
     }
 }
@@ -1652,7 +1714,7 @@ fn worktree_checks(
             }
         };
         for (kind, number, _) in &worktrees {
-            let (status, detail) = match worktree_state(env.exec, owner, *number) {
+            let (status, detail) = match worktree_item_state(env.exec, repo, owner, *number) {
                 Ok(state) => (Status::Info, state.detail(*number)),
                 Err(error) => (Status::Warn, format!("item state unknown: {error:#}")),
             };
@@ -1684,8 +1746,8 @@ fn worktree_checks(
 }
 
 /// The report label of one item worktree.
-fn worktree_label(alias: &str, kind: WorktreeKind, number: u64) -> String {
-    format!("worktree {alias} {}{number}", kind.prefix())
+fn worktree_label(alias: &str, kind: WorktreeKind, number: Option<u64>) -> String {
+    format!("worktree {alias} {}", dir_name(kind, number))
 }
 
 #[cfg(test)]
@@ -1822,8 +1884,13 @@ mod tests {
         fs::create_dir_all(repo_path.join(".git")).expect("the fake checkout must be creatable");
         let state_dir = dir.join("state");
         for number in [7, 8] {
-            fs::create_dir_all(item_path(&state_dir, "acme", WorktreeKind::Issue, number))
-                .expect("the worktree dirs must be creatable");
+            fs::create_dir_all(item_path(
+                &state_dir,
+                "acme",
+                WorktreeKind::Issue,
+                Some(number),
+            ))
+            .expect("the worktree dirs must be creatable");
         }
         let config_path = dir.join("factory.toml");
         fs::write(
@@ -2774,7 +2841,7 @@ mod tests {
             "the stale sibling must not parse as an item: {found:?}"
         );
         assert_eq!(found[0].0, WorktreeKind::Pr);
-        assert_eq!(found[0].1, 7);
+        assert_eq!(found[0].1, Some(7));
         assert_eq!(found[0].2, worktrees.join("pr-7"));
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
@@ -3022,7 +3089,7 @@ mod tests {
     fn clean_removes_only_the_worktree_of_the_closed_issue() {
         let fx = fixture();
         let repo_text = fx.repo_path.to_string_lossy().into_owned();
-        let closed_text = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7)
+        let closed_text = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7))
             .to_string_lossy()
             .into_owned();
         let removal_argv = git_args(&[
@@ -3053,7 +3120,7 @@ mod tests {
             );
         let exec = RemovingExec {
             script,
-            remove_path: item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7),
+            remove_path: item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)),
         };
         let env = fixture_env(&fx, &exec);
         let asked = Cell::new(false);
@@ -3079,12 +3146,179 @@ mod tests {
             );
         }
         assert!(
-            !item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7).exists(),
+            !item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists(),
             "the closed issue's worktree must be removed"
         );
         assert!(
-            item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 8).exists(),
+            item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(8)).exists(),
             "the open issue's worktree must survive the clean"
+        );
+        fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
+    }
+
+    /// Match the `gh pr list` that derives the open model branch.
+    fn model_pr_list() -> impl Fn(&aif::exec::Call) -> bool + Send + Sync + 'static {
+        let expected = git_args(&[
+            "pr",
+            "list",
+            "--repo",
+            "acme/borsuk",
+            "--state",
+            "open",
+            "--limit",
+            "200",
+            "--json",
+            "number,headRefName",
+        ]);
+        move |call| call.program == "gh" && call.args == expected
+    }
+
+    /// One open model pull request of the fixture repository.
+    fn open_model_pr() -> CmdOut {
+        CmdOut::ok(r#"[{"number":9,"headRefName":"aif/acme/model-a1b2c3d4"}]"#)
+    }
+
+    #[test]
+    fn the_report_lists_the_model_worktree_with_its_open_pull_request() {
+        let fx = fixture();
+        fs::create_dir_all(item_path(&fx.state_dir, "acme", WorktreeKind::Model, None))
+            .expect("the model worktree dir must be creatable");
+        let exec = repo_answers(ScriptExec::new(), &fx.repo_path)
+            .expect(
+                gh_get("repos/acme/borsuk/issues/7"),
+                issue_answer(7, "open"),
+            )
+            .expect(
+                gh_get("repos/acme/borsuk/issues/8"),
+                issue_answer(8, "open"),
+            )
+            .expect(model_pr_list(), open_model_pr());
+        let env = fixture_env(&fx, &exec);
+        let config = read_config(&env).expect("the fixture config must parse");
+        let facts = repo_facts(&exec, &config);
+
+        let checks = worktree_checks(&env, &config, &facts);
+
+        let model = checks
+            .iter()
+            .find(|check| check.label == "worktree acme model")
+            .expect("the report lists the model worktree");
+        assert_eq!(model.detail, "model PR 9 is open");
+        assert_eq!(model.status, Status::Info);
+        assert_eq!(
+            checks
+                .iter()
+                .find(|check| check.label == "worktrees")
+                .map(|check| check.detail.as_str()),
+            Some("3 worktrees")
+        );
+        fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn clean_keeps_the_model_worktree_while_its_pull_request_is_open() {
+        let fx = fixture();
+        let model = item_path(&fx.state_dir, "acme", WorktreeKind::Model, None);
+        fs::create_dir_all(&model).expect("the model worktree dir must be creatable");
+        let exec = repo_answers(ScriptExec::new(), &fx.repo_path)
+            .expect(
+                gh_get("repos/acme/borsuk/issues/7"),
+                issue_answer(7, "open"),
+            )
+            .expect(
+                gh_get("repos/acme/borsuk/issues/8"),
+                issue_answer(8, "open"),
+            )
+            .expect(model_pr_list(), open_model_pr());
+        let env = fixture_env(&fx, &exec);
+
+        let code = clean(&env, true, &mut || Ok(false)).expect("the clean must succeed");
+
+        assert_eq!(code, 0);
+        assert!(model.exists(), "an open model PR keeps the model worktree");
+        assert!(
+            exec.calls().iter().all(|call| !call
+                .args
+                .windows(2)
+                .any(|pair| pair == ["worktree", "remove"])),
+            "no worktree removal may run while the model PR is open"
+        );
+        fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn clean_removes_the_model_worktree_once_no_model_pull_request_is_open() {
+        let fx = fixture();
+        let repo_text = fx.repo_path.to_string_lossy().into_owned();
+        let model = item_path(&fx.state_dir, "acme", WorktreeKind::Model, None);
+        fs::create_dir_all(&model).expect("the model worktree dir must be creatable");
+        let model_text = model.to_string_lossy().into_owned();
+        let head_argv = git_args(&["-C", &model_text, "rev-parse", "--abbrev-ref", "HEAD"]);
+        let removal_argv = git_args(&[
+            "-C",
+            &repo_text,
+            "worktree",
+            "remove",
+            "--force",
+            &model_text,
+        ]);
+        let branch_argv = git_args(&["-C", &repo_text, "branch", "-D", "aif/acme/model-a1b2c3d4"]);
+        let script = repo_answers(ScriptExec::new(), &fx.repo_path)
+            .expect(
+                gh_get("repos/acme/borsuk/issues/7"),
+                issue_answer(7, "open"),
+            )
+            .expect(
+                gh_get("repos/acme/borsuk/issues/8"),
+                issue_answer(8, "open"),
+            )
+            .expect(model_pr_list(), CmdOut::ok("[]"))
+            .expect(
+                move |call| call.program == "git" && call.args == head_argv,
+                CmdOut::ok("aif/acme/model-a1b2c3d4\n"),
+            )
+            .expect(
+                move |call| call.program == "git" && call.args == removal_argv,
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |call| call.program == "git" && call.args == branch_argv,
+                CmdOut::ok(""),
+            );
+        let exec = RemovingExec {
+            script,
+            remove_path: model.clone(),
+        };
+        let env = fixture_env(&fx, &exec);
+
+        let code = clean(&env, true, &mut || Ok(false)).expect("the clean must succeed");
+
+        assert_eq!(code, 0);
+        assert!(!model.exists(), "no open model PR frees the worktree");
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists());
+        let removals: Vec<Vec<String>> = exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "git"
+                    && call
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["worktree", "remove"])
+            })
+            .map(|call| call.args.clone())
+            .collect();
+        assert_eq!(
+            removals,
+            vec![git_args(&[
+                "-C",
+                &repo_text,
+                "worktree",
+                "remove",
+                "--force",
+                &model_text,
+            ])],
+            "the model worktree is the one removal"
         );
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
@@ -3112,7 +3346,7 @@ mod tests {
             "no removal may run before the confirmation"
         );
         assert!(
-            item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7).exists(),
+            item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists(),
             "the closed issue's worktree must survive an aborted clean"
         );
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
@@ -3149,7 +3383,7 @@ mod tests {
     fn clean_proceeds_on_confirmation() {
         let fx = fixture();
         let repo_text = fx.repo_path.to_string_lossy().into_owned();
-        let closed_text = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7)
+        let closed_text = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7))
             .to_string_lossy()
             .into_owned();
         let removal_argv = git_args(&[
@@ -3216,8 +3450,8 @@ mod tests {
                 .any(|pair| pair == ["worktree", "remove"])),
             "no worktree removal may run while the issue state is unknown"
         );
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7).exists());
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 8).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(8)).exists());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
@@ -3238,8 +3472,8 @@ mod tests {
         let code = clean(&env, true, &mut || Ok(false)).expect("the clean must succeed");
 
         assert_eq!(code, 0);
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7).exists());
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 8).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(8)).exists());
         assert!(
             exec.calls().iter().all(|call| !call
                 .args
@@ -3255,7 +3489,7 @@ mod tests {
     fn clean_removes_a_merged_pull_request_worktree() {
         let fx = fixture();
         let repo_text = fx.repo_path.to_string_lossy().into_owned();
-        let closed_path = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7);
+        let closed_path = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7));
         let closed_text = closed_path.to_string_lossy().into_owned();
         let removal_argv = git_args(&[
             "-C",
@@ -3297,14 +3531,14 @@ mod tests {
 
         assert_eq!(code, 0);
         assert!(!closed_path.exists());
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 8).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(8)).exists());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
     #[test]
     fn clean_removes_a_pr_worktree_whose_pr_closed_without_a_merge() {
         let fx = fixture();
-        let pr_dir = item_path(&fx.state_dir, "acme", WorktreeKind::Pr, 3);
+        let pr_dir = item_path(&fx.state_dir, "acme", WorktreeKind::Pr, Some(3));
         fs::create_dir_all(&pr_dir).expect("the pr worktree dir must be creatable");
         let repo_text = fx.repo_path.to_string_lossy().into_owned();
         let pr_text = pr_dir.to_string_lossy().into_owned();
@@ -3348,7 +3582,7 @@ mod tests {
             !pr_dir.exists(),
             "the pr worktree of a closed PR must be removed"
         );
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
@@ -3373,8 +3607,8 @@ mod tests {
         let code = clean(&env, true, &mut || Ok(false)).expect("the clean must succeed");
 
         assert_eq!(code, 0);
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 7).exists());
-        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, 8).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists());
+        assert!(item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(8)).exists());
         assert_eq!(exec.calls().len(), 5, "calls: {:?}", exec.calls());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
