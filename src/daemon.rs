@@ -58,17 +58,20 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AskView, InputMode, PauseScope, PromptSource, PromptView, Push, SettingsOperation,
-    SettingsResult, SettingsResultStatus, StateInput, StateView, TicketAction, TicketDetails,
-    TicketProposal,
+    Action, AreaView, AskView, EntryView, InputMode, PauseScope, PromptSource, PromptView, Push,
+    SettingsOperation, SettingsResult, SettingsResultStatus, StateInput, StateView, SurfaceView,
+    TheoryView, TicketAction, TicketDetails, TicketProposal,
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
+use crate::theory::model::{self, Model};
 use crate::theory::records::{event_block, Event, RecordKey, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL};
+use crate::theory::skills::{self, SkillSet};
+use crate::theory::verify::VerifyMap;
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
-use crate::worktree::{WorktreeKind, WorktreeManager, TRAIN_DIR};
+use crate::worktree::{self, WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// How long a parked session stays alive without activity before the reaper
 /// stops its process.
@@ -114,8 +117,33 @@ pub const TICKET_REFINEMENT_MESSAGE: &str =
 /// number 0, so the daemon uses it as the marker of a ticket session.
 pub const TICKET_NUMBER: u64 = 0;
 
+/// The directory of the run skills inside the skills checkout.
+pub const SKILLS_DIR: &str = ".claude/skills/";
+
 /// The release policy that never fires on its own.
 static MANUAL_POLICY: ReleasePolicy = ReleasePolicy::Manual;
+
+/// The theory of one repository, at one theory checkout commit.
+///
+/// A parse error is a cached value, not a failure, so a broken file costs
+/// one read per commit and never one per poll.
+struct ModelCache {
+    /// The commit the files were read at. Empty when the read failed.
+    commit: String,
+    /// The parsed model, or the error the Theory view shows.
+    model: Result<Model, String>,
+    /// The parsed verification map. A missing file is an empty map.
+    verify: Result<VerifyMap, String>,
+}
+
+/// The run skills of one repository, at one skills checkout commit.
+struct SkillCache {
+    /// The commit the files were read at. Empty when the read failed.
+    commit: String,
+    /// The parsed skills, or the error the Theory view shows. A file that
+    /// does not parse is a lint finding inside the set, not an error.
+    skills: Result<SkillSet, String>,
+}
 
 /// One message of the event loop.
 ///
@@ -241,6 +269,14 @@ pub struct Daemon {
     release_batches: BTreeMap<String, Vec<u64>>,
     /// The ticket-PR links of each repository, rebuilt on every poll.
     links: BTreeMap<String, Links>,
+    /// The theory of each governed repository, at the theory checkout
+    /// commit it was read from.
+    theory_models: BTreeMap<String, ModelCache>,
+    /// The run skills of each governed repository, at the skills checkout
+    /// commit they were read from.
+    theory_skills: BTreeMap<String, SkillCache>,
+    /// The Theory view of each repository, rebuilt on every poll.
+    theory_views: BTreeMap<String, TheoryView>,
     /// The finished pipeline runs that wait for GitHub to confirm their
     /// stage transition, with the moment each one gives up. The map is
     /// runtime only: a restart re-derives the work from the labels.
@@ -592,6 +628,9 @@ impl Daemon {
             trains,
             release_batches,
             links: BTreeMap::new(),
+            theory_models: BTreeMap::new(),
+            theory_skills: BTreeMap::new(),
+            theory_views: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
             ticket_controller,
@@ -943,6 +982,7 @@ impl Daemon {
             usage: &usage,
             prompts: &self.prompts,
             role_bindings: &self.role_bindings,
+            theory: &self.theory_views,
             now_ms: self.now_ms,
         };
         let mut view = match input.build() {
@@ -1199,6 +1239,7 @@ impl Daemon {
         self.snapshot.apply(repo, fresh.clone());
         self.links
             .insert(repo.to_string(), Links::derive(repo, &fresh));
+        self.refresh_theory(repo);
         self.settle_confirming(Some(repo));
         self.pending_stacked.insert(repo.to_string());
         if let Some(old) = old.filter(|_| !unchanged) {
@@ -1218,6 +1259,248 @@ impl Daemon {
         if changed {
             self.changed = true;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The theory read
+    // ------------------------------------------------------------------
+
+    /// Read the theory of one repository at its checkout commits.
+    ///
+    /// The model and the verification map come from the theory checkout,
+    /// the run skills from the skills checkout. Each read runs once per
+    /// commit, so a poll that finds the same commit reads no file. A
+    /// missing or broken file is cached like a value and never stops the
+    /// daemon: the view carries the error and the next drive still runs.
+    fn refresh_theory(&mut self, repo: &str) {
+        let Some(config) = self.config.repos.get(repo) else {
+            return;
+        };
+        let governed = config.theory.governor.is_on();
+        let theory_path = config.theory.checkout(&config.path);
+        let skills_path = config.skills_checkout();
+        if governed {
+            let theory_commit = self.head_commit(&theory_path);
+            let skills_commit = if skills_path == theory_path {
+                theory_commit.clone()
+            } else {
+                self.head_commit(&skills_path)
+            };
+            self.refresh_model(repo, &theory_path, theory_commit);
+            self.refresh_skills(repo, &skills_path, skills_commit);
+        } else {
+            self.theory_models.remove(repo);
+            self.theory_skills.remove(repo);
+        }
+        let view = self.theory_view(repo, governed);
+        if self.theory_views.get(repo) != Some(&view) {
+            self.theory_views.insert(repo.to_string(), view);
+            self.changed = true;
+        }
+    }
+
+    /// Read `theory/model.toml` and `theory/verify.toml` at the theory
+    /// checkout commit.
+    fn refresh_model(&mut self, repo: &str, path: &Path, commit: Result<String, String>) {
+        let commit = match commit {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.theory_models.insert(
+                    repo.to_string(),
+                    ModelCache {
+                        commit: String::new(),
+                        model: Err(error),
+                        verify: Ok(VerifyMap::default()),
+                    },
+                );
+                return;
+            }
+        };
+        if self
+            .theory_models
+            .get(repo)
+            .is_some_and(|cache| cache.commit == commit)
+        {
+            return;
+        }
+        let model = match self.show_file(path, &commit, "theory/model.toml") {
+            Some(text) => model::parse(&text).map_err(|error| error.to_string()),
+            None => Err("theory/model.toml: missing".to_string()),
+        };
+        // The map names the boundaries of the model, so a model that did
+        // not parse leaves nothing to check the map against.
+        let verify = match &model {
+            Ok(model) => match self.show_file(path, &commit, "theory/verify.toml") {
+                Some(text) => VerifyMap::parse(&text, model).map_err(|error| error.to_string()),
+                None => Ok(VerifyMap::default()),
+            },
+            Err(_) => Ok(VerifyMap::default()),
+        };
+        self.theory_models.insert(
+            repo.to_string(),
+            ModelCache {
+                commit,
+                model,
+                verify,
+            },
+        );
+    }
+
+    /// Read every run skill at the skills checkout commit.
+    fn refresh_skills(&mut self, repo: &str, path: &Path, commit: Result<String, String>) {
+        let commit = match commit {
+            Ok(commit) => commit,
+            Err(error) => {
+                self.theory_skills.insert(
+                    repo.to_string(),
+                    SkillCache {
+                        commit: String::new(),
+                        skills: Err(error),
+                    },
+                );
+                return;
+            }
+        };
+        if self
+            .theory_skills
+            .get(repo)
+            .is_some_and(|cache| cache.commit == commit)
+        {
+            return;
+        }
+        let skills = self.read_skills(path, &commit);
+        self.theory_skills
+            .insert(repo.to_string(), SkillCache { commit, skills });
+    }
+
+    /// List the skills tree at `commit` and read every file it holds.
+    fn read_skills(&self, path: &Path, commit: &str) -> Result<SkillSet, String> {
+        let out = worktree::git(
+            self.exec.as_ref(),
+            path,
+            &["ls-tree", "-r", "--name-only", commit, SKILLS_DIR],
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        if out.status != 0 {
+            return Err(format!("git ls-tree {SKILLS_DIR}: {}", out.stderr.trim()));
+        }
+        let wanted: Vec<&str> = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| skills::classify(line).is_some())
+            .collect();
+        let mut files: Vec<(String, String)> = Vec::with_capacity(wanted.len());
+        for file in wanted {
+            if let Some(text) = self.show_file(path, commit, file) {
+                files.push((file.to_string(), text));
+            }
+        }
+        Ok(SkillSet::from_files(
+            files
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
+        ))
+    }
+
+    /// The commit the default base of one checkout points at.
+    fn head_commit(&self, path: &Path) -> Result<String, String> {
+        let base = self
+            .worktrees
+            .default_base(self.exec.as_ref(), path)
+            .map_err(|error| format!("{error:#}"))?;
+        let out = worktree::git(self.exec.as_ref(), path, &["rev-parse", &base])
+            .map_err(|error| format!("{error:#}"))?;
+        if out.status != 0 {
+            return Err(format!("git rev-parse {base}: {}", out.stderr.trim()));
+        }
+        let commit = out.stdout.trim();
+        if commit.is_empty() {
+            return Err("git rev-parse returned an empty commit".to_string());
+        }
+        Ok(commit.to_string())
+    }
+
+    /// One file of a checkout at one commit, `None` when it is absent.
+    fn show_file(&self, path: &Path, commit: &str, file: &str) -> Option<String> {
+        let spec = format!("{commit}:{file}");
+        let out = worktree::git(self.exec.as_ref(), path, &["show", &spec]).ok()?;
+        (out.status == 0).then_some(out.stdout)
+    }
+
+    /// Derive the Theory view of one repository from the caches.
+    fn theory_view(&self, repo: &str, governed: bool) -> TheoryView {
+        let mut view = TheoryView {
+            governor: governed,
+            ..TheoryView::default()
+        };
+        if !governed {
+            return view;
+        }
+        let empty_map = VerifyMap::default();
+        let mut map = &empty_map;
+        if let Some(cache) = self.theory_models.get(repo) {
+            match &cache.model {
+                Ok(model) => {
+                    view.entries = model
+                        .entries
+                        .iter()
+                        .map(|entry| EntryView {
+                            id: entry.id().to_string(),
+                            kind: entry.kind_name().to_string(),
+                            title: entry.title().to_string(),
+                            statement: entry.statement().to_string(),
+                        })
+                        .collect();
+                }
+                Err(error) => view.error.clone_from(error),
+            }
+            match &cache.verify {
+                Ok(parsed) => map = parsed,
+                Err(error) if view.error.is_empty() => view.error.clone_from(error),
+                Err(_) => {}
+            }
+        }
+        let empty_set = SkillSet::default();
+        let mut set = &empty_set;
+        if let Some(cache) = self.theory_skills.get(repo) {
+            match &cache.skills {
+                Ok(parsed) => set = parsed,
+                Err(error) if view.error.is_empty() => view.error.clone_from(error),
+                Err(_) => {}
+            }
+        }
+        let findings = skills::lint(set, map);
+        for (name, skill) in &set.surfaces {
+            view.skills.insert(
+                name.clone(),
+                SurfaceView {
+                    tier: skill.tier,
+                    features: set.feature_ids(name),
+                    lint: Vec::new(),
+                },
+            );
+        }
+        for finding in &findings {
+            view.skills
+                .entry(finding.surface.clone())
+                .or_default()
+                .lint
+                .push(finding.to_string());
+        }
+        view.areas = map
+            .areas
+            .iter()
+            .map(|area| AreaView {
+                id: area.id.clone(),
+                tier: skills::area_tier(&area.id, map, set),
+                min_tier: area.min_tier,
+                lint: skills::surface_names(&area.id, map, set)
+                    .iter()
+                    .any(|name| findings.iter().any(|one| &one.surface == name)),
+            })
+            .collect();
+        view
     }
 
     /// Cancel restored active tasks whose item is absent from the first
@@ -5981,7 +6264,9 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExecutionRole, Harness, RoleOverride, RoleSettings, StageConfig};
+    use crate::config::{
+        ExecutionRole, Governor, Harness, RoleOverride, RoleSettings, StageConfig,
+    };
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use crate::prompts::{
@@ -5989,6 +6274,7 @@ mod tests {
     };
     use crate::tasks::MAX_ATTEMPTS;
     use crate::theory::records::parse_event_blocks;
+    use crate::theory::verify::Tier;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -6412,7 +6698,11 @@ mod tests {
                 owner_repo: "acme/borsuk".to_string(),
                 lanes: BTreeMap::new(),
                 release: ReleasePolicy::Manual,
-                theory: crate::config::TheoryConfig::default(),
+                theory: crate::config::TheoryConfig {
+                    governor: Governor::Off,
+                    ..crate::config::TheoryConfig::default()
+                },
+                skills: None,
                 role_overrides: BTreeMap::new(),
                 tag_route_overrides: BTreeMap::new(),
             },
@@ -17348,5 +17638,367 @@ mod tests {
         assert!(usage_rx.try_recv().is_err());
         assert!(rig.daemon.usage_views().is_empty());
         assert!(rig.daemon.usage_in_flight.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // The theory read
+    // ------------------------------------------------------------------
+
+    /// The model file the theory tests read.
+    const THEORY_MODEL: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"checkout\"\n",
+        "statement = \"the cart pays\"\nsides = [\"web\", \"api\"]\npaths = [\"web/**\"]\n",
+    );
+
+    /// The verification map the theory tests read.
+    const THEORY_VERIFY: &str = concat!(
+        "[[area]]\nid = \"web-checkout\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the cart pays\"\n",
+        "[[area]]\nid = \"api-orders\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the order lands\"\n",
+    );
+
+    /// One `run-web` skill file with the given tier.
+    fn run_skill(tier: &str) -> String {
+        format!(
+            "---\nname: run-web\ndescription: Launch and drive the web app.\n\
+             surface: web\ndriver: playwright-cli\ntier: {tier}\nblind: native dialogs\n---\n\
+             # Run web\n\n## Run\nnpm run dev\n\n## Fast\nnpx playwright test\n"
+        )
+    }
+
+    /// The feature index of `run-web`.
+    const RUN_INDEX: &str = "# Features of web\n\n- checkout: the cart pays\n";
+
+    /// The one feature file of `run-web`.
+    const RUN_FEATURE: &str =
+        "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n";
+
+    /// The tree listing of one skills checkout. The helper script is
+    /// listed and never read.
+    const SKILLS_TREE: &str = concat!(
+        ".claude/skills/run-web/SKILL.md\n",
+        ".claude/skills/run-web/features/README.md\n",
+        ".claude/skills/run-web/features/checkout.md\n",
+        ".claude/skills/run-web/wait_for.sh\n",
+    );
+
+    /// The scripted git steps of one theory read at `commit`.
+    fn theory_steps(repo: &Path, commit: &str, skill: &str) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok(format!("{commit}\n")),
+            ),
+            git_step(
+                repo,
+                &["show", &format!("{commit}:theory/model.toml")],
+                CmdOut::ok(THEORY_MODEL),
+            ),
+            git_step(
+                repo,
+                &["show", &format!("{commit}:theory/verify.toml")],
+                CmdOut::ok(THEORY_VERIFY),
+            ),
+            git_step(
+                repo,
+                &["ls-tree", "-r", "--name-only", commit, SKILLS_DIR],
+                CmdOut::ok(SKILLS_TREE),
+            ),
+            git_step(
+                repo,
+                &["show", &format!("{commit}:.claude/skills/run-web/SKILL.md")],
+                CmdOut::ok(skill),
+            ),
+            git_step(
+                repo,
+                &[
+                    "show",
+                    &format!("{commit}:.claude/skills/run-web/features/README.md"),
+                ],
+                CmdOut::ok(RUN_INDEX),
+            ),
+            git_step(
+                repo,
+                &[
+                    "show",
+                    &format!("{commit}:.claude/skills/run-web/features/checkout.md"),
+                ],
+                CmdOut::ok(RUN_FEATURE),
+            ),
+        ]
+    }
+
+    /// The two scripted git steps of a poll that finds the same commit.
+    fn commit_steps(repo: &Path, commit: &str) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok(format!("{commit}\n")),
+            ),
+        ]
+    }
+
+    /// Turn the governor on for the rig repository.
+    fn governed(config: &mut Config) {
+        config.repos.get_mut("borsuk").unwrap().theory.governor = Governor::On;
+    }
+
+    /// How many calls of the scripted exec ran `git <first argument after
+    /// the directory>`.
+    fn git_calls(rig: &Rig, verb: &str) -> usize {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "git" && call.argv().get(2) == Some(&verb))
+            .count()
+    }
+
+    /// The Theory view of the rig repository.
+    fn theory_of(rig: &Rig) -> TheoryView {
+        rig.daemon.theory_views["borsuk"].clone()
+    }
+
+    #[test]
+    fn a_governed_poll_reads_every_skill_file_once_per_commit() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(theory_steps(&repo, "bbb222", &run_skill("browser")));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(Vec::new(), Vec::new());
+
+        assert_eq!(git_calls(&rig, "ls-tree"), 1);
+        assert_eq!(
+            git_calls(&rig, "show"),
+            5,
+            "two theory files, the skill, its index, and one feature"
+        );
+        assert_eq!(
+            git_calls(&rig, "rev-parse"),
+            1,
+            "one checkout answers one rev-parse"
+        );
+        let view = theory_of(&rig);
+        assert!(view.governor);
+        assert_eq!(view.error, "");
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].id, "B-checkout");
+        assert_eq!(view.entries[0].kind, "boundary");
+        assert_eq!(
+            view.areas
+                .iter()
+                .map(|area| area.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-checkout", "api-orders"]
+        );
+        assert_eq!(view.areas[0].tier, Tier::Browser);
+        assert_eq!(view.areas[1].tier, Tier::None);
+        assert!(!view.areas[0].lint);
+        assert_eq!(view.skills["web"].tier, Tier::Browser);
+        assert_eq!(view.skills["web"].features, vec!["checkout".to_string()]);
+        assert!(view.skills["web"].lint.is_empty());
+        let cached = rig.daemon.theory_skills["borsuk"].skills.as_ref().unwrap();
+        assert_eq!(cached.surfaces["web"].index.as_deref(), Some(RUN_INDEX));
+
+        rig.poll(Vec::new(), Vec::new());
+
+        assert_eq!(
+            git_calls(&rig, "ls-tree"),
+            1,
+            "the same commit reads no tree"
+        );
+        assert_eq!(git_calls(&rig, "show"), 5, "the same commit reads no file");
+        assert_eq!(theory_of(&rig), view);
+
+        rig.poll(Vec::new(), Vec::new());
+
+        assert_eq!(
+            git_calls(&rig, "ls-tree"),
+            2,
+            "a moved commit reads the tree"
+        );
+        assert_eq!(
+            git_calls(&rig, "show"),
+            10,
+            "a moved commit reads every file"
+        );
+    }
+
+    #[test]
+    fn a_skill_parse_error_becomes_a_lint_finding_and_the_daemon_keeps_running() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("pixels"));
+        steps.extend(theory_steps(&repo, "bbb222", &run_skill("browser")));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(Vec::new(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(view.error, "", "a parse error never becomes a read error");
+        assert_eq!(
+            view.skills["web"].lint,
+            vec!["SKILL.md: unknown tier \"pixels\"".to_string()]
+        );
+        assert_eq!(view.skills["web"].tier, Tier::None);
+        assert_eq!(view.areas[0].tier, Tier::None);
+        assert!(
+            view.areas[0].lint,
+            "the finding marks the area of the broken surface"
+        );
+
+        rig.drive();
+        rig.poll(Vec::new(), Vec::new());
+
+        let fixed = theory_of(&rig);
+        assert!(fixed.skills["web"].lint.is_empty());
+        assert_eq!(fixed.areas[0].tier, Tier::Browser);
+    }
+
+    #[test]
+    fn a_missing_model_file_is_an_error_and_a_missing_map_is_empty() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let steps = vec![
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                &repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("aaa111\n"),
+            ),
+            git_step(
+                &repo,
+                &["show", "aaa111:theory/model.toml"],
+                CmdOut {
+                    status: 128,
+                    stdout: String::new(),
+                    stderr: "path does not exist\n".to_string(),
+                },
+            ),
+            git_step(
+                &repo,
+                &["ls-tree", "-r", "--name-only", "aaa111", SKILLS_DIR],
+                CmdOut::ok(""),
+            ),
+        ];
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(Vec::new(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(view.error, "theory/model.toml: missing");
+        assert!(view.entries.is_empty());
+        assert!(view.areas.is_empty());
+        assert!(view.skills.is_empty());
+        assert_eq!(
+            git_calls(&rig, "show"),
+            1,
+            "a missing model leaves no map to read"
+        );
+        rig.drive();
+    }
+
+    #[test]
+    fn an_ungoverned_repository_reads_no_theory_file() {
+        let mut rig = Rig::make(Vec::new());
+
+        rig.poll(Vec::new(), Vec::new());
+
+        assert!(rig.exec.calls().is_empty(), "the governor is off");
+        assert_eq!(theory_of(&rig), TheoryView::default());
+    }
+
+    #[test]
+    fn a_skills_path_override_reads_a_second_checkout() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let elsewhere = dir.join("verify");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let mut steps = vec![
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                &repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("aaa111\n"),
+            ),
+            git_step(
+                &elsewhere,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                &elsewhere,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("ccc333\n"),
+            ),
+            git_step(
+                &repo,
+                &["show", "aaa111:theory/model.toml"],
+                CmdOut::ok(THEORY_MODEL),
+            ),
+            git_step(
+                &repo,
+                &["show", "aaa111:theory/verify.toml"],
+                CmdOut::ok(THEORY_VERIFY),
+            ),
+        ];
+        steps.extend(vec![
+            git_step(
+                &elsewhere,
+                &["ls-tree", "-r", "--name-only", "ccc333", SKILLS_DIR],
+                CmdOut::ok(SKILLS_TREE),
+            ),
+            git_step(
+                &elsewhere,
+                &["show", "ccc333:.claude/skills/run-web/SKILL.md"],
+                CmdOut::ok(run_skill("browser")),
+            ),
+            git_step(
+                &elsewhere,
+                &["show", "ccc333:.claude/skills/run-web/features/README.md"],
+                CmdOut::ok(RUN_INDEX),
+            ),
+            git_step(
+                &elsewhere,
+                &["show", "ccc333:.claude/skills/run-web/features/checkout.md"],
+                CmdOut::ok(RUN_FEATURE),
+            ),
+        ]);
+        let path = elsewhere.clone();
+        let mut rig = Rig::make_in(dir, steps, move |config| {
+            governed(config);
+            config.repos.get_mut("borsuk").unwrap().skills =
+                Some(crate::config::SkillsPath { path });
+        });
+
+        rig.poll(Vec::new(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.skills["web"].tier, Tier::Browser);
+        assert_eq!(view.areas[0].tier, Tier::Browser);
     }
 }

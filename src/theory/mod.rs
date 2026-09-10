@@ -2,6 +2,8 @@
 
 pub mod model;
 pub mod records;
+pub mod skills;
+pub mod verify;
 
 #[cfg(test)]
 mod stance {

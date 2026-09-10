@@ -1647,6 +1647,7 @@ mod tests {
             },
             settings: crate::sock::SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         };
         state
             .settings

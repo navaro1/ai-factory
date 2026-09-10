@@ -268,3 +268,69 @@ fn an_edit_cannot_add_a_repository_override_for_a_theory_role() {
         assert!(format!("{error:#}").contains("a theory role takes no repository override"));
     }
 }
+
+#[test]
+fn a_skills_table_overrides_the_theory_checkout_and_rejects_an_unknown_key() {
+    let text = BASE.replace(
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"",
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"\nskills = { path = \"/tmp/s\" }",
+    );
+
+    let config = Config::parse(&text).expect("the skills table must parse");
+    let repo = &config.repos["borsuk"];
+
+    assert_eq!(
+        repo.skills.as_ref().map(|skills| skills.path.as_path()),
+        Some(Path::new("/tmp/s"))
+    );
+    assert_eq!(repo.skills_checkout(), Path::new("/tmp/s"));
+
+    let typo = BASE.replace(
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"",
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"\nskills = { paht = \"x\" }",
+    );
+    let error = Config::parse(&typo).expect_err("the unknown skills key must fail");
+    assert!(
+        format!("{error:#}").contains("unknown field"),
+        "error was: {error:#}"
+    );
+
+    let missing = BASE.replace(
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"",
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"\nskills = {}",
+    );
+    let error = Config::parse(&missing).expect_err("the missing skills path must fail");
+    assert!(
+        format!("{error:#}").contains("repo.borsuk.skills.path is required"),
+        "error was: {error:#}"
+    );
+
+    let empty = BASE.replace(
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"",
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"\nskills = { path = \"  \" }",
+    );
+    let error = Config::parse(&empty).expect_err("the empty skills path must fail");
+    assert!(
+        format!("{error:#}").contains("must not be empty"),
+        "error was: {error:#}"
+    );
+}
+
+#[test]
+fn the_skills_checkout_falls_back_to_the_theory_checkout_then_the_repository() {
+    let shadow = BASE.replace(
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"",
+        "[repo.borsuk]\npath = \"/tmp/borsuk\"\ntheory = { path = \"/tmp/theory\" }",
+    );
+    let config = Config::parse(&shadow).expect("the theory table must parse");
+    assert_eq!(
+        config.repos["borsuk"].skills_checkout(),
+        Path::new("/tmp/theory")
+    );
+
+    let plain = Config::parse(BASE).expect("the plain repository must parse");
+    assert_eq!(
+        plain.repos["borsuk"].skills_checkout(),
+        Path::new("/tmp/borsuk")
+    );
+}
