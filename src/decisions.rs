@@ -105,7 +105,8 @@ pub enum DecisionKind {
         /// The model entry the card names, when it names one.
         #[serde(default)]
         entry: Option<String>,
-        /// Whether the operator answered the card with a recall.
+        /// Whether the operator gave the cause `recall` to an event the
+        /// grading of this card opened.
         #[serde(default)]
         recalled: bool,
     },
@@ -309,9 +310,9 @@ impl Decision {
 
     /// Build one card row from the card of the day.
     ///
-    /// `recalled` is true once the operator answered the card with a
-    /// recall, and the row then offers the teach key instead of the
-    /// answer key.
+    /// `recalled` is true once the operator gave the cause `recall` to
+    /// an event the grading of this card opened, and the row then
+    /// offers the teach key instead of the answer key.
     pub fn card(repo: &str, card: &CardView, recalled: bool, opened_ms: u64) -> Self {
         Self::from_parts(
             format!("card:{repo}:{}", card.slug()),

@@ -1093,7 +1093,8 @@ impl Inbox {
         );
     }
 
-    /// Start the teach task of one card the operator recalled.
+    /// Start the teach task of one card whose event the operator
+    /// answered with the cause `recall`.
     ///
     /// A `merged-pr` card teaches its pull request. A `stale-entry` card
     /// teaches the area of its entry; an entry that maps to no area
@@ -1539,7 +1540,7 @@ fn feed_message(decision: &Decision) -> String {
             prompt,
             recalled,
             ..
-        } if *recalled => format!("{source}: {prompt} Answered with a recall."),
+        } if *recalled => format!("{source}: {prompt} The event of this card is a recall."),
         DecisionKind::Card { source, prompt, .. } => format!("{source}: {prompt}"),
         DecisionKind::FirstRun {
             area,
@@ -3016,10 +3017,28 @@ mod tests {
         )
     }
 
+    /// One THEORY row over the event the grading of the card opened.
+    fn card_event_row() -> Decision {
+        Decision::theory_event(
+            "borsuk",
+            TheoryRow {
+                kind: ItemKind::Pr,
+                number: 7,
+                slot: "event:0".to_string(),
+                entry: "web-checkout".to_string(),
+                tag: "card".to_string(),
+                question: "The answer misses the new retry count.".to_string(),
+                source: "event".to_string(),
+            },
+            OPENED,
+        )
+    }
+
     #[test]
-    fn a_card_answered_with_a_recall_offers_the_teach_key_and_starts_the_teach() {
+    fn a_card_whose_event_the_operator_recalls_offers_the_teach_key() {
         // The operator answers the card. The answer crosses as a text
-        // response, and the daemon marks the card recalled.
+        // response, and the row keeps the answer key while its grading
+        // runs.
         let state = theory_state(vec![pr_card(false)], &["web-checkout"]);
         let mut inbox = selected(&state, 0);
         let (mut tx, rx) = fake_sink();
@@ -3029,7 +3048,7 @@ mod tests {
             "[t] answer"
         );
         inbox.handle_key(&state, press('t'), &mut tx);
-        type_text(&mut inbox, &state, "recall the retry landed", &mut tx);
+        type_text(&mut inbox, &state, "nothing changed", &mut tx);
         inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
 
         assert_eq!(
@@ -3037,12 +3056,38 @@ mod tests {
             Some(Action::Answer {
                 decision_id: "card:borsuk:7".to_string(),
                 response: Response::Text {
-                    text: "recall the retry landed".to_string(),
+                    text: "nothing changed".to_string(),
                 },
             })
         );
 
-        // The row comes back recalled, and now the same key teaches.
+        // The grading opens one event, and the operator gives it the
+        // cause recall with the key r.
+        let state = theory_state(vec![card_event_row()], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('r'), &mut tx);
+        type_text(&mut inbox, &state, "INV-3", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('1'), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Answer {
+                decision_id: "theory:borsuk:p7:event:0".to_string(),
+                response: Response::Theory {
+                    cause: Cause::Recall,
+                    entry: "INV-3".to_string(),
+                    rung: 1,
+                    area: "web-checkout".to_string(),
+                    note: String::new(),
+                },
+            })
+        );
+
+        // The card row comes back recalled, and the same key teaches.
         let state = theory_state(vec![pr_card(true)], &["web-checkout"]);
         let mut inbox = selected(&state, 0);
         let (mut tx, rx) = fake_sink();
@@ -3050,7 +3095,7 @@ mod tests {
         assert_eq!(presentation(&state.decisions[0].kind).footer(), "[t] teach");
         assert_eq!(
             footer_text(&state, &inbox),
-            "PgUp PgDn \u{b7} j k move \u{b7} t teach"
+            "PgUp PgDn · j k move · t teach"
         );
         inbox.handle_key(&state, press('t'), &mut tx);
 

@@ -75,6 +75,9 @@ pub struct RecordRow {
     /// The merge moment of a merged pull request, as GitHub reports it.
     /// `None` for an issue and for a pull request that never merged.
     pub merged_at: Option<String>,
+    /// The body of the record, empty when the row carries none. A pull
+    /// request body names the tickets the merge closes.
+    pub body: String,
 }
 
 /// One comment page with the ETag the next call sends back.
@@ -982,6 +985,11 @@ fn record_row_from_value(value: &Value) -> Result<RecordRow> {
             .pointer("/pull_request/merged_at")
             .and_then(Value::as_str)
             .map(str::to_string),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -2249,8 +2257,9 @@ mod tests {
                 "HTTP/2 200",
                 &[],
                 "[{\"number\":7,\"state\":\"closed\",\"labels\":[],\
+                 \"body\":\"Closes #142\",\
                  \"pull_request\":{\"merged_at\":\"2026-09-10T10:00:00Z\"}},\
-                 {\"number\":9,\"state\":\"closed\",\"labels\":[],\
+                 {\"number\":9,\"state\":\"closed\",\"labels\":[],\"body\":null,\
                  \"pull_request\":{\"merged_at\":null}}]",
             )),
         );
@@ -2261,10 +2270,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows[0].merged_at.as_deref(), Some("2026-09-10T10:00:00Z"));
+        assert_eq!(rows[0].body, "Closes #142", "the body names the ticket");
         assert_eq!(
             rows[1].merged_at, None,
             "a closed pull request never merged"
         );
+        assert_eq!(rows[1].body, "", "a null body reads as no body");
     }
 
     #[test]
