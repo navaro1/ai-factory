@@ -58,6 +58,52 @@ Each implementation issue gets one git worktree (a second repository
 checkout). The implementation and review agents use this worktree. The
 factory creates the worktree. The agents never create it.
 
+### Ticket dependencies
+
+A ticket can name the work that it waits for. Write `Blocked by #12`,
+`Blocked-by #12`, or `Depends on #12` in the ticket body. Each phrase accepts
+a list, so `Depends on #4, #5 and #6` names three blockers. A blocker is open
+while GitHub shows it as an open ticket or an open pull request. Every other
+blocker is settled. A ticket never blocks itself, so its own number in the
+list does nothing.
+
+GitHub counts tickets and pull requests together, so `#42` names one item of
+either kind. Write only a number that exists. A number above the last one is
+free today, and the next pull request can take it and block your ticket.
+
+The `refined` label alone opens the implement gate. A blocked ticket
+therefore gets its task and its row on the board, and the factory then holds
+that task:
+
+| Condition | What the factory does |
+|---|---|
+| A ticket gets `refined` while a blocker is open. | The factory creates the task. The task waits in the queue. |
+| A blocker of a queued task reopens. | The factory holds the task in the queue. |
+| The last blocker of a ticket closes. | The task starts in its turn. |
+
+The factory checks the blockers before every start, not once. So a blocker
+that reopens holds the task again, and a restart cannot lose the wait.
+
+The dispatch steps over a blocked task, so a ready ticket behind it takes the
+slot. The factory also moves the blocked task down the queue. The board then
+shows the order that the dispatch follows: ready tickets first, blocked
+tickets behind them.
+
+A blocked ticket keeps its task row, its `refined` label, and its attempt
+count. It does not fail. The session view of the task names the open blocker.
+
+A blocked task holds nothing else back. The factory reviews a draft pull
+request that already exists for the ticket, and it accepts a chat message on
+that review.
+
+A chat message for a blocked ticket waits with the ticket. The factory keeps
+the message and sends it when the ticket starts.
+
+A blocker prevents the factory from starting a task. It does not stop a task
+that already runs. An agent that already implements the ticket completes its
+work. A daemon restart is different: the restart queues every task again, so
+a blocked ticket waits for its blocker before it continues.
+
 ## Install
 
 You need:
