@@ -1214,6 +1214,27 @@ pub struct TicketResult {
     pub conflict: Option<TicketConflict>,
 }
 
+/// One theory command inside [`Action::Theory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "theory_action", rename_all = "snake_case")]
+pub enum TheoryAction {
+    /// Create the run skill ticket of one repository surface.
+    Setup {
+        /// The repository alias.
+        repo: String,
+        /// The surface name the operator typed.
+        surface: String,
+    },
+}
+
+/// The request identity prefix of one run skill ticket creation.
+///
+/// The daemon reports the outcome through [`Push::TicketResult`], which is
+/// the one result channel a GitHub mutation already has. The UI toasts a
+/// result that carries this prefix, because the operator asked for it in
+/// the Theory view and no ticket row waits for it.
+pub const SKILL_TICKET_REQUEST: &str = "skill-ticket:";
+
 /// One ticket command inside [`Action::Ticket`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "ticket_action", rename_all = "snake_case")]
@@ -1601,6 +1622,8 @@ pub enum Action {
     },
     /// Perform one ticket review or mutation action.
     Ticket(TicketAction),
+    /// Perform one Theory view action.
+    Theory(TheoryAction),
     /// Save one role edit against an exact file revision.
     SaveSettings {
         /// The request identity from the UI.
@@ -2317,6 +2340,10 @@ mod tests {
             Action::TicketCreate {
                 repo: "qubitsok".to_string(),
             },
+            Action::Theory(TheoryAction::Setup {
+                repo: "borsuk".to_string(),
+                surface: "web".to_string(),
+            }),
             Action::Reconcile { repo: None },
             Action::Stop,
         ]
