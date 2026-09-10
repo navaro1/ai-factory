@@ -14,6 +14,7 @@ use crate::config::{
     validate_extra_args, ExecutionRole, Harness, RoleOverride, RoleSettings, SettingsEdit,
     SettingsSource, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES,
 };
+use crate::labels::LabelNames;
 use crate::prompts;
 use crate::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
 use crate::sock::{
@@ -1794,6 +1795,21 @@ impl Settings {
         targets[self.role.min(targets.len() - 1)]
     }
 
+    /// The label names of the scope the panel shows.
+    ///
+    /// The global scope uses the global set. A repository scope uses that
+    /// repository's set, so a renamed prefix shows the name the factory
+    /// really matches.
+    fn scoped_labels<'a>(&self, state: &'a StateView) -> &'a LabelNames {
+        if self.scope == 0 {
+            return &state.settings.labels;
+        }
+        self.repositories(state)
+            .get(self.scope - 1)
+            .and_then(|alias| state.settings.repository_labels.get(alias))
+            .unwrap_or(&state.settings.labels)
+    }
+
     fn selected_role_for(&self) -> ExecutionRole {
         self.selected_target().execution_role()
     }
@@ -1972,7 +1988,10 @@ impl Settings {
         let mut lines = Vec::new();
         if let SettingsTarget::TagRoute(key) = self.selected_target() {
             lines.push(Line::from(vec![
-                Span::styled(format!("tag {}  ", key.label()), THEME.dim()),
+                Span::styled(
+                    format!("tag {}  ", key.label(self.scoped_labels(state))),
+                    THEME.dim(),
+                ),
                 Span::raw(self.current_settings_ref(state).map_or_else(
                     || "unavailable".to_string(),
                     |settings| {
@@ -3015,6 +3034,8 @@ mod tests {
         ];
         state.settings = SettingsView {
             revision: "rev-one".to_string(),
+            labels: crate::labels::LabelNames::default(),
+            repository_labels: std::collections::BTreeMap::new(),
             global: ExecutionRole::ALL
                 .into_iter()
                 .zip(harnesses)

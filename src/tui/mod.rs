@@ -234,7 +234,7 @@ impl Confirm {
                         request: tickets::request_code(),
                         repo: repo.clone(),
                         number,
-                        label: crate::gates::TO_REFINE.to_string(),
+                        label: app.refine_label(&repo),
                         on: true,
                     }),
                     format!("sent to-refine {repo} #{number}"),
@@ -368,6 +368,20 @@ impl App {
     }
 
     /// Toast `text` for one toast period.
+    /// The refine label of one repository, from the pushed settings.
+    ///
+    /// The panel falls back to the default name before the first push and
+    /// for a repository the daemon does not report.
+    fn refine_label(&self, repo: &str) -> String {
+        self.state
+            .as_ref()
+            .and_then(|state| state.settings.repository_labels.get(repo))
+            .map_or_else(
+                || crate::labels::DEFAULT_TO_REFINE.to_string(),
+                |names| names.to_refine.clone(),
+            )
+    }
+
     fn show_toast(&mut self, text: &str) {
         self.toast = Some((text.to_string(), Instant::now() + TOAST_TIME));
     }
@@ -641,7 +655,7 @@ impl App {
                 }
                 if key.code == KeyCode::Char('m') && self.tickets.focus_plain() {
                     if let Some((repo, number)) = self.tickets.focus_key() {
-                        if self.tickets.focus_has_label(crate::gates::TO_REFINE) {
+                        if self.tickets.focus_has_label(&self.refine_label(&repo)) {
                             self.show_toast("the ticket already has to-refine");
                         } else {
                             self.confirm = Some(Confirm::Refine { repo, number });
@@ -2127,6 +2141,8 @@ mod tests {
         let mut state = crate::tui::pipeline::sample_view();
         state.settings = crate::sock::SettingsView {
             revision: "rev-one".to_string(),
+            labels: crate::labels::LabelNames::default(),
+            repository_labels: std::collections::BTreeMap::new(),
             global: crate::config::ExecutionRole::ALL
                 .into_iter()
                 .map(|role| crate::sock::GlobalRoleSettingsView {

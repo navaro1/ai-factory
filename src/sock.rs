@@ -35,6 +35,7 @@ use crate::config::{
     RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
+use crate::labels::LabelNames;
 use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
@@ -136,6 +137,10 @@ pub struct SettingsView {
     pub global_tag_routes: Vec<GlobalTagRouteSettingsView>,
     /// Every effective repository tag route, in repository and route order.
     pub repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
+    /// The global label names, from the defaults and the `[labels]` table.
+    pub labels: LabelNames,
+    /// The effective label names of every repository, by alias.
+    pub repository_labels: BTreeMap<String, LabelNames>,
     /// The effective prompt template of every role that has one, in role
     /// order. The theory roles carry no template, so they are absent.
     pub prompts: Vec<PromptView>,
@@ -189,6 +194,10 @@ struct SettingsViewWire {
     #[serde(default)]
     repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
     #[serde(default)]
+    labels: LabelNames,
+    #[serde(default)]
+    repository_labels: BTreeMap<String, LabelNames>,
+    #[serde(default)]
     theory_global: Vec<GlobalRoleSettingsView>,
     #[serde(default)]
     prompts: Vec<PromptView>,
@@ -229,6 +238,8 @@ impl<'de> Deserialize<'de> for SettingsView {
             repositories: wire.repositories,
             global_tag_routes: wire.global_tag_routes,
             repository_tag_routes: wire.repository_tag_routes,
+            labels: wire.labels,
+            repository_labels: wire.repository_labels,
             prompts: wire.prompts,
         })
     }
@@ -300,12 +311,19 @@ impl SettingsView {
                 });
             }
         }
+        let repository_labels = config
+            .repos
+            .keys()
+            .map(|alias| (alias.clone(), config.resolved_labels(Some(alias))))
+            .collect();
         Ok(Self {
             revision: revision.to_string(),
             global,
             repositories,
             global_tag_routes,
             repository_tag_routes,
+            labels: config.resolved_labels(None),
+            repository_labels,
             prompts: prompts.to_vec(),
         })
     }

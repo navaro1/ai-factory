@@ -16,25 +16,16 @@
 
 use std::collections::BTreeSet;
 
+use crate::labels::{LabelKey, LabelNames};
 use crate::model::{Issue, ItemKind, Pr, RepoSnapshot, Stage};
 
-/// The label that asks the factory to shape a raw issue.
-pub const TO_REFINE: &str = "to-refine";
-
-/// The label that marks a shaped issue as ready to implement.
-pub const REFINED: &str = "refined";
-
-/// The label that marks a parent whose chunks became sub-tickets.
-///
-/// A refine run has two outcomes. It shapes one ticket and adds
-/// [`REFINED`], or it splits the work and adds this label to the parent.
-/// A parent never carries [`REFINED`], so [`implement_ready`] stays false
-/// on it and only the sub-tickets reach the implement stage. The parent
-/// closes when the PR of the final chunk merges.
-pub const EPIC: &str = "epic";
-
-/// The label that asks a human to decide something on GitHub.
-pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
+// The names of these labels are configuration, not constants. The
+// `labels` module owns them, and `Config::resolved_labels` gives one set
+// per repository. A refine run has two outcomes: it shapes one ticket and
+// adds the refined label, or it splits the work and adds the epic label to
+// the parent. A parent never carries the refined label, so
+// `implement_ready` stays false on it and only the sub-tickets reach the
+// implement stage. The parent closes when the PR of the final chunk merges.
 
 /// Work that a stage gate reports as ready to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,9 +42,9 @@ pub struct ReadyWork {
     pub head_sha: Option<String>,
 }
 
-/// True when the issue is open and carries `to-refine`.
-pub fn refine_ready(issue: &Issue) -> bool {
-    issue.open && has_label(&issue.labels, TO_REFINE)
+/// True when the issue is open and carries the refine label.
+pub fn refine_ready(issue: &Issue, names: &LabelNames) -> bool {
+    issue.open && names.has(LabelKey::ToRefine, &issue.labels)
 }
 
 /// True when the issue is open, carries `refined`, and does not carry
@@ -74,8 +65,10 @@ pub fn refine_ready(issue: &Issue) -> bool {
 /// closed, or is absent, because that ticket left the stage. A ticket that
 /// waits for a blocker is still implement work. It keeps its task, and the
 /// dispatch defers that task.
-pub fn implement_ready(issue: &Issue) -> bool {
-    issue.open && has_label(&issue.labels, REFINED) && !has_label(&issue.labels, TO_REFINE)
+pub fn implement_ready(issue: &Issue, names: &LabelNames) -> bool {
+    issue.open
+        && names.has(LabelKey::Refined, &issue.labels)
+        && !names.has(LabelKey::ToRefine, &issue.labels)
 }
 
 /// True when `number` still blocks work in this repository.
@@ -122,18 +115,13 @@ pub fn unmet_blockers(snap: &RepoSnapshot, issue: &Issue) -> Vec<u64> {
 /// operator answers and the daemon removes the label, the gate goes from
 /// false to true and fires one fresh review, which reads the answer in the
 /// comments of the pull request.
-pub fn review_ready(pr: &Pr) -> bool {
-    pr.open && pr.draft && !has_label(&pr.labels, NEEDS_HUMAN_LABEL)
+pub fn review_ready(pr: &Pr, names: &LabelNames) -> bool {
+    pr.open && pr.draft && !names.has(LabelKey::NeedsHuman, &pr.labels)
 }
 
 /// True when the pull request is open and is no longer a draft.
 pub fn release_ready(pr: &Pr) -> bool {
     pr.open && !pr.draft
-}
-
-/// True when the label list contains `wanted`.
-fn has_label(labels: &[String], wanted: &str) -> bool {
-    labels.iter().any(|label| label == wanted)
 }
 
 /// Collect the issue numbers that a body names as blockers.
@@ -266,12 +254,17 @@ impl GateTracker {
     /// An item that vanished from the snapshot loses its memory, so a
     /// returned item reports again. A poll of one repository never
     /// disturbs the memory of another.
-    pub fn observe(&mut self, repo: &str, snap: &RepoSnapshot) -> Vec<ReadyWork> {
+    pub fn observe(
+        &mut self,
+        repo: &str,
+        snap: &RepoSnapshot,
+        names: &LabelNames,
+    ) -> Vec<ReadyWork> {
         let mut now_ready = BTreeSet::new();
         for issue in snap.issues.values() {
             for (stage, open) in [
-                (Stage::Refine, refine_ready(issue)),
-                (Stage::Implement, implement_ready(issue)),
+                (Stage::Refine, refine_ready(issue, names)),
+                (Stage::Implement, implement_ready(issue, names)),
             ] {
                 if open {
                     now_ready.insert(GateKey {
@@ -286,7 +279,7 @@ impl GateTracker {
         }
         for pr in snap.prs.values() {
             for (stage, open) in [
-                (Stage::Review, review_ready(pr)),
+                (Stage::Review, review_ready(pr, names)),
                 (Stage::Release, release_ready(pr)),
             ] {
                 if open {

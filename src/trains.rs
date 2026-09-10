@@ -10,13 +10,6 @@ use anyhow::{bail, Context, Result};
 use crate::config::ReleasePolicy;
 use crate::gh::GhClient;
 
-/// The GitHub label that marks a pull request as part of the stacked batch.
-///
-/// This is the label the naming rules call `release-stacked`. It carries the
-/// stack across a daemon restart, a crash, and a reboot, because GitHub, not
-/// this process, holds it.
-pub const STACKED_LABEL: &str = "release-stacked";
-
 /// The release train of one repository.
 ///
 /// The queue holds ready pull requests. [`Train::stacked`] mirrors the
@@ -85,7 +78,14 @@ impl Train {
     /// The pull request must be in the queue, so a stacked set stays a
     /// subset of the queue. Stacking an already stacked pull request and
     /// unstacking an absent one make no label call.
-    pub fn stack(&mut self, pr: u64, on: bool, owner_repo: &str, gh: &GhClient<'_>) -> Result<()> {
+    pub fn stack(
+        &mut self,
+        pr: u64,
+        on: bool,
+        owner_repo: &str,
+        gh: &GhClient<'_>,
+        label: &str,
+    ) -> Result<()> {
         if on {
             if !self.queue.contains(&pr) {
                 bail!("cannot stack pr {pr}: it is not in the release queue");
@@ -93,8 +93,8 @@ impl Train {
             if self.stacked.contains(&pr) {
                 return Ok(());
             }
-            gh.add_label(owner_repo, pr, STACKED_LABEL)
-                .with_context(|| format!("cannot add {STACKED_LABEL} to pr {pr}"))?;
+            gh.add_label(owner_repo, pr, label)
+                .with_context(|| format!("cannot add {label} to pr {pr}"))?;
             self.stacked.push(pr);
             let queue = self.queue.clone();
             self.stacked.sort_by_key(|number| {
@@ -107,8 +107,8 @@ impl Train {
             if !self.stacked.contains(&pr) {
                 return Ok(());
             }
-            gh.remove_label(owner_repo, pr, STACKED_LABEL)
-                .with_context(|| format!("cannot remove {STACKED_LABEL} from pr {pr}"))?;
+            gh.remove_label(owner_repo, pr, label)
+                .with_context(|| format!("cannot remove {label} from pr {pr}"))?;
             self.stacked.retain(|n| *n != pr);
         }
         Ok(())
@@ -269,7 +269,13 @@ impl Train {
     ///
     /// A label error keeps the train active. A later call can retry the
     /// label cleanup. A call without an active batch changes nothing.
-    pub fn finish(&mut self, ok: bool, owner_repo: &str, gh: &GhClient<'_>) -> Result<Vec<u64>> {
+    pub fn finish(
+        &mut self,
+        ok: bool,
+        owner_repo: &str,
+        gh: &GhClient<'_>,
+        label: &str,
+    ) -> Result<Vec<u64>> {
         if self.in_flight.is_none() {
             return Ok(Vec::new());
         }
@@ -288,8 +294,8 @@ impl Train {
         }
         for pr in &fired {
             if self.stacked.contains(pr) {
-                gh.remove_label(owner_repo, *pr, STACKED_LABEL)
-                    .with_context(|| format!("cannot remove {STACKED_LABEL} from pr {pr}"))?;
+                gh.remove_label(owner_repo, *pr, label)
+                    .with_context(|| format!("cannot remove {label} from pr {pr}"))?;
             }
             self.queue.retain(|n| *n != *pr);
             self.stacked.retain(|n| *n != *pr);
