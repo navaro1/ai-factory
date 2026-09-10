@@ -40,6 +40,8 @@ use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStag
 use crate::sched::{Limits, Paused};
 use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
+use crate::theory::model::Model;
+use crate::theory::records::{FullPrediction, ShortPrediction};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
@@ -140,15 +142,27 @@ pub struct TheoryView {
     /// The theory read error, empty when every file parsed.
     #[serde(default)]
     pub error: String,
-    /// The model entries, in file order.
+    /// The parsed model, empty when the model did not parse.
+    ///
+    /// This field replaces the flat `entries` view of C1. The full
+    /// prediction template runs in the interface and reads the relations
+    /// of each entry, and only the model carries them. The Theory view
+    /// still counts `model.entries` for its header strip.
     #[serde(default)]
-    pub entries: Vec<EntryView>,
+    pub model: Model,
     /// The areas of the verification map, in file order.
     #[serde(default)]
     pub areas: Vec<AreaView>,
     /// The run skills, by surface.
     #[serde(default)]
     pub skills: BTreeMap<String, SurfaceView>,
+    /// The predictions the daemon refused, in refusal order. An entry
+    /// lives until a prediction of the same item posts.
+    #[serde(default)]
+    pub holds: Vec<HoldView>,
+    /// The blocks of each theory record the daemon read, by record key.
+    #[serde(default)]
+    pub records: BTreeMap<String, RecordView>,
     /// The calibration share of the last daily sweep: the sure hits over
     /// the sure slots. `None` until a sweep sees a sure slot.
     #[serde(default)]
@@ -164,19 +178,37 @@ pub struct TheoryView {
     pub stale_entries: Vec<String>,
 }
 
-/// One model entry, as the Theory view shows it.
+/// One item the governor holds out of a stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldView {
+    /// The issue or pull request the hold names.
+    #[serde(default)]
+    pub number: u64,
+    /// Why the item waits, in one line.
+    #[serde(default)]
+    pub reason: String,
+    /// The stage the item waits for.
+    #[serde(default = "refine_stage")]
+    pub stage: Stage,
+}
+
+/// The stage of a hold that carries none, for a daemon older than C9.
+fn refine_stage() -> Stage {
+    Stage::Refine
+}
+
+/// The blocks of one theory record, as the first sight read them.
+///
+/// The daemon fetches the comments of a record once per label set and
+/// parses every block it knows. The UI never reads comments itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryView {
+pub struct RecordView {
+    /// The last short prediction of the record.
     #[serde(default)]
-    pub id: String,
-    /// The entry kind name: `invariant`, `state`, `transition`,
-    /// `boundary`, or `failure`.
+    pub short: Option<ShortPrediction>,
+    /// The last full prediction of the record.
     #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub statement: String,
+    pub full: Option<FullPrediction>,
 }
 
 /// One row of the AREAS panel.
@@ -1250,6 +1282,15 @@ pub enum TheoryAction {
         /// The repository alias.
         repo: String,
     },
+    /// Take the full prediction of one refined ticket.
+    Predict {
+        /// The repository alias.
+        repo: String,
+        /// The ticket number.
+        number: u64,
+        /// The five slots the operator wrote.
+        prediction: FullPrediction,
+    },
     /// Ask for the model worktree, so the UI can edit `theory/model.toml`.
     ///
     /// The daemon answers with one [`Push::ModelPath`] that carries the
@@ -1293,6 +1334,13 @@ pub const MODEL_COMMIT_REQUEST: &str = "model-commit:";
 /// result that carries this prefix, because the operator asked for it in
 /// the Theory view and no ticket row waits for it.
 pub const SKILL_TICKET_REQUEST: &str = "skill-ticket:";
+
+/// The request identity prefix of one prediction result.
+///
+/// The result rides [`Push::TicketResult`] like a run skill ticket does,
+/// and the UI toasts it. The operator pressed `r` or `p` in the pipeline
+/// view, so no ticket row waits for the answer.
+pub const PREDICTION_REQUEST: &str = "prediction:";
 
 /// One ticket command inside [`Action::Ticket`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1586,6 +1634,12 @@ pub enum Push {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     /// Queue a refine task for one item.
+    ///
+    /// On a governed repository the action carries the short prediction
+    /// the operator typed. The daemon posts it, labels the record, and
+    /// adds `to-refine`; the poll gate then queues the task. With the
+    /// governor off the prediction is absent and the daemon queues the
+    /// task itself.
     Refine {
         /// The repository alias.
         repo: String,
@@ -1593,6 +1647,9 @@ pub enum Action {
         kind: ItemKind,
         /// The issue or pull request number.
         number: u64,
+        /// The short prediction of a governed item.
+        #[serde(default)]
+        prediction: Option<ShortPrediction>,
     },
     /// Fetch the question comment of one `needs-human` item.
     ///
@@ -2349,6 +2406,11 @@ mod tests {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
                 number: 142,
+                prediction: Some(ShortPrediction {
+                    kind: crate::theory::records::PREDICTION_SHORT.to_string(),
+                    text: "the poller parks on a 304".to_string(),
+                    areas: vec!["poll".to_string()],
+                }),
             },
             Action::Ask {
                 repo: "borsuk".to_string(),
@@ -2417,6 +2479,21 @@ mod tests {
             }),
             Action::Theory(TheoryAction::Sweep {
                 repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::Predict {
+                repo: "borsuk".to_string(),
+                number: 142,
+                prediction: FullPrediction {
+                    kind: crate::theory::records::PREDICTION_FULL.to_string(),
+                    slots: crate::theory::records::PREDICTION_SLOT_NAMES
+                        .iter()
+                        .map(|name| crate::theory::records::PredictionSlot {
+                            name: (*name).to_string(),
+                            entries: vec!["B-checkout".to_string()],
+                            tag: crate::theory::records::PredictionTag::Sure,
+                        })
+                        .collect(),
+                },
             }),
             Action::Theory(TheoryAction::EditModel {
                 request: "edit-model-1".to_string(),
@@ -2733,12 +2810,21 @@ mod tests {
             TheoryView {
                 governor: true,
                 error: String::new(),
-                entries: vec![EntryView {
-                    id: "B-checkout".to_string(),
-                    kind: "boundary".to_string(),
-                    title: "checkout".to_string(),
-                    statement: "the cart pays".to_string(),
+                model: Model {
+                    entries: vec![crate::theory::model::Entry::Boundary {
+                        id: "B-checkout".to_string(),
+                        title: "checkout".to_string(),
+                        statement: "the cart pays".to_string(),
+                        sides: vec!["web".to_string(), "api".to_string()],
+                        paths: vec!["web/**".to_string()],
+                    }],
+                },
+                holds: vec![HoldView {
+                    number: 142,
+                    reason: "awaits full prediction".to_string(),
+                    stage: Stage::Implement,
                 }],
+                records: BTreeMap::new(),
                 areas: vec![AreaView {
                     id: "web-checkout".to_string(),
                     tier: Tier::Browser,
@@ -2804,7 +2890,7 @@ mod tests {
         let partial = serde_json::json!({"governor": true});
         let one: TheoryView = serde_json::from_value(partial).unwrap();
         assert!(one.governor);
-        assert!(one.entries.is_empty());
+        assert!(one.model.entries.is_empty());
         assert!(one.areas.is_empty());
         assert!(one.skills.is_empty());
         assert_eq!(one.error, "");
@@ -3387,6 +3473,7 @@ mod tests {
             repo: "borsuk".to_string(),
             kind: ItemKind::Issue,
             number: 142,
+            prediction: None,
         };
         client.send(&action).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), action);

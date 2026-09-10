@@ -2,10 +2,11 @@
 //!
 //! The view draws one block per repository: the header strip with the
 //! governor state and the counts, then the AREAS panel with the tier each
-//! area reaches. The operator moves the cursor with `j` and `k`. On a
-//! repository row `v` asks for the run skill of one surface. On an area
-//! row `t` asks the agent to teach that area. On a repository row `e`
-//! opens `theory/model.toml` in the operator's editor.
+//! area reaches, then the HOLDS panel with the items the governor holds.
+//! The operator moves the cursor with `j` and `k`. On a repository row
+//! `v` asks for the run skill of one surface. On an area row `t` asks the
+//! agent to teach that area. On a repository row `e` opens
+//! `theory/model.toml` in the operator's editor.
 
 use std::fs;
 use std::path::Path;
@@ -18,10 +19,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::sock::{Action, AreaView, ModelPath, StateView, TheoryAction, TheoryView};
+use crate::sock::{Action, AreaView, HoldView, ModelPath, StateView, TheoryAction, TheoryView};
 use crate::tasks::TeachKey;
 use crate::theory::model;
-use crate::theory::records::MODEL_FILE;
+use crate::theory::records::{names_empty_area, MODEL_FILE};
 use crate::theory::verify::Tier;
 
 use super::editor::EditorOutcome;
@@ -347,6 +348,11 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &Theory) 
                 .is_some_and(|stop| *stop == Stop::Area(alias.clone(), one.id.clone()));
             lines.push(area_row(one, here));
         }
+        if row.holds.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled("HOLDS", THEME.dim())));
+        lines.extend(row.holds.iter().map(hold_row));
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no repository", THEME.dim())));
@@ -371,7 +377,7 @@ fn strip(view: &TheoryView) -> Line<'static> {
         spans.push(Span::styled(
             format!(
                 "ENTRIES {}{DOT}AREAS {}",
-                view.entries.len(),
+                view.model.entries.len(),
                 view.areas.len()
             ),
             Style::default().fg(THEME.text),
@@ -416,6 +422,19 @@ fn area_row(row: &AreaView, is_selected: bool) -> Line<'static> {
     }
 }
 
+/// One row of the HOLDS panel: the item, the reason, and the bootstrap
+/// key when the reason names an area the model does not cover.
+///
+/// Bootstrapping writes the missing area, so it answers that hold alone.
+fn hold_row(hold: &HoldView) -> Line<'static> {
+    let mut text = format!("  #{}{DOT}{}", hold.number, hold.reason);
+    if names_empty_area(&hold.reason) {
+        text.push_str(DOT);
+        text.push_str("b bootstrap");
+    }
+    Line::from(Span::styled(text, Style::default().fg(THEME.error)))
+}
+
 /// The tier mark of one area: the tier name, `-` when no surface maps to
 /// the area, and `!` for a lint finding or a floor above reach.
 fn mark(row: &AreaView) -> String {
@@ -436,6 +455,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::sock::SurfaceView;
+    use crate::theory::model::Entry;
+
+    /// One boundary entry of the model the strip counts.
+    fn boundary(id: &str) -> Entry {
+        Entry::Boundary {
+            id: id.to_string(),
+            title: "checkout".to_string(),
+            statement: "the cart pays".to_string(),
+            sides: vec!["web".to_string(), "api".to_string()],
+            paths: vec!["web/**".to_string()],
+        }
+    }
 
     fn view(areas: Vec<AreaView>, entries: usize) -> StateView {
         let mut theory = BTreeMap::new();
@@ -444,9 +475,13 @@ mod tests {
             TheoryView {
                 governor: true,
                 error: String::new(),
-                entries: vec![crate::sock::EntryView::default(); entries],
+                model: crate::theory::model::Model {
+                    entries: vec![boundary("B-checkout"); entries],
+                },
                 areas,
                 skills: BTreeMap::new(),
+                holds: Vec::new(),
+                records: BTreeMap::new(),
                 calibration: None,
                 rungs: [0; 3],
                 events_per_day: 0,
@@ -508,6 +543,52 @@ mod tests {
             min_tier,
             lint,
         }
+    }
+
+    /// The HOLDS panel names each held item, and offers the bootstrap key
+    /// on the hold that names an area the model does not cover.
+    #[test]
+    fn the_holds_panel_offers_the_bootstrap_action_on_an_empty_area() {
+        let mut state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        );
+        state.theory.get_mut("borsuk").unwrap().holds = vec![
+            HoldView {
+                number: 142,
+                reason: "area gh has no entries".to_string(),
+                stage: crate::model::Stage::Implement,
+            },
+            HoldView {
+                number: 143,
+                reason: "awaits full prediction".to_string(),
+                stage: crate::model::Stage::Implement,
+            },
+        ];
+        let screen = render(&state);
+        assert!(screen.contains("HOLDS"), "{screen}");
+        assert!(
+            screen.contains("#142 \u{b7} area gh has no entries \u{b7} b bootstrap"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("#143 \u{b7} awaits full prediction"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("awaits full prediction \u{b7} b bootstrap"),
+            "bootstrap answers an empty area alone:\n{screen}"
+        );
+    }
+
+    /// A repository with no hold draws no HOLDS panel at all.
+    #[test]
+    fn a_repository_without_a_hold_draws_no_holds_panel() {
+        let screen = render(&view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        ));
+        assert!(!screen.contains("HOLDS"), "{screen}");
     }
 
     #[test]

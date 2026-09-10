@@ -8,13 +8,24 @@
 //! Chunk 19 adds the interaction keys to this file. The `Row` model and
 //! the selection movement exist so those keys can resolve their target.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+use super::editor::{self, EditorOutcome};
 use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
 use crate::daemon::FAST_CHECK_FAILED;
+use crate::gates::{REFINED, TO_REFINE};
 use crate::model::{ItemKind, Stage};
-use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView};
+use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView, TheoryAction};
 use crate::tasks::TaskState;
+use crate::theory::records::{
+    full_template, parse_full, skips_prediction_gates, FullPrediction, RecordKey, ShortPrediction,
+    PREDICTION_SHORT, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -439,7 +450,11 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
     match key.code {
         KeyCode::Char('+') => change_amount(app, sink, AmountChange::Increase),
         KeyCode::Char('-') => change_amount(app, sink, AmountChange::Decrease),
-        KeyCode::Char('p') => pause_selected(app, sink),
+        KeyCode::Char('p') => {
+            if !predict_ticket(app, sink) {
+                pause_selected(app, sink);
+            }
+        }
         KeyCode::Char('P') => pause_all(app, sink),
         KeyCode::Char('r') => refine_ticket(app, sink),
         KeyCode::Char('n') => create_ticket(app, sink),
@@ -691,7 +706,29 @@ fn pause_all(app: &mut App, sink: &mut impl ActionSink) {
     }
 }
 
+/// What the operator types before a governed refine.
+///
+/// The short prediction is one line: the claim, then the areas it touches
+/// in a trailing bracket list. The daemon validates the areas, posts the
+/// claim, and lets the poll gate queue the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PredictionInput {
+    /// The repository alias of the ticket.
+    repo: String,
+    /// Whether the item is an issue or a pull request.
+    kind: ItemKind,
+    /// The issue or pull request number.
+    number: u64,
+    /// The line typed so far.
+    buffer: String,
+}
+
 /// Send `Action::Refine` for the selected ticket and follow the new task.
+///
+/// A governed ticket takes its short prediction first, so the key opens
+/// the one-line input instead of sending. A `model-pr` or `verify-skill`
+/// ticket carries no prediction and sends at once, as an ungoverned
+/// ticket does.
 fn refine_ticket(app: &mut App, sink: &mut impl ActionSink) {
     let found = {
         let Some(state) = app.state.as_ref() else {
@@ -706,6 +743,31 @@ fn refine_ticket(app: &mut App, sink: &mut impl ActionSink) {
         (task.repo.clone(), task.kind, task.number)
     };
     let (repo, kind, number) = found;
+    if app
+        .state
+        .as_ref()
+        .is_some_and(|state| wants_prediction(state, &repo, number))
+    {
+        app.prediction = Some(PredictionInput {
+            repo,
+            kind,
+            number,
+            buffer: String::new(),
+        });
+        return;
+    }
+    send_refine(app, sink, repo, kind, number, None);
+}
+
+/// Send one refine action and follow the task it creates.
+fn send_refine(
+    app: &mut App,
+    sink: &mut impl ActionSink,
+    repo: String,
+    kind: ItemKind,
+    number: u64,
+    prediction: Option<ShortPrediction>,
+) {
     emit(
         app,
         sink,
@@ -713,6 +775,7 @@ fn refine_ticket(app: &mut App, sink: &mut impl ActionSink) {
             repo: repo.clone(),
             kind,
             number,
+            prediction,
         },
         format!("sent refine {repo} {}{number}", kind.as_str()),
     );
@@ -725,6 +788,231 @@ fn refine_ticket(app: &mut App, sink: &mut impl ActionSink) {
         ),
         Wanted::Refine { repo, kind, number },
     );
+}
+
+/// True while one ticket of a governed repository still owes its short
+/// prediction.
+fn wants_prediction(state: &StateView, repo: &str, number: u64) -> bool {
+    if !state.theory.get(repo).is_some_and(|theory| theory.governor) {
+        return false;
+    }
+    let Some(ticket) = state
+        .tickets
+        .iter()
+        .find(|ticket| ticket.repo == repo && ticket.number == number)
+    else {
+        return false;
+    };
+    !ticket
+        .labels
+        .iter()
+        .any(|label| label == THEORY_SHORT_LABEL)
+        && !skips_prediction_gates(&ticket.labels)
+}
+
+/// Handle one key while the short prediction input holds the keyboard.
+///
+/// Escape closes the input and sends nothing, and so does an empty line.
+/// Enter sends every other line. A line that names areas but makes no
+/// claim closes the input and says why, because a silent close reads
+/// like a lost key press.
+pub(super) fn typing_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSink) {
+    let allowed = match key.code {
+        KeyCode::Char(_) => key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT,
+        _ => key.modifiers.is_empty(),
+    };
+    if !allowed {
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => app.prediction = None,
+        KeyCode::Backspace => {
+            if let Some(input) = app.prediction.as_mut() {
+                input.buffer.pop();
+            }
+        }
+        KeyCode::Char(character) => {
+            if let Some(input) = app.prediction.as_mut() {
+                input.buffer.push(character);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(input) = app.prediction.take() else {
+                return;
+            };
+            if input.buffer.trim().is_empty() {
+                return;
+            }
+            let Some(prediction) = parse_prediction(&input.buffer) else {
+                app.show_toast(NEEDS_CLAIM);
+                return;
+            };
+            send_refine(
+                app,
+                sink,
+                input.repo,
+                input.kind,
+                input.number,
+                Some(prediction),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// What the toast says when the typed line carries no claim.
+const NEEDS_CLAIM: &str = "a prediction needs a claim before the area list";
+
+/// Parse one typed line into a short prediction.
+///
+/// The grammar is the claim, then an optional trailing `[area, area]`
+/// list. A line that holds only the area list carries no claim and
+/// yields nothing. An empty area name drops out of the list.
+fn parse_prediction(line: &str) -> Option<ShortPrediction> {
+    let line = line.trim();
+    let mut text = line;
+    let mut areas = Vec::new();
+    if let Some(open) = line.strip_suffix(']').and_then(|rest| rest.rfind('[')) {
+        text = line[..open].trim();
+        areas = line[open + 1..line.len() - 1]
+            .split(',')
+            .map(str::trim)
+            .filter(|area| !area.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some(ShortPrediction {
+        kind: PREDICTION_SHORT.to_string(),
+        text: text.to_string(),
+        areas,
+    })
+}
+
+/// Take the full prediction of the selected refined ticket.
+///
+/// The key pauses everywhere else, so the flow reports whether it owns
+/// this row. Every row that is not a governed ticket waiting for its full
+/// prediction leaves the key to the pause.
+fn predict_ticket(app: &mut App, sink: &mut impl ActionSink) -> bool {
+    predict_ticket_with(app, sink, editor::edit_dir, editor::edit_file)
+}
+
+/// Run the full prediction flow with one scratch directory and one
+/// editor bridge.
+fn predict_ticket_with(
+    app: &mut App,
+    sink: &mut impl ActionSink,
+    dir: impl FnOnce() -> Result<PathBuf>,
+    edit: impl FnOnce(&Path) -> Result<EditorOutcome>,
+) -> bool {
+    let Some((repo, number)) = full_prediction_target(app) else {
+        return false;
+    };
+    let outcome = app
+        .state
+        .as_ref()
+        .ok_or_else(|| "the state is gone".to_string())
+        .and_then(|state| write_full_prediction(state, &repo, number, dir, edit));
+    match outcome {
+        Ok(prediction) => {
+            let toast = format!("sent the full prediction of {repo} #{number}");
+            emit(
+                app,
+                sink,
+                Action::Theory(TheoryAction::Predict {
+                    repo,
+                    number,
+                    prediction,
+                }),
+                toast,
+            );
+        }
+        Err(reason) => app.show_toast(&reason),
+    }
+    true
+}
+
+/// The repository and number of the row that owes a full prediction.
+///
+/// The row must carry `refined`, lack `to-refine`, and lack
+/// `theory-full` in a governed repository. That is the implement gate of
+/// the same ticket, so the key offers the prediction exactly where it
+/// unblocks the work. A ticket a refine agent still reshapes carries
+/// `to-refine` and takes the pause key instead. A `model-pr` or
+/// `verify-skill` ticket writes no prediction, and neither does a pull
+/// request row.
+fn full_prediction_target(app: &App) -> Option<(String, u64)> {
+    let state = app.state.as_ref()?;
+    let Row::Ticket { index } = selected_row(app)? else {
+        return None;
+    };
+    let task = state.tasks.get(index)?;
+    if task.kind != ItemKind::Issue {
+        return None;
+    }
+    if !state
+        .theory
+        .get(&task.repo)
+        .is_some_and(|theory| theory.governor)
+    {
+        return None;
+    }
+    let ticket = state
+        .tickets
+        .iter()
+        .find(|ticket| ticket.repo == task.repo && ticket.number == task.number)?;
+    let carries = |label: &str| ticket.labels.iter().any(|one| one == label);
+    if skips_prediction_gates(&ticket.labels)
+        || !carries(REFINED)
+        || carries(TO_REFINE)
+        || carries(THEORY_FULL_LABEL)
+    {
+        return None;
+    }
+    Some((task.repo.clone(), task.number))
+}
+
+/// Write the template, run the editor over it, and parse what came back.
+///
+/// The template names the candidate entries of the areas the short
+/// prediction claimed, so the operator picks ids instead of recalling
+/// them. An editor that saved nothing writes no prediction.
+fn write_full_prediction(
+    state: &StateView,
+    repo: &str,
+    number: u64,
+    dir: impl FnOnce() -> Result<PathBuf>,
+    edit: impl FnOnce(&Path) -> Result<EditorOutcome>,
+) -> Result<FullPrediction, String> {
+    let theory = state
+        .theory
+        .get(repo)
+        .ok_or_else(|| format!("{repo} carries no theory"))?;
+    let areas = theory
+        .records
+        .get(&RecordKey::Issue(number).key_text())
+        .and_then(|record| record.short.as_ref())
+        .map(|short| short.areas.clone())
+        .unwrap_or_default();
+    let reason = |error: anyhow::Error| format!("{error:#}");
+    let path = dir()
+        .map_err(reason)?
+        .join(format!("{repo}-{number}-prediction.toml"));
+    fs::write(&path, full_template(&areas, &theory.model))
+        .with_context(|| format!("cannot write {}", path.display()))
+        .map_err(reason)?;
+    match edit(&path).map_err(reason)? {
+        EditorOutcome::Saved => {}
+        EditorOutcome::Unchanged => return Err("the prediction did not change".to_string()),
+        EditorOutcome::Failed(failure) => return Err(failure),
+    }
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))
+        .map_err(reason)?;
+    parse_full(&text, &theory.model)
 }
 
 /// Send `Action::TicketCreate` for the selected repository and follow it.
@@ -979,6 +1267,12 @@ fn next_policy(policy: &ReleasePolicy) -> ReleasePolicy {
 /// offers the retry key. A pull request of the fixed active batch takes
 /// no `space` key; a pull request of the waiting queue does.
 pub(super) fn footer_hints(app: &App) -> String {
+    if let Some(input) = app.prediction.as_ref() {
+        return format!(
+            "prediction: {}_ · text [area, area] · enter send · esc cancel",
+            input.buffer
+        );
+    }
     let no_selection = || "j k move · enter open · ? help".to_string();
     let Some(state) = app.state.as_ref() else {
         return no_selection();
@@ -994,6 +1288,9 @@ pub(super) fn footer_hints(app: &App) -> String {
                 format!("{FAST_CHECK_FAILED} · enter open · x abort · R retry · ? help")
             }
             Some(TaskState::Failed(_)) => "enter open · x abort · R retry · ? help".to_string(),
+            _ if full_prediction_target(app).is_some() => {
+                "enter open · p predict · x abort · ? help".to_string()
+            }
             _ => "enter open · r refine · x abort · ? help".to_string(),
         },
         Row::Train { .. } => "g release · s policy · ? help".to_string(),
@@ -1272,6 +1569,27 @@ fn ordinary_lane_lines(
             if stage_is_empty(state, stage) {
                 lines.push(Line::from(Span::styled("  no tasks", THEME.dim())));
             }
+            if matches!(stage, Stage::Refine | Stage::Implement) {
+                lines.extend(hold_lines(state, stage));
+            }
+        }
+    }
+    lines
+}
+
+/// One line per ticket the daemon holds out of `stage`.
+///
+/// A held ticket owns no task, so the lane would otherwise stay silent
+/// about it. The daemon derives every reason from the same gate the
+/// dispatch reads, so the lane and the gate never disagree.
+fn hold_lines(state: &StateView, stage: Stage) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (alias, theory) in &state.theory {
+        for hold in theory.holds.iter().filter(|hold| hold.stage == stage) {
+            lines.push(Line::from(Span::styled(
+                format!("  {alias} #{} {}", hold.number, hold.reason),
+                THEME.dim(),
+            )));
         }
     }
     lines
@@ -4212,11 +4530,428 @@ mod tests {
             vec![Action::Refine {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
-                number: 140
+                number: 140,
+                prediction: None
             }]
         );
         assert_eq!(app.view, View::Session);
         assert_eq!(app.session_task.as_deref(), Some("borsuk/refine-i140"));
+    }
+
+    // ------------------------------------------------------------------
+    // The short prediction
+    // ------------------------------------------------------------------
+
+    /// The render moment of the prediction tests.
+    const NOW_MS: u64 = 1_000_000;
+
+    /// One press of the enter key.
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    use crate::gates::{AWAITS_SHORT_HINT, MODEL_ERROR_HINT};
+
+    /// One state whose `borsuk` repository is governed and holds ticket
+    /// 140 with `labels`.
+    fn governed_view(labels: &[&str], error: &str, holds: Vec<crate::sock::HoldView>) -> StateView {
+        let mut state = sample_view();
+        state.tickets = vec![crate::sock::TicketSummary {
+            repo: "borsuk".to_string(),
+            number: 140,
+            title: "the checkout".to_string(),
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            updated_at: String::new(),
+            group: crate::sock::TicketGroup::ToRefine,
+        }];
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                error: error.to_string(),
+                holds,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+        state
+    }
+
+    /// The sample app with the governed ticket 140 selected.
+    fn governed_app(labels: &[&str]) -> App {
+        App {
+            state: Some(governed_view(labels, "", Vec::new())),
+            connected: true,
+            selection: Selection::Row(8),
+            ..App::default()
+        }
+    }
+
+    /// The refine lane draws one line per hold the daemon shipped, so a
+    /// ticket with no task still names its reason.
+    #[test]
+    fn the_refine_lane_shows_why_a_governed_ticket_has_no_task() {
+        let hold = |reason: &str| {
+            vec![crate::sock::HoldView {
+                number: 140,
+                reason: reason.to_string(),
+                stage: Stage::Refine,
+            }]
+        };
+        for reason in [
+            AWAITS_SHORT_HINT,
+            MODEL_ERROR_HINT,
+            "area gh has no entries",
+        ] {
+            let board = render_board(
+                governed_view(&[TO_REFINE], "", hold(reason)),
+                200,
+                30,
+                NOW_MS,
+            );
+            assert!(
+                board.contains(&format!("borsuk #140 {reason}")),
+                "the lane names the hold {reason}:\n{board}"
+            );
+        }
+
+        let settled = render_board(governed_view(&[TO_REFINE], "", Vec::new()), 200, 30, NOW_MS);
+        assert!(
+            !settled.contains("awaits short prediction"),
+            "an unheld ticket adds no line:\n{settled}"
+        );
+    }
+
+    /// `r` on a governed ticket takes one line first, and the line ships
+    /// the claim and the bracket area list.
+    #[test]
+    fn r_on_a_governed_ticket_takes_the_short_prediction_first() {
+        let mut app = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('r'), &mut sink);
+        assert!(sink.0.is_empty(), "the key sends nothing yet");
+        assert!(app.prediction.is_some(), "the input is open");
+        assert!(
+            footer_hints(&app).starts_with("prediction: _ · text [area, area]"),
+            "the hint names the grammar: {}",
+            footer_hints(&app)
+        );
+
+        for character in "block the empty card [web-checkout, api-orders]".chars() {
+            typing_key(&mut app, pressed(character), &mut sink);
+        }
+        typing_key(&mut app, enter(), &mut sink);
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Refine {
+                repo: "borsuk".to_string(),
+                kind: ItemKind::Issue,
+                number: 140,
+                prediction: Some(ShortPrediction {
+                    kind: PREDICTION_SHORT.to_string(),
+                    text: "block the empty card".to_string(),
+                    areas: vec!["web-checkout".to_string(), "api-orders".to_string()],
+                })
+            }]
+        );
+        assert!(app.prediction.is_none(), "the input closes after the send");
+    }
+
+    /// A line that names areas but makes no claim closes the input and
+    /// says why, and an empty line closes it quietly.
+    #[test]
+    fn a_prediction_line_with_no_claim_says_why_and_sends_nothing() {
+        let mut app = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('r'), &mut sink);
+        for character in "[web-checkout]".chars() {
+            typing_key(&mut app, pressed(character), &mut sink);
+        }
+        typing_key(&mut app, enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "the claimless line sends nothing");
+        assert!(app.prediction.is_none(), "the input closes");
+        assert_eq!(
+            app.visible_toast(),
+            Some("a prediction needs a claim before the area list")
+        );
+
+        let mut quiet = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut quiet, pressed('r'), &mut sink);
+        typing_key(&mut quiet, enter(), &mut sink);
+
+        assert!(sink.0.is_empty(), "the empty line sends nothing");
+        assert!(quiet.prediction.is_none(), "the input closes");
+        assert_eq!(quiet.visible_toast(), None, "an empty line says nothing");
+    }
+
+    /// Escape closes the input and sends nothing.
+    #[test]
+    fn esc_cancels_the_short_prediction_input() {
+        let mut app = governed_app(&[TO_REFINE]);
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('r'), &mut sink);
+        typing_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut sink,
+        );
+        assert!(app.prediction.is_none());
+        assert!(sink.0.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // The full prediction
+    // ------------------------------------------------------------------
+
+    /// The model of the full prediction tests: one boundary named
+    /// `web-checkout` and one invariant over it.
+    fn full_model() -> crate::theory::model::Model {
+        crate::theory::model::parse(concat!(
+            "[[entry]]\nkind = \"boundary\"\nid = \"web-checkout\"\ntitle = \"checkout\"\n",
+            "statement = \"the cart pays\"\nsides = [\"web\", \"api\"]\npaths = [\"web/**\"]\n",
+            "[[entry]]\nkind = \"invariant\"\nid = \"paid-once\"\ntitle = \"paid once\"\n",
+            "statement = \"the cart pays once\"\nconstrains = [\"web-checkout\"]\n",
+        ))
+        .expect("the test model parses")
+    }
+
+    /// The sample app whose ticket 140 is refined and governed, with the
+    /// short prediction of `web-checkout` on its record.
+    fn refined_app(labels: &[&str]) -> App {
+        let mut state = governed_view(labels, "", Vec::new());
+        let theory = state.theory.get_mut("borsuk").expect("the repository");
+        theory.model = full_model();
+        theory.records.insert(
+            crate::theory::records::RecordKey::Issue(140).key_text(),
+            crate::sock::RecordView {
+                short: Some(ShortPrediction {
+                    kind: PREDICTION_SHORT.to_string(),
+                    text: "block the empty card".to_string(),
+                    areas: vec!["web-checkout".to_string()],
+                }),
+                full: None,
+            },
+        );
+        App {
+            state: Some(state),
+            connected: true,
+            selection: Selection::Row(8),
+            ..App::default()
+        }
+    }
+
+    /// A scratch directory for one prediction test.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aif-predict-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `p` on a refined governed ticket writes the template, runs the
+    /// editor, and sends the parsed prediction.
+    #[test]
+    fn p_on_a_refined_ticket_edits_the_template_and_sends_the_prediction() {
+        let mut app = refined_app(&[REFINED]);
+        let mut sink = FakeSink::default();
+        let dir = scratch("sends");
+        let seen = std::cell::RefCell::new(String::new());
+        let handled = predict_ticket_with(
+            &mut app,
+            &mut sink,
+            || Ok(dir.clone()),
+            |path| {
+                seen.replace(std::fs::read_to_string(path).unwrap());
+                std::fs::write(
+                    path,
+                    concat!(
+                        "[behaviours]\nentries = []\ntag = \"unsure\"\n",
+                        "[states]\nentries = []\ntag = \"unsure\"\n",
+                        "[invariants]\nentries = [\"paid-once\"]\ntag = \"sure\"\n",
+                        "[failure-modes]\nentries = []\ntag = \"unsure\"\n",
+                        "[other-areas]\nentries = []\ntag = \"unsure\"\n",
+                    ),
+                )
+                .unwrap();
+                Ok(EditorOutcome::Saved)
+            },
+        );
+
+        assert!(handled, "the key owns a refined governed row");
+        assert!(
+            dir.join("borsuk-140-prediction.toml").is_file(),
+            "the template lands in the scratch directory"
+        );
+        assert!(
+            seen.borrow()
+                .contains("# candidates: paid-once\n[invariants]"),
+            "the template names the candidates of the short area:\n{}",
+            seen.borrow()
+        );
+        let Some(Action::Theory(TheoryAction::Predict {
+            repo,
+            number,
+            prediction,
+        })) = sink.0.first().cloned()
+        else {
+            panic!("the flow sends one predict action: {:?}", sink.0);
+        };
+        assert_eq!((repo.as_str(), number), ("borsuk", 140));
+        assert_eq!(prediction.slots.len(), 5);
+        assert_eq!(prediction.slots[2].entries, vec!["paid-once".to_string()]);
+        assert_eq!(
+            prediction.slots[2].tag,
+            crate::theory::records::PredictionTag::Sure
+        );
+    }
+
+    /// A template that does not parse sends nothing and names the entry
+    /// and the reason on a toast.
+    #[test]
+    fn a_broken_template_sends_nothing_and_names_the_reason() {
+        let mut app = refined_app(&[REFINED]);
+        let mut sink = FakeSink::default();
+        let dir = scratch("broken");
+        let handled = predict_ticket_with(
+            &mut app,
+            &mut sink,
+            || Ok(dir.clone()),
+            |path| {
+                let text = std::fs::read_to_string(path).unwrap().replace(
+                    "[invariants]\nentries = []",
+                    "[invariants]\nentries = [\"nope\"]",
+                );
+                std::fs::write(path, text).unwrap();
+                Ok(EditorOutcome::Saved)
+            },
+        );
+
+        assert!(handled);
+        assert!(sink.0.is_empty(), "the flow sends nothing: {:?}", sink.0);
+        assert_eq!(
+            app.visible_toast(),
+            Some("slot invariants: unknown entry nope")
+        );
+    }
+
+    /// An editor that saved nothing writes no prediction.
+    #[test]
+    fn an_unchanged_template_sends_nothing() {
+        let mut app = refined_app(&[REFINED]);
+        let mut sink = FakeSink::default();
+        let dir = scratch("unchanged");
+        predict_ticket_with(
+            &mut app,
+            &mut sink,
+            || Ok(dir.clone()),
+            |_| Ok(EditorOutcome::Unchanged),
+        );
+
+        assert!(sink.0.is_empty());
+        assert_eq!(app.visible_toast(), Some("the prediction did not change"));
+    }
+
+    /// The key pauses every row that owes no full prediction, and the
+    /// footer names the key only where the flow owns it.
+    #[test]
+    fn p_pauses_every_row_that_owes_no_full_prediction() {
+        for labels in [
+            vec![REFINED, THEORY_FULL_LABEL],
+            vec![REFINED, "verify-skill"],
+            vec![REFINED, TO_REFINE],
+            vec![TO_REFINE],
+        ] {
+            let mut app = refined_app(&labels);
+            let mut sink = FakeSink::default();
+            handle_key(&mut app, pressed('p'), &mut sink);
+            assert!(
+                matches!(sink.0.first(), Some(Action::Pause { .. })),
+                "{labels:?} keeps the pause key: {:?}",
+                sink.0
+            );
+            assert!(footer_hints(&app).contains("r refine"), "{labels:?}");
+        }
+
+        let mut ungoverned = refined_app(&[REFINED]);
+        ungoverned
+            .state
+            .as_mut()
+            .unwrap()
+            .theory
+            .get_mut("borsuk")
+            .unwrap()
+            .governor = false;
+        let mut sink = FakeSink::default();
+        handle_key(&mut ungoverned, pressed('p'), &mut sink);
+        assert!(
+            matches!(sink.0.first(), Some(Action::Pause { .. })),
+            "the governor off keeps the pause key: {:?}",
+            sink.0
+        );
+
+        let refined = refined_app(&[REFINED]);
+        assert!(
+            footer_hints(&refined).contains("p predict"),
+            "{}",
+            footer_hints(&refined)
+        );
+    }
+
+    /// The character column one line of the board starts `needle` at.
+    fn column_of(board: &str, needle: &str) -> usize {
+        board
+            .lines()
+            .find_map(|line| line.find(needle).map(|at| line[..at].chars().count()))
+            .unwrap_or_else(|| panic!("the board draws {needle}:\n{board}"))
+    }
+
+    /// Each lane draws the holds of its own stage. The refine hold sits
+    /// in the refine column and the implement hold in the implement
+    /// column, so a hold never lands in the wrong lane.
+    #[test]
+    fn each_lane_draws_the_holds_of_its_own_stage() {
+        let mut state = governed_view(
+            &[REFINED],
+            "",
+            vec![
+                crate::sock::HoldView {
+                    number: 140,
+                    reason: crate::gates::AWAITS_FULL_HINT.to_string(),
+                    stage: Stage::Implement,
+                },
+                crate::sock::HoldView {
+                    number: 141,
+                    reason: AWAITS_SHORT_HINT.to_string(),
+                    stage: Stage::Refine,
+                },
+            ],
+        );
+        state.theory.get_mut("borsuk").unwrap().model = full_model();
+        let board = render_board(state, 200, 30, NOW_MS);
+
+        let header = board
+            .lines()
+            .find(|line| line.contains("refine") && line.contains("implement"))
+            .unwrap_or_else(|| panic!("the four lanes share one row:\n{board}"));
+        let refine_at = header[..header.find("refine").unwrap()].chars().count();
+        let implement_at = header[..header.find("implement").unwrap()].chars().count();
+        let review_at = header[..header.find("review").unwrap()].chars().count();
+
+        let short_at = column_of(&board, "borsuk #141 awaits short prediction");
+        assert!(
+            (refine_at..implement_at).contains(&short_at),
+            "the short hold sits in the refine lane at {short_at}, \
+             which spans {refine_at}..{implement_at}:\n{board}"
+        );
+
+        let full_at = column_of(&board, "borsuk #140 awaits full prediction");
+        assert!(
+            (implement_at..review_at).contains(&full_at),
+            "the full hold sits in the implement lane at {full_at}, \
+             which spans {implement_at}..{review_at}:\n{board}"
+        );
     }
 
     #[test]

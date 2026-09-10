@@ -59,10 +59,11 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AreaView, AskView, EntryView, InputMode, ModelPath, PauseScope, PromptSource,
-    PromptView, Push, SettingsOperation, SettingsResult, SettingsResultStatus, StateInput,
-    StateView, SurfaceView, TheoryAction, TheoryView, TicketAction, TicketDetails, TicketProposal,
-    TicketResult, TicketResultKind, MODEL_COMMIT_REQUEST, SKILL_TICKET_REQUEST,
+    Action, AreaView, AskView, HoldView, InputMode, ModelPath, PauseScope, PromptSource,
+    PromptView, Push, RecordView, SettingsOperation, SettingsResult, SettingsResultStatus,
+    StateInput, StateView, SurfaceView, TheoryAction, TheoryView, TicketAction, TicketDetails,
+    TicketProposal, TicketResult, TicketResultKind, MODEL_COMMIT_REQUEST, PREDICTION_REQUEST,
+    SKILL_TICKET_REQUEST,
 };
 use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
@@ -71,8 +72,11 @@ use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
-    self, event_block, parse_delta_blocks, parse_event_blocks, DeltaBlock, Event, RecordKey,
-    EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL, MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL,
+    self, event_block, no_entries, parse_delta_blocks, parse_event_blocks, parse_prediction_blocks,
+    prediction_block, record_labels, skips_prediction_gates, DeltaBlock, Event, FullPrediction,
+    Prediction, RecordKey, ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR,
+    EVENT_OPEN_LABEL, MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS,
+    THEORY_FULL_COLOR, THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL,
     VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
@@ -424,6 +428,20 @@ pub struct Daemon {
     /// The product of the last daily sweep of each repository. Runtime
     /// only: the next sweep re-derives it.
     theory_sweeps: BTreeMap<String, SweepStats>,
+    /// The theory record labels of every governed repository, rebuilt on
+    /// every poll like [`Links`].
+    theory_records: TheoryRecords,
+    /// The theory label set each record was last fetched at, keyed by
+    /// alias and record key. The map is runtime only: it holds the first
+    /// sight of one daemon run, and a fresh run fetches each record once
+    /// more.
+    theory_fetched: BTreeMap<(String, String), Vec<String>>,
+    /// The blocks of each fetched record, keyed by alias and record key.
+    theory_blocks: BTreeMap<(String, String), RecordView>,
+    /// The refused predictions of each repository, in refusal order. The
+    /// map is runtime only: an entry lives until a prediction of the same
+    /// item posts.
+    theory_holds: BTreeMap<String, Vec<HoldView>>,
     /// The ticket-check failure count of each issue. The count bounds the
     /// refine re-queue of a failing ticket: at `MAX_ATTEMPTS` the failure
     /// asks for a human instead of `to-refine`. The map is runtime only:
@@ -819,6 +837,10 @@ impl Daemon {
             links: BTreeMap::new(),
             theory_models: BTreeMap::new(),
             theory_skills: BTreeMap::new(),
+            theory_records: TheoryRecords::default(),
+            theory_fetched: BTreeMap::new(),
+            theory_blocks: BTreeMap::new(),
+            theory_holds: BTreeMap::new(),
             measure_jobs: BTreeMap::new(),
             fast_runs: BTreeMap::new(),
             fast_results: BTreeMap::new(),
@@ -1495,10 +1517,93 @@ impl Daemon {
             self.theory_models.remove(repo);
             self.theory_skills.remove(repo);
         }
-        let view = self.theory_view(repo, governed);
-        if self.theory_views.get(repo) != Some(&view) {
-            self.theory_views.insert(repo.to_string(), view);
-            self.changed = true;
+        self.refresh_records();
+        self.first_sight(repo);
+        self.store_theory_view(repo);
+    }
+
+    /// Rebuild the theory record labels of every governed repository.
+    ///
+    /// The derive runs per poll and persists nothing, like [`Links`]. The
+    /// shadow snapshot map is empty until the daemon polls a theory
+    /// repository of its own. The model of each governed alias lives in
+    /// the daemon cache instead of the snapshot, so its parse state folds
+    /// in afterwards and every gate reads one model.
+    fn refresh_records(&mut self) {
+        let mut records = TheoryRecords::derive(&self.config, &self.snapshot, &BTreeMap::new());
+        for alias in self.config.repos.keys() {
+            let broken = self
+                .theory_models
+                .get(alias)
+                .is_none_or(|cache| cache.model.is_err() || cache.verify.is_err());
+            records.set_model_error(alias, broken);
+        }
+        self.theory_records = records;
+    }
+
+    /// Fetch the comments of every record of one repository that shows a
+    /// theory label the daemon has not read yet.
+    ///
+    /// The fetch runs once per record per label set: the daemon remembers
+    /// the labels it read at, so an unchanged record costs no call and a
+    /// fresh label fetches again. One page of 100 comments is the whole
+    /// read, and the parsed blocks reach the UI in [`TheoryView::records`].
+    fn first_sight(&mut self, alias: &str) {
+        if !self.theory_records.is_governed(alias) {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.repos.get(alias) else {
+            return;
+        };
+        let mut keys: Vec<RecordKey> = snapshot
+            .issues
+            .keys()
+            .copied()
+            .map(RecordKey::Issue)
+            .collect();
+        keys.extend(snapshot.prs.keys().copied().map(RecordKey::Pr));
+        keys.push(RecordKey::Repo);
+        let mut gh = GhClient::new(&*self.exec);
+        let mut read: BTreeMap<(String, u64), RecordView> = BTreeMap::new();
+        for key in keys {
+            let labels = record_labels(self.theory_records.labels_of(alias, &key));
+            let seen = (alias.to_string(), key.key_text());
+            if labels.is_empty() || self.theory_fetched.get(&seen) == Some(&labels) {
+                continue;
+            }
+            let target = match self.theory_record(alias, &key) {
+                Ok(target) => target,
+                Err(error) => {
+                    eprintln!("the theory record of {alias} {}: {error:#}", key.key_text());
+                    continue;
+                }
+            };
+            // One issue can answer two keys: in code mode the repository
+            // record is an issue of the repository as well.
+            if let Some(view) = read.get(&target) {
+                self.theory_blocks.insert(seen.clone(), view.clone());
+                self.theory_fetched.insert(seen, labels);
+                continue;
+            }
+            let page = match gh.fetch_comments(&target.0, target.1) {
+                Ok(page) => page,
+                Err(error) => {
+                    eprintln!("the comments of {alias} {}: {error:#}", key.key_text());
+                    continue;
+                }
+            };
+            let mut view = RecordView::default();
+            for comment in &page.comments {
+                for block in parse_prediction_blocks(&comment.body) {
+                    match block {
+                        Prediction::Short(short) => view.short = Some(short),
+                        Prediction::Full(full) => view.full = Some(full),
+                    }
+                }
+            }
+            read.insert(target, view.clone());
+            self.theory_blocks.insert(seen.clone(), view);
+            self.theory_fetched.insert(seen, labels);
         }
     }
 
@@ -1644,18 +1749,7 @@ impl Daemon {
         let mut map = &empty_map;
         if let Some(cache) = self.theory_models.get(repo) {
             match &cache.model {
-                Ok(model) => {
-                    view.entries = model
-                        .entries
-                        .iter()
-                        .map(|entry| EntryView {
-                            id: entry.id().to_string(),
-                            kind: entry.kind_name().to_string(),
-                            title: entry.title().to_string(),
-                            statement: entry.statement().to_string(),
-                        })
-                        .collect();
-                }
+                Ok(model) => view.model.clone_from(model),
                 Err(error) => view.error.clone_from(error),
             }
             match &cache.verify {
@@ -1703,6 +1797,13 @@ impl Daemon {
                     .any(|name| findings.iter().any(|one| &one.surface == name)),
             })
             .collect();
+        view.holds = self.prediction_holds(repo);
+        view.records = self
+            .theory_blocks
+            .iter()
+            .filter(|((alias, _), _)| alias == repo)
+            .map(|((_, key), blocks)| (key.clone(), blocks.clone()))
+            .collect();
         // The daily sweep joins the view, but only a sweep that ran
         // leaves its numbers here.
         if let Some(stats) = self.theory_sweeps.get(repo) {
@@ -1746,7 +1847,7 @@ impl Daemon {
     fn observe_ready_work(&mut self, repo: &str, fresh: &RepoSnapshot) -> bool {
         let ready: Vec<ReadyWork> = self
             .gates
-            .observe(repo, fresh)
+            .observe(repo, fresh, &self.theory_records)
             .into_iter()
             .filter(|work| {
                 !(work.stage == Stage::Refine
@@ -1949,7 +2050,7 @@ impl Daemon {
                     fresh
                         .issues
                         .get(&task.number)
-                        .is_none_or(|issue| !implement_ready(issue))
+                        .is_none_or(|issue| !implement_ready(issue, repo, &self.theory_records))
                         && !(task.state == TaskState::Running
                             && implementation_transitioned(fresh, &links, task.number))
                 }
@@ -2076,20 +2177,6 @@ impl Daemon {
     // Drive steps
     // ------------------------------------------------------------------
 
-    /// True when the labels of one item skip both prediction gates.
-    ///
-    /// A `model-pr` changes the model itself, and a `verify-skill` ticket
-    /// changes no application behaviour, so neither one carries a
-    /// prediction. Every other check still runs for both: the ticket check,
-    /// the body check, the fast checks, and the review.
-    // The v0.7 gate chunks call this.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn skips_prediction_gates(labels: &[String]) -> bool {
-        labels
-            .iter()
-            .any(|label| label == MODEL_PR_LABEL || label == VERIFY_SKILL_LABEL)
-    }
-
     /// Move gated ready work into the task table and the train queues.
     fn admit_ready(&mut self) {
         let ready = std::mem::take(&mut self.pending_ready);
@@ -2178,8 +2265,9 @@ impl Daemon {
                 if self.admission_held(&work.repo, work.number) {
                     continue;
                 }
-                // The C9 prediction gate of the v0.8 spec sits here; V7
-                // runs the ticket check in its place.
+                // The C9 prediction gate holds a governed ticket in
+                // `implement_ready`, so every ticket here passed it. The
+                // ticket check runs after it.
                 match self.run_ticket_check(&work.repo, work.number) {
                     Ok(()) => {
                         self.ticket_check_failures
@@ -4033,9 +4121,18 @@ impl Daemon {
     /// Apply one operator action from the control socket.
     fn on_action(&mut self, action: Action) {
         match action {
-            Action::Refine { repo, kind, number } => {
+            Action::Refine {
+                repo,
+                kind,
+                number,
+                prediction,
+            } => {
                 if !self.config.repos.contains_key(&repo) {
                     eprintln!("the refine request for {repo}: no such repository");
+                    return;
+                }
+                if self.wants_prediction(&repo, kind, number) {
+                    self.accept_short_prediction(&repo, kind, number, prediction);
                     return;
                 }
                 let log = self.log_path(&repo, Stage::Refine, kind, number);
@@ -4240,6 +4337,8 @@ impl Daemon {
                         self.complete_parked_refines(&repo, &fresh);
                         self.reconcile_unready(&repo, &fresh);
                         self.reconcile_ticket_conversations(&repo, &fresh);
+                        self.refresh_records();
+                        self.store_theory_view(&repo);
                         let ready = self.observe_ready_work(&repo, &fresh);
                         let decisions = self.derive_needs_human(&repo, &fresh);
                         self.changed |= ready || decisions;
@@ -4257,6 +4356,8 @@ impl Daemon {
                         self.complete_parked_refines(&repo, &fresh);
                         self.reconcile_unready(&repo, &fresh);
                         self.reconcile_ticket_conversations(&repo, &fresh);
+                        self.refresh_records();
+                        self.store_theory_view(&repo);
                         let ready = self.observe_ready_work(&repo, &fresh);
                         let decisions = self.derive_needs_human(&repo, &fresh);
                         self.changed |= ready || decisions;
@@ -4717,6 +4818,9 @@ impl Daemon {
         self.config = config;
         self.settings_revision = revision;
         self.changed = true;
+        // A repository may have gained or lost its governor, so the
+        // theory read model of the last poll no longer answers for it.
+        self.refresh_records();
         for alias in &delta.added {
             match self.add_repository(alias) {
                 Ok(()) => notes.push(format!("added {alias}")),
@@ -6463,12 +6567,349 @@ impl Daemon {
         gh.add_label(&owner_repo, number, EVENT_OPEN_LABEL)
     }
 
+    /// True when a refine of one item must carry a short prediction.
+    ///
+    /// The governor takes the operator's claim before the refine agent
+    /// reads the ticket. A `model-pr` or a `verify-skill` item carries no
+    /// claim, and a repository with the governor off keeps the v0.6 path.
+    fn wants_prediction(&self, alias: &str, kind: ItemKind, number: u64) -> bool {
+        if !self
+            .config
+            .repos
+            .get(alias)
+            .is_some_and(|repo| repo.theory.governor.is_on())
+        {
+            return false;
+        }
+        let labels = self
+            .snapshot
+            .repos
+            .get(alias)
+            .and_then(|items| match kind {
+                ItemKind::Issue => items.issues.get(&number).map(|issue| &issue.labels),
+                ItemKind::Pr => items.prs.get(&number).map(|pr| &pr.labels),
+            })
+            .cloned()
+            .unwrap_or_default();
+        if skips_prediction_gates(&labels) {
+            return false;
+        }
+        let key = match kind {
+            ItemKind::Issue => RecordKey::Issue(number),
+            ItemKind::Pr => RecordKey::Pr(number),
+        };
+        // A record that already holds its prediction takes the v0.6 path,
+        // so the key stays the retry key of a refine that failed.
+        !self
+            .theory_records
+            .labels_of(alias, &key)
+            .iter()
+            .any(|label| label == THEORY_SHORT_LABEL)
+    }
+
+    /// Validate one short prediction, post it, and label the item.
+    ///
+    /// The order is the record order: the comment first, then
+    /// `theory-short` on the theory record, then `to-refine` on the item
+    /// itself. The daemon queues no task here. The next poll sees both
+    /// labels, the refine gate opens, and the poll gate queues the work.
+    ///
+    /// A refusal writes nothing at all. It reports the reason and keeps
+    /// it in the hold list of the repository until a prediction of the
+    /// same item posts.
+    fn accept_short_prediction(
+        &mut self,
+        alias: &str,
+        kind: ItemKind,
+        number: u64,
+        prediction: Option<ShortPrediction>,
+    ) {
+        let outcome = match prediction {
+            Some(prediction) => self.post_short_prediction(alias, kind, number, prediction),
+            None => Err(anyhow!("the short prediction is missing")),
+        };
+        let (result, message) = match outcome {
+            Ok(()) => {
+                self.drop_hold(alias, number);
+                (
+                    TicketResultKind::Success,
+                    format!("posted the short prediction of {alias}#{number}"),
+                )
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.hold(alias, number, Stage::Refine, &reason);
+                (TicketResultKind::Failure, reason)
+            }
+        };
+        self.store_theory_view(alias);
+        self.changed = true;
+        let Some(pusher) = self.ticket_pusher.as_ref() else {
+            return;
+        };
+        pusher(Push::TicketResult(TicketResult {
+            request: format!("{PREDICTION_REQUEST}{alias}/{number}"),
+            repo: alias.to_string(),
+            number,
+            kind: result,
+            message,
+            issue: None,
+            conflict: None,
+        }));
+    }
+
+    /// Post one validated short prediction and add the two labels.
+    fn post_short_prediction(
+        &self,
+        alias: &str,
+        kind: ItemKind,
+        number: u64,
+        prediction: ShortPrediction,
+    ) -> Result<()> {
+        let repo_cfg = self
+            .config
+            .repos
+            .get(alias)
+            .ok_or_else(|| anyhow!("no such repository: {alias}"))?;
+        self.check_areas(alias, &prediction.areas)?;
+        let key = match kind {
+            ItemKind::Issue => RecordKey::Issue(number),
+            ItemKind::Pr => RecordKey::Pr(number),
+        };
+        let (record_repo, record_number) = self.theory_record(alias, &key)?;
+        let gh = GhClient::new(&*self.exec);
+        let block = prediction_block(&Prediction::Short(prediction));
+        gh.post_comment(&record_repo, record_number, &block)?;
+        gh.create_label_if_missing(&record_repo, THEORY_SHORT_LABEL, THEORY_SHORT_COLOR)?;
+        gh.add_label(&record_repo, record_number, THEORY_SHORT_LABEL)?;
+        gh.add_label(&repo_cfg.owner_repo, number, TO_REFINE)
+    }
+
+    /// Validate one full prediction, post it, and label the record.
+    ///
+    /// The order is the record order: the comment first, then
+    /// `theory-full` on the theory record. The daemon queues no task
+    /// here. The next poll sees the label, the implement gate opens, and
+    /// the poll gate queues the work.
+    ///
+    /// A refusal writes nothing at all. It reports the reason and keeps
+    /// it in the hold list of the repository until a prediction of the
+    /// same ticket posts.
+    fn accept_full_prediction(&mut self, alias: &str, number: u64, prediction: FullPrediction) {
+        let (result, message) = match self.post_full_prediction(alias, number, prediction) {
+            Ok(()) => {
+                self.drop_hold(alias, number);
+                (
+                    TicketResultKind::Success,
+                    format!("posted the full prediction of {alias}#{number}"),
+                )
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.hold(alias, number, Stage::Implement, &reason);
+                (TicketResultKind::Failure, reason)
+            }
+        };
+        self.store_theory_view(alias);
+        self.changed = true;
+        let Some(pusher) = self.ticket_pusher.as_ref() else {
+            return;
+        };
+        pusher(Push::TicketResult(TicketResult {
+            request: format!("{PREDICTION_REQUEST}{alias}/{number}"),
+            repo: alias.to_string(),
+            number,
+            kind: result,
+            message,
+            issue: None,
+            conflict: None,
+        }));
+    }
+
+    /// Post one validated full prediction and add `theory-full`.
+    fn post_full_prediction(
+        &self,
+        alias: &str,
+        number: u64,
+        prediction: FullPrediction,
+    ) -> Result<()> {
+        let repo_cfg = self
+            .config
+            .repos
+            .get(alias)
+            .ok_or_else(|| anyhow!("no such repository: {alias}"))?;
+        if !repo_cfg.theory.governor.is_on() {
+            bail!("the theory governor of {alias} is off");
+        }
+        self.check_full(alias, &prediction)?;
+        let (record_repo, record_number) = self.theory_record(alias, &RecordKey::Issue(number))?;
+        let gh = GhClient::new(&*self.exec);
+        let block = prediction_block(&Prediction::Full(prediction));
+        gh.post_comment(&record_repo, record_number, &block)?;
+        gh.create_label_if_missing(&record_repo, THEORY_FULL_LABEL, THEORY_FULL_COLOR)?;
+        gh.add_label(&record_repo, record_number, THEORY_FULL_LABEL)
+    }
+
+    /// Check one full prediction against the model.
+    ///
+    /// The shape check runs first, because a message no template wrote
+    /// reaches this action too. The `other-areas` slot names areas, so it
+    /// runs the area check that the short prediction ran and refuses an
+    /// area with no entries. That slot may name none, because a change
+    /// that reaches no other area is an answer. Every other slot names
+    /// model entries, and an id the model does not carry refuses the
+    /// whole prediction.
+    fn check_full(&self, alias: &str, prediction: &FullPrediction) -> Result<()> {
+        records::check_full_shape(prediction).map_err(|reason| anyhow!(reason))?;
+        let areas: Vec<String> = prediction
+            .slots
+            .iter()
+            .filter(|slot| slot.name == PREDICTION_OTHER_AREAS)
+            .flat_map(|slot| slot.entries.clone())
+            .collect();
+        if !areas.is_empty() {
+            self.check_areas(alias, &areas)?;
+        }
+        let cache = self
+            .theory_models
+            .get(alias)
+            .ok_or_else(|| anyhow!("model error: the theory of {alias} is unread"))?;
+        let model = match &cache.model {
+            Ok(model) => model,
+            Err(error) => bail!("model error: {error}"),
+        };
+        for slot in &prediction.slots {
+            if slot.name == PREDICTION_OTHER_AREAS {
+                continue;
+            }
+            for id in &slot.entries {
+                if !model.entries.iter().any(|entry| entry.id() == id) {
+                    bail!("slot {}: unknown entry {id}", slot.name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check that every named area names entries of the model.
+    ///
+    /// Two namespaces answer. An area of `theory/verify.toml` names its
+    /// own id, and a boundary of the model names its entry id. Both
+    /// reach the same place: an area carries one boundary, and the
+    /// boundary carries the path globs, so the slice of C10 and the
+    /// delta both read the area's boundary and its paths. A name in
+    /// neither namespace describes nothing either one can measure, so
+    /// the prediction is refused whole.
+    ///
+    /// A prediction that names no area at all is refused too. It claims
+    /// a change of nothing, and the delta would have no place to land. A
+    /// model that did not parse refuses every area.
+    fn check_areas(&self, alias: &str, areas: &[String]) -> Result<()> {
+        if areas.is_empty() {
+            bail!("a prediction names at least one area");
+        }
+        let cache = self
+            .theory_models
+            .get(alias)
+            .ok_or_else(|| anyhow!("model error: the theory of {alias} is unread"))?;
+        let model = match &cache.model {
+            Ok(model) => model,
+            Err(error) => bail!("model error: {error}"),
+        };
+        let verify = match &cache.verify {
+            Ok(verify) => verify,
+            Err(error) => bail!("model error: {error}"),
+        };
+        for area in areas {
+            let known = verify.areas.iter().any(|one| &one.id == area)
+                || model
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, Entry::Boundary { .. }) && entry.id() == area);
+            if !known {
+                bail!("{}", no_entries(area));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record one refused prediction of `number`, replacing any earlier
+    /// refusal of the same item.
+    fn hold(&mut self, alias: &str, number: u64, stage: Stage, reason: &str) {
+        let holds = self.theory_holds.entry(alias.to_string()).or_default();
+        holds.retain(|hold| hold.number != number);
+        holds.push(HoldView {
+            number,
+            reason: reason.to_string(),
+            stage,
+        });
+    }
+
+    /// Drop the refusal record of `number`.
+    fn drop_hold(&mut self, alias: &str, number: u64) {
+        if let Some(holds) = self.theory_holds.get_mut(alias) {
+            holds.retain(|hold| hold.number != number);
+        }
+    }
+
+    /// The holds of one repository: every refused prediction, then every
+    /// ticket a prediction gate holds.
+    ///
+    /// A refusal comes first and keeps its own reason, because the
+    /// operator pressed `r` on a ticket that does not carry `to-refine`
+    /// yet and the gate says nothing about it.
+    fn prediction_holds(&self, repo: &str) -> Vec<HoldView> {
+        let mut holds = self.theory_holds.get(repo).cloned().unwrap_or_default();
+        let Some(snapshot) = self.snapshot.repos.get(repo) else {
+            return holds;
+        };
+        for issue in snapshot.issues.values() {
+            let found = gates::refine_hold(issue, repo, &self.theory_records)
+                .map(|reason| (Stage::Refine, reason))
+                .or_else(|| {
+                    gates::implement_hold(issue, repo, &self.theory_records)
+                        .map(|reason| (Stage::Implement, reason))
+                });
+            let Some((stage, reason)) = found else {
+                continue;
+            };
+            if holds.iter().any(|hold| hold.number == issue.number) {
+                continue;
+            }
+            holds.push(HoldView {
+                number: issue.number,
+                reason: reason.to_string(),
+                stage,
+            });
+        }
+        holds
+    }
+
+    /// Rebuild and store the Theory view of one repository.
+    fn store_theory_view(&mut self, repo: &str) {
+        let governed = self
+            .config
+            .repos
+            .get(repo)
+            .is_some_and(|config| config.theory.governor.is_on());
+        let view = self.theory_view(repo, governed);
+        if self.theory_views.get(repo) != Some(&view) {
+            self.theory_views.insert(repo.to_string(), view);
+            self.changed = true;
+        }
+    }
+
     /// Apply one Theory view command.
     fn theory_action(&mut self, action: TheoryAction) {
         match action {
             TheoryAction::Setup { repo, surface } => self.setup_skill_ticket(&repo, &surface),
             TheoryAction::Teach { repo, key } => self.teach(&repo, key),
             TheoryAction::Sweep { repo } => self.sweep(&repo),
+            TheoryAction::Predict {
+                repo,
+                number,
+                prediction,
+            } => self.accept_full_prediction(&repo, number, prediction),
             TheoryAction::EditModel { request, repo } => self.edit_model(&request, &repo),
             TheoryAction::CommitModel { repo } => self.commit_model(&repo),
         }
@@ -8743,6 +9184,34 @@ mod tests {
         CmdOut::ok("HTTP/1.1 204 No Content\r\n\r\n")
     }
 
+    /// The one comment page the first sight of one record reads.
+    ///
+    /// A record that shows a theory label is fetched once per label set,
+    /// so a governed poll with `theory-short` on issue `number` scripts
+    /// this step. `comments` is the JSON array of the page.
+    fn comment_page_step(number: u64, comments: &str) -> Step {
+        let url = format!("repos/acme/borsuk/issues/{number}/comments?per_page=100");
+        gh_step(
+            &["api", "-i", "-X", "GET", url.as_str()],
+            CmdOut::ok(format!("HTTP/2 200\r\netag: \"c1\"\r\n\r\n{comments}")),
+        )
+    }
+
+    /// One comment page that holds one short prediction block.
+    fn short_prediction_page(text: &str, areas: &[&str]) -> String {
+        let block = prediction_block(&Prediction::Short(ShortPrediction {
+            kind: records::PREDICTION_SHORT.to_string(),
+            text: text.to_string(),
+            areas: areas.iter().map(|area| area.to_string()).collect(),
+        }));
+        serde_json::to_string(&serde_json::json!([{
+            "user": {"login": "operator"},
+            "created_at": "2026-09-01T10:00:00Z",
+            "body": block,
+        }]))
+        .unwrap()
+    }
+
     /// The `fetch_pull` step that one review completion reads.
     ///
     /// [`Daemon::review_contract_met`] runs this call before it completes a
@@ -9222,7 +9691,7 @@ mod tests {
              \n[stage.release]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
              \n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\npermission_mode = \"manual\"\npermission_handler = \"inbox\"\ntools = [\"Read\", \"Glob\", \"Grep\"]\n\
-             \n[repo.borsuk]\npath = \"{}\"\n",
+             \n[repo.borsuk]\npath = \"{}\"\ngovernor = \"off\"\n",
             repo.display()
         )
     }
@@ -13328,17 +13797,15 @@ mod tests {
     #[test]
     fn a_verify_skill_ticket_admits_refine_and_implement_with_no_theory_label() {
         let labels = vec!["to-refine".to_string(), VERIFY_SKILL_LABEL.to_string()];
-        assert!(Daemon::skips_prediction_gates(&labels));
+        assert!(skips_prediction_gates(&labels));
         assert!(
             !labels
                 .iter()
                 .any(|label| label == THEORY_SHORT_LABEL || label == THEORY_FULL_LABEL),
             "the ticket carries no prediction label"
         );
-        assert!(Daemon::skips_prediction_gates(
-            &[MODEL_PR_LABEL.to_string()]
-        ));
-        assert!(!Daemon::skips_prediction_gates(&["refined".to_string()]));
+        assert!(skips_prediction_gates(&[MODEL_PR_LABEL.to_string()]));
+        assert!(!skips_prediction_gates(&["refined".to_string()]));
 
         let mut rig = Rig::make_paused(vec![]);
         let title = SkillTicket::Setup.title("borsuk", "web");
@@ -15465,6 +15932,7 @@ mod tests {
             repo: "borsuk".to_string(),
             kind: ItemKind::Issue,
             number: 142,
+            prediction: None,
         });
 
         let roles = rig.roles.lock().unwrap();
@@ -16396,6 +16864,7 @@ mod tests {
             repo: "borsuk".to_string(),
             kind: ItemKind::Issue,
             number: 142,
+            prediction: None,
         });
 
         let roles = rig.roles.lock().unwrap();
@@ -17160,6 +17629,7 @@ mod tests {
             repo: "missing".to_string(),
             kind: ItemKind::Issue,
             number: 1,
+            prediction: None,
         });
         rig.act(Action::TicketCreate {
             repo: "missing".to_string(),
@@ -20155,6 +20625,7 @@ mod tests {
             repo: "borsuk".to_string(),
             kind: ItemKind::Issue,
             number: 142,
+            prediction: None,
         });
         let view = last_view(&push_rx);
         let task = pushed_task(&view, "borsuk/refine-i142");
@@ -22938,9 +23409,9 @@ mod tests {
         let view = theory_of(&rig);
         assert!(view.governor);
         assert_eq!(view.error, "");
-        assert_eq!(view.entries.len(), 1);
-        assert_eq!(view.entries[0].id, "B-checkout");
-        assert_eq!(view.entries[0].kind, "boundary");
+        assert_eq!(view.model.entries.len(), 1);
+        assert_eq!(view.model.entries[0].id(), "B-checkout");
+        assert_eq!(view.model.entries[0].kind_name(), "boundary");
         assert_eq!(
             view.areas
                 .iter()
@@ -23048,7 +23519,7 @@ mod tests {
 
         let view = theory_of(&rig);
         assert_eq!(view.error, "theory/model.toml: missing");
-        assert!(view.entries.is_empty());
+        assert!(view.model.entries.is_empty());
         assert!(view.areas.is_empty());
         assert!(view.skills.is_empty());
         assert_eq!(
@@ -23139,9 +23610,814 @@ mod tests {
         rig.poll(Vec::new(), Vec::new());
 
         let view = theory_of(&rig);
-        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.model.entries.len(), 1);
         assert_eq!(view.skills["web"].tier, Tier::Browser);
         assert_eq!(view.areas[0].tier, Tier::Browser);
+    }
+
+    // ------------------------------------------------------------------
+    // The short prediction
+    // ------------------------------------------------------------------
+
+    /// One short prediction over the area `web-checkout` of the theory
+    /// fixture.
+    fn short_prediction(areas: &[&str]) -> ShortPrediction {
+        ShortPrediction {
+            kind: records::PREDICTION_SHORT.to_string(),
+            text: "the checkout blocks an empty card".to_string(),
+            areas: areas.iter().map(|area| area.to_string()).collect(),
+        }
+    }
+
+    /// One refine action that carries a short prediction.
+    fn refine_with(prediction: Option<ShortPrediction>) -> Action {
+        Action::Refine {
+            repo: "borsuk".to_string(),
+            kind: ItemKind::Issue,
+            number: 142,
+            prediction,
+        }
+    }
+
+    /// The `gh` argument lists of one rig, in call order.
+    fn gh_argv(rig: &Rig) -> Vec<Vec<String>> {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .map(|call| call.args.clone())
+            .collect()
+    }
+
+    /// The last ticket result the daemon pushed.
+    fn last_result(rx: &Receiver<Push>) -> TicketResult {
+        let mut found = None;
+        while let Ok(push) = rx.try_recv() {
+            if let Push::TicketResult(result) = push {
+                found = Some(result);
+            }
+        }
+        found.expect("the daemon pushed one ticket result")
+    }
+
+    #[test]
+    fn a_governed_refine_posts_the_prediction_then_theory_short_then_to_refine() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let prediction = short_prediction(&["web-checkout"]);
+        let body = format!(
+            "body={}",
+            prediction_block(&Prediction::Short(prediction.clone()))
+        );
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=theory-short",
+                    "-f",
+                    "color=c5def5",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"theory-short\",\"color\":\"c5def5\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=theory-short",
+                ],
+                gh_ok(),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=to-refine",
+                ],
+                gh_ok(),
+            ),
+        ]);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        assert_eq!(rig.job_count(), 0, "the gate holds without theory-short");
+
+        rig.act(refine_with(Some(prediction.clone())));
+
+        let calls = gh_argv(&rig);
+        assert_eq!(calls.len(), 4, "four calls: {calls:?}");
+        assert_eq!(calls[0][3], "repos/acme/borsuk/issues/142/comments");
+        assert_eq!(
+            parse_prediction_blocks(calls[0][5].strip_prefix("body=").unwrap()),
+            vec![Prediction::Short(prediction)],
+            "the comment carries the prediction block"
+        );
+        assert!(
+            calls[1].contains(&"name=theory-short".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls[2].contains(&"labels[]=theory-short".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls[3].contains(&"labels[]=to-refine".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/refine-i142"),
+            "the action queues no task; the poll gate does"
+        );
+    }
+
+    #[test]
+    fn a_prediction_over_an_area_with_no_entries_writes_nothing_and_says_why() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(refine_with(Some(short_prediction(&["gh"]))));
+
+        assert!(gh_argv(&rig).is_empty(), "the refusal writes nothing");
+        let result = last_result(&rx);
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(result.message, "area gh has no entries");
+        assert!(result.request.starts_with(PREDICTION_REQUEST));
+        assert_eq!(
+            theory_of(&rig).holds,
+            vec![HoldView {
+                number: 142,
+                reason: "area gh has no entries".to_string(),
+                stage: Stage::Refine,
+            }],
+            "the view keeps the hold"
+        );
+    }
+
+    /// One full prediction whose `other-areas` slot names `areas`.
+    fn full_prediction(areas: &[&str]) -> FullPrediction {
+        let slots = records::PREDICTION_SLOT_NAMES
+            .iter()
+            .map(|name| records::PredictionSlot {
+                name: (*name).to_string(),
+                entries: if *name == PREDICTION_OTHER_AREAS {
+                    areas.iter().map(|area| area.to_string()).collect()
+                } else {
+                    vec!["B-checkout".to_string()]
+                },
+                tag: if *name == "invariants" {
+                    records::PredictionTag::Unsure
+                } else {
+                    records::PredictionTag::Sure
+                },
+            })
+            .collect();
+        FullPrediction {
+            kind: records::PREDICTION_FULL.to_string(),
+            slots,
+        }
+    }
+
+    /// One predict action for ticket 142.
+    fn predict_with(prediction: FullPrediction) -> Action {
+        Action::Theory(TheoryAction::Predict {
+            repo: "borsuk".to_string(),
+            number: 142,
+            prediction,
+        })
+    }
+
+    #[test]
+    fn a_governed_predict_posts_the_full_block_then_theory_full() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let prediction = full_prediction(&["web-checkout"]);
+        let body = format!(
+            "body={}",
+            prediction_block(&Prediction::Full(prediction.clone()))
+        );
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=theory-full",
+                    "-f",
+                    "color=1d76db",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"theory-full\",\"color\":\"1d76db\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=theory-full",
+                ],
+                gh_ok(),
+            ),
+        ]);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        assert_eq!(rig.job_count(), 0, "the gate holds without theory-full");
+
+        rig.act(predict_with(prediction.clone()));
+
+        let calls = gh_argv(&rig);
+        assert_eq!(
+            calls.len(),
+            4,
+            "one first sight and three writes: {calls:?}"
+        );
+        assert_eq!(calls[1][3], "repos/acme/borsuk/issues/142/comments");
+        let posted = parse_prediction_blocks(calls[1][5].strip_prefix("body=").unwrap());
+        assert_eq!(
+            posted,
+            vec![Prediction::Full(prediction)],
+            "the comment carries the full prediction block"
+        );
+        let Prediction::Full(block) = &posted[0] else {
+            panic!("the block is a full prediction");
+        };
+        assert_eq!(block.kind, "full");
+        assert_eq!(block.slots.len(), 5);
+        assert_eq!(
+            block.slots.iter().map(|slot| slot.tag).collect::<Vec<_>>(),
+            vec![
+                records::PredictionTag::Sure,
+                records::PredictionTag::Sure,
+                records::PredictionTag::Unsure,
+                records::PredictionTag::Sure,
+                records::PredictionTag::Sure,
+            ],
+            "every slot carries its tag"
+        );
+        assert!(
+            calls[2].contains(&"name=theory-full".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls[3].contains(&"labels[]=theory-full".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "the action queues no task; the poll gate does"
+        );
+    }
+
+    /// The `other-areas` slot may name none. A change that reaches no
+    /// other area is an answer, so the empty list posts.
+    #[test]
+    fn a_full_prediction_that_names_no_other_area_still_posts() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let prediction = full_prediction(&[]);
+        let body = format!(
+            "body={}",
+            prediction_block(&Prediction::Full(prediction.clone()))
+        );
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=theory-full",
+                    "-f",
+                    "color=1d76db",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"theory-full\",\"color\":\"1d76db\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=theory-full",
+                ],
+                gh_ok(),
+            ),
+        ]);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+
+        rig.act(predict_with(prediction));
+
+        let calls = gh_argv(&rig);
+        assert_eq!(
+            calls.len(),
+            4,
+            "one first sight and three writes: {calls:?}"
+        );
+        assert!(
+            calls[3].contains(&"labels[]=theory-full".to_string()),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_prediction_over_an_area_with_no_entries_writes_nothing_and_holds_implement() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let before = gh_argv(&rig).len();
+
+        rig.act(predict_with(full_prediction(&["gh"])));
+
+        assert_eq!(
+            gh_argv(&rig).len(),
+            before,
+            "the refusal writes nothing at all"
+        );
+        let result = last_result(&rx);
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(result.message, "area gh has no entries");
+        assert!(result.request.starts_with(PREDICTION_REQUEST));
+        assert_eq!(
+            theory_of(&rig).holds,
+            vec![HoldView {
+                number: 142,
+                reason: "area gh has no entries".to_string(),
+                stage: Stage::Implement,
+            }],
+            "the view keeps the hold"
+        );
+        assert_eq!(rig.job_count(), 0, "the implement gate yields no work");
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/implement-i142"));
+    }
+
+    /// A prediction whose shape no template wrote is refused before any
+    /// post, and the reason names the broken part.
+    #[test]
+    fn a_full_prediction_with_a_broken_shape_is_refused_before_any_post() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let before = gh_argv(&rig).len();
+
+        let mut wrong_kind = full_prediction(&["web-checkout"]);
+        wrong_kind.kind = records::PREDICTION_SHORT.to_string();
+        rig.act(predict_with(wrong_kind));
+
+        assert_eq!(gh_argv(&rig).len(), before, "the refusal writes nothing");
+        assert_eq!(
+            last_result(&rx).message,
+            "the prediction kind is short, not full"
+        );
+
+        let mut missing = full_prediction(&["web-checkout"]);
+        missing.slots.remove(0);
+        rig.act(predict_with(missing));
+
+        assert_eq!(gh_argv(&rig).len(), before, "the refusal writes nothing");
+        assert_eq!(last_result(&rx).message, "slot behaviours is missing");
+    }
+
+    /// An entry id the model does not carry refuses the whole prediction
+    /// and names the slot it sat in.
+    #[test]
+    fn a_full_prediction_over_an_unknown_entry_is_refused_before_any_post() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        let before = gh_argv(&rig).len();
+        let mut prediction = full_prediction(&["web-checkout"]);
+        prediction.slots[2].entries = vec!["nope".to_string()];
+
+        rig.act(predict_with(prediction));
+
+        assert_eq!(gh_argv(&rig).len(), before, "the refusal writes nothing");
+        assert_eq!(
+            last_result(&rx).message,
+            "slot invariants: unknown entry nope"
+        );
+    }
+
+    /// A ticket that carries `theory-full` admits its implement work, and
+    /// the same ticket without it holds with the hint on the board.
+    #[test]
+    fn theory_full_opens_the_implement_gate_of_a_governed_ticket() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // The V7 ticket check runs after this gate, so the body must pass
+        // it for the admission to reach the dispatch.
+        let body = unchecked_ticket_body().replace(
+            "- AC-2 \u{b7} Orders rejects an empty card \u{b7} check: api-orders fast\n",
+            "",
+        );
+
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["refined", THEORY_SHORT_LABEL],
+                &body,
+            )],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 0, "the ticket waits for the full claim");
+        assert_eq!(
+            theory_of(&rig).holds,
+            vec![HoldView {
+                number: 142,
+                reason: gates::AWAITS_FULL_HINT.to_string(),
+                stage: Stage::Implement,
+            }],
+            "the board names the reason"
+        );
+
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                &body,
+            )],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 1, "the label opens the gate");
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert!(theory_of(&rig).holds.is_empty(), "the hold goes away");
+    }
+
+    /// The full prediction is a governor behaviour, so a repository with
+    /// the governor off writes nothing and says why.
+    #[test]
+    fn an_ungoverned_predict_writes_nothing_and_says_why() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(predict_with(full_prediction(&[])));
+
+        assert!(gh_argv(&rig).is_empty(), "the refusal posts nothing");
+        let result = last_result(&rx);
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(result.message, "the theory governor of borsuk is off");
+    }
+
+    #[test]
+    fn an_ungoverned_refine_queues_the_task_itself_and_writes_nothing() {
+        let mut rig = Rig::make(vec![]);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        rig.act(refine_with(None));
+
+        assert!(gh_argv(&rig).is_empty(), "the v0.6 path posts nothing");
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Queued);
+    }
+
+    /// A model that did not parse holds every governed ticket, even one
+    /// that already carries both labels, and the view names the reason.
+    #[test]
+    fn a_model_in_error_holds_a_governed_refine_and_names_the_reason() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        // The two commit reads, then a model that does not parse, then
+        // the skill reads. A broken model never reads the map.
+        let skills = steps.split_off(4);
+        steps.truncate(2);
+        steps.push(git_step(
+            &repo,
+            &["show", "aaa111:theory/model.toml"],
+            CmdOut::ok("[[entry]]\nkind = \"unknown\"\n"),
+        ));
+        steps.extend(skills);
+        steps.push(comment_page_step(142, "[]"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &["to-refine", THEORY_SHORT_LABEL])], vec![]);
+
+        assert_eq!(rig.job_count(), 0, "a broken model holds both labels");
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/refine-i142"),
+            "no refine task exists"
+        );
+        let view = theory_of(&rig);
+        assert!(!view.error.is_empty(), "the view carries the read error");
+        assert_eq!(
+            view.holds,
+            vec![HoldView {
+                number: 142,
+                reason: "model error".to_string(),
+                stage: Stage::Refine,
+            }]
+        );
+    }
+
+    /// A prediction that names no area claims a change of nothing, so
+    /// the daemon writes nothing and says why.
+    #[test]
+    fn a_prediction_that_names_no_area_writes_nothing_and_says_why() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(refine_with(Some(short_prediction(&[]))));
+
+        assert!(gh_argv(&rig).is_empty(), "the refusal writes nothing");
+        let result = last_result(&rx);
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(result.message, "a prediction names at least one area");
+    }
+
+    /// An area name reaches the model through either namespace: the area
+    /// id of the map, or the boundary id the area carries.
+    #[test]
+    fn a_prediction_may_name_a_boundary_of_the_model_instead_of_an_area() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let prediction = short_prediction(&["B-checkout"]);
+        let body = format!(
+            "body={}",
+            prediction_block(&Prediction::Short(prediction.clone()))
+        );
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=theory-short",
+                    "-f",
+                    "color=c5def5",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"theory-short\",\"color\":\"c5def5\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=theory-short",
+                ],
+                gh_ok(),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=to-refine",
+                ],
+                gh_ok(),
+            ),
+        ]);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        rig.act(refine_with(Some(prediction)));
+
+        assert_eq!(
+            gh_argv(&rig).len(),
+            4,
+            "the boundary id passes the area check"
+        );
+        assert_eq!(theory_of(&rig).holds[0].reason, gates::AWAITS_SHORT_HINT);
+    }
+
+    /// A record whose theory label set changed is read once more, because
+    /// the new label names a block the daemon has not seen.
+    #[test]
+    fn a_new_theory_label_on_a_record_fetches_its_comments_again() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(comment_page_step(
+            142,
+            &short_prediction_page("the checkout blocks an empty card", &["web-checkout"]),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &[THEORY_SHORT_LABEL])], vec![]);
+        assert_eq!(gh_argv(&rig).len(), 1);
+        assert!(theory_of(&rig).records["issue-142"].short.is_none());
+
+        rig.poll(
+            vec![issue(142, &[THEORY_SHORT_LABEL, "delta-open"])],
+            vec![],
+        );
+
+        assert_eq!(
+            gh_argv(&rig).len(),
+            2,
+            "the new label reads the record again"
+        );
+        assert_eq!(
+            theory_of(&rig).records["issue-142"]
+                .short
+                .as_ref()
+                .map(|short| short.areas.clone()),
+            Some(vec!["web-checkout".to_string()])
+        );
+    }
+
+    /// A comment fetch that fails leaves the record blocks unknown and
+    /// stops nothing: the same poll still admits the refine work.
+    #[test]
+    fn a_failed_first_sight_fetch_leaves_the_poll_running() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/142/comments?per_page=100",
+            ],
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "gh: could not reach github.com".to_string(),
+            },
+        ));
+        steps.extend(fresh_issue_steps(
+            &repo,
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &["to-refine", THEORY_SHORT_LABEL])], vec![]);
+
+        assert!(
+            !theory_of(&rig).records.contains_key("issue-142"),
+            "a failed read ships no blocks"
+        );
+        assert_eq!(
+            rig.job(0).task,
+            "borsuk/refine-i142",
+            "the gate still fires"
+        );
+    }
+
+    #[test]
+    fn the_first_sight_of_a_theory_label_fetches_the_record_comments_once() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(
+            142,
+            &short_prediction_page("the checkout blocks an empty card", &["web-checkout"]),
+        ));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(fresh_issue_steps(
+            &repo,
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &[THEORY_SHORT_LABEL])], vec![]);
+
+        let view = theory_of(&rig);
+        assert_eq!(
+            view.records["issue-142"]
+                .short
+                .as_ref()
+                .map(|short| short.areas.clone()),
+            Some(vec!["web-checkout".to_string()]),
+            "the first sight ships the prediction areas"
+        );
+        let fetches = gh_argv(&rig).len();
+        assert_eq!(fetches, 1, "one comment page: {fetches}");
+
+        rig.poll(vec![issue(142, &["to-refine", THEORY_SHORT_LABEL])], vec![]);
+
+        assert_eq!(
+            gh_argv(&rig).len(),
+            1,
+            "the next poll of the same label set fetches nothing"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/refine-i142");
     }
 
     // ------------------------------------------------------------------
@@ -23323,8 +24599,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         // the refine dispatch of 142, then the revalidation and the
         // dispatch of 143 in the second poll.
         let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(comment_page_step(142, "[]"));
         steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
         steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(comment_page_step(143, "[]"));
         steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 143), 143, &gitdir));
         let mut rig = Rig::make_in(dir, steps, governed);
         // A prompt override that carries {skills}, so the slice reaches
@@ -23332,7 +24610,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         fs::create_dir_all(&rig.prompts).unwrap();
         fs::write(rig.prompts.join("refine.md"), "skills:\n{skills}\n").unwrap();
 
-        rig.poll(vec![issue(142, &["to-refine", "bug"])], vec![]);
+        rig.poll(
+            vec![issue(142, &["to-refine", "bug", THEORY_SHORT_LABEL])],
+            vec![],
+        );
 
         assert_eq!(rig.job_count(), 1);
         assert!(
@@ -23345,8 +24626,8 @@ surface: api\ndriver: curl\ntier: http\n---\n\
 
         rig.poll(
             vec![
-                issue(142, &["to-refine", "bug"]),
-                issue(143, &["to-refine"]),
+                issue(142, &["to-refine", "bug", THEORY_SHORT_LABEL]),
+                issue(143, &["to-refine", THEORY_SHORT_LABEL]),
             ],
             vec![],
         );
@@ -23449,12 +24730,20 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let gitdir = rig_gitdir(&dir);
         let body = unchecked_ticket_body();
         let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
         steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
         steps.extend(commit_steps(&repo, "aaa111"));
         steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
         let mut rig = Rig::make_in(dir, steps, governed);
 
-        rig.poll(vec![issue_with_body(142, &["refined"], &body)], vec![]);
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                &body,
+            )],
+            vec![],
+        );
 
         assert_eq!(
             rig.job_count(),
@@ -23471,7 +24760,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .iter()
             .filter(|call| call.program == "gh")
             .count();
-        assert_eq!(posted, 2, "one finding comment and one label: {posted}");
+        assert_eq!(
+            posted, 3,
+            "one first sight, one finding comment, one label: {posted}"
+        );
         assert!(
             rig.exec.calls().iter().any(|call| {
                 call.program == "gh"
@@ -23489,7 +24781,16 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
 
         rig.poll(
-            vec![issue_with_body(142, &["refined", "to-refine"], &body)],
+            vec![issue_with_body(
+                142,
+                &[
+                    "refined",
+                    "to-refine",
+                    THEORY_SHORT_LABEL,
+                    THEORY_FULL_LABEL,
+                ],
+                &body,
+            )],
             vec![],
         );
 
@@ -23569,12 +24870,13 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let gitdir = rig_gitdir(&dir);
         let body = unchecked_ticket_body();
         let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
         steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
         steps.extend(commit_steps(&repo, "aaa111"));
         let mut rig = Rig::make_in(dir, steps, governed);
 
         rig.poll(
-            vec![issue_with_body(142, &["refined"], &body)],
+            vec![issue_with_body(142, &["refined", THEORY_FULL_LABEL], &body)],
             vec![linked_pr(7, 142)],
         );
 
@@ -23585,7 +24887,9 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
         assert_eq!(rig.job(0).task, "borsuk/implement-i142");
         assert!(
-            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            gh_argv(&rig)
+                .iter()
+                .all(|argv| !argv.iter().any(|arg| arg == "POST")),
             "the check posts no comment and no label"
         );
     }
@@ -23599,9 +24903,22 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let repo = rig_repo(&dir);
         let gitdir = rig_gitdir(&dir);
         let body = unchecked_ticket_body();
-        let refined = || issue_with_body(142, &["refined"], &body);
-        let refining = || issue_with_body(142, &["refined", "to-refine"], &body);
+        let labels: [&str; 3] = ["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL];
+        let refined = || issue_with_body(142, &labels, &body);
+        let refining = || {
+            issue_with_body(
+                142,
+                &[
+                    "refined",
+                    "to-refine",
+                    THEORY_SHORT_LABEL,
+                    THEORY_FULL_LABEL,
+                ],
+                &body,
+            )
+        };
         let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
         steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
         steps.extend(commit_steps(&repo, "aaa111"));
         steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
@@ -23629,7 +24946,16 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
         rig.poll(vec![refined()], vec![]);
         rig.poll(
-            vec![issue_with_body(142, &["refined", "needs-human"], &body)],
+            vec![issue_with_body(
+                142,
+                &[
+                    "refined",
+                    "needs-human",
+                    THEORY_SHORT_LABEL,
+                    THEORY_FULL_LABEL,
+                ],
+                &body,
+            )],
             vec![],
         );
 
