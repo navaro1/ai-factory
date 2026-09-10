@@ -75,21 +75,14 @@ impl From<TaskBindingFile> for TaskBinding {
     }
 }
 
-impl From<TaskBinding> for TaskBindingFile {
-    fn from(binding: TaskBinding) -> Self {
-        TaskBindingFile::Bound {
-            role: binding.role,
-            model_commit: binding.model_commit,
-        }
-    }
-}
-
-/// The on-disk value of one role binding.
+/// The read shape of one role binding in `state.json`.
 ///
 /// A file written before C5 holds the resolved settings bare. A file
-/// written after wraps them and adds the model commit. The untagged order
-/// tries the wrapped shape first; a bare value fails it, because its
-/// `role` field holds a role name, not an object, and still loads.
+/// written after wraps them and adds the model commit. `TaskBinding`
+/// always writes the wrapped shape; `TaskBindingFile` exists for the read
+/// only. The untagged order tries the wrapped shape first. A bare value
+/// fails it, because its `role` field holds a role name, not an object.
+/// The bare value then loads as `Bare`, with `model_commit = None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum TaskBindingFile {

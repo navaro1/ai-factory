@@ -7397,9 +7397,8 @@ impl Daemon {
             return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
         }
         let role = Self::execution_role(task);
-        let name = prompts::file_name(role)
-            .ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
-        let builtin = prompts::builtin(role)
+        let (name, builtin) = prompts::file_name(role)
+            .zip(prompts::builtin(role))
             .ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
         let template = self.prompt_template(name, builtin)?;
         // A crash between the write and the rename can leave a blank file.
