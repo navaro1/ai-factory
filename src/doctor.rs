@@ -19,10 +19,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 use aif::config::{parse_owner_repo, Config, ExecutionRole, Harness, RepoConfig};
+use aif::daemon::SKILLS_DIR;
 use aif::exec::Exec;
-use aif::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
+use aif::routing::{model_family, ComplexityLevel, TagRouteKey, TagRouteStage};
 use aif::sched::{self, Limits};
 use aif::sock::{Client, PauseScope, PausedView, Push};
+use aif::theory::model;
+use aif::theory::skills::{self, SkillSet};
+use aif::theory::verify::VerifyMap;
 use aif::worktree::{Cleanable, WorktreeKind, WorktreeManager, WORKTREE_KINDS};
 
 /// The oldest claude version the factory accepts.
@@ -190,6 +194,8 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             });
             let facts = repo_facts(env.exec, &config);
             checks.extend(repo_checks(&config, &facts));
+            checks.extend(theory_checks(&config));
+            checks.extend(skill_checks(&config));
             checks.extend(tool_checks(env.exec, Some(&config)));
             checks.push(gh_auth_check(env.exec));
             checks.extend(usage_curl_check(env.exec, &config));
@@ -1272,6 +1278,191 @@ fn repo_checks(
         });
     }
     checks
+}
+
+/// The theory governor lines of the report.
+///
+/// One Warn names a repository whose governor is off. One Fail names a
+/// governed theory checkout that is not a git repository, because the
+/// records need Git there. A repository with the governor off gets no
+/// other theory line: v0.6 behaviour holds for it.
+fn theory_checks(config: &Config) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for repo in config.repos.values() {
+        if !repo.theory.governor.is_on() {
+            checks.push(Check {
+                label: format!("theory {}", repo.alias),
+                status: Status::Warn,
+                detail: "the theory governor is off".to_string(),
+            });
+            continue;
+        }
+        let checkout = repo.theory.checkout(&repo.path);
+        if !checkout.join(".git").exists() {
+            checks.push(Check {
+                label: format!("theory {}", repo.alias),
+                status: Status::Fail,
+                detail: format!("{} is not a git repository", checkout.display()),
+            });
+        }
+    }
+    checks
+}
+
+/// The run skill lines of the report for every governed repository.
+///
+/// One line names the tier of every surface of the skills checkout, or
+/// `missing` when the checkout holds no skill file. One Warn per lint
+/// finding. One Warn per area whose `min_tier` is above the tier of every
+/// surface that maps to it. One Warn per complexity level whose implement
+/// route and review route resolve to the same model family, because one
+/// family reviews its own work. A repository with the governor off gets
+/// no line: v0.6 behaviour holds for it.
+fn skill_checks(config: &Config) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for repo in config.repos.values() {
+        if !repo.theory.governor.is_on() {
+            continue;
+        }
+        let files = read_skill_files(&repo.skills_checkout());
+        if files.is_empty() {
+            checks.push(Check {
+                label: "run skill".to_string(),
+                status: Status::Info,
+                detail: format!("{}: missing", repo.alias),
+            });
+        } else {
+            let set = SkillSet::from_files(
+                files
+                    .iter()
+                    .map(|(path, text)| (path.as_str(), text.as_str())),
+            );
+            let verify = read_verify_map(&repo.theory.checkout(&repo.path));
+            for (surface, skill) in &set.surfaces {
+                checks.push(Check {
+                    label: "run skill".to_string(),
+                    status: Status::Info,
+                    detail: format!("{}/{surface}: {}", repo.alias, skill.tier),
+                });
+            }
+            for finding in skills::lint(&set, &verify) {
+                let surface = &finding.surface;
+                checks.push(Check {
+                    label: "run skill".to_string(),
+                    status: Status::Warn,
+                    detail: format!("{alias}/{surface}: lint: {finding}", alias = repo.alias),
+                });
+            }
+            for area in &verify.areas {
+                let reach = skills::area_tier(&area.id, &verify, &set);
+                if area.min_tier > reach {
+                    checks.push(Check {
+                        label: format!("area {}/{}", repo.alias, area.id),
+                        status: Status::Warn,
+                        detail: format!("floor {} above the reach {reach}", area.min_tier),
+                    });
+                }
+            }
+        }
+        checks.extend(route_family_checks(config, repo));
+    }
+    checks
+}
+
+/// One Warn per complexity level whose implement and review routes
+/// resolve to the same model family.
+fn route_family_checks(config: &Config, repo: &RepoConfig) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for level in ComplexityLevel::ALL {
+        let route = |stage| {
+            config
+                .resolved_tag_route(Some(&repo.alias), TagRouteKey::new(stage, level))
+                .ok()
+                .map(|resolved| resolved.settings.model)
+        };
+        let (Some(implement), Some(review)) = (
+            route(TagRouteStage::Implement),
+            route(TagRouteStage::Review),
+        ) else {
+            continue;
+        };
+        if model_family(&implement) == model_family(&review) {
+            checks.push(Check {
+                label: format!("route {} {level}", repo.alias),
+                status: Status::Warn,
+                detail: format!(
+                    "implement {implement} and review {review} share the model family {}",
+                    model_family(&implement)
+                ),
+            });
+        }
+    }
+    checks
+}
+
+/// Every run skill file of one skills checkout, as `(tree path, text)`
+/// pairs.
+///
+/// The tree paths are the ones the daemon lists at a commit, so the
+/// parser sees the same names. Only `SKILL.md` and the direct markdown
+/// children of `features/` are read, because that is what the parser
+/// accepts. A checkout without `.claude/skills/` yields nothing.
+fn read_skill_files(checkout: &Path) -> Vec<(String, String)> {
+    let root = checkout.join(SKILLS_DIR);
+    let Ok(surfaces) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut directories: Vec<String> = surfaces
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("run-"))
+        .collect();
+    directories.sort();
+    let mut files = Vec::new();
+    for directory in directories {
+        let read = |name: String| {
+            fs::read_to_string(checkout.join(&name))
+                .ok()
+                .map(|text| (name, text))
+        };
+        if let Some(pair) = read(format!("{SKILLS_DIR}{directory}/SKILL.md")) {
+            files.push(pair);
+        }
+        let Ok(entries) = fs::read_dir(root.join(&directory).join("features")) else {
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".md"))
+            .collect();
+        names.sort();
+        for name in names {
+            if let Some(pair) = read(format!("{SKILLS_DIR}{directory}/features/{name}")) {
+                files.push(pair);
+            }
+        }
+    }
+    files
+}
+
+/// The verification map of one theory checkout, from the working tree.
+///
+/// A missing file or a parse error is an empty map, the way the daemon
+/// treats one, so the report still prints every line it can read.
+fn read_verify_map(checkout: &Path) -> VerifyMap {
+    let Ok(text) = fs::read_to_string(checkout.join("theory/model.toml")) else {
+        return VerifyMap::default();
+    };
+    let Ok(parsed) = model::parse(&text) else {
+        return VerifyMap::default();
+    };
+    let Ok(text) = fs::read_to_string(checkout.join("theory/verify.toml")) else {
+        return VerifyMap::default();
+    };
+    VerifyMap::parse(&text, &parsed).unwrap_or_default()
 }
 
 /// The worktrees the manager owns under `dir`: one `(kind, number, path)`
@@ -3790,6 +3981,250 @@ mod tests {
             Some(std::ffi::OsStr::new("aifd")),
             "program: {}",
             program.display()
+        );
+    }
+
+    // --- Theory and run skill lines. ---
+
+    const BOUNDARY_MODEL: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"t\"\n",
+        "statement = \"s\"\nsides = [\"in\", \"out\"]\npaths = [\"web/**\"]\n",
+    );
+
+    #[test]
+    fn theory_checks_warn_a_governor_off_repository_and_fail_a_missing_git_checkout() {
+        let dir = temp_dir("theory-checks");
+        let checkout = dir.join("repo");
+        fs::create_dir_all(checkout.join(".git")).expect("the fake checkout must be creatable");
+        let text = config_text(
+            &[],
+            &format!(
+                "[repo.onrepo]\npath = \"{}\"\n\
+                 [repo.offrepo]\npath = \"/nowhere\"\ngovernor = \"off\"\n",
+                checkout.display()
+            ),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = theory_checks(&config);
+
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].label, "theory offrepo");
+        assert_eq!(checks[0].status, Status::Warn);
+        assert_eq!(checks[0].detail, "the theory governor is off");
+
+        let config = Config::parse(&config_text(
+            &[],
+            "[repo.onrepo]\npath = \"/nowhere/theory-checks\"\n",
+        ))
+        .expect("the config must parse");
+
+        let checks = theory_checks(&config);
+
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].label, "theory onrepo");
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(
+            checks[0].detail.contains("is not a git repository"),
+            "detail: {}",
+            checks[0].detail
+        );
+        assert!(has_failures(&checks));
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn skill_checks_name_the_tier_of_every_surface() {
+        let dir = temp_dir("skill-tiers");
+        let checkout = dir.join("repo");
+        let skills = checkout.join(".claude/skills/run-web");
+        fs::create_dir_all(&skills).expect("the skills directory must be creatable");
+        fs::write(
+            skills.join("SKILL.md"),
+            "---\nname: run-web\ndescription: d\nsurface: web\n\
+             driver: playwright-cli\ntier: browser\n---\n",
+        )
+        .expect("the skill file must be writable");
+        let text = config_text(
+            &[],
+            &format!("[repo.borsuk]\npath = \"{}\"\n", checkout.display()),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = skill_checks(&config);
+
+        let lines: Vec<_> = checks
+            .iter()
+            .filter(|check| check.label == "run skill")
+            .collect();
+        assert_eq!(lines.len(), 1, "checks: {checks:?}");
+        assert_eq!(lines[0].status, Status::Info);
+        assert_eq!(lines[0].detail, "borsuk/web: browser");
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn skill_checks_print_missing_and_skip_an_ungoverned_repository() {
+        let text = config_text(
+            &[],
+            "[repo.borsuk]\npath = \"/nowhere/skill-missing\"\n\
+             [repo.quiet]\npath = \"/nowhere/quiet\"\ngovernor = \"off\"\n",
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = skill_checks(&config);
+
+        let lines: Vec<_> = checks
+            .iter()
+            .filter(|check| check.label == "run skill")
+            .collect();
+        assert_eq!(lines.len(), 1, "checks: {checks:?}");
+        assert_eq!(lines[0].status, Status::Info);
+        assert_eq!(lines[0].detail, "borsuk: missing");
+        // The built-in routes put one family on both pipeline stages of
+        // every level, so each governed level warns.
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|check| check.label.starts_with("route "))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn skill_checks_print_one_line_per_lint_finding() {
+        let dir = temp_dir("skill-lint");
+        let checkout = dir.join("repo");
+        let skills = checkout.join(".claude/skills/run-web");
+        fs::create_dir_all(skills.join("features")).expect("the skill tree must be creatable");
+        fs::write(
+            skills.join("SKILL.md"),
+            "---\nname: run-web\ndescription: d\nsurface: web\n\
+             driver: playwright-cli\ntier: browser\n---\n",
+        )
+        .expect("the skill file must be writable");
+        fs::write(
+            skills.join("features").join("checkout.md"),
+            "---\narea: nope\n---\n",
+        )
+        .expect("the feature file must be writable");
+        let text = config_text(
+            &[],
+            &format!("[repo.borsuk]\npath = \"{}\"\n", checkout.display()),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = skill_checks(&config);
+
+        let findings: Vec<_> = checks
+            .iter()
+            .filter(|check| check.label == "run skill" && check.status == Status::Warn)
+            .collect();
+        assert_eq!(findings.len(), 1, "checks: {checks:?}");
+        assert_eq!(
+            findings[0].detail,
+            "borsuk/web: lint: features/checkout.md: area nope unknown"
+        );
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn skill_checks_warn_when_an_area_floor_is_above_every_surface_reach() {
+        let dir = temp_dir("skill-floor");
+        let checkout = dir.join("repo");
+        let skills = checkout.join(".claude/skills/run-api");
+        fs::create_dir_all(&skills).expect("the skills directory must be creatable");
+        fs::write(
+            skills.join("SKILL.md"),
+            "---\nname: run-api\ndescription: d\nsurface: api\n\
+             driver: curl\ntier: http\n---\n",
+        )
+        .expect("the skill file must be writable");
+        fs::create_dir_all(checkout.join("theory")).expect("the theory dir must be creatable");
+        fs::write(checkout.join("theory/model.toml"), BOUNDARY_MODEL)
+            .expect("the model file must be writable");
+        let map = |min_tier: &str| {
+            format!(
+                "[[area]]\nid = \"web-checkout\"\nboundary = \"B-checkout\"\n\
+                 statement = \"s\"\nskills = [\"run-api\"]\nmin_tier = \"{min_tier}\"\n"
+            )
+        };
+        fs::write(checkout.join("theory/verify.toml"), map("browser"))
+            .expect("the map file must be writable");
+        let text = config_text(
+            &[],
+            &format!("[repo.borsuk]\npath = \"{}\"\n", checkout.display()),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = skill_checks(&config);
+
+        let floors: Vec<_> = checks
+            .iter()
+            .filter(|check| check.label.starts_with("area "))
+            .collect();
+        assert_eq!(floors.len(), 1, "checks: {checks:?}");
+        assert_eq!(floors[0].label, "area borsuk/web-checkout");
+        assert_eq!(floors[0].status, Status::Warn);
+        assert_eq!(floors[0].detail, "floor browser above the reach http");
+
+        // A floor the one surface reaches warns nowhere.
+        fs::write(checkout.join("theory/verify.toml"), map("http"))
+            .expect("the map file must be writable");
+
+        let checks = skill_checks(&config);
+
+        assert!(
+            !checks.iter().any(|check| check.label.starts_with("area ")),
+            "checks: {checks:?}"
+        );
+        fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+    }
+
+    #[test]
+    fn skill_checks_warn_when_implement_and_review_share_one_model_family() {
+        let routes = "[tag_routes.implement.low]\nmodel = \"claude-opus-5\"\n\
+                      [tag_routes.review.low]\nmodel = \"gpt-5.6-sol\"\n\
+                      [tag_routes.implement.medium]\nmodel = \"claude-opus-5\"\n\
+                      [tag_routes.review.medium]\nmodel = \"gpt-5.6-sol\"\n\
+                      [tag_routes.implement.high]\nmodel = \"claude-opus-5\"\n\
+                      [tag_routes.review.high]\nmodel = \"claude-fable-5-1\"\n\
+                      [tag_routes.implement.very-high]\nmodel = \"claude-opus-5\"\n\
+                      [tag_routes.review.very-high]\nmodel = \"gpt-5.6-sol\"\n";
+        let parse = |routes: &str| {
+            Config::parse(&config_text(
+                &[],
+                &format!("[repo.borsuk]\npath = \"/nowhere\"\n{routes}"),
+            ))
+            .expect("the config must parse")
+        };
+
+        let checks = skill_checks(&parse(routes));
+
+        let families: Vec<_> = checks
+            .iter()
+            .filter(|check| check.label.starts_with("route "))
+            .collect();
+        assert_eq!(families.len(), 1, "checks: {checks:?}");
+        assert_eq!(families[0].label, "route borsuk high");
+        assert!(
+            families[0].detail.contains("claude-opus-5"),
+            "detail: {}",
+            families[0].detail
+        );
+        assert!(
+            families[0].detail.contains("claude-fable-5-1"),
+            "detail: {}",
+            families[0].detail
+        );
+
+        // A review outside the implement family warns nowhere.
+        let checks = skill_checks(&parse(&routes.replace("claude-fable-5-1", "gpt-5.6-sol")));
+
+        assert!(
+            !checks.iter().any(|check| check.label.starts_with("route ")),
+            "checks: {checks:?}"
         );
     }
 }
