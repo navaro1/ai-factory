@@ -731,6 +731,44 @@ Put valid JSON between the markers. Do not quote a block. Do not put a
 block in a code fence. Write no text after the last closing marker.
 "#;
 
+/// The built-in prompt of one card grading.
+///
+/// The audit role reads the card, the answer of the operator, and the
+/// subject the card names: the diff of the merged pull request, or the
+/// model entry. It grades the answer against the subject and ends the
+/// turn with one event block per gap. A correct answer ends with no
+/// block, so a pass opens no theory event.
+pub const AUDIT_CARD_PROMPT: &str = r#"You grade one card answer of the operator
+of the repository {repo}. You work in {worktree}, the repository checkout.
+Read the files you need. Change no file.
+
+The card
+
+{card}
+
+The answer of the operator
+
+{answer}
+
+The subject
+
+{subject}
+
+Compare the answer against the subject. A claim the subject contradicts is a
+gap. A part of the subject the answer misses is a gap. A claim the subject
+supports is a hit.
+
+End the turn with one block per gap. An answer with no gap ends with no
+block. Each block takes this form.
+
+<aif-event-v1>
+{"kind":"card","text":"One sentence on the gap.","area":"area id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
 /// The built-in prompt of one bootstrap chat.
 ///
 /// The operator dictates a stream of memory about one area, and the agent
@@ -1247,6 +1285,31 @@ mod tests {
         assert!(filled.contains(
             r#"{"kind":"skill-drift","text":"The dead paths and the dead handles.","surface":"surface id"}"#
         ), "the drift block stays literal:\n{filled}");
+    }
+
+    #[test]
+    fn the_audit_card_prompt_names_exactly_its_five_placeholders() {
+        assert_eq!(
+            scan_placeholders(AUDIT_CARD_PROMPT),
+            vec!["repo", "worktree", "card", "answer", "subject"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(AUDIT_CARD_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(AUDIT_CARD_PROMPT, &values).expect("the card prompt fills");
+        assert!(filled.contains("<card>"));
+        assert!(filled.contains("<answer>"));
+        assert!(filled.contains("<subject>"));
+        assert!(
+            filled
+                .contains(r#"{"kind":"card","text":"One sentence on the gap.","area":"area id"}"#),
+            "the card block stays literal:\n{filled}"
+        );
+        assert!(
+            filled.contains("An answer with no gap ends with no\nblock."),
+            "the prompt says a pass opens no event:\n{filled}"
+        );
     }
 
     #[test]

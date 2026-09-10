@@ -72,6 +72,12 @@ pub struct RecordRow {
     pub labels: Vec<String>,
     /// Whether the row is a pull request.
     pub pull_request: bool,
+    /// The merge moment of a merged pull request, as GitHub reports it.
+    /// `None` for an issue and for a pull request that never merged.
+    pub merged_at: Option<String>,
+    /// The body of the record, empty when the row carries none. A pull
+    /// request body names the tickets the merge closes.
+    pub body: String,
 }
 
 /// One comment page with the ETag the next call sends back.
@@ -177,6 +183,24 @@ impl<'a> GhClient<'a> {
             pull_pages: BTreeMap::new(),
             comment_pages: BTreeMap::new(),
         }
+    }
+
+    /// The GitHub login of the account the `gh` CLI runs as.
+    ///
+    /// One call answers `gh api user`. The caller caches the answer, so
+    /// the login costs one call per daemon run.
+    pub fn viewer_login(&self) -> Result<String> {
+        let out = self
+            .exec
+            .run("gh", &["api", "user"], None)
+            .context("gh api user failed to run")?;
+        if out.status != 0 {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            bail!("gh api user exited with status {}: {detail}", out.status);
+        }
+        let body: Value =
+            serde_json::from_str(&out.stdout).context("gh api user returned a broken body")?;
+        Ok(str_field(&body, "login")?.to_string())
     }
 
     /// Fetch the open issues of `owner_repo` and follow pagination.
@@ -957,6 +981,15 @@ fn record_row_from_value(value: &Value) -> Result<RecordRow> {
         number: u64_field(value, "number")?,
         labels: label_names(value)?,
         pull_request: value.get("pull_request").is_some(),
+        merged_at: value
+            .pointer("/pull_request/merged_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -2202,8 +2235,67 @@ mod tests {
         assert_eq!(rows[99].number, 99);
         assert_eq!(rows[100].number, 100);
         assert!(rows[100].pull_request);
+        assert_eq!(
+            rows[100].merged_at, None,
+            "an open pull request never merged"
+        );
         let calls = exec.calls();
         assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn a_record_row_reports_the_merge_moment_of_a_merged_pull_request() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response(
+                "HTTP/2 200",
+                &[],
+                "[{\"number\":7,\"state\":\"closed\",\"labels\":[],\
+                 \"body\":\"Closes #142\",\
+                 \"pull_request\":{\"merged_at\":\"2026-09-10T10:00:00Z\"}},\
+                 {\"number\":9,\"state\":\"closed\",\"labels\":[],\"body\":null,\
+                 \"pull_request\":{\"merged_at\":null}}]",
+            )),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let rows = client
+            .fetch_record_rows("acme/borsuk", "2026-08-11T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(rows[0].merged_at.as_deref(), Some("2026-09-10T10:00:00Z"));
+        assert_eq!(rows[0].body, "Closes #142", "the body names the ticket");
+        assert_eq!(
+            rows[1].merged_at, None,
+            "a closed pull request never merged"
+        );
+        assert_eq!(rows[1].body, "", "a null body reads as no body");
+    }
+
+    #[test]
+    fn the_viewer_login_names_the_account_the_cli_runs_as() {
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "user"]),
+            CmdOut::ok("{\"login\":\"piotr\",\"id\":42}"),
+        );
+
+        assert_eq!(
+            GhClient::new(&exec).viewer_login().unwrap(),
+            "piotr".to_string()
+        );
+
+        let broken = ScriptExec::new().expect(gh(&["api", "user"]), CmdOut::ok("{\"id\":42}"));
+        let error = GhClient::new(&broken).viewer_login().unwrap_err();
+        assert!(
+            error.to_string().contains("login"),
+            "the error names the missing field: {error}"
+        );
     }
 
     #[test]

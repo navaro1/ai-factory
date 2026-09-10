@@ -41,6 +41,7 @@ use crate::sched::{Limits, Paused};
 use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
 use crate::theory::answers::AnswerBlock;
+use crate::theory::cards::CardView;
 use crate::theory::model::Model;
 use crate::theory::records::{DeltaBlock, Event, FullPrediction, ShortPrediction};
 #[cfg(test)]
@@ -188,6 +189,10 @@ pub struct TheoryView {
     /// no gauge.
     #[serde(default)]
     pub window: (usize, usize),
+    /// The cards of the day, in batch order. The daily sweep builds them
+    /// and a restart drops them until the next sweep.
+    #[serde(default)]
+    pub cards: Vec<CardView>,
 }
 
 /// Whether one delta still waits for the operator.
@@ -3023,6 +3028,12 @@ mod tests {
                 rungs: [2, 5, 3],
                 events_per_day: 4,
                 stale_entries: vec!["INV-9".to_string()],
+                cards: vec![CardView {
+                    source: crate::theory::cards::MERGED_PR_SOURCE.to_string(),
+                    prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+                    number: Some(7),
+                    entry: None,
+                }],
             },
         );
         let view = StateView {

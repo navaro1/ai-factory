@@ -77,12 +77,34 @@ impl TeachKey {
     }
 }
 
+/// What one card asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardKey {
+    /// One merged pull request.
+    Pr(u64),
+    /// One model entry.
+    Entry(String),
+}
+
+impl CardKey {
+    /// The id fragment of one key: `7` or `INV-9`.
+    pub fn slug(&self) -> String {
+        match self {
+            CardKey::Pr(number) => number.to_string(),
+            CardKey::Entry(id) => id.clone(),
+        }
+    }
+}
+
 /// Which audit one audit task runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditJob {
     /// The drift sweep over every model entry and every run skill.
     Sweep,
+    /// The grading of one answered card.
+    Card(CardKey),
 }
 
 /// The workflow purpose of one task.
@@ -243,10 +265,12 @@ pub fn bootstrap_id(repo: &str, area: &str) -> String {
     format!("{repo}/bootstrap-{area}")
 }
 
-/// The task id for one audit task: `<repo>/audit-sweep`.
+/// The task id for one audit task: `<repo>/audit-sweep` or
+/// `<repo>/audit-card-<key>`.
 pub fn audit_id(repo: &str, job: &AuditJob) -> String {
     match job {
         AuditJob::Sweep => format!("{repo}/audit-sweep"),
+        AuditJob::Card(key) => format!("{repo}/audit-card-{}", key.slug()),
     }
 }
 
@@ -677,6 +701,17 @@ mod tests {
     #[test]
     fn an_audit_id_names_the_sweep() {
         assert_eq!(audit_id("borsuk", &AuditJob::Sweep), "borsuk/audit-sweep");
+        assert_eq!(
+            audit_id("borsuk", &AuditJob::Card(CardKey::Pr(7))),
+            "borsuk/audit-card-7"
+        );
+        assert_eq!(
+            audit_id(
+                "borsuk",
+                &AuditJob::Card(CardKey::Entry("INV-9".to_string()))
+            ),
+            "borsuk/audit-card-INV-9"
+        );
     }
 
     #[test]
