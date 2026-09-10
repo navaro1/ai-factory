@@ -187,6 +187,17 @@ pub enum SettingsEdit {
         /// The partial override. `None` restores the global route.
         settings: Option<RoleOverride>,
     },
+    /// Write label names in one scope.
+    ///
+    /// One save carries every key the operator changed. A `None` value
+    /// removes that key, so the global table falls back to the built-in
+    /// default and a repository table falls back to the global name.
+    Labels {
+        /// The repository alias, or `None` for the global `[labels]` table.
+        repository: Option<String>,
+        /// Each key to write, with its new name or `None` to remove it.
+        names: BTreeMap<LabelKey, Option<String>>,
+    },
     /// Insert one repository with a single `path` key.
     AddRepository {
         /// The repository alias.
@@ -1882,6 +1893,48 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
                 write_role_override(table, settings);
             } else {
                 remove_repository_tag_route(&mut document, repository, *key)?;
+            }
+        }
+        SettingsEdit::Labels { repository, names } => {
+            let table = match repository {
+                None => ensure_table(document.as_table_mut(), "labels", "labels")?,
+                Some(alias) => {
+                    if !valid_alias(alias) {
+                        bail!("repo.\"{alias}\": alias must match [a-z0-9._-]+");
+                    }
+                    let repo = document
+                        .get_mut("repo")
+                        .and_then(toml_edit::Item::as_table_mut)
+                        .and_then(|repos| repos.get_mut(alias))
+                        .and_then(toml_edit::Item::as_table_mut)
+                        .ok_or_else(|| anyhow!("repo.{alias}: no configured repository"))?;
+                    ensure_table(repo, "labels", &format!("repo.{alias}.labels"))?
+                }
+            };
+            for (key, name) in names {
+                match name {
+                    Some(name) => set_string(table, key.as_str(), Some(name)),
+                    None => {
+                        table.remove(key.as_str());
+                    }
+                }
+            }
+            if table.is_empty() {
+                match repository {
+                    None => {
+                        document.as_table_mut().remove("labels");
+                    }
+                    Some(alias) => {
+                        if let Some(repo) = document
+                            .get_mut("repo")
+                            .and_then(toml_edit::Item::as_table_mut)
+                            .and_then(|repos| repos.get_mut(alias))
+                            .and_then(toml_edit::Item::as_table_mut)
+                        {
+                            repo.remove("labels");
+                        }
+                    }
+                }
             }
         }
         SettingsEdit::AddRepository { alias, path } => {
