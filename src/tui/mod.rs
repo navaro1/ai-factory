@@ -1625,7 +1625,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("?", "toggle this help"),
         ("ctrl-q", "quit"),
         ("+ -", "stage limit / repo lane"),
-        ("p P", "pause selected / all"),
+        ("p P", "predict or pause / pause all"),
         ("r n", "refine / new ticket"),
         ("x R", "abort / retry"),
         ("space", "toggle the selected PR"),

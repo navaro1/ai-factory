@@ -14,7 +14,7 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 
 /// The parsed theory model of one repository.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
     pub entries: Vec<Entry>,
 }

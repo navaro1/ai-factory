@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::contract::{self, ContractContext, Finding};
+use super::model::{Entry, Model};
 use crate::config::Config;
 use crate::model::{RepoSnapshot, Snapshot};
 
@@ -22,6 +23,9 @@ pub const THEORY_SHORT_LABEL: &str = "theory-short";
 pub const THEORY_SHORT_COLOR: &str = "c5def5";
 /// The label that marks a ticket with an accepted full prediction.
 pub const THEORY_FULL_LABEL: &str = "theory-full";
+
+/// The color GitHub renders `theory-full` with, as six hex digits.
+pub const THEORY_FULL_COLOR: &str = "1d76db";
 /// The label that marks a record with an open delta.
 pub const DELTA_OPEN_LABEL: &str = "delta-open";
 /// The label that marks a record with an open theory event.
@@ -194,6 +198,15 @@ pub const PREDICTION_SLOT_NAMES: [&str; 5] = [
     "other-areas",
 ];
 
+/// The index of the slot that names areas instead of entries.
+const OTHER_AREAS_SLOT: usize = 4;
+
+/// The slot whose entries name model areas, not model entries.
+pub const PREDICTION_OTHER_AREAS: &str = PREDICTION_SLOT_NAMES[OTHER_AREAS_SLOT];
+
+/// The entry kind each slot draws its candidates from, in slot order.
+const SLOT_KINDS: [&str; 5] = ["transition", "state", "invariant", "failure", "boundary"];
+
 /// The confidence tag of one prediction slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -305,6 +318,141 @@ fn scan_block_bodies<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
         rest = &after_open[end + close.len()..];
     }
     bodies
+}
+
+/// The refusal reason of one area the model does not cover.
+pub fn no_entries(area: &str) -> String {
+    format!("area {area} has no entries")
+}
+
+/// True when one refusal reason names an area with no entries.
+///
+/// The Theory view offers the bootstrap action on such a hold alone,
+/// because bootstrapping fixes nothing else.
+pub fn names_empty_area(reason: &str) -> bool {
+    reason.starts_with("area ") && reason.ends_with(" has no entries")
+}
+
+/// The template of one full prediction, for the areas of the short one.
+///
+/// The file holds one table per slot of [`PREDICTION_SLOT_NAMES`], each
+/// with an empty entry list and the `unsure` tag. A comment line above
+/// each table lists the candidate entry ids, so the operator picks from
+/// the model instead of recalling ids. The comment is a hint, never a
+/// bound: [`parse_full`] takes any entry of the model.
+pub fn full_template(areas: &[String], model: &Model) -> String {
+    let mut blocks = Vec::with_capacity(PREDICTION_SLOT_NAMES.len());
+    for (slot, name) in PREDICTION_SLOT_NAMES.iter().enumerate() {
+        let ids = candidates(slot, model, areas);
+        let list = if ids.is_empty() {
+            "none".to_string()
+        } else {
+            ids.join(", ")
+        };
+        blocks.push(format!(
+            "# candidates: {list}\n[{name}]\nentries = []\ntag = \"unsure\"\n"
+        ));
+    }
+    blocks.join("\n")
+}
+
+/// The candidate entry ids of one slot, in model order.
+///
+/// The first four slots take the entries of the named areas that carry
+/// the slot's kind. The `other-areas` slot takes every boundary the areas
+/// leave out, because that slot names areas the change can reach.
+fn candidates(slot: usize, model: &Model, areas: &[String]) -> Vec<String> {
+    let names = area_names(model, areas);
+    model
+        .entries
+        .iter()
+        .filter(|entry| entry.kind_name() == SLOT_KINDS[slot])
+        .filter(|entry| {
+            if slot == OTHER_AREAS_SLOT {
+                return !areas.iter().any(|area| area == entry.id());
+            }
+            names.contains(entry.id()) || relations(entry).iter().any(|name| names.contains(name))
+        })
+        .map(|entry| entry.id().to_string())
+        .collect()
+}
+
+/// The names one set of areas covers: each area and the sides of its
+/// boundary entry.
+///
+/// A state names no boundary and a transition names no boundary either,
+/// so the sides carry the area down to the states it separates and to the
+/// transitions between them.
+fn area_names<'a>(model: &'a Model, areas: &'a [String]) -> BTreeSet<&'a str> {
+    let mut names: BTreeSet<&str> = areas.iter().map(String::as_str).collect();
+    for entry in &model.entries {
+        if let Entry::Boundary { id, sides, .. } = entry {
+            if areas.iter().any(|area| area == id) {
+                names.extend(sides.iter().map(String::as_str));
+            }
+        }
+    }
+    names
+}
+
+/// What the relation fields of one entry point at.
+fn relations(entry: &Entry) -> Vec<&str> {
+    match entry {
+        Entry::Invariant { constrains, .. } => constrains.iter().map(String::as_str).collect(),
+        Entry::State { .. } => Vec::new(),
+        Entry::Transition { from, to, .. } => vec![from.as_str(), to.as_str()],
+        Entry::Boundary { sides, .. } => sides.iter().map(String::as_str).collect(),
+        Entry::Failure { crosses, .. } => vec![crosses.as_str()],
+    }
+}
+
+/// One slot table of the template file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSlot {
+    /// The entry ids the operator listed.
+    #[serde(default)]
+    entries: Vec<String>,
+    /// The confidence tag the operator left or changed.
+    #[serde(default)]
+    tag: String,
+}
+
+/// Parse one edited template into a full prediction.
+///
+/// Every error names the slot and what broke in it, because the operator
+/// fixes one slot at a time. The `other-areas` slot names areas, so the
+/// daemon validates it against the areas and this parse lets it through.
+pub fn parse_full(text: &str, model: &Model) -> Result<FullPrediction, String> {
+    let raw: BTreeMap<String, RawSlot> =
+        toml::from_str(text).map_err(|error| format!("invalid TOML: {error}"))?;
+    let mut slots = Vec::with_capacity(PREDICTION_SLOT_NAMES.len());
+    for (slot, name) in PREDICTION_SLOT_NAMES.iter().enumerate() {
+        let Some(table) = raw.get(*name) else {
+            return Err(format!("slot {name} is missing"));
+        };
+        let tag = match table.tag.as_str() {
+            "sure" => PredictionTag::Sure,
+            "unsure" => PredictionTag::Unsure,
+            other => return Err(format!("slot {name}: unknown tag {other}")),
+        };
+        if slot != OTHER_AREAS_SLOT {
+            for id in &table.entries {
+                if !model.entries.iter().any(|entry| entry.id() == id) {
+                    return Err(format!("slot {name}: unknown entry {id}"));
+                }
+            }
+        }
+        slots.push(PredictionSlot {
+            name: (*name).to_string(),
+            entries: table.entries.clone(),
+            tag,
+        });
+    }
+    Ok(FullPrediction {
+        kind: PREDICTION_FULL.to_string(),
+        slots,
+    })
 }
 
 /// The theory read model of one poll: the labels of every record.
@@ -472,6 +620,139 @@ fn open_markers(labels: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model of the prediction tests: two areas, one of them
+    /// `daemon`, each with its states, its transition, its invariant, and
+    /// its failure mode.
+    const PREDICTION_MODEL: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"daemon\"\ntitle = \"the daemon\"\n",
+        "statement = \"the daemon owns the task table\"\nsides = [\"idle\", \"polling\"]\n",
+        "paths = [\"src/daemon.rs\"]\n",
+        "[[entry]]\nkind = \"state\"\nid = \"idle\"\ntitle = \"idle\"\n",
+        "statement = \"the daemon waits\"\n",
+        "[[entry]]\nkind = \"state\"\nid = \"polling\"\ntitle = \"polling\"\n",
+        "statement = \"the daemon reads GitHub\"\n",
+        "[[entry]]\nkind = \"state\"\nid = \"drawing\"\ntitle = \"drawing\"\n",
+        "statement = \"the interface draws\"\n",
+        "[[entry]]\nkind = \"transition\"\nid = \"poll\"\ntitle = \"poll\"\n",
+        "statement = \"the daemon starts one poll\"\nfrom = \"idle\"\nto = \"polling\"\n",
+        "[[entry]]\nkind = \"transition\"\nid = \"draw\"\ntitle = \"draw\"\n",
+        "statement = \"the interface draws one frame\"\nfrom = \"drawing\"\nto = \"drawing\"\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"one-poll\"\ntitle = \"one poll\"\n",
+        "statement = \"one poll runs at a time\"\nconstrains = [\"daemon\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"one-frame\"\ntitle = \"one frame\"\n",
+        "statement = \"one frame draws at a time\"\nconstrains = [\"drawing\"]\n",
+        "[[entry]]\nkind = \"failure\"\nid = \"poll-storm\"\ntitle = \"poll storm\"\n",
+        "statement = \"the daemon polls without a pause\"\ncrosses = \"daemon\"\n",
+        "[[entry]]\nkind = \"failure\"\nid = \"torn-frame\"\ntitle = \"torn frame\"\n",
+        "statement = \"the interface draws half a frame\"\ncrosses = \"tui\"\n",
+        "[[entry]]\nkind = \"boundary\"\nid = \"tui\"\ntitle = \"the interface\"\n",
+        "statement = \"the interface owns the screen\"\nsides = [\"drawing\", \"outside\"]\n",
+        "paths = [\"src/tui/*.rs\"]\n",
+    );
+
+    /// The parsed model of the prediction tests.
+    fn prediction_model() -> Model {
+        super::super::model::parse(PREDICTION_MODEL).expect("the test model parses")
+    }
+
+    /// The areas of the short prediction of the template tests.
+    fn daemon_area() -> Vec<String> {
+        vec!["daemon".to_string()]
+    }
+
+    /// The template writes one table per slot, each empty and unsure, and
+    /// names the candidates of the area the short prediction claimed.
+    #[test]
+    fn the_template_writes_five_slots_with_the_candidates_of_one_area() {
+        let text = full_template(&daemon_area(), &prediction_model());
+        assert_eq!(
+            text,
+            concat!(
+                "# candidates: poll\n[behaviours]\nentries = []\ntag = \"unsure\"\n\n",
+                "# candidates: idle, polling\n[states]\nentries = []\ntag = \"unsure\"\n\n",
+                "# candidates: one-poll\n[invariants]\nentries = []\ntag = \"unsure\"\n\n",
+                "# candidates: poll-storm\n[failure-modes]\nentries = []\ntag = \"unsure\"\n\n",
+                "# candidates: tui\n[other-areas]\nentries = []\ntag = \"unsure\"\n",
+            )
+        );
+
+        let parsed = parse_full(&text, &prediction_model()).expect("the template parses");
+        assert_eq!(parsed.kind, PREDICTION_FULL);
+        assert_eq!(
+            parsed
+                .slots
+                .iter()
+                .map(|slot| slot.name.as_str())
+                .collect::<Vec<_>>(),
+            PREDICTION_SLOT_NAMES.to_vec()
+        );
+        assert!(parsed
+            .slots
+            .iter()
+            .all(|slot| slot.entries.is_empty() && slot.tag == PredictionTag::Unsure));
+    }
+
+    /// An area the model does not cover names no candidate at all, so the
+    /// template says so instead of listing every entry.
+    #[test]
+    fn the_template_of_an_unknown_area_names_no_candidate() {
+        let text = full_template(&["gh".to_string()], &prediction_model());
+        assert!(
+            text.starts_with("# candidates: none\n[behaviours]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# candidates: daemon, tui\n[other-areas]\n"),
+            "every boundary is another area: {text}"
+        );
+    }
+
+    /// Every parse error names the slot and what broke in it.
+    #[test]
+    fn parse_full_names_the_slot_and_what_broke_in_it() {
+        let model = prediction_model();
+        let template = full_template(&daemon_area(), &model);
+
+        let unknown_entry = template.replace(
+            "[invariants]\nentries = []",
+            "[invariants]\nentries = [\"nope\"]",
+        );
+        assert_eq!(
+            parse_full(&unknown_entry, &model),
+            Err("slot invariants: unknown entry nope".to_string())
+        );
+
+        let unknown_tag = template.replace(
+            "[states]\nentries = []\ntag = \"unsure\"",
+            "[states]\nentries = []\ntag = \"maybe\"",
+        );
+        assert_eq!(
+            parse_full(&unknown_tag, &model),
+            Err("slot states: unknown tag maybe".to_string())
+        );
+
+        let missing = template.replace("[failure-modes]\nentries = []\ntag = \"unsure\"\n", "");
+        assert_eq!(
+            parse_full(&missing, &model),
+            Err("slot failure-modes is missing".to_string())
+        );
+    }
+
+    /// The `other-areas` slot names areas, not model entries, so the
+    /// parse lets an unknown name through and the daemon refuses it.
+    #[test]
+    fn parse_full_leaves_the_other_areas_slot_to_the_daemon() {
+        let model = prediction_model();
+        let text = full_template(&daemon_area(), &model).replace(
+            "[other-areas]\nentries = []",
+            "[other-areas]\nentries = [\"gh\"]",
+        );
+        let parsed = parse_full(&text, &model).expect("the parse takes any area name");
+        assert_eq!(parsed.slots[4].entries, vec!["gh".to_string()]);
+        assert!(names_empty_area(&no_entries("gh")));
+        assert!(!names_empty_area("model error"));
+    }
 
     /// One event with every field set.
     fn full_event() -> Event {
