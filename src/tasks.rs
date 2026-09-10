@@ -57,8 +57,28 @@ impl fmt::Display for TaskState {
     }
 }
 
+/// What one teach task explains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeachKey {
+    /// One merged pull request.
+    Pr(u64),
+    /// One area of the verification map.
+    Area(String),
+}
+
+impl TeachKey {
+    /// The id fragment of one key: `pr-7` or `area-web-checkout`.
+    pub fn slug(&self) -> String {
+        match self {
+            TeachKey::Pr(number) => format!("pr-{number}"),
+            TeachKey::Area(id) => format!("area-{id}"),
+        }
+    }
+}
+
 /// The workflow purpose of one task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPurpose {
     /// A normal pipeline task.
@@ -70,6 +90,8 @@ pub enum TaskPurpose {
     TicketChat,
     /// One measurer or fast check: a shell command, not an agent.
     Measure,
+    /// A one-shot explanation of one subject against the model.
+    Teach(TeachKey),
 }
 
 /// One stage of one item in one repository.
@@ -181,6 +203,11 @@ pub fn scoped_id(repo: &str, scope: &str) -> String {
 /// The task id for one issue conversation.
 pub fn ticket_chat_id(repo: &str, number: u64) -> String {
     format!("{repo}/ticket-i{number}")
+}
+
+/// The task id for one teach task: `<repo>/teach-<key>`.
+pub fn teach_id(repo: &str, key: &TeachKey) -> String {
+    format!("{repo}/teach-{}", key.slug())
 }
 
 /// All tasks of the daemon, in insertion order.
@@ -568,6 +595,15 @@ mod tests {
         assert_eq!(
             table.by_id["borsuk/ticket-i42"].purpose,
             TaskPurpose::TicketChat
+        );
+    }
+
+    #[test]
+    fn a_teach_id_names_the_pull_request_or_the_area() {
+        assert_eq!(teach_id("borsuk", &TeachKey::Pr(7)), "borsuk/teach-pr-7");
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
+            "borsuk/teach-area-web-checkout"
         );
     }
 

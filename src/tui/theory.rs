@@ -2,8 +2,9 @@
 //!
 //! The view draws one block per repository: the header strip with the
 //! governor state and the counts, then the AREAS panel with the tier each
-//! area reaches. The operator marks one repository with `j` and `k`, and
-//! `v` asks for the run skill of one surface.
+//! area reaches. The operator moves the cursor with `j` and `k`. On a
+//! repository row `v` asks for the run skill of one surface. On an area
+//! row `t` asks the agent to teach that area.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -13,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::sock::{Action, AreaView, StateView, TheoryAction, TheoryView};
+use crate::tasks::TeachKey;
 use crate::theory::verify::Tier;
 
 use super::theme::THEME;
@@ -33,14 +35,51 @@ pub(super) enum Outcome {
     Send(Box<Action>, String),
 }
 
+/// One stop of the Theory cursor.
+///
+/// Each governed repository contributes its header row and one row per
+/// area, in draw order. An ungoverned repository draws no AREAS panel, so
+/// it contributes its header row alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Stop {
+    /// The header row of one repository.
+    Repo(String),
+    /// One area row of one repository.
+    Area(String, String),
+}
+
+impl Stop {
+    /// The repository alias of the stop.
+    fn repo(&self) -> &str {
+        match self {
+            Stop::Repo(alias) | Stop::Area(alias, _) => alias,
+        }
+    }
+}
+
+/// The stops of one state view, in draw order.
+fn stops(state: &StateView) -> Vec<Stop> {
+    let mut all = Vec::new();
+    for (alias, view) in &state.theory {
+        all.push(Stop::Repo(alias.clone()));
+        if !view.governor {
+            continue;
+        }
+        for area in &view.areas {
+            all.push(Stop::Area(alias.clone(), area.id.clone()));
+        }
+    }
+    all
+}
+
 /// The Theory view state.
 ///
-/// It holds no repository data. The marked alias survives a state push, and
-/// the shell falls back to the first repository when the marked one is gone.
+/// It holds no repository data. The marked stop survives a state push, and
+/// the view falls back to the first stop when the marked one is gone.
 #[derive(Debug, Default)]
 pub(super) struct Theory {
-    /// The alias the operator marked.
-    marked: Option<String>,
+    /// The stop the operator marked.
+    marked: Option<Stop>,
     /// The surface name typed so far, while the input is open.
     input: Option<String>,
 }
@@ -51,23 +90,25 @@ impl Theory {
         self.input.is_some()
     }
 
-    /// The alias the keys act on: the marked repository, else the first one.
-    fn current(&self, state: &StateView) -> Option<String> {
-        let marked = self
-            .marked
-            .as_ref()
-            .filter(|alias| state.theory.contains_key(*alias));
-        match marked {
-            Some(alias) => Some(alias.clone()),
-            None => state.theory.keys().next().cloned(),
+    /// The stop the keys act on: the marked one, else the first one.
+    fn at(&self, state: &StateView) -> Option<Stop> {
+        let all = stops(state);
+        match self.marked.as_ref().filter(|stop| all.contains(stop)) {
+            Some(stop) => Some(stop.clone()),
+            None => all.into_iter().next(),
         }
+    }
+
+    /// The alias the keys act on: the repository of the marked stop.
+    fn current(&self, state: &StateView) -> Option<String> {
+        self.at(state).map(|stop| stop.repo().to_string())
     }
 
     /// The key hints of the footer.
     pub(super) fn footer_hints(&self) -> String {
         match &self.input {
             Some(buffer) => format!("surface: {buffer}_{DOT}enter send{DOT}esc cancel"),
-            None => format!("1-6 view{DOT}j/k row{DOT}v run skill{DOT}esc home"),
+            None => format!("1-6 view{DOT}j/k row{DOT}v run skill{DOT}t teach{DOT}esc home"),
         }
     }
 
@@ -91,6 +132,7 @@ impl Theory {
                 }
                 Outcome::None
             }
+            KeyCode::Char('t') => self.send_teach(state),
             _ => Outcome::Pass,
         }
     }
@@ -155,19 +197,35 @@ impl Theory {
         )
     }
 
+    /// Send the teach action of the marked area row.
+    ///
+    /// A repository row names no area, so it sends nothing.
+    fn send_teach(&self, state: &StateView) -> Outcome {
+        let Some(Stop::Area(repo, id)) = self.at(state) else {
+            return Outcome::None;
+        };
+        let toast = format!("asked to teach {repo}/{id}");
+        Outcome::Send(
+            Box::new(Action::Theory(TheoryAction::Teach {
+                repo,
+                key: TeachKey::Area(id),
+            })),
+            toast,
+        )
+    }
+
     /// Move the mark by `delta` rows, without wrapping.
     fn move_mark(&mut self, state: &StateView, delta: isize) {
-        let aliases: Vec<&String> = state.theory.keys().collect();
-        if aliases.is_empty() {
+        let all = stops(state);
+        if all.is_empty() {
             return;
         }
-        let current = self.current(state);
-        let at = current
-            .as_ref()
-            .and_then(|alias| aliases.iter().position(|one| *one == alias))
+        let at = self
+            .at(state)
+            .and_then(|stop| all.iter().position(|one| *one == stop))
             .unwrap_or(0);
-        let next = (at as isize + delta).clamp(0, aliases.len() as isize - 1) as usize;
-        self.marked = Some(aliases[next].clone());
+        let next = (at as isize + delta).clamp(0, all.len() as isize - 1) as usize;
+        self.marked = Some(all[next].clone());
     }
 }
 
@@ -192,7 +250,8 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &Theory) 
                 .fg(THEME.accent)
                 .add_modifier(Modifier::BOLD),
         ));
-    let marked = view.current(state);
+    let at = view.at(state);
+    let marked = at.as_ref().map(|stop| stop.repo().to_string());
     let mut lines: Vec<Line> = Vec::new();
     for (alias, row) in &state.theory {
         if !lines.is_empty() {
@@ -211,7 +270,12 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &Theory) 
         if row.areas.is_empty() {
             lines.push(Line::from(Span::styled("no area", THEME.dim())));
         }
-        lines.extend(row.areas.iter().map(area_row));
+        for one in &row.areas {
+            let here = at
+                .as_ref()
+                .is_some_and(|stop| *stop == Stop::Area(alias.clone(), one.id.clone()));
+            lines.push(area_row(one, here));
+        }
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no repository", THEME.dim())));
@@ -251,18 +315,34 @@ fn strip(view: &TheoryView) -> Line<'static> {
 }
 
 /// One row of the AREAS panel: the area id and its tier mark.
-fn area_row(row: &AreaView) -> Line<'static> {
+fn area_row(row: &AreaView, is_selected: bool) -> Line<'static> {
     let mark = mark(row);
     let color = match mark.as_str() {
         "!" => THEME.error,
         "-" => THEME.dim,
         _ => THEME.accent,
     };
-    Line::from(vec![
+    let marker = if is_selected {
+        Span::styled(
+            "\u{25b8} ",
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+    let line = Line::from(vec![
+        marker,
         Span::styled(row.id.clone(), Style::default().fg(THEME.text)),
         Span::styled(DOT, THEME.dim()),
         Span::styled(mark, Style::default().fg(color)),
-    ])
+    ]);
+    if is_selected {
+        line.style(THEME.selected())
+    } else {
+        line
+    }
 }
 
 /// The tier mark of one area: the tier name, `-` when no surface maps to
@@ -564,6 +644,53 @@ mod tests {
                 surface: "a".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn the_cursor_walks_the_repository_row_then_its_areas_and_t_teaches_one() {
+        let state = view(
+            vec![
+                area("api-orders", Tier::Http, Tier::None, false),
+                area("web-checkout", Tier::Browser, Tier::None, false),
+            ],
+            0,
+        );
+        let mut pane = Theory::default();
+
+        // The cursor starts on the repository row, where t sends nothing.
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('t'))),
+            Outcome::None
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        let screen = render_with(&state, &pane);
+        assert!(
+            screen.contains("\u{25b8} web-checkout"),
+            "screen was:\n{screen}"
+        );
+
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('t'))),
+            Outcome::Send(
+                Box::new(Action::Theory(TheoryAction::Teach {
+                    repo: "borsuk".to_string(),
+                    key: TeachKey::Area("web-checkout".to_string()),
+                })),
+                "asked to teach borsuk/web-checkout".to_string()
+            )
+        );
+
+        // The cursor does not wrap, and v still names the repository of
+        // the marked area row.
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        pane.handle_key(&state, press(KeyCode::Char('v')));
+        pane.handle_key(&state, press(KeyCode::Char('a')));
+        assert!(matches!(
+            pane.handle_key(&state, press(KeyCode::Enter)),
+            Outcome::Send(_, _)
+        ));
     }
 
     #[test]

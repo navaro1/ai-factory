@@ -449,6 +449,51 @@ Put valid JSON between the markers. Do not quote the block. Do not put the
 block in a code fence. Include no text after the closing marker.
 "#;
 
+/// The built-in prompt of one teach task.
+///
+/// The theory roles carry no prompt file, so a teach task fills this
+/// template directly. The placeholders are `{repo}`, `{worktree}`,
+/// `{subject}`, `{history}`, `{model}`, and `{skills}`.
+pub const TEACH_PROMPT: &str = r#"You explain one subject of the repository {repo}
+to the operator. You work in {worktree}, the repository checkout. Read the
+files you need. Change no file.
+
+The subject
+
+{subject}
+
+The history
+
+{history}
+
+The model
+
+{model}
+
+The skills
+
+{skills}
+
+Explain how the subject works and why it works that way. Use the model, the
+skills, and the history. Give the smallest complete answer first. Then add
+one layer at a time. Build the picture in steps, one part per step.
+
+Keep the confidence of what you found. Name the history when the history
+shows a fact. Say that you infer a step when you reason it out. Print no
+framing label. Ask the operator no question. Set no quiz.
+
+End the turn with one block per contradiction you find between the code and
+the model. A subject that matches the model ends with no block. Each block
+takes this form.
+
+<aif-event-v1>
+{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
 /// The body of one run skill ticket, before the daemon fills it.
 ///
 /// The eight steps are section 6.2 of the verification toolbelt design
@@ -836,6 +881,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_teach_prompt_names_exactly_its_six_placeholders() {
+        assert_eq!(
+            scan_placeholders(TEACH_PROMPT),
+            vec!["repo", "worktree", "subject", "history", "model", "skills"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(TEACH_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(TEACH_PROMPT, &values).expect("the teach prompt fills");
+        assert!(filled.contains("<subject>"));
+        assert!(filled.contains("<history>"));
+        assert!(
+            filled.contains(
+                r#"{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}"#
+            ),
+            "the event block stays literal:\n{filled}"
+        );
     }
 
     /// The theory roles carry no template yet. Every prompt entry point

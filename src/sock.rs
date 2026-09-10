@@ -1225,6 +1225,13 @@ pub enum TheoryAction {
         /// The surface name the operator typed.
         surface: String,
     },
+    /// Explain one subject against the model and the skills.
+    Teach {
+        /// The repository alias.
+        repo: String,
+        /// The subject of the explanation.
+        key: crate::tasks::TeachKey,
+    },
 }
 
 /// The request identity prefix of one run skill ticket creation.
@@ -2345,6 +2352,14 @@ mod tests {
                 surface: "web".to_string(),
             }),
             Action::Reconcile { repo: None },
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Area("web-checkout".to_string()),
+            }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Pr(7),
+            }),
             Action::Stop,
         ]
     }

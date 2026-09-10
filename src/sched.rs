@@ -169,12 +169,12 @@ pub fn can_start(
     stage: Stage,
     repo: &str,
     task: &str,
-    purpose: TaskPurpose,
+    purpose: &TaskPurpose,
 ) -> Verdict {
     if paused.blocks_task(stage, repo, task) {
         return Verdict::No(Reason::Paused);
     }
-    if purpose == TaskPurpose::Measure {
+    if *purpose == TaskPurpose::Measure {
         return if table.running_measure() >= limits.measure {
             Verdict::No(Reason::StageFull)
         } else {
@@ -232,7 +232,7 @@ pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Opt
                 task.stage,
                 &task.repo,
                 &task.id,
-                task.purpose,
+                &task.purpose,
             ),
             Verdict::Yes
         ) {
@@ -308,7 +308,7 @@ mod tests {
             stage,
             repo,
             "test-task",
-            TaskPurpose::Pipeline,
+            &TaskPurpose::Pipeline,
         )
     }
 
@@ -747,7 +747,7 @@ mod tests {
                 Stage::Review,
                 "borsuk",
                 id,
-                TaskPurpose::Measure,
+                &TaskPurpose::Measure,
             )
         };
 

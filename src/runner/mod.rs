@@ -57,15 +57,15 @@ pub const fn capabilities(harness: Harness) -> Capabilities {
 /// shell command under a synthetic role, so no configured harness applies
 /// to it.
 pub trait RunnerFactory: Send + Sync {
-    fn build(&self, role: &ResolvedRoleSettings, purpose: TaskPurpose) -> Box<dyn Runner>;
+    fn build(&self, role: &ResolvedRoleSettings, purpose: &TaskPurpose) -> Box<dyn Runner>;
 }
 
 /// The factory that selects the installed harness adapter.
 pub struct DefaultRunnerFactory;
 
 impl RunnerFactory for DefaultRunnerFactory {
-    fn build(&self, role: &ResolvedRoleSettings, purpose: TaskPurpose) -> Box<dyn Runner> {
-        if purpose == TaskPurpose::Measure {
+    fn build(&self, role: &ResolvedRoleSettings, purpose: &TaskPurpose) -> Box<dyn Runner> {
+        if *purpose == TaskPurpose::Measure {
             return Box::new(script::ScriptRunner::new());
         }
         match role.settings.harness {

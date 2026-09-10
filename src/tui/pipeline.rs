@@ -448,6 +448,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
         KeyCode::Char(' ') => stack_selected_pr(app, sink),
         KeyCode::Char('g') => ask_release(app),
         KeyCode::Char('s') => cycle_policy(app, sink),
+        KeyCode::Char('t') => teach_selected_pr(app, sink),
         KeyCode::Enter => open_selected_task(app),
         _ => {}
     }
@@ -804,6 +805,25 @@ fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
 }
 
 /// Stack or unstack the selected pull request in a waiting release queue.
+/// Send one teach request for the selected release pull request.
+///
+/// The board holds no merged pull request of its own, so the train rows
+/// are the pull requests a release merges. Every other row sends nothing.
+fn teach_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
+    let Some(Row::ReleasePr { repo, pr }) = selected_row(app) else {
+        return;
+    };
+    emit(
+        app,
+        sink,
+        Action::Theory(crate::sock::TheoryAction::Teach {
+            repo: repo.clone(),
+            key: crate::tasks::TeachKey::Pr(pr),
+        }),
+        format!("sent teach #{pr} {repo}"),
+    );
+}
+
 fn stack_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
     let found = {
         let Some(state) = app.state.as_ref() else {
@@ -984,9 +1004,9 @@ pub(super) fn footer_hints(app: &App) -> String {
                 .find(|train| train.repo == repo)
                 .is_some_and(|train| train.queue.contains(&pr) && !train.batch.contains(&pr));
             if stackable {
-                "space stack · enter details · ? help".to_string()
+                "space stack · t teach · enter details · ? help".to_string()
             } else {
-                "enter details · p pause · ? help".to_string()
+                "t teach · enter details · p pause · ? help".to_string()
             }
         }
     }
@@ -4868,14 +4888,14 @@ mod tests {
                     repo: "borsuk".to_string(),
                     pr: 7,
                 },
-                "space stack · enter details · ? help",
+                "space stack · t teach · enter details · ? help",
             ),
             (
                 Row::ReleasePr {
                     repo: "borsuk".to_string(),
                     pr: 5,
                 },
-                "enter details · p pause · ? help",
+                "t teach · enter details · p pause · ? help",
             ),
         ];
         for (row, expected) in cases {

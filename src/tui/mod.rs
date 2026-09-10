@@ -275,7 +275,7 @@ struct App {
     tickets: Tickets,
     /// The execution role settings editor.
     settings: Settings,
-    /// The Theory view mark and its surface input.
+    /// The Theory view cursor and its surface input.
     theory: theory::Theory,
     /// The task id the session view follows.
     session_task: Option<String>,
@@ -3083,6 +3083,52 @@ mod tests {
             app.visible_toast(),
             Some("created the run skill ticket borsuk#12")
         );
+    }
+
+    #[test]
+    fn t_on_an_areas_row_sends_one_teach_request_for_that_area() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        let area = |id: &str| crate::sock::AreaView {
+            id: id.to_string(),
+            tier: crate::theory::verify::Tier::Browser,
+            ..crate::sock::AreaView::default()
+        };
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                areas: vec![area("api-orders"), area("web-checkout")],
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        // The cursor starts on the repository row, so two steps reach the
+        // second area.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('j'), key('j'), key('t')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Theory(crate::sock::TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Area("web-checkout".to_string()),
+            })]
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("asked to teach borsuk/web-checkout")
+        );
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("t teach"), "{screen}");
+        assert!(screen.contains("\u{25b8} web-checkout"), "{screen}");
     }
 
     #[test]
