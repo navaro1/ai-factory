@@ -66,7 +66,7 @@ use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
 use crate::theory::model::{self, Model};
 use crate::theory::records::{event_block, Event, RecordKey, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL};
-use crate::theory::skills::{self, SkillSet};
+use crate::theory::skills::{self, SkillSet, SKILLS_DIR};
 use crate::theory::verify::VerifyMap;
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
@@ -116,9 +116,6 @@ pub const TICKET_REFINEMENT_MESSAGE: &str =
 /// The item number of a ticket-creation task. A real issue never carries
 /// number 0, so the daemon uses it as the marker of a ticket session.
 pub const TICKET_NUMBER: u64 = 0;
-
-/// The directory of the run skills inside the skills checkout.
-pub const SKILLS_DIR: &str = ".claude/skills/";
 
 /// The release policy that never fires on its own.
 static MANUAL_POLICY: ReleasePolicy = ReleasePolicy::Manual;
@@ -5965,6 +5962,16 @@ impl Daemon {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        // The theory placeholders render only for a governed repository;
+        // with the governor off v0.6 behaviour holds and no git call runs.
+        let (model_text, skills_text) = if repo_cfg.theory.governor.is_on() {
+            (
+                self.model_entries(&task.repo),
+                self.skills_slice(task, worktree),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         Ok(vec![
             ("repo", task.repo.clone()),
             ("owner_repo", repo_cfg.owner_repo.clone()),
@@ -5976,7 +5983,102 @@ impl Daemon {
             ("pr_list", pr_list),
             ("pr_numbers", pr_numbers),
             ("pr_count", pr_count),
+            ("model", model_text),
+            // Predictions do not exist yet; the later chunks fill these.
+            ("prediction", String::new()),
+            ("comparison", String::new()),
+            ("skills", skills_text),
+            ("rules", String::new()),
+            ("why_rule", String::new()),
         ])
+    }
+
+    /// The cached model entries of one repository as prompt lines, empty
+    /// when the model did not parse.
+    fn model_entries(&self, repo: &str) -> String {
+        self.theory_models
+            .get(repo)
+            .and_then(|cache| cache.model.as_ref().ok())
+            .map(|model| {
+                model
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "- {} ({}): {}",
+                            entry.id(),
+                            entry.kind_name(),
+                            entry.statement()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `{skills}` value of one task: the slice of requirement R9 over
+    /// the areas the stage names.
+    ///
+    /// Refine and implement slice over every area of `verify.toml`,
+    /// because predictions do not exist yet. Review slices over the areas
+    /// of the PR diff. A repository whose theory did not read slices to an
+    /// empty block, so a broken model never blocks a dispatch.
+    fn skills_slice(&self, task: &Task, worktree: &Path) -> String {
+        let Some(cache) = self.theory_models.get(&task.repo) else {
+            return String::new();
+        };
+        let (Ok(model), Ok(verify)) = (&cache.model, &cache.verify) else {
+            return String::new();
+        };
+        let Some(skills) = self.theory_skills.get(&task.repo) else {
+            return String::new();
+        };
+        let Ok(set) = &skills.skills else {
+            return String::new();
+        };
+        let areas: Vec<&str> = match task.stage {
+            Stage::Review => {
+                let paths = self.diff_paths(worktree);
+                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                verify.areas_for_paths(model, &refs)
+            }
+            _ => verify.areas.iter().map(|area| area.id.as_str()).collect(),
+        };
+        let stage = match task.stage {
+            Stage::Refine => skills::SliceStage::Refine {
+                bug: self
+                    .snapshot
+                    .repos
+                    .get(&task.repo)
+                    .and_then(|snapshot| snapshot.issues.get(&task.number))
+                    .is_some_and(|issue| issue.labels.iter().any(|label| label == "bug")),
+            },
+            Stage::Implement | Stage::Review => skills::SliceStage::Implement,
+            Stage::Release => return String::new(),
+        };
+        skills::slice(stage, &areas, verify, set)
+    }
+
+    /// The changed paths of one PR worktree against the default base.
+    ///
+    /// A base or a diff git cannot resolve yields no paths, so the review
+    /// runs with an empty `{skills}` instead of failing the dispatch.
+    fn diff_paths(&self, worktree: &Path) -> Vec<String> {
+        let base = match self.worktrees.default_base(self.exec.as_ref(), worktree) {
+            Ok(base) => base,
+            Err(_) => return Vec::new(),
+        };
+        let range = format!("{base}...HEAD");
+        let out = match worktree::git(
+            self.exec.as_ref(),
+            worktree,
+            &["diff", "--name-only", &range],
+        ) {
+            Ok(out) if out.status == 0 => out,
+            _ => return Vec::new(),
+        };
+        out.stdout.lines().map(str::to_string).collect()
     }
 
     /// Read the prompt template of one role at this moment.
@@ -18000,5 +18102,254 @@ mod tests {
         assert_eq!(view.entries.len(), 1);
         assert_eq!(view.skills["web"].tier, Tier::Browser);
         assert_eq!(view.areas[0].tier, Tier::Browser);
+    }
+
+    // ------------------------------------------------------------------
+    // The skills slice
+    // ------------------------------------------------------------------
+
+    /// The model of the slicing tests: one boundary per area.
+    const SLICE_MODEL: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"checkout\"\n",
+        "statement = \"the cart pays\"\nsides = [\"web\", \"api\"]\npaths = [\"web/**\"]\n",
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-orders\"\ntitle = \"orders\"\n",
+        "statement = \"the order lands\"\nsides = [\"web\", \"api\"]\npaths = [\"api/orders/**\"]\n",
+    );
+
+    /// The map of the slicing tests: one area per boundary.
+    const SLICE_VERIFY: &str = concat!(
+        "[[area]]\nid = \"web-checkout\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the cart pays\"\n",
+        "[[area]]\nid = \"api-orders\"\nboundary = \"B-orders\"\n",
+        "statement = \"the order lands\"\n",
+    );
+
+    /// The `run-web` skill of the slicing tests, with Drive and Logs.
+    const SLICE_WEB_SKILL: &str = "---\nname: run-web\n\
+description: Launch and drive the web app.\n\
+surface: web\ndriver: playwright-cli\ntier: browser\nblind: native dialogs\n---\n\
+# Run web\n\n## Run\nnpm run dev\n\n## Fast\nnpx playwright test\n\n\
+## Drive\nplaywright click the pay button\n\n## Logs\ndev.log holds every request\n";
+
+    /// The `run-api` skill of the slicing tests.
+    const SLICE_API_SKILL: &str = "---\nname: run-api\ndescription: Drive the api.\n\
+surface: api\ndriver: curl\ntier: http\n---\n\
+# Run api\n\n## Run\ncargo run\n\n## Fast\ncargo test\n";
+
+    const SLICE_WEB_INDEX: &str = "# Features of web\n\n- checkout: the cart pays\n";
+    const SLICE_API_INDEX: &str = "# Features of api\n\n- orders: the order lands\n";
+
+    const SLICE_WEB_FEATURE: &str =
+        "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n";
+
+    const SLICE_API_FEATURE: &str =
+        "---\narea: api-orders\nfast: cargo test orders\n---\n# Orders\n";
+
+    /// The tree listing of the slicing fixtures: two surfaces, two
+    /// features each.
+    const SLICE_TREE: &str = concat!(
+        ".claude/skills/run-web/SKILL.md\n",
+        ".claude/skills/run-web/features/README.md\n",
+        ".claude/skills/run-web/features/checkout.md\n",
+        ".claude/skills/run-api/SKILL.md\n",
+        ".claude/skills/run-api/features/README.md\n",
+        ".claude/skills/run-api/features/orders.md\n",
+    );
+
+    /// The scripted git steps of one theory read of the slicing fixtures.
+    fn slice_steps(repo: &Path, commit: &str) -> Vec<Step> {
+        let show = |file: &str| format!("{commit}:{file}");
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok(format!("{commit}\n")),
+            ),
+            git_step(
+                repo,
+                &["show", &show("theory/model.toml")],
+                CmdOut::ok(SLICE_MODEL),
+            ),
+            git_step(
+                repo,
+                &["show", &show("theory/verify.toml")],
+                CmdOut::ok(SLICE_VERIFY),
+            ),
+            git_step(
+                repo,
+                &["ls-tree", "-r", "--name-only", commit, SKILLS_DIR],
+                CmdOut::ok(SLICE_TREE),
+            ),
+            git_step(
+                repo,
+                &["show", &show(".claude/skills/run-web/SKILL.md")],
+                CmdOut::ok(SLICE_WEB_SKILL),
+            ),
+            git_step(
+                repo,
+                &["show", &show(".claude/skills/run-web/features/README.md")],
+                CmdOut::ok(SLICE_WEB_INDEX),
+            ),
+            git_step(
+                repo,
+                &["show", &show(".claude/skills/run-web/features/checkout.md")],
+                CmdOut::ok(SLICE_WEB_FEATURE),
+            ),
+            git_step(
+                repo,
+                &["show", &show(".claude/skills/run-api/SKILL.md")],
+                CmdOut::ok(SLICE_API_SKILL),
+            ),
+            git_step(
+                repo,
+                &["show", &show(".claude/skills/run-api/features/README.md")],
+                CmdOut::ok(SLICE_API_INDEX),
+            ),
+            git_step(
+                repo,
+                &["show", &show(".claude/skills/run-api/features/orders.md")],
+                CmdOut::ok(SLICE_API_FEATURE),
+            ),
+        ]
+    }
+
+    /// The placeholder value of one name, empty when the name is absent.
+    fn placeholder_of(values: &[(&'static str, String)], name: &str) -> String {
+        values
+            .iter()
+            .find(|(one, _)| *one == name)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_review_slice_carries_only_the_areas_the_diff_touches() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(git_step(
+            &pr_worktree,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &pr_worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("api/orders/new.rs\n"),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(Vec::new(), Vec::new());
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        assert!(
+            placeholder_of(&values, "skills").contains("# Orders"),
+            "the touched area's feature file:\n{}",
+            placeholder_of(&values, "skills")
+        );
+        assert!(
+            !placeholder_of(&values, "skills").contains("# Checkout"),
+            "the untouched area stays out:\n{}",
+            placeholder_of(&values, "skills")
+        );
+        assert_eq!(
+            placeholder_of(&values, "model"),
+            "- B-checkout (boundary): the cart pays\n- B-orders (boundary): the order lands"
+        );
+        assert_eq!(placeholder_of(&values, "prediction"), "");
+        assert_eq!(placeholder_of(&values, "comparison"), "");
+        assert_eq!(placeholder_of(&values, "rules"), "");
+        assert_eq!(placeholder_of(&values, "why_rule"), "");
+    }
+
+    #[test]
+    fn a_bug_ticket_refine_prompt_carries_the_drive_section_and_a_plain_one_does_not() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(commit_steps(&repo, "aaa111"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // A prompt override that carries {skills}, so the slice reaches
+        // the rendered prompt.
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(rig.prompts.join("refine.md"), "skills:\n{skills}\n").unwrap();
+
+        rig.poll(vec![issue(142, &["to-refine", "bug"])], vec![]);
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            rig.job(0)
+                .prompt
+                .contains("playwright click the pay button"),
+            "the bug slice carries Drive:\n{}",
+            rig.job(0).prompt
+        );
+
+        rig.poll(
+            vec![
+                issue(142, &["to-refine", "bug"]),
+                issue(143, &["to-refine"]),
+            ],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 2);
+        assert!(
+            !rig.job(1)
+                .prompt
+                .contains("playwright click the pay button"),
+            "the plain slice carries no Drive:\n{}",
+            rig.job(1).prompt
+        );
+        assert!(
+            rig.job(1).prompt.contains("cargo run"),
+            "the plain slice still carries Run:\n{}",
+            rig.job(1).prompt
+        );
+    }
+
+    #[test]
+    fn an_ungoverned_repository_fills_the_theory_placeholders_empty_with_no_git_call() {
+        let mut rig = Rig::make(Vec::new());
+
+        rig.poll(vec![], vec![]);
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &PathBuf::new())
+            .expect("the values must render");
+
+        assert!(
+            rig.exec.calls().is_empty(),
+            "the governor is off, so no git call runs"
+        );
+        for name in [
+            "model",
+            "prediction",
+            "comparison",
+            "skills",
+            "rules",
+            "why_rule",
+        ] {
+            assert_eq!(
+                placeholder_of(&values, name),
+                "",
+                "{name} must render empty"
+            );
+        }
     }
 }
