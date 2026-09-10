@@ -3234,7 +3234,7 @@ mod tests {
         labeled
             .issue
             .labels
-            .push(crate::gates::TO_REFINE.to_string());
+            .push(crate::labels::DEFAULT_TO_REFINE.to_string());
         app.tickets.observe_details(labeled);
 
         run_messages(

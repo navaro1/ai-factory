@@ -333,6 +333,10 @@ impl GateTracker {
 mod tests {
     use super::*;
 
+    fn names() -> LabelNames {
+        LabelNames::default()
+    }
+
     fn issue(number: u64, labels: &[&str]) -> Issue {
         Issue {
             number,
@@ -377,21 +381,21 @@ mod tests {
 
     #[test]
     fn refine_takes_open_issues_labelled_to_refine() {
-        assert!(refine_ready(&issue(1, &["to-refine"])));
-        assert!(!refine_ready(&issue(2, &["refined"])));
+        assert!(refine_ready(&issue(1, &["to-refine"]), &names()));
+        assert!(!refine_ready(&issue(2, &["refined"]), &names()));
         let mut closed = issue(3, &["to-refine"]);
         closed.open = false;
-        assert!(!refine_ready(&closed));
+        assert!(!refine_ready(&closed, &names()));
     }
 
     #[test]
     fn implement_takes_refined_issues_without_to_refine() {
-        assert!(implement_ready(&issue(1, &["refined"])));
-        assert!(!implement_ready(&issue(1, &["refined", "to-refine"])));
-        assert!(!implement_ready(&issue(1, &[])));
+        assert!(implement_ready(&issue(1, &["refined"]), &names()));
+        assert!(!implement_ready(&issue(1, &["refined", "to-refine"]), &names()));
+        assert!(!implement_ready(&issue(1, &[]), &names()));
         let mut closed = issue(1, &["refined"]);
         closed.open = false;
-        assert!(!implement_ready(&closed));
+        assert!(!implement_ready(&closed, &names()));
     }
 
     /// The parent of a split carries `epic` and never `refined`, so the
@@ -399,16 +403,16 @@ mod tests {
     #[test]
     fn an_epic_parent_never_opens_the_implement_gate() {
         let snap = repo(
-            vec![issue(1, &[EPIC]), issue(2, &[REFINED, "chunk"])],
+            vec![issue(1, &["epic"]), issue(2, &["refined", "chunk"])],
             vec![],
         );
-        assert!(!implement_ready(&snap.issues[&1]));
+        assert!(!implement_ready(&snap.issues[&1], &names()));
         assert!(
-            !refine_ready(&snap.issues[&1]),
+            !refine_ready(&snap.issues[&1], &names()),
             "the parent is not refined again"
         );
         assert!(
-            implement_ready(&snap.issues[&2]),
+            implement_ready(&snap.issues[&2], &names()),
             "the sub-ticket carries the work"
         );
     }
@@ -420,26 +424,26 @@ mod tests {
     fn an_open_dependency_leaves_the_implement_gate_open() {
         let blocked = issue_with_body(1, &["refined"], "blocked by #2");
         let held = repo(vec![blocked, issue(2, &[])], vec![]);
-        assert!(implement_ready(&held.issues[&1]));
+        assert!(implement_ready(&held.issues[&1], &names()));
         assert_eq!(unmet_blockers(&held, &held.issues[&1]), vec![2]);
 
         let free = repo(
             vec![issue_with_body(1, &["refined"], "blocked by #2")],
             vec![],
         );
-        assert!(implement_ready(&free.issues[&1]));
+        assert!(implement_ready(&free.issues[&1], &names()));
         assert!(unmet_blockers(&free, &free.issues[&1]).is_empty());
     }
 
     #[test]
     fn review_takes_open_drafts_and_release_takes_ready_ones() {
-        assert!(review_ready(&pr(1, true, "aaa")));
-        assert!(!review_ready(&pr(2, false, "bbb")));
+        assert!(review_ready(&pr(1, true, "aaa"), &names()));
+        assert!(!review_ready(&pr(2, false, "bbb"), &names()));
         assert!(release_ready(&pr(3, false, "ccc")));
         assert!(!release_ready(&pr(4, true, "ddd")));
         let mut closed = pr(5, false, "eee");
         closed.open = false;
-        assert!(!review_ready(&closed));
+        assert!(!review_ready(&closed, &names()));
         assert!(!release_ready(&closed));
     }
 
@@ -450,10 +454,10 @@ mod tests {
     fn a_needs_human_draft_rests_until_the_label_goes_away() {
         let mut tracker = GateTracker::new();
         let mut waiting = pr(7, true, "aaa");
-        waiting.labels = vec![NEEDS_HUMAN_LABEL.to_string()];
-        assert!(!review_ready(&waiting), "the label closes the review gate");
+        waiting.labels = vec!["needs-human".to_string()];
+        assert!(!review_ready(&waiting, &names()), "the label closes the review gate");
 
-        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![waiting.clone()]));
+        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![waiting.clone()]), &names());
         assert!(
             !fired.iter().any(|work| work.stage == Stage::Review),
             "a labelled draft starts no review"
@@ -463,7 +467,7 @@ mod tests {
         // so the agent's own repair commits cannot restart its review.
         let mut pushed = waiting.clone();
         pushed.head_sha = "bbb".to_string();
-        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![pushed.clone()]));
+        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![pushed.clone()]), &names());
         assert!(
             !fired.iter().any(|work| work.stage == Stage::Review),
             "a push on a labelled draft starts no review"
@@ -473,7 +477,7 @@ mod tests {
         // goes from false to true and reports the work exactly once.
         let mut answered = pushed.clone();
         answered.labels.clear();
-        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![answered.clone()]));
+        let fired = tracker.observe("borsuk", &repo(Vec::new(), vec![answered.clone()]), &names());
         let review: Vec<&ReadyWork> = fired
             .iter()
             .filter(|work| work.stage == Stage::Review)
@@ -482,7 +486,7 @@ mod tests {
         assert_eq!(review[0].number, 7);
         assert_eq!(review[0].head_sha.as_deref(), Some("bbb"));
 
-        let again = tracker.observe("borsuk", &repo(Vec::new(), vec![answered]));
+        let again = tracker.observe("borsuk", &repo(Vec::new(), vec![answered]), &names());
         assert!(
             !again.iter().any(|work| work.stage == Stage::Review),
             "the open gate reports once"
@@ -604,7 +608,7 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        let first = tracker.observe("borsuk", &ready);
+        let first = tracker.observe("borsuk", &ready, &names());
         assert_eq!(
             first,
             vec![ReadyWork {
@@ -615,7 +619,7 @@ mod tests {
                 head_sha: None,
             }]
         );
-        assert!(tracker.observe("borsuk", &ready).is_empty());
+        assert!(tracker.observe("borsuk", &ready, &names()).is_empty());
     }
 
     #[test]
@@ -625,9 +629,9 @@ mod tests {
         // No gate label, so neither the refine nor the implement gate is open.
         let idle = repo(vec![issue(1, &["question"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
-        assert!(tracker.observe("borsuk", &idle).is_empty());
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
+        assert!(tracker.observe("borsuk", &idle, &names()).is_empty());
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
     }
 
     #[test]
@@ -635,10 +639,10 @@ mod tests {
         let mut tracker = GateTracker::new();
         let draft = |sha: &str| repo(vec![], vec![pr(5, true, sha)]);
 
-        assert_eq!(tracker.observe("borsuk", &draft("aaa")).len(), 1);
-        assert!(tracker.observe("borsuk", &draft("aaa")).is_empty());
+        assert_eq!(tracker.observe("borsuk", &draft("aaa"), &names()).len(), 1);
+        assert!(tracker.observe("borsuk", &draft("aaa"), &names()).is_empty());
 
-        let again = tracker.observe("borsuk", &draft("bbb"));
+        let again = tracker.observe("borsuk", &draft("bbb"), &names());
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].head_sha.as_deref(), Some("bbb"));
     }
@@ -652,12 +656,12 @@ mod tests {
         renamed.head_ref = "aif/borsuk/issue-142".to_string();
 
         assert_eq!(
-            tracker.observe("borsuk", &repo(vec![], vec![first])).len(),
+            tracker.observe("borsuk", &repo(vec![], vec![first]), &names()).len(),
             1
         );
         assert_eq!(
             tracker
-                .observe("borsuk", &repo(vec![], vec![renamed]))
+                .observe("borsuk", &repo(vec![], vec![renamed]), &names())
                 .len(),
             1
         );
@@ -680,14 +684,14 @@ mod tests {
             vec![],
         );
 
-        let fired = tracker.observe("borsuk", &held);
+        let fired = tracker.observe("borsuk", &held, &names());
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Implement);
         assert_eq!(fired[0].number, 7);
 
         // The blocker closing is not a gate edge, so no second task fires.
-        assert!(tracker.observe("borsuk", &held).is_empty());
-        assert!(tracker.observe("borsuk", &free).is_empty());
+        assert!(tracker.observe("borsuk", &held, &names()).is_empty());
+        assert!(tracker.observe("borsuk", &free, &names()).is_empty());
     }
 
     #[test]
@@ -696,9 +700,9 @@ mod tests {
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
         let gone = repo(vec![], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
-        assert!(tracker.observe("borsuk", &gone).is_empty());
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
+        assert!(tracker.observe("borsuk", &gone, &names()).is_empty());
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
     }
 
     #[test]
@@ -706,13 +710,13 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
         tracker.forget("borsuk", ItemKind::Issue, 1);
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
 
         // Forgetting another item does not revive this one.
         tracker.forget("borsuk", ItemKind::Issue, 2);
-        assert!(tracker.observe("borsuk", &ready).is_empty());
+        assert!(tracker.observe("borsuk", &ready, &names()).is_empty());
     }
 
     #[test]
@@ -720,13 +724,13 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
-        assert_eq!(tracker.observe("qubitsok", &ready).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
+        assert_eq!(tracker.observe("qubitsok", &ready, &names()).len(), 1);
         tracker.forget_repo("borsuk");
         // The removed repository fires again on a return; the kept one
         // holds its memory.
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
-        assert!(tracker.observe("qubitsok", &ready).is_empty());
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
+        assert!(tracker.observe("qubitsok", &ready, &names()).is_empty());
     }
 
     #[test]
@@ -736,18 +740,18 @@ mod tests {
         // The first poll sees a draft, so the review gate fires, not release.
         assert_eq!(
             tracker
-                .observe("borsuk", &repo(vec![], vec![pr(3, true, "aaa")]))
+                .observe("borsuk", &repo(vec![], vec![pr(3, true, "aaa")]), &names())
                 .len(),
             1
         );
 
-        let ready = tracker.observe("borsuk", &repo(vec![], vec![pr(3, false, "aaa")]));
+        let ready = tracker.observe("borsuk", &repo(vec![], vec![pr(3, false, "aaa")]), &names());
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].stage, Stage::Release);
         assert_eq!(ready[0].head_sha.as_deref(), Some("aaa"));
 
         assert!(tracker
-            .observe("borsuk", &repo(vec![], vec![pr(3, false, "aaa")]))
+            .observe("borsuk", &repo(vec![], vec![pr(3, false, "aaa")]), &names())
             .is_empty());
     }
 
@@ -756,12 +760,12 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &ready, &names()).len(), 1);
         assert!(tracker
-            .observe("qubitsok", &repo(vec![], vec![]))
+            .observe("qubitsok", &repo(vec![], vec![]), &names())
             .is_empty());
         // The empty qubitsok poll must not clear borsuk's memory.
-        assert!(tracker.observe("borsuk", &ready).is_empty());
+        assert!(tracker.observe("borsuk", &ready, &names()).is_empty());
     }
 
     #[test]
@@ -776,11 +780,11 @@ mod tests {
             vec![],
         );
 
-        assert_eq!(tracker.observe("borsuk", &to_refine).len(), 1);
+        assert_eq!(tracker.observe("borsuk", &to_refine, &names()).len(), 1);
 
         // The label moved, so the implement gate opens. Issue 9 is still
         // open, and the daemon defers the task it gets from this report.
-        let fired = tracker.observe("borsuk", &refined);
+        let fired = tracker.observe("borsuk", &refined, &names());
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Implement);
         assert_eq!(unmet_blockers(&refined, &refined.issues[&1]), vec![9]);

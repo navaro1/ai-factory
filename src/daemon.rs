@@ -5578,6 +5578,7 @@ impl Daemon {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let names = self.config.resolved_labels(Some(&task.repo));
         Ok(vec![
             ("repo", task.repo.clone()),
             ("owner_repo", repo_cfg.owner_repo.clone()),
@@ -5589,6 +5590,14 @@ impl Daemon {
             ("pr_list", pr_list),
             ("pr_numbers", pr_numbers),
             ("pr_count", pr_count),
+            ("label_to_refine", names.to_refine.clone()),
+            ("label_refined", names.refined.clone()),
+            ("label_epic", names.epic.clone()),
+            ("label_chunk", names.chunk.clone()),
+            ("label_needs_human", names.needs_human.clone()),
+            ("label_release_stacked", names.release_stacked.clone()),
+            ("label_complexity", names.complexity_prefix.clone()),
+            ("label_review_complexity", names.review_complexity_prefix.clone()),
         ])
     }
 
@@ -5881,6 +5890,10 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::config::{ExecutionRole, Harness, RoleOverride, RoleSettings, StageConfig};
+    use crate::labels::{
+        DEFAULT_EPIC as EPIC, DEFAULT_NEEDS_HUMAN as NEEDS_HUMAN_LABEL,
+        DEFAULT_REFINED as REFINED, DEFAULT_TO_REFINE as TO_REFINE,
+    };
     use crate::exec::{Call, CmdOut, ScriptExec};
     use crate::model::{Issue, Pr, RepoSnapshot};
     use crate::prompts::{
@@ -6986,7 +6999,7 @@ mod tests {
 
         rig.poll(
             vec![
-                issue(142, &[gates::EPIC]),
+                issue(142, &[EPIC]),
                 issue(143, &["refined", "chunk"]),
                 wave_two(),
             ],
@@ -7007,7 +7020,7 @@ mod tests {
         );
 
         // Wave one closes, which frees the slot and settles the blocker.
-        rig.poll(vec![issue(142, &[gates::EPIC]), wave_two()], vec![]);
+        rig.poll(vec![issue(142, &[EPIC]), wave_two()], vec![]);
         rig.event(exited("borsuk/implement-i143", false, "cancelled"));
 
         assert_eq!(rig.task("borsuk/implement-i144").state, TaskState::Running);
@@ -10558,7 +10571,7 @@ mod tests {
     #[test]
     fn builtin_prompts_advance_the_github_gates() {
         assert!(
-            REFINE_PROMPT.contains("--remove-label to-refine --add-label refined"),
+            REFINE_PROMPT.contains("--remove-label {label_to_refine} --add-label {label_refined}"),
             "the refine prompt must open the implement gate"
         );
         assert!(
@@ -10566,7 +10579,7 @@ mod tests {
             "the implement prompt must leave the pull request in the review gate"
         );
         assert!(
-            IMPLEMENT_PROMPT.contains("--remove-label refined"),
+            IMPLEMENT_PROMPT.contains("--remove-label {label_refined}"),
             "the implement prompt must close its issue gate"
         );
         assert!(
@@ -14195,7 +14208,7 @@ mod tests {
         // The run created the sub-tickets and marked the parent an epic.
         rig.poll(
             vec![
-                issue(142, &[gates::EPIC]),
+                issue(142, &[EPIC]),
                 issue(143, &["refined", "chunk"]),
             ],
             vec![],
@@ -14214,10 +14227,10 @@ mod tests {
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(exited("borsuk/refine-i142", true, "code 0"));
-        rig.poll(vec![issue(142, &[gates::EPIC])], vec![]);
+        rig.poll(vec![issue(142, &[EPIC])], vec![]);
 
         // A second poll would fire any gate the first one opened.
-        rig.poll(vec![issue(142, &[gates::EPIC])], vec![]);
+        rig.poll(vec![issue(142, &[EPIC])], vec![]);
 
         assert!(
             !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),

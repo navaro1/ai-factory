@@ -27,6 +27,9 @@ the pull requests in order.
 Labels drive the flow: `to-refine`, `refined`, `needs-human`, and
 `release-stacked`. Add the label `to-refine` to an issue to start the work.
 
+Those names are defaults, not constants. A repository that already owns a
+label taxonomy renames each one. See "Label names" below.
+
 A refine run has two outcomes. It shapes one issue, which then carries
 `refined`. Or it splits the plan into one sub-issue per chunk. Each sub-issue
 carries `refined` and `chunk`, and the parent carries `epic`. A parent never
@@ -279,6 +282,36 @@ absent file means the built-in prompt. The daemon reads the file each time
 a task of the role starts. A saved prompt applies to the next task start. A
 running task keeps its prompt. The Settings view edits each prompt; see the
 `prompt` field below.
+
+### Label names
+
+The factory owns six labels and two complexity prefixes. Their names are
+configuration. A `[labels]` table sets them for every repository, and a
+`[repo.<alias>.labels]` table overrides them for one repository. An absent
+table keeps the default, so an old `factory.toml` needs no edit.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `to_refine` | `to-refine` | Start the refine stage on this issue. |
+| `refined` | `refined` | Open the implement gate on this issue. |
+| `epic` | `epic` | Mark the parent of a split plan. |
+| `chunk` | `chunk` | Mark one sub-ticket of a split plan. |
+| `needs_human` | `needs-human` | Ask the operator to decide. |
+| `release_stacked` | `release-stacked` | Stack this PR into the next train. |
+| `complexity_prefix` | `complexity:` | Prefix of the implement route label. |
+| `review_complexity_prefix` | `review-complexity:` | Prefix of the review route label. |
+
+A repository whose taxonomy prefixes every type label sets this:
+
+```toml
+[repo.gh-klon.labels]
+epic = "type:epic"
+chunk = "type:chunk"
+```
+
+The parser rejects an empty name, a padded name, and two keys that resolve
+to the same name. The refine, implement, and review prompts carry the
+configured names, so the agent writes the name the factory reads.
 
 Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` for migration steps.
 

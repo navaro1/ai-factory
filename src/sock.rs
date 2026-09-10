@@ -35,7 +35,7 @@ use crate::config::{
     RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
-use crate::labels::LabelNames;
+use crate::labels::{LabelKey, LabelNames};
 use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
@@ -179,6 +179,8 @@ struct SettingsViewRef<'a> {
     repositories: &'a [RepositoryRoleSettingsView],
     global_tag_routes: &'a [GlobalTagRouteSettingsView],
     repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
+    labels: &'a LabelNames,
+    repository_labels: &'a BTreeMap<String, LabelNames>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     theory_global: Vec<&'a GlobalRoleSettingsView>,
     prompts: &'a [PromptView],
@@ -218,6 +220,8 @@ impl Serialize for SettingsView {
             repositories: &self.repositories,
             global_tag_routes: &self.global_tag_routes,
             repository_tag_routes: &self.repository_tag_routes,
+            labels: &self.labels,
+            repository_labels: &self.repository_labels,
             theory_global,
             prompts: &self.prompts,
         }
@@ -704,17 +708,18 @@ impl StateInput<'_> {
             .keys()
             .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
             .flat_map(|(repo, items)| {
+                let names = config.resolved_labels(Some(repo));
                 items
                     .issues
                     .values()
                     .filter(|issue| issue.open)
-                    .map(|issue| TicketSummary {
+                    .map(move |issue| TicketSummary {
                         repo: repo.clone(),
                         number: issue.number,
                         title: issue.title.clone(),
                         labels: issue.labels.clone(),
                         updated_at: issue.updated_at.clone(),
-                        group: TicketGroup::from_labels(&issue.labels),
+                        group: TicketGroup::from_labels(&issue.labels, &names),
                     })
             })
             .collect();
@@ -925,10 +930,10 @@ pub enum TicketGroup {
 
 impl TicketGroup {
     /// Classify one label set.
-    fn from_labels(labels: &[String]) -> Self {
-        if labels.iter().any(|label| label == "to-refine") {
+    fn from_labels(labels: &[String], names: &LabelNames) -> Self {
+        if names.has(LabelKey::ToRefine, labels) {
             TicketGroup::ToRefine
-        } else if labels.iter().any(|label| label == "refined") {
+        } else if names.has(LabelKey::Refined, labels) {
             TicketGroup::Refined
         } else {
             TicketGroup::Untouched

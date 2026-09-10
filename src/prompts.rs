@@ -97,16 +97,16 @@ the error that reports an existing label:
 Give two complexity labels to every ticket that an agent implements. The
 factory reads them to select the model of the implement stage and of the
 review stage. The scale is `low`, `medium`, `high`, and `very-high`. The
-implementation label is `complexity:<level>`. The review label is
-`review-complexity:<level>`. Rate the size and the risk of that one ticket,
+implementation label is `{label_complexity}<level>`. The review label is
+`{label_review_complexity}<level>`. Rate the size and the risk of that one ticket,
 not of the whole feature. An absent label means `medium`, so state the level
 even when you choose medium.
 
 # One chunk
 
 When the plan holds one chunk, the ticket stays one ticket. Run
-`gh issue edit {number} --remove-label to-refine --add-label refined` and add
-the two complexity labels in the same command. Report one line that says the
+`gh issue edit {number} --remove-label {label_to_refine} --add-label {label_refined}`
+and add the two complexity labels in the same command. Report one line that says the
 ticket is refined.
 
 # Several chunks
@@ -135,9 +135,9 @@ When a chunk depends on an earlier chunk, add one line `Blocked by #A and #B`
 to the body of the sub-ticket. Name every earlier chunk it needs. The factory
 holds the sub-ticket until those tickets close.
 
-Give each sub-ticket the `refined` label, the `chunk` label, one
-`complexity:<level>` label, and one `review-complexity:<level>` label. Never
-give a sub-ticket the `to-refine` label.
+Give each sub-ticket the `{label_refined}` label, the `{label_chunk}` label, one
+`{label_complexity}<level>` label, and one `{label_review_complexity}<level>`
+label. Never give a sub-ticket the `{label_to_refine}` label.
 
 The last sub-ticket is the coordinator. Add this line to its body:
 
@@ -150,9 +150,9 @@ Then edit the parent:
   the form `- [ ] #A short goal`.
 - Add a `## Definition of done` section. State that the parent closes when the
   PR of the final chunk merges.
-- Run `gh issue edit {number} --remove-label to-refine --add-label epic`.
+- Run `gh issue edit {number} --remove-label {label_to_refine} --add-label {label_epic}`.
 
-Never give the parent the `refined` label. That label starts a second
+Never give the parent the `{label_refined}` label. That label starts a second
 implementation of work the sub-tickets already own, and it leaves the parent
 open forever.
 
@@ -160,7 +160,7 @@ Report one line that says the ticket is refined, and name the sub-tickets.
 
 # A second run on the same parent
 
-A parent carries the `epic` label and a `## Chunks` section. When you refine
+A parent carries the `{label_epic}` label and a `## Chunks` section. When you refine
 such a ticket again, do not create the sub-tickets a second time. Read the
 sub-tickets the section names. Update the body and the labels of each open
 one. Create a sub-ticket only for a chunk that has none. Close a sub-ticket
@@ -168,8 +168,8 @@ that the new plan drops, and state the reason in a comment.
 
 # A human decision
 
-When you need a human decision, add the `needs-human` label to the ticket with
-`gh` and state the question in a comment. Stop after the label is on. When the
+When you need a human decision, add the `{label_needs_human}` label to the ticket
+with `gh` and state the question in a comment. Stop after the label is on. When the
 decision is a choice between named answers, end the comment with one strict
 block in this form. Keep the JSON on one line:
 <aif-ask-v1>
@@ -230,10 +230,10 @@ Open a draft PR with `gh pr create --draft` when the work is done. Put
 `Closes #{number}` in the body. When the ticket body names a parent ticket and
 marks this ticket as the final chunk, add a second `Closes` line for the parent
 number, so the merge closes the parent too. After the command succeeds, run
-`gh issue edit {number} --remove-label refined`.
+`gh issue edit {number} --remove-label {label_refined}`.
 
 If the specification is incomplete, or you need a human decision, add the
-`needs-human` label to ticket #{number} with `gh`, write the question into a
+`{label_needs_human}` label to ticket #{number} with `gh`, write the question into a
 comment on it, and stop. Do not guess. When the decision is a choice between
 named answers, end the comment with one strict block in this form. Keep the JSON
 on one line:
@@ -270,7 +270,7 @@ Tickets this PR closes: {tickets}
 
 You are the last agent on this change. You repair every finding yourself. You
 never hand a finding back to the author. The PR must leave your run ready for
-review, or labelled `needs-human`.
+review, or labelled `{label_needs_human}`.
 
 Read the diff of the PR with `gh pr diff {number}`. Review it for
 correctness, tests, and fit with the codebase. Read the repository
@@ -306,7 +306,7 @@ When the PR needs no repair, post the record and run `gh pr ready {number}`.
 
 Take the human path when the PR comes from a fork, when a finding needs a human
 decision, when the repair leaves the scope of the linked tickets, or when the
-push fails. On that path, add the `needs-human` label to the PR with `gh`, write
+push fails. On that path, add the `{label_needs_human}` label to the PR with `gh`, write
 the question into a comment, leave the draft, and stop. Do not guess. When the
 decision is a choice between named answers, end the comment with one strict
 block in this form. Keep the JSON on one line:
@@ -394,6 +394,17 @@ const STAGE_PLACEHOLDERS: &[&str] = &[
     "pr_list",
     "pr_numbers",
     "pr_count",
+    // The configured label names of this repository. A prompt names a
+    // label through one of these, never as literal text, so a repository
+    // that renamed a label gets an agent that writes the right name.
+    "label_to_refine",
+    "label_refined",
+    "label_epic",
+    "label_chunk",
+    "label_needs_human",
+    "label_release_stacked",
+    "label_complexity",
+    "label_review_complexity",
 ];
 
 /// The placeholders the daemon fills in the ticket-creation prompt.
@@ -1040,10 +1051,10 @@ mod tests {
             "Create the sub-tickets in wave order",
             "A sub-ticket must stand alone",
             // The routing labels the tag routes read.
-            "`complexity:<level>`",
-            "`review-complexity:<level>`",
-            "Give each sub-ticket the `refined` label, the `chunk` label",
-            "Never give a sub-ticket the `to-refine` label",
+            "`{label_complexity}<level>`",
+            "`{label_review_complexity}<level>`",
+            "Give each sub-ticket the `{label_refined}` label, the `{label_chunk}` label",
+            "Never give a sub-ticket the `{label_to_refine}` label",
             // A missing label would fail `gh issue create`.
             "gh label create <name>",
             // The wave order rides on the blocker parser of the gates module.
@@ -1052,8 +1063,8 @@ mod tests {
             // when the final chunk merges. Both rules keep it from going
             // stale as an open ticket no agent ever finishes.
             "No agent implements the parent",
-            "Never give the parent the `refined` label",
-            "--remove-label to-refine --add-label epic",
+            "Never give the parent the `{label_refined}` label",
+            "--remove-label {label_to_refine} --add-label {label_epic}",
             "add a second `Closes #{number}` line to the PR body",
             "the parent closes when the PR of the final chunk merges",
             // A second refine run must not duplicate the sub-tickets.
@@ -1105,7 +1116,7 @@ merge closes the parent too."
             .join(" ");
         for required in [
             "You repair every finding yourself",
-            "ready for review, or labelled `needs-human`",
+            "ready for review, or labelled `{label_needs_human}`",
             "gh pr view {number} --json isCrossRepository --jq .isCrossRepository",
             "Never push a fork repair to `origin`",
             "Take the human path when the PR comes from a fork",
@@ -1114,7 +1125,7 @@ merge closes the parent too."
             "git push origin HEAD:$(gh pr view {number} --json headRefName --jq .headRefName) && gh pr ready {number}",
             "Never pass `--force`. Never merge the PR.",
             "GitHub refuses a formal review of your own PR",
-            "add the `needs-human` label to the PR",
+            "add the `{label_needs_human}` label to the PR",
         ] {
             assert!(prompt.contains(required), "missing: {required}");
         }

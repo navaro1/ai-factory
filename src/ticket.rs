@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::exec::Exec;
 use crate::gh::GhClient;
+use crate::labels::LabelKey;
 use crate::mentions;
 use crate::model::{Issue, Snapshot};
 use crate::sock::{
@@ -193,7 +194,8 @@ impl TicketController {
                         confirmed: None,
                     };
                 }
-                if issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "refined")) {
+                let names = config.resolved_labels(Some(&repo));
+                if issue.is_some_and(|issue| names.has(LabelKey::Refined, &issue.labels)) {
                     return TicketEffects {
                         pushes: vec![Push::TicketResult(result(
                             request,

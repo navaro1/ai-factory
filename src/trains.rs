@@ -309,6 +309,9 @@ impl Train {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default name, so the existing expectations keep reading well.
+    const STACKED: &str = crate::labels::DEFAULT_RELEASE_STACKED;
     use crate::exec::{Call, CmdOut, ScriptExec};
 
     /// A matcher for one exact `gh` argument vector.
@@ -359,7 +362,7 @@ mod tests {
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
 
-        let returned = t.finish(false, "acme/borsuk", &client).unwrap();
+        let returned = t.finish(false, "acme/borsuk", &client, STACKED).unwrap();
 
         assert_eq!(returned, vec![2]);
         assert_eq!(t.queue, vec![2]);
@@ -386,7 +389,7 @@ mod tests {
         assert_eq!(t.should_fire(&policy, 2_000), None);
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
-        t.finish(true, "acme/borsuk", &client).unwrap();
+        t.finish(true, "acme/borsuk", &client, STACKED).unwrap();
         assert!(exec.calls().is_empty());
         assert_eq!(t.queue, vec![4], "only the fired batch drains");
         assert_eq!(t.should_fire(&policy, 3_000), None);
@@ -481,7 +484,7 @@ mod tests {
         t.enqueue(4);
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
-        let finished = t.finish(false, "acme/borsuk", &client).unwrap();
+        let finished = t.finish(false, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(finished, vec![1, 2, 3]);
         assert_eq!(t.in_flight, None);
         assert_eq!(t.queue, vec![4, 1, 2, 3], "the batch is back in the queue");
@@ -500,11 +503,11 @@ mod tests {
 
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
-        t.finish(false, "acme/borsuk", &client).unwrap();
+        t.finish(false, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(t.batch(), &[1, 3], "a failed batch stays visible for retry");
 
         t.fire(&[1, 3], 2_000).unwrap();
-        t.finish(true, "acme/borsuk", &client).unwrap();
+        t.finish(true, "acme/borsuk", &client, STACKED).unwrap();
         assert!(t.batch().is_empty(), "a successful batch leaves no outline");
     }
 
@@ -514,7 +517,7 @@ mod tests {
         t.fire(&[1, 2], 1_000).unwrap();
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
-        t.finish(false, "acme/borsuk", &client).unwrap();
+        t.finish(false, "acme/borsuk", &client, STACKED).unwrap();
         t.enqueue(3);
 
         let err = t.fire(&[3], 2_000).unwrap_err();
@@ -541,7 +544,7 @@ mod tests {
         );
         let client = GhClient::new(&exec);
         let mut t = train(&[1, 2]);
-        t.stack(2, true, "acme/borsuk", &client).unwrap();
+        t.stack(2, true, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(t.stacked, vec![2]);
         assert_eq!(exec.calls().len(), 1);
     }
@@ -576,8 +579,8 @@ mod tests {
         let client = GhClient::new(&exec);
         let mut t = train(&[7, 9]);
 
-        t.stack(9, true, "acme/borsuk", &client).unwrap();
-        t.stack(7, true, "acme/borsuk", &client).unwrap();
+        t.stack(9, true, "acme/borsuk", &client, STACKED).unwrap();
+        t.stack(7, true, "acme/borsuk", &client, STACKED).unwrap();
 
         assert_eq!(t.stacked, vec![7, 9]);
     }
@@ -597,7 +600,7 @@ mod tests {
         let client = GhClient::new(&exec);
         let mut t = train(&[1, 2]);
         t.stacked = vec![2];
-        t.stack(2, false, "acme/borsuk", &client).unwrap();
+        t.stack(2, false, "acme/borsuk", &client, STACKED).unwrap();
         assert!(t.stacked.is_empty());
     }
 
@@ -617,8 +620,8 @@ mod tests {
         );
         let client = GhClient::new(&exec);
         let mut t = train(&[2]);
-        t.stack(2, true, "acme/borsuk", &client).unwrap();
-        t.stack(2, true, "acme/borsuk", &client).unwrap();
+        t.stack(2, true, "acme/borsuk", &client, STACKED).unwrap();
+        t.stack(2, true, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(t.stacked, vec![2]);
         assert_eq!(exec.calls().len(), 1);
     }
@@ -628,7 +631,7 @@ mod tests {
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
         let mut t = train(&[1]);
-        t.stack(1, false, "acme/borsuk", &client).unwrap();
+        t.stack(1, false, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(exec.calls().len(), 0);
     }
 
@@ -637,7 +640,7 @@ mod tests {
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
         let mut t = Train::new("borsuk");
-        let err = t.stack(9, true, "acme/borsuk", &client).unwrap_err();
+        let err = t.stack(9, true, "acme/borsuk", &client, STACKED).unwrap_err();
         assert!(err.to_string().contains("not in the release queue"));
         assert_eq!(exec.calls().len(), 0, "no label call happens");
     }
@@ -669,7 +672,7 @@ mod tests {
         t.rebuild_stacked(&[2]);
 
         assert_eq!(t.stacked, vec![2]);
-        assert_eq!(t.finish(true, "acme/borsuk", &client).unwrap(), vec![2]);
+        assert_eq!(t.finish(true, "acme/borsuk", &client, STACKED).unwrap(), vec![2]);
         assert_eq!(exec.calls().len(), 1);
     }
 
@@ -701,7 +704,7 @@ mod tests {
         t.stacked = vec![2, 5];
         let batch = t.fired_set();
         t.fire(&batch, 1_000).unwrap();
-        let finished = t.finish(true, "acme/borsuk", &client).unwrap();
+        let finished = t.finish(true, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(finished, vec![2, 5]);
         assert_eq!(t.queue, vec![1]);
         assert!(t.stacked.is_empty());
@@ -717,7 +720,7 @@ mod tests {
         let batch = t.fired_set();
         t.fire(&batch, 1_000).unwrap();
 
-        let finished = t.finish(true, "acme/borsuk", &client).unwrap();
+        let finished = t.finish(true, "acme/borsuk", &client, STACKED).unwrap();
 
         assert_eq!(finished, vec![1, 2]);
         assert!(t.queue.is_empty());
@@ -751,14 +754,14 @@ mod tests {
         t.stacked = vec![2];
         let id = t.fire(&[2], 1_000).unwrap();
 
-        let err = t.finish(true, "acme/borsuk", &client).unwrap_err();
+        let err = t.finish(true, "acme/borsuk", &client, STACKED).unwrap_err();
 
         assert!(err.to_string().contains("cannot remove release-stacked"));
         assert_eq!(t.in_flight.as_deref(), Some(id.as_str()));
         assert_eq!(t.stacked, vec![2]);
         assert!(t.queue.is_empty());
 
-        let finished = t.finish(true, "acme/borsuk", &client).unwrap();
+        let finished = t.finish(true, "acme/borsuk", &client, STACKED).unwrap();
         assert_eq!(finished, vec![2]);
         assert_eq!(t.in_flight, None);
         assert!(t.stacked.is_empty());
@@ -770,7 +773,7 @@ mod tests {
         let exec = ScriptExec::new();
         let client = GhClient::new(&exec);
         let mut t = train(&[1]);
-        let finished = t.finish(true, "acme/borsuk", &client).unwrap();
+        let finished = t.finish(true, "acme/borsuk", &client, STACKED).unwrap();
         assert!(finished.is_empty());
         assert_eq!(exec.calls().len(), 0);
     }
