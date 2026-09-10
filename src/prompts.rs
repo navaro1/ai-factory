@@ -394,6 +394,14 @@ const STAGE_PLACEHOLDERS: &[&str] = &[
     "pr_list",
     "pr_numbers",
     "pr_count",
+    // The theory placeholders. `prediction`, `comparison`, `rules`, and
+    // `why_rule` render empty until their chunks land.
+    "model",
+    "prediction",
+    "comparison",
+    "skills",
+    "rules",
+    "why_rule",
 ];
 
 /// The placeholders the daemon fills in the ticket-creation prompt.
