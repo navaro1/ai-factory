@@ -64,6 +64,7 @@ use crate::sock::{
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, Task, TaskPurpose, TaskState, TaskTable};
+use crate::theory::records::{event_block, Event, RecordKey, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
@@ -4786,25 +4787,153 @@ impl Daemon {
     }
 
     /// Post one comment on an issue or pull request with `gh api`.
-    ///
-    /// [`GhClient`] has no comment call, so the daemon runs the api call
-    /// itself through the command runner.
     fn post_issue_comment(&self, repo: &RepoConfig, number: u64, text: &str) -> Result<()> {
-        let url = format!("repos/{}/issues/{number}/comments", repo.owner_repo);
-        let field = format!("body={text}");
-        let args = ["api", "-X", "POST", url.as_str(), "-f", field.as_str()];
+        let gh = GhClient::new(&*self.exec);
+        gh.post_comment(&repo.owner_repo, number, text)
+    }
+
+    /// Resolve the theory record of one item to its `(owner_repo, number)`.
+    ///
+    /// In code mode, with no `theory.repo`, an issue or a pull request is
+    /// its own record, and the record of the whole repository is the issue
+    /// titled `<alias>/theory`, found in the snapshot or created. With
+    /// `theory.repo` set, the record is the issue titled `<alias>#<n>` (or
+    /// `<alias>/theory`) in the theory repository, found through
+    /// `gh issue list` or created.
+    // The v0.8 chunks call this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn theory_record(&self, alias: &str, key: &RecordKey) -> Result<(String, u64)> {
+        let repo_cfg = self
+            .config
+            .repos
+            .get(alias)
+            .ok_or_else(|| anyhow!("no such repository: {alias}"))?;
+        let shadow = repo_cfg
+            .theory
+            .theory
+            .as_ref()
+            .and_then(|theory| theory.repo.as_deref());
+        let (target_repo, title, body) = match (shadow, key) {
+            (None, RecordKey::Issue(number) | RecordKey::Pr(number)) => {
+                return Ok((repo_cfg.owner_repo.clone(), *number));
+            }
+            (Some(theory_repo), RecordKey::Issue(number) | RecordKey::Pr(number)) => (
+                theory_repo.to_string(),
+                format!("{alias}#{number}"),
+                format!("Theory record of {}#{number}", repo_cfg.owner_repo),
+            ),
+            (Some(theory_repo), RecordKey::Repo) => (
+                theory_repo.to_string(),
+                format!("{alias}/theory"),
+                format!("Theory record of {alias}"),
+            ),
+            (None, RecordKey::Repo) => {
+                let title = format!("{alias}/theory");
+                if let Some(number) = self
+                    .snapshot
+                    .repos
+                    .get(alias)
+                    .and_then(|items| {
+                        items
+                            .issues
+                            .values()
+                            .find(|issue| issue.open && issue.title == title)
+                    })
+                    .map(|issue| issue.number)
+                {
+                    return Ok((repo_cfg.owner_repo.clone(), number));
+                }
+                let gh = GhClient::new(&*self.exec);
+                let issue = gh.create_issue(
+                    &repo_cfg.owner_repo,
+                    &title,
+                    &format!("Theory record of {alias}"),
+                    &[],
+                )?;
+                return Ok((repo_cfg.owner_repo.clone(), issue.number));
+            }
+        };
+        self.find_or_create_theory_issue(&target_repo, &title, &body)
+    }
+
+    /// Find one open issue by exact title, or create it.
+    ///
+    /// The search is one page of `gh issue list` over the title; a hit
+    /// whose title matches exactly wins.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn find_or_create_theory_issue(
+        &self,
+        owner_repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(String, u64)> {
+        let search = format!("{title} in:title");
+        let args = [
+            "issue",
+            "list",
+            "--repo",
+            owner_repo,
+            "--search",
+            search.as_str(),
+            "--state",
+            "open",
+            "--json",
+            "number,title",
+        ];
         let out = self
             .exec
             .run("gh", &args, None)
-            .map_err(|e| anyhow!("gh could not run: {e:#}"))?;
+            .context("gh issue list failed to run")?;
         if out.status != 0 {
             bail!(
-                "gh exited with status {}: {}",
+                "gh issue list exited with status {}: {}",
                 out.status,
                 out.stderr.trim()
             );
         }
-        Ok(())
+        let found: Vec<serde_json::Value> =
+            serde_json::from_str(&out.stdout).context("gh issue list returned a broken body")?;
+        let hit = found.iter().find(|hit| {
+            hit.get("title").and_then(serde_json::Value::as_str) == Some(title)
+                && hit
+                    .get("number")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+        });
+        if let Some(number) = hit
+            .and_then(|hit| hit.get("number"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            return Ok((owner_repo.to_string(), number));
+        }
+        let gh = GhClient::new(&*self.exec);
+        let issue = gh.create_issue(owner_repo, title, body, &[])?;
+        Ok((owner_repo.to_string(), issue.number))
+    }
+
+    /// Post one comment on the theory record of one item.
+    // The v0.8 chunks call this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn post_record_comment(&self, alias: &str, key: &RecordKey, text: &str) -> Result<()> {
+        let (owner_repo, number) = self.theory_record(alias, key)?;
+        let gh = GhClient::new(&*self.exec);
+        gh.post_comment(&owner_repo, number, text)
+    }
+
+    /// Open one theory event on the theory record of one item.
+    ///
+    /// The event ships as one `<aif-event-v1>` block comment with a JSON
+    /// body, and the `event-open` label exists afterwards: the daemon
+    /// creates it when the repository has none, then adds it to the
+    /// record.
+    // The v0.8 chunks call this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn open_event(&self, alias: &str, key: &RecordKey, event: &Event) -> Result<()> {
+        let (owner_repo, number) = self.theory_record(alias, key)?;
+        let gh = GhClient::new(&*self.exec);
+        gh.post_comment(&owner_repo, number, &event_block(event))?;
+        gh.create_label_if_missing(&owner_repo, EVENT_OPEN_LABEL, EVENT_OPEN_COLOR)?;
+        gh.add_label(&owner_repo, number, EVENT_OPEN_LABEL)
     }
 
     /// Queue a failed task again from attempt 1.
@@ -5850,6 +5979,7 @@ mod tests {
         scan_placeholders, IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT,
     };
     use crate::tasks::MAX_ATTEMPTS;
+    use crate::theory::records::parse_event_blocks;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -10016,6 +10146,250 @@ mod tests {
             "cancel removes the label without a comment"
         );
         assert!(rig.decision("human:borsuk:i10").is_none());
+    }
+
+    /// The `gh issue list` search of one shadow theory repository.
+    fn shadow_search_step(title: &str, out: CmdOut) -> Step {
+        let search = format!("{title} in:title");
+        gh_step(
+            &[
+                "issue",
+                "list",
+                "--repo",
+                "acme/borsuk-theory",
+                "--search",
+                &search,
+                "--state",
+                "open",
+                "--json",
+                "number,title",
+            ],
+            out,
+        )
+    }
+
+    /// Point the `borsuk` theory at a shadow GitHub repository.
+    fn use_shadow_theory(config: &mut Config) {
+        config.repos.get_mut("borsuk").unwrap().theory.theory = Some(crate::config::TheoryRepo {
+            repo: Some("acme/borsuk-theory".to_string()),
+            path: PathBuf::from("theory-checkout"),
+        });
+    }
+
+    #[test]
+    fn theory_record_returns_the_item_itself_in_code_mode() {
+        let rig = Rig::make(vec![]);
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Issue(142))
+                .unwrap(),
+            ("acme/borsuk".to_string(), 142)
+        );
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Pr(5))
+                .unwrap(),
+            ("acme/borsuk".to_string(), 5)
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "an item is its own record with no gh call"
+        );
+    }
+
+    #[test]
+    fn theory_record_creates_the_repo_issue_once_and_reuses_it_from_the_snapshot() {
+        let created = json!({
+            "number": 7,
+            "node_id": "node-7",
+            "title": "borsuk/theory",
+            "body": "Theory record of borsuk",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-10T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk/issues/7"
+        })
+        .to_string();
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=borsuk/theory",
+                "-f",
+                "body=Theory record of borsuk",
+            ],
+            CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+        )];
+        let mut rig = Rig::make_paused(steps);
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Repo)
+                .unwrap(),
+            ("acme/borsuk".to_string(), 7)
+        );
+
+        // The next poll shows the record issue, so the second call
+        // resolves it from the snapshot and creates nothing.
+        let mut record = issue(7, &[]);
+        record.title = "borsuk/theory".to_string();
+        rig.poll(vec![record], vec![]);
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Repo)
+                .unwrap(),
+            ("acme/borsuk".to_string(), 7)
+        );
+        assert_eq!(rig.exec.calls().len(), 1, "the create ran once");
+    }
+
+    #[test]
+    fn theory_record_in_shadow_mode_searches_then_creates_the_issue_once() {
+        let created = json!({
+            "number": 300,
+            "node_id": "node-300",
+            "title": "borsuk#142",
+            "body": "Theory record of acme/borsuk#142",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-10T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk-theory/issues/300"
+        })
+        .to_string();
+        let steps = vec![
+            shadow_search_step("borsuk#142", CmdOut::ok("[]")),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk-theory/issues",
+                    "-f",
+                    "title=borsuk#142",
+                    "-f",
+                    "body=Theory record of acme/borsuk#142",
+                ],
+                CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+            ),
+            shadow_search_step(
+                "borsuk#142",
+                CmdOut::ok(r#"[{"number":300,"title":"borsuk#142"}]"#),
+            ),
+        ];
+        let rig = Rig::make_with(steps, use_shadow_theory);
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Issue(142))
+                .unwrap(),
+            ("acme/borsuk-theory".to_string(), 300)
+        );
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Issue(142))
+                .unwrap(),
+            ("acme/borsuk-theory".to_string(), 300)
+        );
+        assert_eq!(rig.exec.calls().len(), 3, "the create ran once");
+    }
+
+    #[test]
+    fn open_event_posts_the_block_comment_then_adds_the_label() {
+        let event = Event {
+            kind: "violation".to_string(),
+            text: "INV-3 broke: the poller never parked.".to_string(),
+            area: Some("poll".to_string()),
+            number: Some(142),
+        };
+        let body = format!("body={}", event_block(&event));
+        let steps = vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=event-open",
+                    "-f",
+                    "color=d4c5f9",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"event-open\",\"color\":\"d4c5f9\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    "labels[]=event-open",
+                ],
+                gh_ok(),
+            ),
+        ];
+        let rig = Rig::make(steps);
+        rig.daemon
+            .open_event("borsuk", &RecordKey::Issue(142), &event)
+            .unwrap();
+
+        let calls = rig.exec.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].program, "gh");
+        let field = calls[0]
+            .args
+            .iter()
+            .find(|arg| arg.starts_with("body="))
+            .expect("the comment carries a body field")
+            .strip_prefix("body=")
+            .unwrap()
+            .to_string();
+        assert!(field.contains("<aif-event-v1>"));
+        assert_eq!(
+            parse_event_blocks(&field),
+            vec![event],
+            "the block holds the event as valid JSON"
+        );
+    }
+
+    #[test]
+    fn post_record_comment_posts_on_the_resolved_record() {
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/5/comments",
+                "-f",
+                "body=note",
+            ],
+            CmdOut::ok(""),
+        )];
+        let rig = Rig::make(steps);
+        rig.daemon
+            .post_record_comment("borsuk", &RecordKey::Pr(5), "note")
+            .unwrap();
+        assert_eq!(rig.exec.calls().len(), 1);
     }
 
     /// The two scripted calls of one answered `needs-human` row on
