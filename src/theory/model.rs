@@ -108,11 +108,13 @@ impl Model {
     /// The slice of this model over `areas`, in file order.
     ///
     /// Every name is the id of a boundary entry. The slice holds those
-    /// boundaries, the states their sides name, the transitions between
-    /// those states, and every invariant and failure that names one of
-    /// them. It then takes one hop: every boundary those invariants and
-    /// failures touch. A boundary that only shares a side name stays out,
-    /// because a shared region name is not a relation.
+    /// boundaries, the states their sides name, every transition that
+    /// touches one of those states, and every invariant and failure that
+    /// names one of them. It then takes one hop: every boundary those
+    /// invariants and failures touch. A transition out of the area keeps
+    /// its own entry, and the state it leads to stays out. A boundary
+    /// that only shares a side name stays out, because a shared region
+    /// name is not a relation.
     pub fn slice(&self, areas: &[&str]) -> Model {
         let mut names: BTreeSet<&str> = areas.iter().copied().collect();
         for entry in &self.entries {
@@ -666,6 +668,31 @@ mod tests {
         assert!(
             !far.iter().any(|id| id == "S-out"),
             "the hop takes the boundary, not its states"
+        );
+    }
+
+    #[test]
+    fn slice_keeps_an_outbound_transition_and_leaves_the_state_it_leads_to_out() {
+        let text = format!(
+            "{}{}{}{}{}",
+            entry("state", "S-in", ""),
+            entry("state", "S-out", ""),
+            entry("state", "S-far", ""),
+            entry(
+                "boundary",
+                "B-1",
+                "sides = [\"S-in\", \"S-out\"]\npaths = [\"src/one/**\"]"
+            ),
+            entry("transition", "T-1", "from = \"S-out\"\nto = \"S-far\""),
+        );
+        let model = parse(&text).expect("the outbound model must parse");
+
+        let ids = slice_ids(&model, &["B-1"]);
+
+        assert_eq!(ids, ["S-in", "S-out", "B-1", "T-1"]);
+        assert!(
+            !ids.iter().any(|id| id == "S-far"),
+            "the state the transition leads to stays out"
         );
     }
 

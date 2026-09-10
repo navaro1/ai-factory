@@ -260,6 +260,16 @@ pub enum PredictionTag {
     Unsure,
 }
 
+impl PredictionTag {
+    /// The lowercase name of the tag, as a block writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sure => "sure",
+            Self::Unsure => "unsure",
+        }
+    }
+}
+
 /// One slot of a full prediction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredictionSlot {

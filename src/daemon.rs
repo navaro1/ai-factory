@@ -72,11 +72,10 @@ use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
     self, event_block, no_entries, parse_event_blocks, parse_prediction_blocks, prediction_block,
-    record_labels, skips_prediction_gates, Event, FullPrediction, Prediction, PredictionTag,
-    RecordKey, ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
-    MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS, THEORY_FULL_COLOR,
-    THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR,
-    VERIFY_SKILL_LABEL,
+    record_labels, skips_prediction_gates, Event, FullPrediction, Prediction, RecordKey,
+    ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL, MODEL_FILE,
+    MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS, THEORY_FULL_COLOR, THEORY_FULL_LABEL,
+    THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
@@ -8273,14 +8272,16 @@ impl Daemon {
             .theory_models
             .get(&task.repo)
             .and_then(|cache| cache.verify.as_ref().ok());
-        let resolved = names
+        let boundaries = names
+            .model
             .as_ref()
             .zip(verify)
-            .map(|(names, verify)| resolve_areas(names, verify));
-        let (areas, boundaries) = match resolved {
-            Some((areas, boundaries)) => (Some(areas), Some(boundaries)),
-            None => (None, None),
-        };
+            .map(|(names, verify)| resolve_areas(names, verify).1);
+        let areas = names
+            .skills
+            .as_ref()
+            .zip(verify)
+            .map(|(names, verify)| resolve_areas(names, verify).0);
         (
             self.model_slice(&task.repo, boundaries.as_deref()),
             self.prediction_text(task),
@@ -8288,49 +8289,64 @@ impl Daemon {
         )
     }
 
-    /// The area names one stage prompt slices over, or `None` when the
-    /// record carries no prediction.
+    /// The area names the two slices of one stage prompt take.
     ///
-    /// Refine takes the short prediction's areas. Implement takes the
-    /// full prediction's areas. Review takes the implement areas of every
-    /// ticket the pull request closes plus the areas of
-    /// `git diff --name-only <base>...<head>` in the worktree. A name is
-    /// an area of `theory/verify.toml` or a boundary of the model, as a
+    /// Refine takes the short prediction's areas for both. Implement
+    /// takes the full prediction's areas for both. Review parts the two:
+    /// the skills slice takes the areas of
+    /// `git diff --name-only <base>...<head>` alone, because requirement
+    /// R9 of v0.8 binds the run skills to what the diff touched, and the
+    /// model slice adds the areas every linked ticket predicted. A review
+    /// whose diff matches no boundary and whose tickets predicted nothing
+    /// leaves the model whole, the way v0.8 rendered it. A name is an
+    /// area of `theory/verify.toml` or a boundary of the model, as a
     /// prediction writes it.
-    fn slice_areas(&self, task: &Task, repo_path: &Path, worktree: &Path) -> Option<Vec<String>> {
-        let cache = self.theory_models.get(&task.repo)?;
+    fn slice_areas(&self, task: &Task, repo_path: &Path, worktree: &Path) -> SliceAreas {
+        let Some(cache) = self.theory_models.get(&task.repo) else {
+            return SliceAreas::whole();
+        };
         let (Ok(model), Ok(verify)) = (&cache.model, &cache.verify) else {
-            return None;
+            return SliceAreas::whole();
         };
         match task.stage {
-            Stage::Refine => Some(
-                self.record_view(&task.repo, task.number)?
-                    .short
-                    .as_ref()?
-                    .areas
-                    .clone(),
-            ),
-            Stage::Implement => {
-                let view = self.record_view(&task.repo, task.number)?;
-                (view.short.is_some() || view.full.is_some()).then(|| predicted_areas(view))
-            }
+            Stage::Refine => match self
+                .record_view(&task.repo, task.number)
+                .and_then(|view| view.short.as_ref())
+            {
+                Some(short) => SliceAreas::shared(short.areas.clone()),
+                None => SliceAreas::whole(),
+            },
+            Stage::Implement => match self.record_view(&task.repo, task.number) {
+                Some(view) if view.short.is_some() || view.full.is_some() => {
+                    SliceAreas::shared(predicted_areas(view))
+                }
+                _ => SliceAreas::whole(),
+            },
             Stage::Review => {
-                let mut names: Vec<String> = Vec::new();
+                let mut union: Vec<String> = Vec::new();
                 for ticket in self.linked_tickets(&task.repo, task.number) {
                     if let Some(view) = self.record_view(&task.repo, ticket) {
                         for name in predicted_areas(view) {
-                            push_once(&mut names, name);
+                            push_once(&mut union, name);
                         }
                     }
                 }
                 let paths = self.diff_paths(repo_path, worktree);
                 let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-                for area in verify.areas_for_paths(model, &refs) {
-                    push_once(&mut names, area.to_string());
+                let touched: Vec<String> = verify
+                    .areas_for_paths(model, &refs)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                for area in &touched {
+                    push_once(&mut union, area.clone());
                 }
-                Some(names)
+                SliceAreas {
+                    model: (!union.is_empty()).then_some(union),
+                    skills: Some(touched),
+                }
             }
-            Stage::Release => None,
+            Stage::Release => SliceAreas::whole(),
         }
     }
 
@@ -8393,7 +8409,7 @@ impl Daemon {
                     lines.push(format!(
                         "{} ({}): {}",
                         slot.name,
-                        tag_name(slot.tag),
+                        slot.tag.name(),
                         name_list(&slot.entries)
                     ));
                 }
@@ -8858,6 +8874,35 @@ impl Daemon {
     }
 }
 
+/// The area names the model slice and the skills slice of one prompt take.
+///
+/// A `None` field is the v0.8 fallback: the whole model for `model`, and
+/// every area of the verification map for `skills`.
+struct SliceAreas {
+    /// The names the `{model}` slice takes.
+    model: Option<Vec<String>>,
+    /// The names the `{skills}` slice takes.
+    skills: Option<Vec<String>>,
+}
+
+impl SliceAreas {
+    /// The whole model and every area, for a record with no prediction.
+    fn whole() -> Self {
+        Self {
+            model: None,
+            skills: None,
+        }
+    }
+
+    /// One name list for both slices.
+    fn shared(names: Vec<String>) -> Self {
+        Self {
+            model: Some(names.clone()),
+            skills: Some(names),
+        }
+    }
+}
+
 /// The entries of one model as prompt lines.
 fn entry_lines(model: &Model) -> String {
     model
@@ -8937,14 +8982,6 @@ fn name_list(names: &[String]) -> String {
         return "none".to_string();
     }
     names.join(", ")
-}
-
-/// The lowercase name of one prediction tag.
-fn tag_name(tag: PredictionTag) -> &'static str {
-    match tag {
-        PredictionTag::Sure => "sure",
-        PredictionTag::Unsure => "unsure",
-    }
 }
 
 /// The task id of one run event.
@@ -9120,7 +9157,7 @@ mod tests {
     };
     use crate::tasks::MAX_ATTEMPTS;
     use crate::theory::records::{
-        parse_event_blocks, PredictionSlot, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
+        parse_event_blocks, PredictionSlot, PredictionTag, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
     };
     use crate::theory::verify::Tier;
     use serde_json::json;
@@ -24741,6 +24778,21 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         }
     }
 
+    /// One full prediction over the named slots, in the given order.
+    fn full_view(slots: &[(&str, Vec<&str>, PredictionTag)]) -> FullPrediction {
+        FullPrediction {
+            kind: records::PREDICTION_FULL.to_string(),
+            slots: slots
+                .iter()
+                .map(|(name, entries, tag)| PredictionSlot {
+                    name: (*name).to_string(),
+                    entries: entries.iter().map(|id| id.to_string()).collect(),
+                    tag: *tag,
+                })
+                .collect(),
+        }
+    }
+
     /// Store one record view under the issue key of `ticket`.
     fn store_view(rig: &mut Rig, ticket: u64, view: RecordView) {
         rig.daemon.theory_blocks.insert(
@@ -24799,14 +24851,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             142,
             RecordView {
                 short: Some(short_view("the submit blocks", &["web-checkout"])),
-                full: Some(FullPrediction {
-                    kind: records::PREDICTION_FULL.to_string(),
-                    slots: vec![PredictionSlot {
-                        name: PREDICTION_OTHER_AREAS.to_string(),
-                        entries: vec!["api-orders".to_string()],
-                        tag: PredictionTag::Sure,
-                    }],
-                }),
+                full: Some(full_view(&[(
+                    PREDICTION_OTHER_AREAS,
+                    vec!["api-orders"],
+                    PredictionTag::Sure,
+                )])),
             },
         );
 
@@ -24871,21 +24920,13 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             142,
             RecordView {
                 short: Some(short_view("the submit blocks", &["web-checkout"])),
-                full: Some(FullPrediction {
-                    kind: records::PREDICTION_FULL.to_string(),
-                    slots: vec![
-                        PredictionSlot {
-                            name: "invariants".to_string(),
-                            entries: vec!["I-1".to_string()],
-                            tag: PredictionTag::Sure,
-                        },
-                        PredictionSlot {
-                            name: PREDICTION_OTHER_AREAS.to_string(),
-                            entries: Vec::new(),
-                            tag: PredictionTag::Unsure,
-                        },
-                    ],
-                }),
+                full: Some(full_view(&[
+                    ("behaviours", vec!["T-1"], PredictionTag::Sure),
+                    ("states", Vec::new(), PredictionTag::Unsure),
+                    ("invariants", vec!["I-1"], PredictionTag::Sure),
+                    ("failure-modes", vec!["F-1"], PredictionTag::Unsure),
+                    (PREDICTION_OTHER_AREAS, Vec::new(), PredictionTag::Unsure),
+                ])),
             },
         );
 
@@ -24902,9 +24943,13 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 "ticket #142\n",
                 "short: the submit blocks\n",
                 "areas: web-checkout\n",
+                "behaviours (sure): T-1\n",
+                "states (unsure): none\n",
                 "invariants (sure): I-1\n",
+                "failure-modes (unsure): F-1\n",
                 "other-areas (unsure): none",
-            )
+            ),
+            "the block keeps the five slots in their template order"
         );
         assert_eq!(
             placeholder_of(&values, "model"),
@@ -24913,6 +24958,108 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
         prompts::fill_template(prompts::REVIEW_PROMPT, &values)
             .expect("the review prompt must accept every value");
+    }
+
+    /// The rig steps of one review slice test: the theory read, then the
+    /// head diff of pull request 7.
+    fn review_slice_steps(dir: &Path, repo: &Path, diff: &str) -> Vec<Step> {
+        let mut steps = slice_steps(repo, "aaa111");
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &pr_wt(dir, 7),
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps
+    }
+
+    /// Link pull request 7 to ticket 142 in the rig.
+    fn link_pr_seven(rig: &mut Rig) {
+        let mut snapshot = RepoSnapshot::default();
+        snapshot.prs.insert(7, contract_pr("## Why\n"));
+        rig.daemon
+            .links
+            .insert("borsuk".to_string(), Links::derive("borsuk", &snapshot));
+    }
+
+    /// Requirement R9 of v0.8 binds the run skills to what the diff
+    /// touched. A predicted area the diff never reached widens the model
+    /// block and must leave the skills block alone.
+    #[test]
+    fn the_review_skills_slice_ignores_a_predicted_area_the_diff_never_touched() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = review_slice_steps(&dir, &repo, "api/orders/new.rs");
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        link_pr_seven(&mut rig);
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: None,
+            },
+        );
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        let skills = placeholder_of(&values, "skills");
+        assert!(
+            skills.contains("# Orders"),
+            "the diff area's file:\n{skills}"
+        );
+        assert!(
+            !skills.contains("# Checkout"),
+            "the predicted area the diff never touched stays out:\n{skills}"
+        );
+        assert!(
+            !skills.contains("index only"),
+            "the diff area's files stay inline:\n{skills}"
+        );
+        assert_eq!(
+            placeholder_of(&values, "model"),
+            BOTH_ENTRIES,
+            "the model block still unions the predicted area with the diff area"
+        );
+    }
+
+    /// A `verify-skill` pull request changes no area. The model block
+    /// keeps every entry, the way v0.8 rendered it.
+    #[test]
+    fn a_review_with_no_prediction_and_no_touched_area_keeps_the_whole_model() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = review_slice_steps(&dir, &repo, "docs/readme.md");
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        link_pr_seven(&mut rig);
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        assert_eq!(placeholder_of(&values, "model"), BOTH_ENTRIES);
+        assert_eq!(
+            placeholder_of(&values, "skills"),
+            "",
+            "no touched area leaves the skills block empty"
+        );
+        assert_eq!(placeholder_of(&values, "prediction"), "none");
     }
 
     #[test]
