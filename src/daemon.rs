@@ -64,7 +64,7 @@ use crate::sock::{
     TheoryAction, TheoryView, TicketAction, TicketDetails, TicketProposal, TicketResult,
     TicketResultKind, SKILL_TICKET_REQUEST,
 };
-use crate::state::{DaemonState, RuntimeState, TicketConversationState};
+use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
@@ -333,7 +333,7 @@ pub struct Daemon {
     /// All tasks, in insertion order.
     table: TaskTable,
     /// The immutable resolved role of each task that started at least once.
-    role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    role_bindings: BTreeMap<String, TaskBinding>,
     /// The decisions that wait for a human.
     decisions: Decisions,
     /// The allowed permission rules of each one-shot task, armed for its
@@ -1899,28 +1899,61 @@ impl Daemon {
         }
     }
 
+    /// The rows one label derives from the records of one repository.
+    ///
+    /// A record is one `(kind, number, labels, title)` item of the fresh
+    /// snapshot. Every record whose labels hold `label` becomes one row
+    /// through `make_row`, in record order. The walk serves the
+    /// label-driven inbox derivations: NeedsHuman today, the theory labels
+    /// of the later chunks.
+    fn derive_label_rows<'a, T>(
+        repo: &str,
+        records: impl IntoIterator<Item = (ItemKind, u64, &'a [String], &'a str)>,
+        label: &str,
+        mut make_row: impl FnMut(&str, ItemKind, u64, &str) -> T,
+    ) -> Vec<T> {
+        records
+            .into_iter()
+            .filter(|(_, _, labels, _)| labels.iter().any(|one| one == label))
+            .map(|(kind, number, _, title)| make_row(repo, kind, number, title))
+            .collect()
+    }
+
     /// Re-derive the `NeedsHuman` decisions from the labels of one poll.
     ///
     /// A labeled item opens or refreshes its row; an item that lost the label
     /// loses its row. Nothing is lost between polls: the labels are the
     /// truth. Returns true when any row opened, refreshed, or closed.
     fn derive_needs_human(&mut self, repo: &str, fresh: &RepoSnapshot) -> bool {
+        let now_ms = self.now_ms;
+        let records = fresh
+            .issues
+            .iter()
+            .map(|(number, issue)| {
+                (
+                    ItemKind::Issue,
+                    *number,
+                    issue.labels.as_slice(),
+                    issue.title.as_str(),
+                )
+            })
+            .chain(fresh.prs.iter().map(|(number, pr)| {
+                (
+                    ItemKind::Pr,
+                    *number,
+                    pr.labels.as_slice(),
+                    pr.title.as_str(),
+                )
+            }));
+        let rows = Self::derive_label_rows(
+            repo,
+            records,
+            NEEDS_HUMAN_LABEL,
+            |repo, kind, number, title| Decision::needs_human(repo, kind, number, title, now_ms),
+        );
         let mut changed = false;
         let mut live: BTreeSet<String> = BTreeSet::new();
-        for (number, issue) in &fresh.issues {
-            if !issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL) {
-                continue;
-            }
-            let row =
-                Decision::needs_human(repo, ItemKind::Issue, *number, &issue.title, self.now_ms);
-            live.insert(row.id.clone());
-            changed |= self.decisions.push(row).is_some();
-        }
-        for (number, pr) in &fresh.prs {
-            if !pr.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL) {
-                continue;
-            }
-            let row = Decision::needs_human(repo, ItemKind::Pr, *number, &pr.title, self.now_ms);
+        for row in rows {
             live.insert(row.id.clone());
             changed |= self.decisions.push(row).is_some();
         }
@@ -7147,10 +7180,10 @@ impl Daemon {
 
     /// Resolve the current typed settings for one task.
     fn resolved_task_role(&self, task: &Task) -> Result<ResolvedRoleSettings> {
-        self.role_bindings
-            .get(&task.id)
-            .cloned()
-            .map_or_else(|| self.current_task_role(task), Ok)
+        match self.role_bindings.get(&task.id) {
+            Some(binding) => Ok(binding.role.clone()),
+            None => self.current_task_role(task),
+        }
     }
 
     /// Resolve the current settings before the task gets an immutable binding.
@@ -7231,10 +7264,16 @@ impl Daemon {
     /// Resolve and persist the immutable settings before one first run.
     fn bind_task_role(&mut self, task: &Task) -> Result<ResolvedRoleSettings> {
         if let Some(binding) = self.role_bindings.get(&task.id) {
-            return Ok(binding.clone());
+            return Ok(binding.role.clone());
         }
         let binding = self.current_task_role(task)?;
-        self.role_bindings.insert(task.id.clone(), binding.clone());
+        self.role_bindings.insert(
+            task.id.clone(),
+            TaskBinding {
+                role: binding.clone(),
+                model_commit: None,
+            },
+        );
         let state = self.collect_state();
         let text = state.to_json()?;
         if let Err(error) = state.save(&self.state_path) {
@@ -7358,14 +7397,15 @@ impl Daemon {
             return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
         }
         let role = Self::execution_role(task);
-        let template = self.prompt_template(role)?;
+        let name = prompts::file_name(role)
+            .ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
+        let builtin = prompts::builtin(role)
+            .ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
+        let template = self.prompt_template(name, builtin)?;
         // A crash between the write and the rename can leave a blank file.
         // An agent with no instructions is worse than a failed dispatch.
         if template.trim().is_empty() {
-            bail!(
-                "the {role} prompt file {} is empty",
-                prompts::file_name(role).unwrap_or_default()
-            );
+            bail!("the {role} prompt file {name} is empty");
         }
         let values = self.placeholder_values(task, repo_cfg, worktree)?;
         prompts::fill_template(&template, &values)
@@ -7818,18 +7858,25 @@ impl Daemon {
         }
     }
 
-    /// Read the prompt template of one role at this moment.
+    /// Read the prompt template `name` at this moment, with `builtin` as
+    /// the fallback text.
     ///
     /// The prompt file wins; an absent file yields the built-in. The read
-    /// also refreshes the prompt view of the role, so a file another
-    /// program edited reaches the UI at the next task start.
-    fn prompt_template(&mut self, role: ExecutionRole) -> Result<String> {
-        let template = prompts::load(&self.prompts_dir, role)?;
-        let view = prompt_view(role, &template);
-        if let Some(slot) = self.prompts.iter_mut().find(|view| view.role == role) {
-            if *slot != view {
-                *slot = view;
-                self.changed = true;
+    /// also refreshes the prompt view of the role that owns the name, so
+    /// a file another program edited reaches the UI at the next task
+    /// start.
+    fn prompt_template(&mut self, name: &str, builtin: &str) -> Result<String> {
+        let template = prompts::load_named(&self.prompts_dir, name, builtin)?;
+        if let Some(role) = prompts::ROLES
+            .into_iter()
+            .find(|role| prompts::file_name(*role) == Some(name))
+        {
+            let view = prompt_view(role, &template);
+            if let Some(slot) = self.prompts.iter_mut().find(|view| view.role == role) {
+                if *slot != view {
+                    *slot = view;
+                    self.changed = true;
+                }
             }
         }
         Ok(template.text)
@@ -15680,6 +15727,103 @@ mod tests {
                 .unwrap()
                 .title,
             "Proposed title"
+        );
+    }
+
+    #[test]
+    fn a_pipeline_task_with_no_expected_block_buffers_nothing() {
+        let dir = temp_root();
+        let steps = refine_worktree_steps(&dir, &[142], 1);
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+        assert_eq!(rig.job_count(), 1);
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/refine-i142".to_string(),
+            text: "Plain pipeline prose with no block.".to_string(),
+        });
+        assert!(rig.daemon.ticket_turn_text.is_empty());
+
+        rig.event(turn_ended("borsuk/refine-i142"));
+        assert!(rig.daemon.ticket_turn_text.is_empty());
+    }
+
+    #[test]
+    fn a_ticket_chat_prompt_override_reads_the_file_through_the_one_loader() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, vec![], |_| {});
+        fs::create_dir_all(&rig.prompts).unwrap();
+        fs::write(
+            rig.prompts.join("ticket-chat.md"),
+            "custom chat prompt for {number}\n",
+        )
+        .unwrap();
+
+        rig.poll(vec![issue(7, &[])], vec![]);
+        rig.act(Action::Ticket(TicketAction::Chat {
+            request: "chat-7".to_string(),
+            repo: "borsuk".to_string(),
+            number: 7,
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            rig.job(0).prompt.contains("custom chat prompt for 7"),
+            "prompt:\n{}",
+            rig.job(0).prompt
+        );
+        let view = rig
+            .daemon
+            .prompts
+            .iter()
+            .find(|view| view.role == ExecutionRole::TicketChat)
+            .unwrap();
+        assert_eq!(view.source, PromptSource::File);
+        assert!(view.text.contains("custom chat prompt for {number}"));
+    }
+
+    #[test]
+    fn derive_label_rows_yields_one_row_per_labelled_record() {
+        let records = [
+            (
+                ItemKind::Issue,
+                1u64,
+                vec!["needs-human".to_string()],
+                "issue one".to_string(),
+            ),
+            (ItemKind::Issue, 2u64, Vec::new(), "issue two".to_string()),
+            (
+                ItemKind::Pr,
+                3u64,
+                vec!["needs-human".to_string(), "other".to_string()],
+                "pr three".to_string(),
+            ),
+        ];
+        let rows = Daemon::derive_label_rows(
+            "borsuk",
+            records.iter().map(|(kind, number, labels, title)| {
+                (*kind, *number, labels.as_slice(), title.as_str())
+            }),
+            "needs-human",
+            |repo, kind, number, title| (repo.to_string(), kind, number, title.to_string()),
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "borsuk".to_string(),
+                    ItemKind::Issue,
+                    1,
+                    "issue one".to_string()
+                ),
+                (
+                    "borsuk".to_string(),
+                    ItemKind::Pr,
+                    3,
+                    "pr three".to_string()
+                ),
+            ]
         );
     }
 

@@ -31,14 +31,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
-    Config, ExecutionRole, Harness, ReleasePolicy, ResolvedRoleSettings, RoleOverride,
-    RoleSettings, SettingsSource,
+    Config, ExecutionRole, Harness, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
 use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 use crate::sched::{Limits, Paused};
+use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
@@ -638,7 +638,7 @@ pub struct StateInput<'a> {
     /// The effective prompt template of every role.
     pub prompts: &'a [PromptView],
     /// The immutable role binding of each bound task, keyed by task id.
-    pub role_bindings: &'a BTreeMap<String, ResolvedRoleSettings>,
+    pub role_bindings: &'a BTreeMap<String, TaskBinding>,
     /// The Theory view of each repository, keyed by alias.
     pub theory: &'a BTreeMap<String, TheoryView>,
     /// The current time in milliseconds since the Unix epoch.
@@ -736,11 +736,11 @@ impl StateInput<'_> {
                         .get(id)
                         .cloned()
                         .ok_or_else(|| anyhow!("task \"{id}\" has no input mode"))?,
-                    binding: role_bindings.get(id).map(|role| RoleBindingView {
-                        harness: role.settings.harness,
-                        model: role.settings.model.clone(),
-                        effort: role.settings.effort.clone(),
-                        tag_route: role.tag_route.clone(),
+                    binding: role_bindings.get(id).map(|binding| RoleBindingView {
+                        harness: binding.role.settings.harness,
+                        model: binding.role.settings.model.clone(),
+                        effort: binding.role.settings.effort.clone(),
+                        tag_route: binding.role.tag_route.clone(),
                     }),
                     queued_messages: 0,
                 })
@@ -2190,6 +2190,7 @@ impl Iterator for Pushes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ResolvedRoleSettings;
 
     const LEGACY_WIRE_PROTOCOL_REVISION: u32 = 2;
 
@@ -3083,7 +3084,13 @@ mod tests {
             },
         };
         let mut role_bindings = BTreeMap::new();
-        role_bindings.insert(bound.id.clone(), binding);
+        role_bindings.insert(
+            bound.id.clone(),
+            TaskBinding {
+                role: binding,
+                model_commit: None,
+            },
+        );
         let mut input_modes = BTreeMap::new();
         input_modes.insert(bound.id.clone(), InputMode::NextTurn);
         input_modes.insert(queued.id.clone(), InputMode::Live);
