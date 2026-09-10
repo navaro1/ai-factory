@@ -2089,7 +2089,9 @@ impl Daemon {
     /// task of a ticket is already out through the quiet skip of
     /// [`Daemon::admit_ready`]. A theory that did not parse leaves the
     /// ticket to the operator, because the Theory view already reports
-    /// the parse error.
+    /// the parse error. A ticket that already carries
+    /// [`NEEDS_HUMAN_LABEL`] is left alone, so a restart re-derives the
+    /// attempt bound from the labels.
     fn run_ticket_check(&self, alias: &str, number: u64) -> Result<(), contract::Finding> {
         let Some(config) = self.config.repos.get(alias) else {
             return Ok(());
@@ -2112,6 +2114,9 @@ impl Daemon {
         else {
             return Ok(());
         };
+        if issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL) {
+            return Ok(());
+        }
         let Some(cache) = self.theory_models.get(alias) else {
             return Ok(());
         };
@@ -2135,17 +2140,22 @@ impl Daemon {
     /// Post the finding of one failed ticket check and re-queue the
     /// refine work.
     ///
-    /// The failure adds `to-refine` back, which the poll gate turns into
-    /// a refine task. `MAX_ATTEMPTS` bounds the loop only through this
-    /// counter: `upsert_queued` restarts every terminal task at attempt
-    /// 1, so the task attempts never see the label cycle. The daemon
-    /// counts the failed checks itself, and at `MAX_ATTEMPTS` it asks
-    /// for a human instead of `to-refine`, which leaves the refine gate
-    /// no edge to fire on.
+    /// The failure comments on the ticket itself, which the refine agent
+    /// reads on its next run, and adds `to-refine` back, which the poll
+    /// gate turns into a refine task. `MAX_ATTEMPTS` bounds the loop only
+    /// through this counter: `upsert_queued` restarts every terminal task
+    /// at attempt 1, so the task attempts never see the label cycle. The
+    /// daemon counts the failed checks itself, and at `MAX_ATTEMPTS` it
+    /// asks for a human instead of `to-refine`, which leaves the refine
+    /// gate no edge to fire on. A restart drops the counter, and the
+    /// `needs-human` label of the capped ticket makes the check skip.
     fn handle_ticket_finding(&mut self, alias: &str, number: u64, finding: &contract::Finding) {
         eprintln!("the ticket check of {alias}#{number} failed: {finding}");
         let text = format!("ticket: {finding}");
-        if let Err(error) = self.post_record_comment(alias, &RecordKey::Issue(number), &text) {
+        let Some(repo_cfg) = self.config.repos.get(alias) else {
+            return;
+        };
+        if let Err(error) = self.post_issue_comment(repo_cfg, number, &text) {
             eprintln!("the ticket check comment of {alias}#{number}: {error:#}");
         }
         let count = self
@@ -2157,9 +2167,6 @@ impl Daemon {
             NEEDS_HUMAN_LABEL
         } else {
             gates::TO_REFINE
-        };
-        let Some(repo_cfg) = self.config.repos.get(alias) else {
-            return;
         };
         let gh = GhClient::new(&*self.exec);
         if let Err(error) = gh.add_label(&repo_cfg.owner_repo, number, label) {
@@ -21688,6 +21695,37 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert!(
             rig.exec.calls().iter().all(|call| call.program != "gh"),
             "the check posts nothing when the governor is off"
+        );
+    }
+
+    /// A ticket that already carries `needs-human` gets no finding
+    /// comment and no label after a restart; the check skips it and the
+    /// admission proceeds.
+    #[test]
+    fn a_needs_human_ticket_is_left_alone_after_a_restart() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue_with_body(142, &["refined", "needs-human"], &body)],
+            vec![],
+        );
+
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the label skips only the check, not the admission"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert!(
+            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            "the check posts no comment and no label"
         );
     }
 

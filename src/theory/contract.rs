@@ -32,6 +32,7 @@ pub const SECTION_REPRO: &str = "## Repro";
 
 /// The header cell that names the owned-path column of the plan table.
 const PLAN_OWNED_COLUMN: &str = "Owned files or paths";
+const FAST_COLUMN: &str = "Fast";
 
 /// One acceptance criterion of a refined ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,11 +170,13 @@ fn named_no_check(line: &str, reason: &str) -> Option<String> {
 
 /// Check the contract of one refined ticket.
 ///
-/// The ticket must carry every section of the grammar, every criterion
-/// line must parse, every check target must name a resolved feature or a
-/// measurer of the map, and the plan table must give every chunk a
-/// non-empty owned path. `bug` adds the `## Repro` section. The first
-/// broken rule wins.
+/// The ticket must carry every section of the grammar, its acceptance
+/// section must hold at least one criterion line, every criterion line
+/// must parse, every check target must name a resolved feature, a
+/// measurer of the map, or a feature the plan table declares as
+/// `new: <feature>` in its Fast column, and the plan table must give
+/// every chunk a non-empty owned path. `bug` adds the `## Repro`
+/// section. The first broken rule wins.
 pub fn check_ticket(
     body: &str,
     features: &[&Feature],
@@ -195,8 +198,15 @@ pub fn check_ticket(
     if let Some(finding) = findings.into_iter().next() {
         return Err(finding);
     }
+    if criteria.is_empty() {
+        return Err(Finding {
+            reason: "no acceptance criteria".to_string(),
+        });
+    }
+    let new_features = new_features(body);
     for criterion in &criteria {
-        if let Some(name) = unresolved_target(&criterion.target, features, measurers) {
+        if let Some(name) = unresolved_target(&criterion.target, features, &new_features, measurers)
+        {
             return Err(Finding {
                 reason: format!(
                     "AC-{} check {name} is not a feature or a measurer",
@@ -208,16 +218,20 @@ pub fn check_ticket(
     check_plan(body)
 }
 
-/// The name of a target that names no resolved feature and no measurer.
+/// The name of a target that names no resolved feature, no feature the
+/// plan declares as new, and no measurer.
 fn unresolved_target(
     target: &CheckTarget,
     features: &[&Feature],
+    new_features: &[String],
     measurers: &[Measurer],
 ) -> Option<String> {
     let (name, found) = match target {
-        CheckTarget::Drive(name) | CheckTarget::Fast(name) => {
-            (name, features.iter().any(|feature| &feature.id == name))
-        }
+        CheckTarget::Drive(name) | CheckTarget::Fast(name) => (
+            name,
+            features.iter().any(|feature| &feature.id == name)
+                || new_features.iter().any(|new| new == name),
+        ),
         CheckTarget::Measure(id) => (id, measurers.iter().any(|measurer| &measurer.id == id)),
     };
     if found {
@@ -225,6 +239,44 @@ fn unresolved_target(
     } else {
         Some(name.clone())
     }
+}
+
+/// The features the plan table declares as `new: <feature>` in its Fast
+/// column. The table is the one whose header row names
+/// [`PLAN_OWNED_COLUMN`]; a declared feature needs no run skill yet.
+fn new_features(body: &str) -> Vec<String> {
+    let mut fast_column: Option<usize> = None;
+    let mut new_names = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        match fast_column {
+            None => {
+                if line.starts_with('|') {
+                    let cells = table_cells(line);
+                    if let Some(column) = cells.iter().position(|cell| *cell == FAST_COLUMN) {
+                        fast_column = Some(column);
+                    }
+                }
+            }
+            Some(column) => {
+                if !line.starts_with('|') {
+                    break;
+                }
+                let cells = table_cells(line);
+                if cells.iter().all(|cell| is_separator_cell(cell)) {
+                    continue;
+                }
+                if let Some(name) = cells
+                    .get(column)
+                    .and_then(|cell| cell.strip_prefix("new: "))
+                    .filter(|name| !name.is_empty())
+                {
+                    new_names.push(name.to_string());
+                }
+            }
+        }
+    }
+    new_names
 }
 
 /// Check the plan table of a ticket body.
@@ -525,6 +577,22 @@ mod tests {
                 false,
                 "plan row 1 has an empty owned path",
             ),
+            (
+                good_body().replace("measure poll_p95", "cli fast"),
+                false,
+                "AC-2 check cli is not a feature or a measurer",
+            ),
+            (
+                good_body().replace(
+                    concat!(
+                        "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive\n",
+                        "- AC-2 \u{b7} The poll budget holds \u{b7} check: measure poll_p95\n",
+                    ),
+                    "",
+                ),
+                false,
+                "no acceptance criteria",
+            ),
         ];
         for (body, bug, expected) in cases {
             let finding = check_ticket(&body, &feature_refs, &measurers, bug).expect_err(expected);
@@ -534,6 +602,35 @@ mod tests {
                 finding.reason
             );
         }
+    }
+
+    /// A feature that only the plan table declares as `new: <feature>`
+    /// passes for an empty feature set, and fails without the
+    /// declaration.
+    #[test]
+    fn check_ticket_accepts_a_feature_the_plan_declares_new() {
+        let measurers = good_measurers();
+        let empty: Vec<&Feature> = Vec::new();
+        let only_cli = good_body().replace(
+            concat!(
+                "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive\n",
+                "- AC-2 \u{b7} The poll budget holds \u{b7} check: measure poll_p95\n",
+            ),
+            "- AC-2 \u{b7} The poll budget holds \u{b7} check: cli fast\n",
+        );
+        let declared = only_cli.replace(
+            "| cargo test | npx playwright | 1 |",
+            "| cargo test | new: cli | 1 |",
+        );
+        check_ticket(&declared, &empty, &measurers, false)
+            .expect("the plan declares the cli feature");
+        let undeclared = only_cli;
+        let finding = check_ticket(&undeclared, &empty, &measurers, false)
+            .expect_err("cli is no feature and no plan row declares it");
+        assert_eq!(
+            finding.reason,
+            "AC-2 check cli is not a feature or a measurer"
+        );
     }
 
     #[test]

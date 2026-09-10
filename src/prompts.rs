@@ -183,17 +183,17 @@ the shared specification. No agent implements the parent.
 Create the sub-tickets in wave order. Then you know the number of every
 earlier chunk when you write a dependency.
 
-The body of a sub-ticket must hold these sections:
+The body of a sub-ticket must hold these sections as `##` headings:
 
-- Parent: #{number}
-- Problem
-- Grounding
-- Decisions
-- Repro, when the parent carries the `bug` label
-- Acceptance criteria
-- Implementation plan, as the table above, with one C1 row for this chunk
-- Owned files or paths
-- Validation
+- A `Parent: #{number}` line before the headings
+- `## Problem`
+- `## Grounding`
+- `## Decisions`
+- `## Repro`, when the parent carries the `bug` label
+- `## Acceptance criteria`
+- `## Implementation plan`, as the table above, with one C1 row for this chunk
+- The `Owned files or paths` column of the plan table
+- `## Validation`
 
 A sub-ticket must stand alone. Copy every fact the chunk needs from the
 parent. The agent that implements the chunk reads the sub-ticket only.
