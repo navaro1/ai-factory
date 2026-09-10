@@ -66,6 +66,7 @@ use crate::sock::{
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
@@ -349,6 +350,12 @@ pub struct Daemon {
     theory_skills: BTreeMap<String, SkillCache>,
     /// The Theory view of each repository, rebuilt on every poll.
     theory_views: BTreeMap<String, TheoryView>,
+    /// The ticket-check failure count of each issue. The count bounds the
+    /// refine re-queue of a failing ticket: at `MAX_ATTEMPTS` the failure
+    /// asks for a human instead of `to-refine`. The map is runtime only:
+    /// the `needs-human` label re-derives the bound, and the count
+    /// restarts at zero.
+    ticket_check_failures: BTreeMap<(String, u64), u32>,
     /// The finished pipeline runs that wait for GitHub to confirm their
     /// stage transition, with the moment each one gives up. The map is
     /// runtime only: a restart re-derives the work from the labels.
@@ -723,6 +730,7 @@ impl Daemon {
             fast_runs: BTreeMap::new(),
             fast_results: BTreeMap::new(),
             theory_views: BTreeMap::new(),
+            ticket_check_failures: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
             ticket_controller,
@@ -2018,6 +2026,26 @@ impl Daemon {
             if work.stage == Stage::Review && self.head_already_reviewed(&work, &review_tickets) {
                 continue;
             }
+            if work.stage == Stage::Implement && work.kind == ItemKind::Issue {
+                // A capped ticket holds its admission: the `needs-human`
+                // label re-derives the attempt bound after a restart, and
+                // no task exists for the ticket until the label goes.
+                if self.admission_held(&work.repo, work.number) {
+                    continue;
+                }
+                // The C9 prediction gate of the v0.8 spec sits here; V7
+                // runs the ticket check in its place.
+                match self.run_ticket_check(&work.repo, work.number) {
+                    Ok(()) => {
+                        self.ticket_check_failures
+                            .remove(&(work.repo.clone(), work.number));
+                    }
+                    Err(finding) => {
+                        self.handle_ticket_finding(&work.repo, work.number, &finding);
+                        continue;
+                    }
+                }
+            }
             let log = self.log_path(&work.repo, work.stage, work.kind, work.number);
             let replaces_task = self.table.by_id.values().any(|task| {
                 task.repo == work.repo
@@ -2058,6 +2086,112 @@ impl Daemon {
         }
         for (repo, number, review) in fast_checks {
             self.start_fast_checks(&repo, number, &review);
+        }
+    }
+
+    /// True when the implement admission of a governed ticket is held
+    /// because the daemon already asked a human for it.
+    fn admission_held(&self, alias: &str, number: u64) -> bool {
+        let governed = self
+            .config
+            .repos
+            .get(alias)
+            .is_some_and(|config| config.theory.governor.is_on());
+        governed
+            && self
+                .snapshot
+                .repos
+                .get(alias)
+                .and_then(|snapshot| snapshot.issues.get(&number))
+                .is_some_and(|issue| issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+    }
+
+    /// Check the contract of one ticket that the implement gate admits.
+    ///
+    /// The check runs only for a governed repository whose theory parses,
+    /// and never for a ticket that already has a pull request; the active
+    /// task of a ticket is already out through the quiet skip of
+    /// [`Daemon::admit_ready`]. A theory that did not parse leaves the
+    /// ticket to the operator, because the Theory view already reports
+    /// the parse error. The admission of a ticket that carries
+    /// [`NEEDS_HUMAN_LABEL`] is held in [`Daemon::admit_ready`] before
+    /// the check runs.
+    fn run_ticket_check(&self, alias: &str, number: u64) -> Result<(), contract::Finding> {
+        let Some(config) = self.config.repos.get(alias) else {
+            return Ok(());
+        };
+        if !config.theory.governor.is_on() {
+            return Ok(());
+        }
+        let Some(issue) = self
+            .snapshot
+            .repos
+            .get(alias)
+            .and_then(|snapshot| snapshot.issues.get(&number))
+        else {
+            return Ok(());
+        };
+        if self
+            .links
+            .get(alias)
+            .is_some_and(|links| !links.prs_of(number).is_empty())
+        {
+            return Ok(());
+        }
+        let Some(cache) = self.theory_models.get(alias) else {
+            return Ok(());
+        };
+        let (Ok(_), Ok(verify)) = (&cache.model, &cache.verify) else {
+            return Ok(());
+        };
+        let Some(skills_cache) = self.theory_skills.get(alias) else {
+            return Ok(());
+        };
+        let Ok(set) = &skills_cache.skills else {
+            return Ok(());
+        };
+        let bug = issue.labels.iter().any(|label| label == "bug");
+        let mut features: Vec<&skills::Feature> = Vec::new();
+        for area in &verify.areas {
+            features.extend(skills::resolve(&area.id, verify, set));
+        }
+        contract::check_ticket(&issue.body, &features, &verify.measurers, bug)
+    }
+
+    /// Post the finding of one failed ticket check and re-queue the
+    /// refine work.
+    ///
+    /// The failure comments on the ticket itself, which the refine agent
+    /// reads on its next run, and adds `to-refine` back, which the poll
+    /// gate turns into a refine task. `MAX_ATTEMPTS` bounds the loop only
+    /// through this counter: `upsert_queued` restarts every terminal task
+    /// at attempt 1, so the task attempts never see the label cycle. The
+    /// daemon counts the failed checks itself, and at `MAX_ATTEMPTS` it
+    /// asks for a human instead of `to-refine`, which leaves the refine
+    /// gate no edge to fire on. A restart drops the counter, and the
+    /// `needs-human` label of the capped ticket holds the admission.
+    fn handle_ticket_finding(&mut self, alias: &str, number: u64, finding: &contract::Finding) {
+        eprintln!("the ticket check of {alias}#{number} failed: {finding}");
+        let text = format!("ticket: {finding}");
+        let Some(repo_cfg) = self.config.repos.get(alias) else {
+            return;
+        };
+        if let Err(error) = self.post_issue_comment(repo_cfg, number, &text) {
+            eprintln!("the ticket check comment of {alias}#{number}: {error:#}");
+        }
+        let count = self
+            .ticket_check_failures
+            .entry((alias.to_string(), number))
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        let label = if *count >= tasks::MAX_ATTEMPTS {
+            NEEDS_HUMAN_LABEL
+        } else {
+            gates::TO_REFINE
+        };
+        let gh = GhClient::new(&*self.exec);
+        if let Err(error) = gh.add_label(&repo_cfg.owner_repo, number, label) {
+            eprintln!("the ticket check label of {alias}#{number}: {error:#}");
         }
     }
 
@@ -21424,6 +21558,298 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
     }
 
+    /// The ticket body of 142 whose `AC-2` names a target that is no
+    /// feature of the fixture model and no measurer.
+    fn unchecked_ticket_body() -> String {
+        concat!(
+            "## Problem\n",
+            "Orders rejects no empty card.\n",
+            "\n",
+            "## Grounding\n",
+            "web-checkout covers the checkout form.\n",
+            "\n",
+            "## Decisions\n",
+            "The submit blocks on an empty card field.\n",
+            "\n",
+            "## Acceptance criteria\n",
+            "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive\n",
+            "- AC-2 \u{b7} Orders rejects an empty card \u{b7} check: api-orders fast\n",
+            "\n",
+            "# The implementation plan\n",
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |\n",
+            "|---|---|---|---|---|---|---|\n",
+            "| 1 | Block the submit | src/checkout.rs | - | cargo test | npx playwright | 1 |\n",
+        )
+        .to_string()
+    }
+
+    /// The finding text of the broken fixture ticket.
+    fn ticket_finding() -> &'static str {
+        "ticket: AC-2 check api-orders is not a feature or a measurer"
+    }
+
+    /// The finding comment and the label call of one failed ticket check.
+    fn ticket_check_steps(finding: &str, label: &str) -> Vec<Step> {
+        vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/comments",
+                    "-f",
+                    &format!("body={finding}"),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/142/labels",
+                    "-f",
+                    &format!("labels[]={label}"),
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// The count of one label call of the scripted exec.
+    fn label_calls(rig: &Rig, label: &str) -> usize {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "gh"
+                    && call
+                        .args
+                        .iter()
+                        .any(|arg| arg == &format!("labels[]={label}"))
+            })
+            .count()
+    }
+
+    /// A governed ticket whose contract fails the check queues no
+    /// implement task, posts the finding, and re-adds `to-refine`.
+    #[test]
+    fn a_failed_ticket_check_posts_the_finding_and_requeues_refine() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue_with_body(142, &["refined"], &body)], vec![]);
+
+        assert_eq!(
+            rig.job_count(),
+            0,
+            "the broken ticket queues no implement job"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "no implement task exists"
+        );
+        let posted = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .count();
+        assert_eq!(posted, 2, "one finding comment and one label: {posted}");
+        assert!(
+            rig.exec.calls().iter().any(|call| {
+                call.program == "gh"
+                    && call
+                        .args
+                        .iter()
+                        .any(|arg| arg == &format!("body={}", ticket_finding()))
+            }),
+            "the finding comment carries the reason"
+        );
+        assert_eq!(
+            label_calls(&rig, "to-refine"),
+            1,
+            "the refine work requeues"
+        );
+
+        rig.poll(
+            vec![issue_with_body(142, &["refined", "to-refine"], &body)],
+            vec![],
+        );
+
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the re-added label fires the refine gate"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/refine-i142");
+    }
+
+    /// A ticket of an ungoverned repository never sees the check, so the
+    /// same broken body dispatches its implement work.
+    #[test]
+    fn an_ungoverned_ticket_is_never_checked() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(
+            vec![issue_with_body(142, &["refined"], &unchecked_ticket_body())],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 1, "the implement work dispatches");
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert!(
+            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            "the check posts nothing when the governor is off"
+        );
+    }
+
+    /// A ticket that already carries `needs-human` holds its admission
+    /// after a restart: no check, no finding comment, no label, and no
+    /// implement task.
+    #[test]
+    fn a_needs_human_ticket_is_left_alone_after_a_restart() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue_with_body(142, &["refined", "needs-human"], &body)],
+            vec![],
+        );
+
+        assert_eq!(
+            rig.job_count(),
+            0,
+            "the needs-human label holds the admission"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "no implement task exists for the held ticket"
+        );
+        assert!(
+            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            "the hold posts no comment and no label"
+        );
+    }
+
+    /// A refined ticket whose pull request is already open skips the
+    /// check through the existing-PR guard: no finding comment and no
+    /// label, and the admission proceeds.
+    #[test]
+    fn a_ticket_with_an_open_pull_request_is_never_checked() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue_with_body(142, &["refined"], &body)],
+            vec![linked_pr(7, 142)],
+        );
+
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the guard skips only the check, not the admission"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert!(
+            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            "the check posts no comment and no label"
+        );
+    }
+
+    /// The failed checks bound their own loop: the first `MAX_ATTEMPTS - 1`
+    /// failures re-add `to-refine`, the failure at the cap asks for a human
+    /// instead, and a further failed check stays silent.
+    #[test]
+    fn a_failing_ticket_check_stops_at_the_attempt_cap() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let refined = || issue_with_body(142, &["refined"], &body);
+        let refining = || issue_with_body(142, &["refined", "to-refine"], &body);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(ticket_check_steps(ticket_finding(), "needs-human"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![refined()], vec![]);
+        rig.poll(vec![refining()], vec![]);
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the first re-queue fires the refine gate"
+        );
+        rig.poll(vec![refined()], vec![]);
+        rig.poll(vec![refining()], vec![]);
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the active refine task skips the gate quietly"
+        );
+        rig.poll(vec![refined()], vec![]);
+        rig.poll(
+            vec![issue_with_body(142, &["refined", "needs-human"], &body)],
+            vec![],
+        );
+
+        assert_eq!(
+            label_calls(&rig, "to-refine"),
+            2,
+            "the first two failures re-add to-refine"
+        );
+        assert_eq!(
+            label_calls(&rig, "needs-human"),
+            1,
+            "the failure at the cap asks for a human"
+        );
+        let comments = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "gh" && call.args.iter().any(|arg| arg.starts_with("body=ticket: "))
+            })
+            .count();
+        assert_eq!(comments, 3, "every failed check posts its finding");
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),
+            "the broken ticket never queues an implement task"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Teach
     // ------------------------------------------------------------------
@@ -21787,7 +22213,6 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
         assert_eq!(rig.task(id).state, TaskState::Done);
     }
-
     #[test]
     fn an_ungoverned_repository_fills_the_theory_placeholders_empty_with_no_git_call() {
         let mut rig = Rig::make(Vec::new());
