@@ -58,6 +58,15 @@ pub struct IssueComment {
     pub body: String,
 }
 
+/// One comment page with the ETag the next call sends back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentPage {
+    /// The ETag of the page; the caller passes it back as `If-None-Match`.
+    pub etag: Option<String>,
+    /// The comments of the page, oldest first.
+    pub comments: Vec<IssueComment>,
+}
+
 /// Which GitHub list a page belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ListKind {
@@ -92,6 +101,15 @@ struct CachedPage<T> {
     items: BTreeMap<u64, T>,
 }
 
+/// What the reader remembers about one comment page.
+#[derive(Debug, Clone)]
+struct CachedComments {
+    /// The ETag of the last 200 answer.
+    etag: Option<String>,
+    /// The mapped comments of the page.
+    comments: Vec<IssueComment>,
+}
+
 /// A GitHub reader for one poller thread.
 ///
 /// The client runs `gh api` through the [`Exec`] indirection and remembers,
@@ -102,6 +120,7 @@ pub struct GhClient<'a> {
     exec: &'a dyn Exec,
     issue_pages: BTreeMap<(String, u64), CachedPage<Issue>>,
     pull_pages: BTreeMap<(String, u64), CachedPage<Pr>>,
+    comment_pages: BTreeMap<(String, u64), CachedComments>,
 }
 
 impl<'a> GhClient<'a> {
@@ -111,6 +130,7 @@ impl<'a> GhClient<'a> {
             exec,
             issue_pages: BTreeMap::new(),
             pull_pages: BTreeMap::new(),
+            comment_pages: BTreeMap::new(),
         }
     }
 
@@ -261,19 +281,68 @@ impl<'a> GhClient<'a> {
             let response = checked_response(&out)?;
             let values: Vec<Value> = serde_json::from_str(&response.body)
                 .context("gh api returned a broken issue comment body")?;
-            for value in &values {
-                comments.push(IssueComment {
-                    author: author_login(value)?.to_string(),
-                    created_at: str_field(value, "created_at")?.to_string(),
-                    body: str_field(value, "body")?.to_string(),
-                });
-            }
+            comments.extend(comments_from_values(&values)?);
             if values.len() < PAGE_SIZE || !response.link_next {
                 break;
             }
             page += 1;
         }
         Ok(comments)
+    }
+
+    /// Fetch one page of the comments of one issue or pull request.
+    ///
+    /// The call asks for one page of [`PAGE_SIZE`] comments. The caller
+    /// passes the ETag of its last page as `etag`; the method sends it as
+    /// `If-None-Match`, and a 304 answer then returns the page the client
+    /// cached at its last 200. A 304 with no cached page is an error.
+    pub fn fetch_comments(
+        &mut self,
+        owner_repo: &str,
+        number: u64,
+        etag: Option<&str>,
+    ) -> Result<CommentPage> {
+        let url = format!("repos/{owner_repo}/issues/{number}/comments?per_page={PAGE_SIZE}");
+        let key = (owner_repo.to_string(), number);
+        let mut args: Vec<&str> = vec!["api", "-i"];
+        let header;
+        if let Some(etag) = etag {
+            header = format!("If-None-Match: {etag}");
+            args.push("-H");
+            args.push(&header);
+        }
+        args.extend(["-X", "GET", url.as_str()]);
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let response = checked_response(&out)?;
+        if response.status == 304 {
+            let cached = self.comment_pages.get(&key).ok_or_else(|| {
+                anyhow!(
+                    "gh api returned 304 for the comments of \
+                     {owner_repo}#{number} with no cached page"
+                )
+            })?;
+            return Ok(CommentPage {
+                etag: cached.etag.clone(),
+                comments: cached.comments.clone(),
+            });
+        }
+        let values: Vec<Value> = serde_json::from_str(&response.body)
+            .context("gh api returned a broken comment page body")?;
+        let comments = comments_from_values(&values)?;
+        self.comment_pages.insert(
+            key,
+            CachedComments {
+                etag: response.etag.clone(),
+                comments: comments.clone(),
+            },
+        );
+        Ok(CommentPage {
+            etag: response.etag,
+            comments,
+        })
     }
 
     /// Post one comment on an issue or pull request.
@@ -640,6 +709,20 @@ fn label_array_names(body: &str, operation: &str) -> Result<Vec<String>> {
     labels
         .iter()
         .map(|label| Ok(str_field(label, "name")?.to_string()))
+        .collect()
+}
+
+/// Map one comment-array body into the comment model, oldest first.
+fn comments_from_values(values: &[Value]) -> Result<Vec<IssueComment>> {
+    values
+        .iter()
+        .map(|value| {
+            Ok(IssueComment {
+                author: author_login(value)?.to_string(),
+                created_at: str_field(value, "created_at")?.to_string(),
+                body: str_field(value, "body")?.to_string(),
+            })
+        })
         .collect()
 }
 
@@ -1969,6 +2052,104 @@ mod tests {
                 "repos/acme/borsuk/issues/9/comments?per_page=100&page=2"
             ]
         );
+    }
+
+    #[test]
+    fn fetch_comments_asks_for_one_page_of_100_and_maps_it() {
+        let body = r#"[{"user":{"login":"agent"},"created_at":"2026-09-01T10:00:00Z","body":"Which mode ships first?"},{"user":{"login":"human"},"created_at":"2026-09-02T11:30:00Z","body":"plain prose"}]"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], body)),
+        );
+        let mut client = GhClient::new(&exec);
+        let page = client.fetch_comments("acme/borsuk", 9, None).unwrap();
+
+        assert_eq!(page.etag, Some("\"c1\"".to_string()));
+        assert_eq!(page.comments.len(), 2);
+        assert_eq!(page.comments[0].author, "agent");
+        assert_eq!(page.comments[0].body, "Which mode ships first?");
+        assert_eq!(page.comments[1].author, "human");
+        assert_eq!(page.comments[1].created_at, "2026-09-02T11:30:00Z");
+        assert_eq!(
+            exec.calls()[0].argv(),
+            [
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100"
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_comments_sends_if_none_match_and_returns_the_cached_page_on_a_304() {
+        let first_body = comments_json(2);
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues/9/comments?per_page=100",
+                ]),
+                CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], &first_body)),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"c1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues/9/comments?per_page=100",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: response("HTTP/2 304", &["etag: \"c1\""], ""),
+                    stderr: "gh: HTTP 304\n".to_string(),
+                },
+            );
+        let mut client = GhClient::new(&exec);
+        let first = client.fetch_comments("acme/borsuk", 9, None).unwrap();
+        let second = client
+            .fetch_comments("acme/borsuk", 9, Some("\"c1\""))
+            .unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(second.comments[1].body, "comment 1");
+        assert_eq!(second.etag, Some("\"c1\"".to_string()));
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn fetch_comments_rejects_a_304_without_a_cached_page() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-H",
+                "If-None-Match: \"c9\"",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100",
+            ]),
+            CmdOut::ok(response("HTTP/2 304", &["etag: \"c9\""], "")),
+        );
+        let mut client = GhClient::new(&exec);
+        let error = client
+            .fetch_comments("acme/borsuk", 9, Some("\"c9\""))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no cached page"), "{error:#}");
     }
 
     #[test]
