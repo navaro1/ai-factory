@@ -4685,6 +4685,7 @@ mod tests {
                     areas: vec!["web-checkout".to_string()],
                 }),
                 full: None,
+                delta: None,
             },
         );
         App {

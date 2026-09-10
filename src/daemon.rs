@@ -59,10 +59,11 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AreaView, AskView, HoldView, InputMode, PauseScope, PromptSource, PromptView, Push,
-    RecordView, SettingsOperation, SettingsResult, SettingsResultStatus, StateInput, StateView,
-    SurfaceView, TheoryAction, TheoryView, TicketAction, TicketDetails, TicketProposal,
-    TicketResult, TicketResultKind, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
+    Action, AreaView, AskView, DeltaState, DeltaView, HoldView, InputMode, PauseScope,
+    PromptSource, PromptView, Push, RecordView, SettingsOperation, SettingsResult,
+    SettingsResultStatus, StateInput, StateView, SurfaceView, TheoryAction, TheoryView,
+    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind,
+    PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
 };
 use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
@@ -72,9 +73,11 @@ use crate::theory::model::{self, Entry, Model};
 #[cfg(test)]
 use crate::theory::records::MODEL_PR_LABEL;
 use crate::theory::records::{
-    self, event_block, no_entries, parse_event_blocks, parse_prediction_blocks, prediction_block,
-    record_labels, skips_prediction_gates, Event, FullPrediction, Prediction, PredictionTag,
-    RecordKey, ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
+    self, delta_block, event_block, no_entries, parse_delta, parse_delta_blocks,
+    parse_event_blocks, parse_prediction_blocks, prediction_block, record_labels,
+    skips_prediction_gates, slot_outcome, DeltaBlock, DeltaOutcome, Event, FullPrediction,
+    Prediction, PredictionTag, RecordKey, ShortPrediction, TheoryRecords, DELTA_BLOCK,
+    DELTA_OPEN_COLOR, DELTA_OPEN_LABEL, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
     PREDICTION_OTHER_AREAS, THEORY_FULL_COLOR, THEORY_FULL_LABEL, THEORY_SHORT_COLOR,
     THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
@@ -87,6 +90,10 @@ use crate::worktree::{self, WorktreeKind, WorktreeManager, TRAIN_DIR};
 
 /// How many diff lines one teach subject carries at most.
 const TEACH_DIFF_LINES: usize = 400;
+
+/// Why one governed review fails when its report carries no readable
+/// delta block.
+const NO_DELTA_BLOCK: &str = "no delta block";
 
 /// What one run skill ticket creation produced.
 ///
@@ -1509,6 +1516,9 @@ impl Daemon {
                         Prediction::Full(full) => view.full = Some(full),
                     }
                 }
+                if let Some(delta) = parse_delta_blocks(&comment.body).pop() {
+                    view.delta = Some(delta);
+                }
             }
             read.insert(target, view.clone());
             self.theory_blocks.insert(seen.clone(), view);
@@ -1713,7 +1723,89 @@ impl Daemon {
             .filter(|((alias, _), _)| alias == repo)
             .map(|((_, key), blocks)| (key.clone(), blocks.clone()))
             .collect();
+        view.deltas = self.delta_views(repo);
         view
+    }
+
+    /// The DELTAS rows of one repository, by pull request number.
+    ///
+    /// Every pull request record whose comments held a delta block
+    /// contributes one row. The row is open while the record still
+    /// carries `delta-open`, and closed once the operator removed it. The
+    /// entries of a missed slot come from the full prediction of the
+    /// tickets the pull request closes, so a miss names what the operator
+    /// predicted; a slot the prediction left empty names itself.
+    fn delta_views(&self, repo: &str) -> Vec<DeltaView> {
+        let mut rows: Vec<DeltaView> = Vec::new();
+        for ((alias, key), blocks) in &self.theory_blocks {
+            if alias != repo {
+                continue;
+            }
+            let (Some(number), Some(delta)) = (pr_key_number(key), blocks.delta.as_ref()) else {
+                continue;
+            };
+            let open = self
+                .theory_records
+                .labels_of(repo, &RecordKey::Pr(number))
+                .iter()
+                .any(|label| label == DELTA_OPEN_LABEL);
+            let predicted = self.predicted_slots(repo, number);
+            let mut row = DeltaView {
+                number,
+                state: if open {
+                    DeltaState::Open
+                } else {
+                    DeltaState::Closed
+                },
+                violations: delta
+                    .violations
+                    .iter()
+                    .map(|one| (one.entry.clone(), one.finding.clone()))
+                    .collect(),
+                question: delta.question.clone(),
+                ..DeltaView::default()
+            };
+            for slot in &delta.slots {
+                let outcome = slot_outcome(slot);
+                match (slot.outcome, slot.tag) {
+                    (DeltaOutcome::Hit, PredictionTag::Sure) => row.hits += 1,
+                    (DeltaOutcome::Hit, PredictionTag::Unsure) => row.unsure += 1,
+                    (DeltaOutcome::Miss, _) => {
+                        let entries = predicted.get(&slot.id).filter(|list| !list.is_empty());
+                        match entries {
+                            Some(entries) => row.misses.extend(
+                                entries.iter().map(|entry| (outcome.clone(), entry.clone())),
+                            ),
+                            None => row.misses.push((outcome, slot.id.clone())),
+                        }
+                    }
+                }
+            }
+            rows.push(row);
+        }
+        rows.sort_by_key(|row| row.number);
+        rows
+    }
+
+    /// The entries of each full prediction slot of the tickets one pull
+    /// request closes.
+    fn predicted_slots(&self, repo: &str, number: u64) -> BTreeMap<String, Vec<String>> {
+        let mut slots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ticket in self.linked_tickets(repo, number) {
+            let Some(full) = self
+                .record_view(repo, ticket)
+                .and_then(|view| view.full.as_ref())
+            else {
+                continue;
+            };
+            for slot in &full.slots {
+                let list = slots.entry(slot.name.clone()).or_default();
+                for entry in &slot.entries {
+                    push_once(list, entry.clone());
+                }
+            }
+        }
+        slots
     }
 
     /// Cancel restored active tasks whose item is absent from the first
@@ -3323,7 +3415,7 @@ impl Daemon {
                     .table
                     .by_id
                     .get(&task_id)
-                    .is_some_and(|task| Self::wants_final_block(task).is_some())
+                    .is_some_and(|task| self.wants_final_block(task).is_some())
                 {
                     let turn = self.ticket_turn_text.entry(task_id).or_default();
                     if proposal_marker_text(&turn.last) {
@@ -7267,18 +7359,92 @@ impl Daemon {
     /// Apply the final block of one finished turn, per the task purpose.
     ///
     /// A ticket chat proposes a rewritten ticket. A teach task opens one
-    /// theory event per contradiction it found. Every other purpose drops
-    /// the buffered text.
+    /// theory event per contradiction it found. A governed review opens
+    /// its delta. Every other purpose drops the buffered text.
     fn finish_final_block_turn(&mut self, id: &str) {
         match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
             Some(TaskPurpose::TicketChat) => self.finish_ticket_proposal_turn(id),
             Some(TaskPurpose::Teach(_)) => self.finish_teach_events(id),
             // An audit sweep keeps its text: the sweep reads it at exit.
             Some(TaskPurpose::Audit(_)) => {}
+            Some(TaskPurpose::Pipeline) => self.finish_review_delta(id),
             _ => {
                 self.ticket_turn_text.remove(id);
             }
         }
+    }
+
+    /// Open the delta of one finished review turn.
+    ///
+    /// The scan reads every assistant text event of the turn with the
+    /// ticket-proposal strictness, so one complete block must end the
+    /// report. A governed review that ends without a readable block fails
+    /// the attempt with the finding `no delta block`, and the task
+    /// re-queues while attempts remain. Every other pipeline task drops
+    /// its text. A failed post goes to standard error only, because the
+    /// review itself succeeded.
+    fn finish_review_delta(&mut self, id: &str) {
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        let Some(task) = self.table.by_id.get(id).cloned() else {
+            return;
+        };
+        if !self.wants_delta(&task) {
+            return;
+        }
+        let Some(delta) = crate::theory::blocks::parse_block(DELTA_BLOCK, &turn.all)
+            .ok()
+            .as_deref()
+            .and_then(parse_delta)
+        else {
+            self.fail_run(&task, NO_DELTA_BLOCK);
+            return;
+        };
+        let delta = self.tagged_delta(&task, delta);
+        if let Err(error) = self.open_delta(&task.repo, task.number, &delta) {
+            eprintln!("task {id}: cannot open the delta: {error:#}");
+        }
+    }
+
+    /// Copy the confidence tag of each slot in from the full prediction.
+    ///
+    /// The review writes the outcome of a slot, never its tag, so the
+    /// posted block carries the tag the operator committed to. A slot no
+    /// linked ticket predicted keeps the `unsure` the parse gave it.
+    fn tagged_delta(&self, task: &Task, mut delta: DeltaBlock) -> DeltaBlock {
+        let mut tags: BTreeMap<String, PredictionTag> = BTreeMap::new();
+        for ticket in self.linked_tickets(&task.repo, task.number) {
+            let Some(full) = self
+                .record_view(&task.repo, ticket)
+                .and_then(|view| view.full.as_ref())
+            else {
+                continue;
+            };
+            for slot in &full.slots {
+                tags.entry(slot.name.clone()).or_insert(slot.tag);
+            }
+        }
+        for slot in &mut delta.slots {
+            if let Some(tag) = tags.get(&slot.id) {
+                slot.tag = *tag;
+            }
+        }
+        delta
+    }
+
+    /// Post one delta on the theory record of one pull request and add
+    /// `delta-open`.
+    ///
+    /// The delta ships as one `<aif-delta-v1>` block comment with a JSON
+    /// body, and the label exists afterwards: the daemon creates it when
+    /// the repository has none, then adds it to the record.
+    fn open_delta(&self, alias: &str, number: u64, delta: &DeltaBlock) -> Result<()> {
+        let (owner_repo, record) = self.theory_record(alias, &RecordKey::Pr(number))?;
+        let gh = GhClient::new(&*self.exec);
+        gh.post_comment(&owner_repo, record, &delta_block(delta))?;
+        gh.create_label_if_missing(&owner_repo, DELTA_OPEN_LABEL, DELTA_OPEN_COLOR)?;
+        gh.add_label(&owner_repo, record, DELTA_OPEN_LABEL)
     }
 
     /// Open one theory event per block of one finished teach turn.
@@ -7590,12 +7756,34 @@ impl Daemon {
     /// the blocks of the turn back. Only the presence of a tag is read
     /// today, because each purpose parses its own blocks; the tag itself
     /// is here for the later chunks that select a parser by it.
-    fn wants_final_block(task: &Task) -> Option<&'static str> {
+    fn wants_final_block(&self, task: &Task) -> Option<&'static str> {
         match task.purpose {
             TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
             TaskPurpose::Teach(_) | TaskPurpose::Audit(_) => Some(EVENT_BLOCK),
-            TaskPurpose::Pipeline | TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
+            TaskPurpose::Pipeline => self.wants_delta(task).then_some(DELTA_BLOCK),
+            TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
         }
+    }
+
+    /// True when one review must end its report with a delta block.
+    ///
+    /// The review of a governed pull request takes the delta when a
+    /// ticket the pull request closes carries `theory-full`. A pull
+    /// request with no linked ticket, and every ungoverned repository,
+    /// takes none.
+    fn wants_delta(&self, task: &Task) -> bool {
+        task.purpose == TaskPurpose::Pipeline
+            && task.stage == Stage::Review
+            && self.theory_records.is_governed(&task.repo)
+            && self
+                .linked_tickets(&task.repo, task.number)
+                .into_iter()
+                .any(|ticket| {
+                    self.theory_records
+                        .labels_of(&task.repo, &RecordKey::Issue(ticket))
+                        .iter()
+                        .any(|label| label == THEORY_FULL_LABEL)
+                })
     }
 
     /// Select the execution role for one task purpose.
@@ -8665,6 +8853,12 @@ fn name_list(names: &[String]) -> String {
     names.join(", ")
 }
 
+/// The pull request number of one record key, `None` for every other
+/// key. [`RecordKey::key_text`] writes a pull request key as `pr-<n>`.
+fn pr_key_number(key: &str) -> Option<u64> {
+    key.strip_prefix("pr-")?.parse().ok()
+}
+
 /// The lowercase name of one prediction tag.
 fn tag_name(tag: PredictionTag) -> &'static str {
     match tag {
@@ -8846,7 +9040,8 @@ mod tests {
     };
     use crate::tasks::MAX_ATTEMPTS;
     use crate::theory::records::{
-        parse_event_blocks, PredictionSlot, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
+        parse_event_blocks, DeltaSlot, DeltaViolation, PredictionSlot, THEORY_FULL_LABEL,
+        THEORY_SHORT_LABEL,
     };
     use crate::theory::verify::Tier;
     use serde_json::json;
@@ -21288,6 +21483,417 @@ mod tests {
         assert_eq!(rig.job(0).task, "borsuk/review-p7");
     }
 
+    // ------------------------------------------------------------------
+    // The delta of one governed review
+    // ------------------------------------------------------------------
+
+    /// The full prediction of ticket 142 in the delta tests. The
+    /// `invariants` slot is sure and names one entry.
+    fn delta_prediction() -> FullPrediction {
+        FullPrediction {
+            kind: records::PREDICTION_FULL.to_string(),
+            slots: vec![
+                PredictionSlot {
+                    name: "behaviours".to_string(),
+                    entries: vec!["T-pay".to_string()],
+                    tag: PredictionTag::Sure,
+                },
+                PredictionSlot {
+                    name: "invariants".to_string(),
+                    entries: vec!["INV-3".to_string()],
+                    tag: PredictionTag::Sure,
+                },
+            ],
+        }
+    }
+
+    /// The refined ticket of the delta tests: the contract ticket with
+    /// `theory-full` on it.
+    fn delta_ticket() -> Issue {
+        let mut ticket = contract_ticket();
+        ticket.labels = vec![THEORY_FULL_LABEL.to_string()];
+        ticket
+    }
+
+    /// One comment page that holds one block.
+    fn block_page(block: &str) -> String {
+        serde_json::to_string(&serde_json::json!([{
+            "user": {"login": "operator"},
+            "created_at": "2026-09-01T10:00:00Z",
+            "body": block,
+        }]))
+        .unwrap()
+    }
+
+    /// The delta the review of the delta tests reports: `behaviours` hit,
+    /// `invariants` missed, one violation, one question.
+    fn reported_delta() -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![
+                DeltaSlot {
+                    id: "behaviours".to_string(),
+                    outcome: DeltaOutcome::Hit,
+                    tag: PredictionTag::Unsure,
+                },
+                DeltaSlot {
+                    id: "invariants".to_string(),
+                    outcome: DeltaOutcome::Miss,
+                    tag: PredictionTag::Unsure,
+                },
+            ],
+            touched: vec!["INV-3".to_string()],
+            violations: vec![DeltaViolation {
+                entry: "INV-3".to_string(),
+                finding: "the retry crosses the boundary".to_string(),
+            }],
+            question: "Does the cart keep the token?".to_string(),
+        }
+    }
+
+    /// The same delta after the daemon copied the prediction tags in.
+    fn tagged_delta_block() -> DeltaBlock {
+        let mut delta = reported_delta();
+        for slot in &mut delta.slots {
+            slot.tag = PredictionTag::Sure;
+        }
+        delta
+    }
+
+    /// One review report that ends with `delta` as its last block.
+    fn delta_report(delta: &DeltaBlock) -> String {
+        format!("The diff meets every criterion.\n\n{}", delta_block(delta))
+    }
+
+    /// The scripted comment, label creation, and label call of one delta
+    /// on the record of pull request 7.
+    fn open_delta_steps(delta: &DeltaBlock) -> Vec<Step> {
+        let body = format!("body={}", delta_block(delta));
+        vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=delta-open",
+                    "-f",
+                    "color=fbca04",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"delta-open\",\"color\":\"fbca04\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=delta-open",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// The scripted steps of one governed poll that dispatches the review
+    /// of pull request 7 over the delta fixtures.
+    fn delta_review_steps(dir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(delta_prediction()))),
+        ));
+        steps.extend(body_admission_steps(
+            &repo,
+            &pr_wt(dir, 7),
+            7,
+            &rig_gitdir(dir),
+            "web/pay.ts",
+        ));
+        let issue_worktree = issue_wt(dir, 142);
+        steps.extend(fresh_issue_steps(
+            &repo,
+            &issue_worktree,
+            142,
+            &rig_gitdir(dir),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &issue_worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        steps
+    }
+
+    /// The pull request body every delta test ships.
+    fn delta_pr_body() -> String {
+        LOW_TIER_BODY.replace("\u{b7} http \u{b7}", "\u{b7} browser \u{b7}")
+    }
+
+    /// Every delta block the rig posted, in call order.
+    fn posted_deltas(rig: &Rig) -> Vec<DeltaBlock> {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .filter_map(|call| call.args.iter().find(|arg| arg.starts_with("body=")))
+            .flat_map(|field| parse_delta_blocks(field.strip_prefix("body=").unwrap_or(field)))
+            .collect()
+    }
+
+    /// A governed review whose ticket carries `theory-full` ends with one
+    /// delta block. The daemon posts it on the record of the pull
+    /// request, with the prediction tags in, and adds `delta-open`.
+    #[test]
+    fn a_governed_review_delta_posts_the_block_and_adds_the_label() {
+        let dir = temp_root();
+        let mut steps = delta_review_steps(&dir);
+        steps.extend(open_delta_steps(&tagged_delta_block()));
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: delta_report(&reported_delta()),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(posted_deltas(&rig), vec![tagged_delta_block()]);
+        assert_eq!(label_calls(&rig, DELTA_OPEN_LABEL), 1);
+        assert_eq!(
+            rig.task(id).state,
+            TaskState::Running,
+            "the review waits for its transition, it did not fail"
+        );
+
+        // The next poll shows the label, reads the record comments, and
+        // the Theory view carries the row.
+        let mut labelled = contract_pr(&delta_pr_body());
+        labelled.labels = vec![DELTA_OPEN_LABEL.to_string()];
+        rig.poll(vec![delta_ticket()], vec![labelled]);
+
+        assert_eq!(
+            theory_of(&rig).deltas,
+            vec![DeltaView {
+                number: 7,
+                state: DeltaState::Open,
+                misses: vec![("sure-miss".to_string(), "INV-3".to_string())],
+                hits: 1,
+                unsure: 0,
+                violations: vec![(
+                    "INV-3".to_string(),
+                    "the retry crosses the boundary".to_string()
+                )],
+                question: "Does the cart keep the token?".to_string(),
+            }]
+        );
+    }
+
+    /// A delta whose record lost `delta-open` reads closed, and the
+    /// cached block still carries its violation.
+    #[test]
+    fn a_record_that_lost_the_label_reads_closed_in_the_theory_view() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(delta_prediction()))),
+        ));
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // A closed pull request admits no review, so the poll reads the
+        // record alone.
+        let mut merged = contract_pr(&delta_pr_body());
+        merged.open = false;
+        merged.draft = false;
+        merged.labels = vec![DELTA_OPEN_LABEL.to_string()];
+
+        rig.poll(vec![delta_ticket()], vec![merged.clone()]);
+
+        assert_eq!(theory_of(&rig).deltas[0].state, DeltaState::Open);
+
+        merged.labels.clear();
+        rig.poll(vec![delta_ticket()], vec![merged]);
+
+        let rows = theory_of(&rig).deltas;
+        assert_eq!(rows[0].state, DeltaState::Closed, "the label is gone");
+        assert_eq!(
+            rows[0].violations,
+            vec![(
+                "INV-3".to_string(),
+                "the retry crosses the boundary".to_string()
+            )],
+            "the cached block keeps the violation"
+        );
+    }
+
+    /// A review of a pull request with no linked ticket expects no block.
+    /// The turn ends without one, the task keeps running towards its
+    /// transition, and no label call goes out.
+    #[test]
+    fn a_review_of_a_pr_without_a_linked_ticket_needs_no_delta_block() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok(
+                "refs/remotes/origin/main
+",
+            ),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(
+                "docs/notes.md
+",
+            ),
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The diff meets every criterion.".to_string(),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(rig.task(id).state, TaskState::Running, "the review holds");
+        assert_eq!(label_calls(&rig, DELTA_OPEN_LABEL), 0);
+        assert_eq!(posted_deltas(&rig), Vec::new());
+    }
+
+    /// A governed review that ends with no block fails the attempt and
+    /// re-queues while attempts remain.
+    #[test]
+    fn a_governed_review_without_a_delta_block_fails_the_attempt() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+        let before = rig.exec.calls().len();
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The diff meets every criterion.".to_string(),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(
+            rig.task(id).state,
+            TaskState::Queued,
+            "the attempt re-queues"
+        );
+        assert_eq!(rig.task(id).attempt, 2);
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a failed attempt posts nothing"
+        );
+    }
+
+    /// The finding of the missing block reaches the operator: the last
+    /// attempt fails with it and the stuck row names the task.
+    #[test]
+    fn a_review_with_no_delta_block_fails_with_the_no_delta_block_finding() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        // The run is on its last attempt, so the failure is terminal and
+        // the state keeps the finding.
+        rig.daemon.table.by_id.get_mut(id).unwrap().attempt = MAX_ATTEMPTS;
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The diff meets every criterion.".to_string(),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(
+            rig.task(id).state,
+            TaskState::Failed(NO_DELTA_BLOCK.to_string())
+        );
+        assert!(rig
+            .decision(&format!("stuck:{id}:{MAX_ATTEMPTS}"))
+            .is_some());
+    }
+
+    /// A block whose slot id names no prediction slot fails the parse, so
+    /// the attempt fails with the same finding.
+    #[test]
+    fn a_delta_block_with_an_unknown_slot_fails_the_attempt() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        let mut broken = reported_delta();
+        broken.slots[0].id = "bananas".to_string();
+        let before = rig.exec.calls().len();
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: delta_report(&broken),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(rig.task(id).state, TaskState::Queued);
+        assert_eq!(rig.task(id).attempt, 2);
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a broken block posts nothing"
+        );
+    }
+
     /// The two git steps of one poll that re-reads the head commit of the
     /// theory checkout and finds the cached skills behind it.
     fn cached_theory_steps(repo: &Path) -> Vec<Step> {
@@ -23616,6 +24222,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             RecordView {
                 short: Some(short_view("the submit blocks", &["web-checkout"])),
                 full: None,
+                delta: None,
             },
         );
 
@@ -23644,6 +24251,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                         tag: PredictionTag::Sure,
                     }],
                 }),
+                delta: None,
             },
         );
 
@@ -23723,6 +24331,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                         },
                     ],
                 }),
+                delta: None,
             },
         );
 

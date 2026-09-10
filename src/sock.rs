@@ -41,7 +41,7 @@ use crate::sched::{Limits, Paused};
 use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
 use crate::theory::model::Model;
-use crate::theory::records::{FullPrediction, ShortPrediction};
+use crate::theory::records::{DeltaBlock, FullPrediction, ShortPrediction};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
@@ -162,6 +162,52 @@ pub struct TheoryView {
     /// The blocks of each theory record the daemon read, by record key.
     #[serde(default)]
     pub records: BTreeMap<String, RecordView>,
+    /// One row per pull request whose record holds a delta, by pull
+    /// request number.
+    #[serde(default)]
+    pub deltas: Vec<DeltaView>,
+}
+
+/// Whether one delta still waits for the operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaState {
+    /// The record still carries `delta-open`.
+    #[default]
+    Open,
+    /// The operator removed the label, so the delta is through.
+    Closed,
+}
+
+/// One delta of one pull request, as the DELTAS panel draws it.
+///
+/// The daemon rebuilds it on every poll from the record blocks and the
+/// record labels, so a delta the operator closed leaves the panel at the
+/// next poll.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaView {
+    /// The pull request the delta belongs to.
+    #[serde(default)]
+    pub number: u64,
+    /// Whether the delta still waits for the operator.
+    #[serde(default)]
+    pub state: DeltaState,
+    /// One row per entry of a missed slot: the outcome name, one of
+    /// `sure-miss` and `unsure-miss`, and the entry the slot named.
+    #[serde(default)]
+    pub misses: Vec<(String, String)>,
+    /// The count of `sure-hit` slots.
+    #[serde(default)]
+    pub hits: usize,
+    /// The count of `unsure-hit` slots.
+    #[serde(default)]
+    pub unsure: usize,
+    /// The model rules the change broke: the entry and the finding.
+    #[serde(default)]
+    pub violations: Vec<(String, String)>,
+    /// The one question the review asked.
+    #[serde(default)]
+    pub question: String,
 }
 
 /// One item the governor holds out of a stage.
@@ -195,6 +241,9 @@ pub struct RecordView {
     /// The last full prediction of the record.
     #[serde(default)]
     pub full: Option<FullPrediction>,
+    /// The last delta of the record.
+    #[serde(default)]
+    pub delta: Option<DeltaBlock>,
 }
 
 /// One row of the AREAS panel.
@@ -2762,6 +2811,18 @@ mod tests {
                         paths: vec!["web/**".to_string()],
                     }],
                 },
+                deltas: vec![DeltaView {
+                    number: 7,
+                    state: DeltaState::Open,
+                    misses: vec![("sure-miss".to_string(), "INV-3".to_string())],
+                    hits: 4,
+                    unsure: 0,
+                    violations: vec![(
+                        "INV-3".to_string(),
+                        "the retry crosses the boundary".to_string(),
+                    )],
+                    question: "Does the cart keep the token?".to_string(),
+                }],
                 holds: vec![HoldView {
                     number: 142,
                     reason: "awaits full prediction".to_string(),
@@ -2813,6 +2874,8 @@ mod tests {
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert!(text.contains("\"usage\":["), "line: {text}");
         assert!(text.contains("\"tier\":\"browser\""), "line: {text}");
+        assert!(text.contains("\"sure-miss\""), "line: {text}");
+        assert!(text.contains("\"state\":\"open\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 

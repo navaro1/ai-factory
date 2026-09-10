@@ -2,9 +2,10 @@
 //!
 //! The view draws one block per repository: the header strip with the
 //! governor state and the counts, then the AREAS panel with the tier each
-//! area reaches, then the HOLDS panel with the items the governor holds.
-//! The operator moves the cursor with `j` and `k`. On a repository row
-//! `v` asks for the run skill of one surface. On an area row `t` asks the
+//! area reaches, then the HOLDS panel with the items the governor holds,
+//! then the DELTAS panel with the deltas the reviews reported. The
+//! operator moves the cursor with `j` and `k`. On a repository row `v`
+//! asks for the run skill of one surface. On an area row `t` asks the
 //! agent to teach that area.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -14,7 +15,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::sock::{Action, AreaView, HoldView, StateView, TheoryAction, TheoryView};
+use crate::sock::{
+    Action, AreaView, DeltaState, DeltaView, HoldView, StateView, TheoryAction, TheoryView,
+};
 use crate::tasks::TeachKey;
 use crate::theory::records::names_empty_area;
 use crate::theory::verify::Tier;
@@ -39,22 +42,25 @@ pub(super) enum Outcome {
 
 /// One stop of the Theory cursor.
 ///
-/// Each governed repository contributes its header row and one row per
-/// area, in draw order. An ungoverned repository draws no AREAS panel, so
-/// it contributes its header row alone.
+/// Each governed repository contributes its header row, one row per area,
+/// and one row per delta, in draw order. A delta that draws several miss
+/// rows is one stop. An ungoverned repository draws no panel, so it
+/// contributes its header row alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Stop {
     /// The header row of one repository.
     Repo(String),
     /// One area row of one repository.
     Area(String, String),
+    /// The delta of one pull request of one repository.
+    Delta(String, u64),
 }
 
 impl Stop {
     /// The repository alias of the stop.
     fn repo(&self) -> &str {
         match self {
-            Stop::Repo(alias) | Stop::Area(alias, _) => alias,
+            Stop::Repo(alias) | Stop::Area(alias, _) | Stop::Delta(alias, _) => alias,
         }
     }
 }
@@ -69,6 +75,9 @@ fn stops(state: &StateView) -> Vec<Stop> {
         }
         for area in &view.areas {
             all.push(Stop::Area(alias.clone(), area.id.clone()));
+        }
+        for delta in &view.deltas {
+            all.push(Stop::Delta(alias.clone(), delta.number));
         }
     }
     all
@@ -278,11 +287,20 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &Theory) 
                 .is_some_and(|stop| *stop == Stop::Area(alias.clone(), one.id.clone()));
             lines.push(area_row(one, here));
         }
-        if row.holds.is_empty() {
+        if !row.holds.is_empty() {
+            lines.push(Line::from(Span::styled("HOLDS", THEME.dim())));
+            lines.extend(row.holds.iter().map(hold_row));
+        }
+        if row.deltas.is_empty() {
             continue;
         }
-        lines.push(Line::from(Span::styled("HOLDS", THEME.dim())));
-        lines.extend(row.holds.iter().map(hold_row));
+        lines.push(Line::from(Span::styled("DELTAS", THEME.dim())));
+        for one in &row.deltas {
+            let here = at
+                .as_ref()
+                .is_some_and(|stop| *stop == Stop::Delta(alias.clone(), one.number));
+            lines.extend(delta_rows(one, here));
+        }
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no repository", THEME.dim())));
@@ -365,6 +383,62 @@ fn hold_row(hold: &HoldView) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(THEME.error)))
 }
 
+/// The rows of one delta: one row per missed entry, else one summary row.
+///
+/// A closed delta reads `#n ✓ CLOSED`. An open delta with a miss
+/// reads one `#n ● <OUTCOME>  <entry>` row per missed entry, so each
+/// miss the operator answers stands on its own line. An open delta that
+/// missed nothing reads `#n ○ OPEN  <hits> hit <unsure> unsure`.
+fn delta_rows(row: &DeltaView, is_selected: bool) -> Vec<Line<'static>> {
+    let number = row.number;
+    let texts: Vec<(String, Style)> = if row.state == DeltaState::Closed {
+        vec![(
+            format!("#{number} \u{2713} CLOSED"),
+            Style::default().fg(THEME.dim),
+        )]
+    } else if row.misses.is_empty() {
+        vec![(
+            format!(
+                "#{number} \u{25cb} OPEN  {} hit {} unsure",
+                row.hits, row.unsure
+            ),
+            Style::default().fg(THEME.accent),
+        )]
+    } else {
+        row.misses
+            .iter()
+            .map(|(outcome, entry)| {
+                (
+                    format!("#{number} \u{25cf} {}  {entry}", outcome.to_uppercase()),
+                    Style::default().fg(THEME.error),
+                )
+            })
+            .collect()
+    };
+    texts
+        .into_iter()
+        .enumerate()
+        .map(|(at, (text, style))| {
+            let marker = if is_selected && at == 0 {
+                Span::styled(
+                    "\u{25b8} ",
+                    Style::default()
+                        .fg(THEME.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            let line = Line::from(vec![marker, Span::styled(text, style)]);
+            if is_selected {
+                line.style(THEME.selected())
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
 /// The tier mark of one area: the tier name, `-` when no surface maps to
 /// the area, and `!` for a lint finding or a floor above reach.
 fn mark(row: &AreaView) -> String {
@@ -412,6 +486,7 @@ mod tests {
                 skills: BTreeMap::new(),
                 holds: Vec::new(),
                 records: BTreeMap::new(),
+                deltas: Vec::new(),
             },
         );
         StateView {
@@ -504,6 +579,77 @@ mod tests {
         assert!(
             !screen.contains("awaits full prediction \u{b7} b bootstrap"),
             "bootstrap answers an empty area alone:\n{screen}"
+        );
+    }
+
+    /// One delta of pull request `number` with the given misses.
+    fn delta(number: u64, misses: &[(&str, &str)], hits: usize, unsure: usize) -> DeltaView {
+        DeltaView {
+            number,
+            state: DeltaState::Open,
+            misses: misses
+                .iter()
+                .map(|(outcome, entry)| (outcome.to_string(), entry.to_string()))
+                .collect(),
+            hits,
+            unsure,
+            violations: Vec::new(),
+            question: String::new(),
+        }
+    }
+
+    /// The DELTAS panel names one row per miss, one summary row for a
+    /// hit-only delta, and one closed row once the label is gone.
+    #[test]
+    fn the_deltas_panel_draws_a_miss_row_a_hit_row_and_a_closed_row() {
+        let mut state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        );
+        let mut closed = delta(9, &[], 5, 0);
+        closed.state = DeltaState::Closed;
+        state.theory.get_mut("borsuk").unwrap().deltas = vec![
+            delta(142, &[("sure-miss", "INV-3")], 4, 0),
+            delta(150, &[], 4, 1),
+            closed,
+        ];
+
+        let screen = render(&state);
+
+        assert!(screen.contains("DELTAS"), "{screen}");
+        assert!(
+            screen.contains("#142 \u{25cf} SURE-MISS  INV-3"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("#150 \u{25cb} OPEN  4 hit 1 unsure"),
+            "{screen}"
+        );
+        assert!(screen.contains("#9 \u{2713} CLOSED"), "{screen}");
+    }
+
+    /// The cursor walks the DELTAS rows after the AREAS rows.
+    #[test]
+    fn the_cursor_walks_from_the_last_area_row_to_the_delta_row() {
+        let mut state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        );
+        state.theory.get_mut("borsuk").unwrap().deltas =
+            vec![delta(142, &[("unsure-miss", "INV-3")], 0, 0)];
+        let mut theory = Theory::default();
+
+        theory.move_mark(&state, 1);
+        theory.move_mark(&state, 1);
+
+        assert_eq!(
+            theory.at(&state),
+            Some(Stop::Delta("borsuk".to_string(), 142))
+        );
+        let screen = render_with(&state, &theory);
+        assert!(
+            screen.contains("\u{25b8} #142 \u{25cf} UNSURE-MISS  INV-3"),
+            "{screen}"
         );
     }
 
