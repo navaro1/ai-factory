@@ -70,11 +70,11 @@ use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
-    event_block, parse_event_blocks, Event, RecordKey, EVENT_BLOCK, EVENT_OPEN_COLOR,
+    self, event_block, parse_event_blocks, Event, RecordKey, EVENT_BLOCK, EVENT_OPEN_COLOR,
     EVENT_OPEN_LABEL, MODEL_PR_LABEL, VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
-use crate::theory::verify::{Measurer, Mode, VerifyMap};
+use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
 use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
@@ -156,6 +156,9 @@ pub const FAST_TIMEOUT_S: u64 = 120;
 
 /// The opening words of the finding one failed fast check posts.
 pub const FAST_CHECK_FAILED: &str = "fast check failed";
+
+/// The kind of the theory event one broken floor opens.
+pub const FLOOR_EVENT: &str = "floor";
 
 /// The reason a plain abort writes into the failed state of one task.
 const CANCELLED_REASON: &str = "cancelled";
@@ -2078,7 +2081,11 @@ impl Daemon {
             }
         }
         for (repo, number, review) in fast_checks {
-            self.start_fast_checks(&repo, number, &review);
+            // A run that holds the review decides at its last exit. With
+            // no run the body check decides here.
+            if !self.start_fast_checks(&repo, number, &review) {
+                self.check_pr_body(&repo, number, &review);
+            }
         }
     }
 
@@ -5538,23 +5545,27 @@ impl Daemon {
     /// governor off, an unreadable worktree, and a diff that touches no
     /// area with a fast command all queue nothing, and the review then runs
     /// as it ran before the governor.
-    fn start_fast_checks(&mut self, alias: &str, number: u64, review_task: &str) {
+    ///
+    /// The answer says whether a run now holds the review. A held review
+    /// takes its body check when the last fast check ends; every other
+    /// review takes it at admission.
+    fn start_fast_checks(&mut self, alias: &str, number: u64, review_task: &str) -> bool {
         let Some(repo_cfg) = self.config.repos.get(alias).cloned() else {
-            return;
+            return false;
         };
         if !repo_cfg.theory.governor.is_on() || !self.has_fast_feature(alias) {
-            return;
+            return false;
         }
         let worktree = match self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number) {
             Ok(path) => path,
             Err(error) => {
                 eprintln!("the fast checks of {alias} pull request {number}: {error:#}");
-                return;
+                return false;
             }
         };
         let features = self.touched_features(alias, &repo_cfg.path, &worktree);
         if features.is_empty() {
-            return;
+            return false;
         }
         // A remembered record without its task row can never be checked
         // against the table again, so it goes when the row goes.
@@ -5562,7 +5573,7 @@ impl Daemon {
             .retain(|id, _| self.table.by_id.contains_key(id));
         let ids = self.queue_fast(alias, &RecordKey::Pr(number), &worktree, &features);
         if ids.is_empty() {
-            return;
+            return false;
         }
         let mut run = FastRun::new(ids);
         for id in &run.tasks {
@@ -5574,6 +5585,7 @@ impl Daemon {
         // Every check of this tree may have run already, and then the
         // remembered records decide now instead of at the next exit.
         self.finish_fast_run(review_task);
+        true
     }
 
     /// True when one repository has a feature that names a fast command.
@@ -5744,9 +5756,6 @@ impl Daemon {
         }
         let failure = run.failure().cloned();
         self.fast_runs.remove(review);
-        let Some(failure) = failure else {
-            return;
-        };
         let Some(task) = self.table.by_id.get(review).cloned() else {
             return;
         };
@@ -5755,6 +5764,12 @@ impl Daemon {
         if task.state.is_terminal() {
             return;
         }
+        let Some(failure) = failure else {
+            // Every check reported 0, so the body check is the last gate
+            // before the review dispatches.
+            self.check_pr_body(&task.repo, task.number, review);
+            return;
+        };
         let exit = failure.value.unwrap_or_default().round() as i64;
         let finding = format!("{FAST_CHECK_FAILED}: {} exit {exit}", failure.id);
         if let Err(error) =
@@ -5766,6 +5781,113 @@ impl Daemon {
         // that stopped the review instead of a bare abort.
         self.cancel_task_with_reason(review, false, &finding);
         self.requeue_implement(&task.repo, task.number);
+    }
+
+    /// Run the body check of one governed pull request and act on it.
+    ///
+    /// A clean body leaves the review to dispatch. A finding posts on the
+    /// theory record, cancels the review, and queues implement again, the
+    /// way a failed fast check does. A broken floor also opens one theory
+    /// event.
+    fn check_pr_body(&mut self, alias: &str, number: u64, review_task: &str) {
+        let Some(finding) = self.body_finding(alias, number) else {
+            return;
+        };
+        let Some(task) = self.table.by_id.get(review_task) else {
+            return;
+        };
+        if task.state.is_terminal() {
+            return;
+        }
+        eprintln!("the body check of {alias} pull request {number} failed: {finding}");
+        let text = format!("PR: {finding}");
+        if let Err(error) = self.post_record_comment(alias, &RecordKey::Pr(number), &text) {
+            eprintln!("the body check finding of {alias} pull request {number}: {error:#}");
+        }
+        if let Some(floor) = &finding.floor {
+            let event = Event {
+                kind: FLOOR_EVENT.to_string(),
+                text: format!(
+                    "area {} asks for the tier {} and the line reached {}",
+                    floor.area, floor.floor, floor.reached
+                ),
+                area: Some(floor.area.clone()),
+                number: Some(number),
+                surface: None,
+            };
+            if let Err(error) = self.open_event(alias, &RecordKey::Pr(number), &event) {
+                eprintln!("the floor event of {alias} pull request {number}: {error:#}");
+            }
+        }
+        self.cancel_task_with_reason(review_task, false, &text);
+        self.requeue_implement(alias, number);
+    }
+
+    /// The finding of the body check of one pull request, when it has one.
+    ///
+    /// The check runs only for a governed repository whose theory parses
+    /// and whose pull request closes a ticket, because that ticket carries
+    /// the criteria and the plan the contract traces to. Every other pull
+    /// request keeps the behaviour it had before the governor.
+    fn body_finding(&self, alias: &str, number: u64) -> Option<contract::Finding> {
+        let repo_cfg = self.config.repos.get(alias)?.clone();
+        if !repo_cfg.theory.governor.is_on() {
+            return None;
+        }
+        let snapshot = self.snapshot.repos.get(alias)?;
+        let pull = snapshot.prs.get(&number)?;
+        let ticket = self
+            .links
+            .get(alias)
+            .map(|links| links.tickets_of(number))
+            .unwrap_or_default()
+            .first()
+            .and_then(|ticket| snapshot.issues.get(ticket))?;
+        let cache = self.theory_models.get(alias)?;
+        let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
+            return None;
+        };
+        let Ok(set) = &self.theory_skills.get(alias)?.skills else {
+            return None;
+        };
+        let worktree = match self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("the body check of {alias} pull request {number}: {error:#}");
+                return None;
+            }
+        };
+        let changed_paths = self.diff_paths(&repo_cfg.path, &worktree);
+        let touched: Vec<&str> = changed_paths.iter().map(String::as_str).collect();
+        let areas: Vec<(String, Tier)> = map
+            .areas_for_paths(model, &touched)
+            .into_iter()
+            .filter_map(|id| {
+                map.areas
+                    .iter()
+                    .find(|area| area.id == id)
+                    .map(|area| (area.id.clone(), area.min_tier))
+            })
+            .collect();
+        let mut features: Vec<Feature> = Vec::new();
+        for area in &map.areas {
+            for feature in skills::resolve(&area.id, map, set) {
+                if !features.iter().any(|seen| seen.id == feature.id) {
+                    features.push(feature.clone());
+                }
+            }
+        }
+        let (criteria, _findings) = contract::parse_criteria(&ticket.body);
+        let ctx = contract::ContractContext {
+            criteria,
+            features,
+            areas,
+            owned_paths: contract::owned_paths(&ticket.body),
+            changed_paths,
+            manifests: &contract::MANIFESTS,
+            ticket_names_dependency: contract::names_dependency(&ticket.body),
+        };
+        records::check_pr(&pull.body, &pull.head_ref, &ctx).err()
     }
 
     /// Queue the implement task of every ticket one pull request closes.
@@ -5964,8 +6086,6 @@ impl Daemon {
     /// body, and the `event-open` label exists afterwards: the daemon
     /// creates it when the repository has none, then adds it to the
     /// record.
-    // The v0.8 chunks call this.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn open_event(&self, alias: &str, key: &RecordKey, event: &Event) -> Result<()> {
         let (owner_repo, number) = self.theory_record(alias, key)?;
         let gh = GhClient::new(&*self.exec);
@@ -9682,7 +9802,9 @@ mod tests {
 
         assert_eq!(rig.job_count(), 1);
         assert!(
-            rig.job(0).prompt.contains("Tickets this PR closes: #4, #9"),
+            rig.job(0)
+                .prompt
+                .contains("The tickets this PR closes are #4, #9"),
             "prompt:\n{}",
             rig.job(0).prompt
         );
@@ -9702,7 +9824,9 @@ mod tests {
 
         assert_eq!(rig.job_count(), 1);
         assert!(
-            rig.job(0).prompt.contains("Tickets this PR closes: none"),
+            rig.job(0)
+                .prompt
+                .contains("The tickets this PR closes are none"),
             "prompt:\n{}",
             rig.job(0).prompt
         );
@@ -20011,6 +20135,348 @@ mod tests {
             "the governor is off, so v0.6 admission holds"
         );
         assert_eq!(rig.job_count(), 1);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+    }
+
+    // ------------------------------------------------------------------
+    // The Before / After body check at review admission
+    // ------------------------------------------------------------------
+
+    /// The verification map of the body-check tests. The checkout area
+    /// asks for the browser tier.
+    const FLOOR_VERIFY: &str = concat!(
+        "[[area]]\nid = \"web-checkout\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the cart pays\"\nmin_tier = \"browser\"\n",
+    );
+
+    /// The skills tree of the body-check tests: one surface, one feature
+    /// that names no fast command, so no fast check holds the review.
+    const BODY_SKILLS_TREE: &str = concat!(
+        ".claude/skills/run-web/SKILL.md\n",
+        ".claude/skills/run-web/features/checkout.md\n",
+    );
+
+    /// The git steps of the governed theory read of the body-check tests.
+    fn body_theory_steps(repo: &Path) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("ccc333\n"),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:theory/model.toml"],
+                CmdOut::ok(THEORY_MODEL),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:theory/verify.toml"],
+                CmdOut::ok(FLOOR_VERIFY),
+            ),
+            git_step(
+                repo,
+                &["ls-tree", "-r", "--name-only", "ccc333", SKILLS_DIR],
+                CmdOut::ok(BODY_SKILLS_TREE),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/SKILL.md"],
+                CmdOut::ok(run_skill("browser")),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/features/checkout.md"],
+                CmdOut::ok(feature_file_without_fast("web-checkout")),
+            ),
+        ]
+    }
+
+    /// The git steps the body check of one governed review runs: the head
+    /// worktree and the diff against the default base.
+    fn body_admission_steps(
+        repo: &Path,
+        worktree: &Path,
+        number: u64,
+        gitdir: &Path,
+        diff: &str,
+    ) -> Vec<Step> {
+        let mut steps = fast_pr_worktree_steps(repo, worktree, number, gitdir);
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps
+    }
+
+    /// The refined ticket the body-check tests link to.
+    fn contract_ticket() -> Issue {
+        let mut ticket = issue(142, &[]);
+        ticket.body = concat!(
+            "## Problem\n",
+            "The checkout accepts an empty card field.\n",
+            "\n",
+            "## Grounding\n",
+            "web-checkout covers the checkout form.\n",
+            "\n",
+            "## Decisions\n",
+            "The submit blocks on an empty card field.\n",
+            "\n",
+            "## Acceptance criteria\n",
+            "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive\n",
+            "\n",
+            "# The implementation plan\n",
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |\n",
+            "|---|---|---|---|---|---|---|\n",
+            "| 1 | Block the submit | web/** | - | cargo test | new: checkout | 1 |\n",
+        )
+        .to_string();
+        ticket
+    }
+
+    /// One draft pull request that closes ticket 142 with the given body.
+    fn contract_pr(body: &str) -> Pr {
+        let mut pull = linked_draft(7);
+        pull.body = format!("Closes #142\n\n{body}");
+        pull
+    }
+
+    /// The pull request body whose one line stops at the http tier.
+    const LOW_TIER_BODY: &str = concat!(
+        "## Why\n",
+        "The checkout accepts an empty card field.\n",
+        "\n",
+        "## Before / After\n",
+        "- AC-1 \u{b7} checkout \u{b7} http \u{b7} `curl -s :4000/pay` \u{b7} before: 500 \u{b7} after: 422\n",
+    );
+
+    #[test]
+    fn a_line_below_the_floor_stops_the_review_and_opens_one_event() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let finding = "line 1 tier http is below the floor browser";
+        let event = Event {
+            kind: FLOOR_EVENT.to_string(),
+            text: "area web-checkout asks for the tier browser and the line reached http"
+                .to_string(),
+            area: Some("web-checkout".to_string()),
+            number: Some(7),
+            surface: None,
+        };
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.push(record_comment_step(&format!("PR: {finding}")));
+        steps.push(record_comment_step(&event_block(&event)));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/labels",
+                "-f",
+                "name=event-open",
+                "-f",
+                "color=d4c5f9",
+            ],
+            CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"event-open\",\"color\":\"d4c5f9\"}"),
+        ));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=event-open",
+            ],
+            gh_ok(),
+        ));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![contract_ticket()], vec![contract_pr(LOW_TIER_BODY)]);
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed(format!("PR: {finding}")),
+            "the body check cancels the review"
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert!(
+            !rig.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.task == "borsuk/review-p7"),
+            "a failed body check dispatches no review"
+        );
+        let comments = findings(&rig, &format!("PR: {finding}"));
+        assert_eq!(comments, 1, "the finding posts once");
+        let events: Vec<Event> = rig
+            .exec
+            .calls()
+            .iter()
+            .filter_map(|call| {
+                call.args
+                    .iter()
+                    .find(|arg| arg.starts_with("body="))
+                    .and_then(|arg| arg.strip_prefix("body="))
+            })
+            .flat_map(parse_event_blocks)
+            .collect();
+        assert_eq!(events, vec![event]);
+        assert!(
+            events[0].text.contains("browser"),
+            "the event names the floor"
+        );
+    }
+
+    #[test]
+    fn a_body_that_meets_the_contract_lets_the_review_dispatch() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        // The review of a pull request that closes one ticket runs in the
+        // issue worktree, and its prompt slice reads the head diff there.
+        let issue_worktree = issue_wt(&dir, 142);
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_worktree,
+            142,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &issue_worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![contract_ticket()],
+            vec![contract_pr(
+                &LOW_TIER_BODY.replace("\u{b7} http \u{b7}", "\u{b7} browser \u{b7}"),
+            )],
+        );
+
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+    }
+
+    #[test]
+    fn green_fast_checks_hand_the_review_to_the_body_check() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let finding = "area api-orders has no line";
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 0));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        // The last green check hands the review to the body check, which
+        // reads the head worktree once more.
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        steps.push(record_comment_step(&format!("PR: {finding}")));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![contract_ticket()], vec![contract_pr(LOW_TIER_BODY)]);
+        rig.event(exited(&checkout, true, "exit 0"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed(format!("PR: {finding}")),
+            "the body check runs after the last green fast check"
+        );
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+    }
+
+    #[test]
+    fn an_ungoverned_review_runs_no_body_check() {
+        let dir = temp_root();
+        let worktree = issue_wt(&dir, 142);
+        let steps = fresh_issue_steps(&rig_repo(&dir), &worktree, 142, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(vec![contract_ticket()], vec![contract_pr("## Summary\n")]);
+
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
         assert_eq!(rig.job(0).task, "borsuk/review-p7");
     }
 
