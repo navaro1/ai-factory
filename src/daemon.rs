@@ -218,6 +218,20 @@ pub const FAST_CHECK_FAILED: &str = "fast check failed";
 /// The kind of the theory event one broken floor opens.
 pub const FLOOR_EVENT: &str = "floor";
 
+/// What the ticket check of one ticket last did.
+///
+/// The count bounds the refine re-queue of a failing ticket. The finding
+/// reaches the next refine prompt, because in shadow mode the comment
+/// that carries it lands on the shadow issue, which the agent never
+/// reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TicketCheckFailure {
+    /// The count of failed checks since the last pass.
+    count: u32,
+    /// What the last failed check said.
+    finding: String,
+}
+
 /// The `{why_rule}` line of a shadow-mode repository.
 ///
 /// The model lives in the theory repository, so an entry ID means
@@ -451,7 +465,7 @@ pub struct Daemon {
     /// asks for a human instead of `to-refine`. The map is runtime only:
     /// the `needs-human` label re-derives the bound, and the count
     /// restarts at zero.
-    ticket_check_failures: BTreeMap<(String, u64), u32>,
+    ticket_check_failures: BTreeMap<(String, u64), TicketCheckFailure>,
     /// The finished pipeline runs that wait for GitHub to confirm their
     /// stage transition, with the moment each one gives up. The map is
     /// runtime only: a restart re-derives the work from the labels.
@@ -1458,6 +1472,13 @@ impl Daemon {
         for alias in aliases {
             self.first_sight(&alias);
             self.store_theory_view(&alias);
+            // A fresh theory label opens a gate that the last code poll
+            // saw closed. The gate tracker fires on the edge, so the
+            // stored code snapshot is the whole question.
+            let Some(snapshot) = self.snapshot.repos.get(&alias).cloned() else {
+                continue;
+            };
+            self.observe_ready_work(&alias, &snapshot);
         }
         self.changed = true;
     }
@@ -2447,12 +2468,13 @@ impl Daemon {
         let Some(repo_cfg) = self.config.repos.get(alias) else {
             return;
         };
-        let count = self
+        let failure = self
             .ticket_check_failures
             .entry((alias.to_string(), number))
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-        let label = if *count >= tasks::MAX_ATTEMPTS {
+            .or_default();
+        failure.count += 1;
+        failure.finding = finding.to_string();
+        let label = if failure.count >= tasks::MAX_ATTEMPTS {
             NEEDS_HUMAN_LABEL
         } else {
             gates::TO_REFINE
@@ -4580,6 +4602,34 @@ impl Daemon {
         Ok(())
     }
 
+    /// Stop the poller of every shadow theory repository the current
+    /// configuration no longer names.
+    ///
+    /// One theory poller serves every alias that names its repository, so
+    /// it stops only when the last of them goes. A wake key is an alias
+    /// or a theory repository, so a key that is neither answers no
+    /// poller any more and its sender goes; the thread ends with it.
+    fn prune_theory_pollers(&mut self) {
+        let live = crate::poll::theory_repos(&self.config);
+        let stale: Vec<String> = self
+            .wake
+            .keys()
+            .filter(|key| !self.config.repos.contains_key(*key) && !live.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.wake.remove(&key);
+        }
+        // An alias that kept its place but dropped its `theory.repo`
+        // reads the code snapshot again, so its theory snapshot goes.
+        self.theory_snapshots.retain(|alias, _| {
+            self.config
+                .repos
+                .get(alias)
+                .is_some_and(|repo| repo.theory_repo().is_some())
+        });
+    }
+
     /// Retire one removed repository and every live record it owns.
     ///
     /// The call cancels every active task of the alias first, so the
@@ -4610,6 +4660,9 @@ impl Daemon {
             self.retire_task(id);
         }
         // The wake sender dies with the entry, so the poller thread ends.
+        // The theory poller of the alias serves every other alias that
+        // names its repository, so [`Daemon::prune_theory_pollers`] stops
+        // it after the configuration swap, not here.
         self.wake.remove(alias);
         self.snapshot.repos.remove(alias);
         self.theory_snapshots.remove(alias);
@@ -4670,6 +4723,7 @@ impl Daemon {
         self.config = config;
         self.settings_revision = revision;
         self.changed = true;
+        self.prune_theory_pollers();
         // A repository may have gained or lost its governor, so the
         // theory read model of the last poll no longer answers for it.
         self.refresh_records();
@@ -8326,6 +8380,17 @@ impl Daemon {
             Some(_) if repo_cfg.theory.governor.is_on() => WHY_RULE_SHADOW.to_string(),
             _ => String::new(),
         };
+        // A refine that a failed ticket check queued reads what the check
+        // said. In shadow mode the finding comments on the shadow issue,
+        // which the agent never reads, so the prompt carries it.
+        let finding = match task.stage {
+            Stage::Refine => self
+                .ticket_check_failures
+                .get(&(task.repo.clone(), task.number))
+                .map(|failure| failure.finding.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         Ok(vec![
             ("repo", task.repo.clone()),
             ("owner_repo", repo_cfg.owner_repo.clone()),
@@ -8344,6 +8409,7 @@ impl Daemon {
             ("skills", skills_text),
             ("rules", String::new()),
             ("why_rule", why_rule),
+            ("finding", finding),
         ])
     }
 
@@ -26792,7 +26858,6 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let gitdir = rig_gitdir(&dir);
         let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
         steps.push(shadow_comment_page_step(SHADOW_TICKET, "[]"));
-        steps.extend(commit_steps(&repo, "aaa111"));
         steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
         let mut rig = Rig::make_in(dir, steps, shadow_of_the_rig);
         // The V7 ticket check runs after this gate, so the body must pass
@@ -26816,12 +26881,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 &[THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
             )],
         );
-        rig.poll(vec![ticket()], vec![]);
 
         assert_eq!(
             rig.job_count(),
             1,
-            "the shadow labels open the implement gate"
+            "the theory poll opens the implement gate itself, with no second code poll"
         );
         assert_eq!(rig.job(0).task, "borsuk/implement-i142");
         assert_eq!(
@@ -26933,5 +26997,153 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 "shadow: {shadow}"
             );
         }
+    }
+
+    /// The refine that a failed ticket check queues reads what the check
+    /// said, because in shadow mode the finding comments on the shadow
+    /// issue and the agent never reads it.
+    #[test]
+    fn a_refine_after_a_failed_ticket_check_reads_the_finding() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                &body,
+            )],
+            vec![],
+        );
+        assert_eq!(rig.job_count(), 0, "the broken ticket queues no implement");
+
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["to-refine", THEORY_SHORT_LABEL],
+                &body,
+            )],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 1, "the finding label queues the refine");
+        assert_eq!(rig.job(0).task, "borsuk/refine-i142");
+        let want = format!(
+            "The last ticket check said: {}",
+            ticket_finding().strip_prefix("ticket: ").unwrap()
+        );
+        assert!(
+            rig.job(0).prompt.contains(&want),
+            "the refine prompt must carry the finding:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    /// A ticket with no failed check behind it renders no finding, and a
+    /// passing check forgets the one it had.
+    #[test]
+    fn a_refine_without_a_failed_check_renders_no_finding() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.poll(vec![issue(142, &[])], vec![]);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let refine = Task::new(
+            "borsuk",
+            Stage::Refine,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+
+        let values = rig
+            .daemon
+            .placeholder_values(&refine, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(placeholder_of(&values, "finding"), "");
+
+        rig.daemon.ticket_check_failures.insert(
+            ("borsuk".to_string(), 142),
+            TicketCheckFailure {
+                count: 1,
+                finding: "AC-1 names no check".to_string(),
+            },
+        );
+        let values = rig
+            .daemon
+            .placeholder_values(&refine, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(placeholder_of(&values, "finding"), "AC-1 names no check");
+
+        // Only a refine reads the memory; the other stages leave it out.
+        let implement = Task::new(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+        let values = rig
+            .daemon
+            .placeholder_values(&implement, &repo_cfg, &dir)
+            .expect("the implement values must render");
+        assert_eq!(placeholder_of(&values, "finding"), "");
+    }
+
+    /// One theory poller serves every alias that names its repository, so
+    /// it stops only when the last of them goes.
+    #[test]
+    fn the_last_shadowed_alias_stops_the_theory_poller() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), shadow_of_the_rig);
+        let borsuk = rig.daemon.config.repos["borsuk"].clone();
+        let mut second = borsuk.clone();
+        second.alias = "second".to_string();
+        second.owner_repo = "acme/second".to_string();
+        rig.daemon.config.repos.insert("second".to_string(), second);
+        let (wake_tx, _wake_rx) = mpsc::channel();
+        rig.daemon
+            .wake
+            .insert(SHADOW_REPO.to_string(), wake_tx.clone());
+        rig.daemon.wake.insert("second".to_string(), wake_tx);
+        rig.daemon
+            .theory_snapshots
+            .insert("borsuk".to_string(), RepoSnapshot::default());
+
+        // `second` goes; `borsuk` still names the theory repository.
+        rig.daemon.config.repos.remove("second");
+        rig.daemon.wake.remove("second");
+        rig.daemon.prune_theory_pollers();
+
+        assert!(
+            rig.daemon.wake.contains_key(SHADOW_REPO),
+            "one live alias keeps the theory poller"
+        );
+
+        // `borsuk` goes too, so nothing names the theory repository.
+        rig.daemon.config.repos.remove("borsuk");
+        rig.daemon.wake.remove("borsuk");
+        rig.daemon.prune_theory_pollers();
+
+        assert!(
+            !rig.daemon.wake.contains_key(SHADOW_REPO),
+            "the last alias stops the theory poller"
+        );
+        assert!(
+            rig.daemon.theory_snapshots.is_empty(),
+            "the theory snapshot goes with the poller"
+        );
     }
 }

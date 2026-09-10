@@ -77,6 +77,8 @@ the surface on its own.
 
 {skills}
 
+The last ticket check said: {finding}
+
 # The ticket body
 
 Rewrite the body of ticket #{number} with `gh` into the sections below, in
@@ -760,6 +762,8 @@ const STAGE_PLACEHOLDERS: &[&str] = &[
     "skills",
     "rules",
     "why_rule",
+    // The last ticket check finding, for a refine that follows one.
+    "finding",
 ];
 
 /// The placeholders the daemon fills in the ticket-creation prompt.
