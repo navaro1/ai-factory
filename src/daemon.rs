@@ -378,6 +378,13 @@ pub struct Daemon {
     /// instead of running the command once more. An entry lives as long as
     /// its task row: [`Daemon::retire_task`] drops both together.
     fast_results: BTreeMap<String, Record>,
+    /// The head each review task was body-checked at, by review task id.
+    ///
+    /// A review that waits in the queue re-enters the admission on every
+    /// poll, and the body check reads the head worktree. The entry makes
+    /// that read happen once per head. An entry lives as long as its task
+    /// row: [`Daemon::retire_task`] drops both together.
+    body_checks: BTreeMap<String, String>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
     /// Active issue conversations, keyed by repository and issue number.
@@ -732,6 +739,7 @@ impl Daemon {
             measure_jobs: BTreeMap::new(),
             fast_runs: BTreeMap::new(),
             fast_results: BTreeMap::new(),
+            body_checks: BTreeMap::new(),
             theory_views: BTreeMap::new(),
             ticket_check_failures: BTreeMap::new(),
             confirming: BTreeMap::new(),
@@ -1724,6 +1732,7 @@ impl Daemon {
         self.measure_jobs.remove(id);
         self.fast_runs.remove(id);
         self.fast_results.remove(id);
+        self.body_checks.remove(id);
         self.pending_chats.remove(id);
         self.ticket_turn_text.remove(id);
         self.paused.tasks.remove(id);
@@ -5811,15 +5820,25 @@ impl Daemon {
     /// way a failed fast check does. A broken floor also opens one theory
     /// event.
     fn check_pr_body(&mut self, alias: &str, number: u64, review_task: &str) {
-        let Some(finding) = self.body_finding(alias, number) else {
-            return;
-        };
-        let Some(task) = self.table.by_id.get(review_task) else {
+        let Some(task) = self.table.by_id.get(review_task).cloned() else {
             return;
         };
         if task.state.is_terminal() {
             return;
         }
+        // A queued review re-enters the admission on every poll. The body
+        // of one head yields one answer, so the check reads the head
+        // worktree once for it. A task with no head sha yet takes the
+        // empty string, which the next admission replaces.
+        let head = task.head_sha.clone().unwrap_or_default();
+        if self.body_checks.get(review_task) == Some(&head) {
+            return;
+        }
+        let finding = self.body_finding(alias, number);
+        self.body_checks.insert(review_task.to_string(), head);
+        let Some(finding) = finding else {
+            return;
+        };
         eprintln!("the body check of {alias} pull request {number} failed: {finding}");
         let text = format!("PR: {finding}");
         if let Err(error) = self.post_record_comment(alias, &RecordKey::Pr(number), &text) {
@@ -5850,6 +5869,10 @@ impl Daemon {
     /// and whose pull request closes a ticket, because that ticket carries
     /// the criteria and the plan the contract traces to. Every other pull
     /// request keeps the behaviour it had before the governor.
+    ///
+    /// The context comes from the first linked ticket. C11 widens the
+    /// check to the rest of its rules and to a pull request that closes
+    /// several tickets.
     fn body_finding(&self, alias: &str, number: u64) -> Option<contract::Finding> {
         let repo_cfg = self.config.repos.get(alias)?.clone();
         if !repo_cfg.theory.governor.is_on() {
@@ -20418,6 +20441,84 @@ mod tests {
 
         assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
         assert_eq!(rig.job(0).task, "borsuk/review-p7");
+    }
+
+    /// The two git steps of one poll that re-reads the head commit of the
+    /// theory checkout and finds the cached skills behind it.
+    fn cached_theory_steps(repo: &Path) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("ccc333\n"),
+            ),
+        ]
+    }
+
+    /// The review gate fires on the edge of readiness, so a queued review
+    /// re-enters the admission when a pull request leaves readiness and
+    /// returns at the same head. The body of one head yields one answer,
+    /// so the check reads the head worktree once.
+    #[test]
+    fn two_admissions_at_one_head_run_one_body_check() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(cached_theory_steps(&rig_repo(&dir)));
+        steps.extend(cached_theory_steps(&rig_repo(&dir)));
+        // A second body check would find these steps. The guard leaves
+        // them unused, and the diff count below proves it.
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // A paused lane keeps the review queued, so the second admission
+        // finds the task of the first one.
+        rig.daemon
+            .paused
+            .lanes
+            .insert((Stage::Review, "borsuk".to_string()), true);
+        let ticket = contract_ticket();
+        let body = LOW_TIER_BODY.replace("\u{b7} http \u{b7}", "\u{b7} browser \u{b7}");
+        let mut held = contract_pr(&body);
+        held.labels = vec![NEEDS_HUMAN_LABEL.to_string()];
+
+        rig.poll(vec![ticket.clone()], vec![contract_pr(&body)]);
+        rig.poll(vec![ticket.clone()], vec![held]);
+        rig.poll(vec![ticket], vec![contract_pr(&body)]);
+
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Queued);
+        assert_eq!(
+            git_calls(&rig, "diff"),
+            1,
+            "the body check reads the head once per head"
+        );
+        assert_eq!(rig.job_count(), 0, "the paused lane starts nothing");
     }
 
     #[test]

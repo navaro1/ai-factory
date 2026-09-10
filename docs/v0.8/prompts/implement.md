@@ -17,12 +17,9 @@ requested scope. Implement the ticket on the current branch.
 
 # The theory slices
 
-The factory fills the two blocks below from the theory governor of the
-repository. The model entries carry the theory model of the repository. The
-run skills carry the drive recipes, the fast commands, and the feature files
-of the areas the ticket touches. Read both blocks before your first edit.
-Empty blocks mean the governor is off, and the ticket then defines the
-surface on its own.
+Read the two blocks below before your first edit. They carry the theory model
+and the run skills of the areas the ticket touches, and they are empty when
+the governor is off.
 
 {model}
 
@@ -71,10 +68,7 @@ test suite pass. Commit the integrated work in small, complete commits.
 Drive every feature you touched once through its run skill, before you open
 the PR. Write one Before / After line per acceptance criterion, from what you
 observed. Write no line you did not observe. Run every fast command of those
-features and read its exit code.
-
-A drive you cannot finish leaves the line inconclusive. The factory refuses an
-inconclusive line. Repair the drive, or repair the code, and drive again.
+features and paste its exit code under the line.
 
 # The lever rule
 
@@ -82,7 +76,8 @@ When you check the same fact by hand twice, or write a throwaway script to
 check it, add that script to the run skill in the same PR. Give it one
 invocation line in `SKILL.md`, or name it as the `fast` command of a feature
 file. Commit the lever on its own. A reviewer must be able to rerun it. A
-one-off `grep` and a line of shell history are not levers.
+one-off `grep`, a line of shell history, and a test that passes when every
+dependency returns nothing are not levers.
 
 # Tests
 
@@ -92,13 +87,8 @@ passes with the change reverted proves nothing. Delete it, or rewrite it.
 
 # The PR body
 
-The body holds these three sections, and nothing else.
-
-## Why
-
-## Before / After
-
-## Blast radius
+The body holds `## Why`, `## Before / After`, and `## Blast radius`, and
+nothing else.
 
 `## Why` holds one or two short paragraphs. Name the behaviour that changes,
 and for whom. `## Blast radius` holds one to three sentences. Name what else
@@ -109,10 +99,10 @@ prove one criterion with two lines. The grammar is this line.
 
 - AC-<n> · <feature or measurer> · <tier or measure> · <command> · before: <observed> · after: <observed>
 
-The separator is one middle dot with one space on each side. The tier names
-how far your drive reached, as `browser`, `dom`, `http`, `terminal`, or
-`none`. A measurer line carries the word `measure` in that field. These two
-lines show the shape.
+The separator is one middle dot with one space on each side. The tier is
+`browser`, `dom`, `http`, `terminal`, `none`, or `measure` for a measurer
+line, and it names how far your drive reached. These two lines show the
+shape.
 
 - AC-1 · checkout-submit · browser · `npx playwright test checkout` · before: an empty card is accepted and the API returns 500 · after: the field shows "Card is required" and the page sends no request
 - AC-2 · api-orders · http · `curl -s -X POST :4000/orders -d @empty.json` · before: 500 and the log line `NullPointer at Orders.create` · after: 422 and the body `{"error":"card_required"}`
@@ -148,6 +138,6 @@ on one line:
 
 Report one line at the end. Name what you did, and the PR number.
 
-Ticket #{number} · {title}
+Ticket #{number}, {title}
 
 {body}

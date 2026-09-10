@@ -711,7 +711,7 @@ fn check_scope(ctx: &ContractContext<'_>) -> Result<(), Finding> {
             }
             continue;
         }
-        if path.starts_with(SKILL_PREFIX) || is_test_path(path) {
+        if is_skill_path(path) || is_test_path(path) {
             continue;
         }
         if ctx.owned_paths.iter().any(|owned| owns(owned, path)) {
@@ -720,6 +720,17 @@ fn check_scope(ctx: &ContractContext<'_>) -> Result<(), Finding> {
         return Err(Finding::plain(format!("{path} is outside the plan")));
     }
     Ok(())
+}
+
+/// True when one changed path belongs to a run skill directory.
+///
+/// The prefix alone is not enough. `.claude/skills/run-web/SKILL.md`
+/// belongs to the `web` surface, and `.claude/skills/run-web.md` belongs
+/// to no surface at all.
+fn is_skill_path(path: &str) -> bool {
+    path.strip_prefix(SKILL_PREFIX)
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(surface, _rest)| !surface.is_empty())
 }
 
 /// True when one changed path is the named dependency manifest.
@@ -1234,10 +1245,15 @@ mod tests {
     }
 
     /// A pull request body that passes every rule of the body check.
+    ///
+    /// Line 3 and line 4 are its two opening prose lines, so a lint case
+    /// can name the line it breaks.
     fn passing_body() -> String {
         concat!(
             "## Why\n",
+            "\n",
             "The checkout accepts an empty card field.\n",
+            "The submit must block on it.\n",
             "\n",
             "## Before / After\n",
             "- AC-1 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the field shows a required message\n",
@@ -1275,7 +1291,7 @@ mod tests {
         let long = format!(
             "{}{}",
             passing_body(),
-            (0..39)
+            (0..38)
                 .map(|n| format!("Prose line {n} says nothing.\n"))
                 .collect::<String>()
         );
@@ -1345,11 +1361,11 @@ mod tests {
             ),
             (
                 passing_body().replace(
-                    "The checkout accepts an empty card field.",
-                    "The checkout accepts an empty card field \u{2014} and it should not.",
+                    "The submit must block on it.",
+                    "The submit must block on it \u{2014} and it does not.",
                 ),
                 body_context(),
-                "long dash at line 2",
+                "long dash at line 4",
             ),
             (
                 passing_body().replace(
@@ -1357,7 +1373,7 @@ mod tests {
                     "The checkout accepts an \u{201c}empty\u{201d} card field.",
                 ),
                 body_context(),
-                "curly quote at line 2",
+                "curly quote at line 3",
             ),
             (
                 passing_body().replace(
@@ -1365,7 +1381,7 @@ mod tests {
                     "One defect: the checkout accepts an empty card field.",
                 ),
                 body_context(),
-                "colon at line 2",
+                "colon at line 3",
             ),
             (long, body_context(), "body has 41 prose lines"),
         ];
@@ -1389,6 +1405,20 @@ mod tests {
                 floor: Tier::Browser,
                 reached: Tier::Http,
             })
+        );
+    }
+
+    #[test]
+    fn a_run_skill_path_outside_a_surface_directory_is_outside_the_plan() {
+        let ctx = ContractContext {
+            changed_paths: vec![".claude/skills/run-web.md".to_string()],
+            ..body_context()
+        };
+        let finding =
+            check_body_lines(&passing_body(), &ctx).expect_err("the file names no surface");
+        assert_eq!(
+            finding.reason,
+            ".claude/skills/run-web.md is outside the plan"
         );
     }
 

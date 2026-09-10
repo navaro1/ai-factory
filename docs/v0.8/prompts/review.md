@@ -12,7 +12,7 @@ Before any other step, read the newest comments of the PR with `gh`. An
 operator answer to a question from an earlier run arrives there. Such an
 answer settles the question. Act on it, and never ask that question again.
 
-PR #{number} · {title}
+PR #{number}, {title}
 
 {body}
 
@@ -38,11 +38,8 @@ Before your first edit, prove that this worktree holds the PR head. Compare
 
 # The theory slices
 
-The factory fills the two blocks below from the theory governor of the
-repository. The model entries carry the theory model of the repository. The
-run skills carry the drive recipes, the fast commands, and the feature files
-of the areas this diff touches. Empty blocks mean the governor is off, and
-the re-drive below then runs the commands the PR body names.
+The two blocks below carry the theory model and the run skills of the areas
+this diff touches, and they are empty when the governor is off.
 
 {model}
 
