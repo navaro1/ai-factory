@@ -226,6 +226,33 @@ pub const FAST_CHECK_FAILED: &str = "fast check failed";
 /// The kind of the theory event one broken floor opens.
 pub const FLOOR_EVENT: &str = "floor";
 
+/// What the ticket check of one ticket last did.
+///
+/// The count bounds the refine re-queue of a failing ticket. The finding
+/// reaches the next refine prompt, because in shadow mode the comment
+/// that carries it lands on the shadow issue, which the agent never
+/// reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TicketCheckFailure {
+    /// The count of failed checks since the last pass.
+    count: u32,
+    /// What the last failed check said.
+    finding: String,
+}
+
+/// What the `{finding}` line of a refine prompt opens with.
+///
+/// The whole line lives in the value, so a ticket behind no failed
+/// check renders nothing at all.
+pub const TICKET_FINDING_LEAD: &str = "The last ticket check said";
+
+/// The `{why_rule}` line of a shadow-mode repository.
+///
+/// The model lives in the theory repository, so an entry ID means
+/// nothing to a reader of the code pull request. The rule tells the
+/// implement agent to write the behaviour instead.
+pub const WHY_RULE_SHADOW: &str = "name behaviours in words, not entry IDs";
+
 /// The reason a plain abort writes into the failed state of one task.
 const CANCELLED_REASON: &str = "cancelled";
 
@@ -431,6 +458,11 @@ pub struct Daemon {
     /// The theory record labels of every governed repository, rebuilt on
     /// every poll like [`Links`].
     theory_records: TheoryRecords,
+    /// The snapshot of the shadow theory repository of each shadowed
+    /// alias. One theory repository may serve several aliases, so its
+    /// poll stores one clone per alias it serves. The map never reaches
+    /// [`Snapshot::repos`], which keeps one entry per code repository.
+    theory_snapshots: BTreeMap<String, RepoSnapshot>,
     /// The theory label set each record was last fetched at, keyed by
     /// alias and record key. The map is runtime only: it holds the first
     /// sight of one daemon run, and a fresh run fetches each record once
@@ -447,7 +479,7 @@ pub struct Daemon {
     /// asks for a human instead of `to-refine`. The map is runtime only:
     /// the `needs-human` label re-derives the bound, and the count
     /// restarts at zero.
-    ticket_check_failures: BTreeMap<(String, u64), u32>,
+    ticket_check_failures: BTreeMap<(String, u64), TicketCheckFailure>,
     /// The finished pipeline runs that wait for GitHub to confirm their
     /// stage transition, with the moment each one gives up. The map is
     /// runtime only: a restart re-derives the work from the labels.
@@ -826,6 +858,7 @@ impl Daemon {
             theory_models: BTreeMap::new(),
             theory_skills: BTreeMap::new(),
             theory_records: TheoryRecords::default(),
+            theory_snapshots: BTreeMap::new(),
             theory_fetched: BTreeMap::new(),
             theory_blocks: BTreeMap::new(),
             theory_holds: BTreeMap::new(),
@@ -1414,7 +1447,54 @@ impl Daemon {
                 repo,
                 snapshot,
             } => self.apply_poll(&repo, snapshot, started_ms),
+            DaemonMsg::TheoryPolled { repo, snapshot } => {
+                self.apply_theory_poll(&repo, &snapshot);
+            }
         }
+    }
+
+    /// Store the fresh snapshot of one shadow theory repository.
+    ///
+    /// One theory repository may serve several aliases, so the snapshot
+    /// lands under every governed alias whose `theory.repo` names it, and
+    /// [`TheoryRecords::derive`] tells the records of one alias from those
+    /// of another by the shadow issue title. A poll whose repository no
+    /// alias names any more changes nothing. The code snapshot map never
+    /// sees this snapshot.
+    fn apply_theory_poll(&mut self, theory_repo: &str, fresh: &RepoSnapshot) {
+        let aliases: Vec<String> = self
+            .config
+            .repos
+            .values()
+            .filter(|repo| repo.theory.governor.is_on())
+            .filter(|repo| repo.theory_repo() == Some(theory_repo))
+            .map(|repo| repo.alias.clone())
+            .collect();
+        let mut changed = false;
+        for alias in aliases {
+            if self.theory_snapshots.get(&alias) == Some(fresh) {
+                continue;
+            }
+            self.theory_snapshots.insert(alias.clone(), fresh.clone());
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.refresh_records();
+        let aliases: Vec<String> = self.theory_snapshots.keys().cloned().collect();
+        for alias in aliases {
+            self.first_sight(&alias);
+            self.store_theory_view(&alias);
+            // A fresh theory label opens a gate that the last code poll
+            // saw closed. The gate tracker fires on the edge, so the
+            // stored code snapshot is the whole question.
+            let Some(snapshot) = self.snapshot.repos.get(&alias).cloned() else {
+                continue;
+            };
+            self.observe_ready_work(&alias, &snapshot);
+        }
+        self.changed = true;
     }
 
     /// Store a fresh snapshot and derive everything GitHub drives.
@@ -1503,13 +1583,15 @@ impl Daemon {
 
     /// Rebuild the theory record labels of every governed repository.
     ///
-    /// The derive runs per poll and persists nothing, like [`Links`]. The
-    /// shadow snapshot map is empty until the daemon polls a theory
-    /// repository of its own. The model of each governed alias lives in
-    /// the daemon cache instead of the snapshot, so its parse state folds
-    /// in afterwards and every gate reads one model.
+    /// The derive runs per poll and persists nothing, like [`Links`]. A
+    /// shadowed alias reads its labels from the theory snapshot its own
+    /// poller fills, so a shadowed alias with no theory poll yet holds
+    /// every gate. The model of each governed alias lives in the daemon
+    /// cache instead of the snapshot, so its parse state folds in
+    /// afterwards and every gate reads one model.
     fn refresh_records(&mut self) {
-        let mut records = TheoryRecords::derive(&self.config, &self.snapshot, &BTreeMap::new());
+        let mut records =
+            TheoryRecords::derive(&self.config, &self.snapshot, &self.theory_snapshots);
         for alias in self.config.repos.keys() {
             let broken = self
                 .theory_models
@@ -1780,11 +1862,20 @@ impl Daemon {
             })
             .collect();
         view.holds = self.prediction_holds(repo);
+        // The blocks come from the cached fetch and the labels from the
+        // current derive, so a shadow issue that gained a theory label
+        // ships it without a second read.
         view.records = self
             .theory_blocks
             .iter()
             .filter(|((alias, _), _)| alias == repo)
-            .map(|((_, key), blocks)| (key.clone(), blocks.clone()))
+            .map(|((_, key), blocks)| {
+                let mut record = blocks.clone();
+                if let Some(parsed) = RecordKey::parse(key) {
+                    record.labels = self.theory_records.labels_of(repo, &parsed).to_vec();
+                }
+                (key.clone(), record)
+            })
             .collect();
         view.deltas = self.delta_views(repo);
         view
@@ -2454,9 +2545,10 @@ impl Daemon {
     /// Post the finding of one failed ticket check and re-queue the
     /// refine work.
     ///
-    /// The failure comments on the ticket itself, which the refine agent
-    /// reads on its next run, and adds `to-refine` back, which the poll
-    /// gate turns into a refine task. `MAX_ATTEMPTS` bounds the loop only
+    /// The failure comments on the theory record of the ticket, which is
+    /// the ticket itself in code mode and the shadow issue in shadow
+    /// mode, and adds `to-refine` back, which the poll gate turns into a
+    /// refine task. `MAX_ATTEMPTS` bounds the loop only
     /// through this counter: `upsert_queued` restarts every terminal task
     /// at attempt 1, so the task attempts never see the label cycle. The
     /// daemon counts the failed checks itself, and at `MAX_ATTEMPTS` it
@@ -2466,18 +2558,22 @@ impl Daemon {
     fn handle_ticket_finding(&mut self, alias: &str, number: u64, finding: &contract::Finding) {
         eprintln!("the ticket check of {alias}#{number} failed: {finding}");
         let text = format!("ticket: {finding}");
+        if !self.config.repos.contains_key(alias) {
+            return;
+        }
+        if let Err(error) = self.post_record_comment(alias, &RecordKey::Issue(number), &text) {
+            eprintln!("the ticket check comment of {alias}#{number}: {error:#}");
+        }
         let Some(repo_cfg) = self.config.repos.get(alias) else {
             return;
         };
-        if let Err(error) = self.post_issue_comment(repo_cfg, number, &text) {
-            eprintln!("the ticket check comment of {alias}#{number}: {error:#}");
-        }
-        let count = self
+        let failure = self
             .ticket_check_failures
             .entry((alias.to_string(), number))
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-        let label = if *count >= tasks::MAX_ATTEMPTS {
+            .or_default();
+        failure.count += 1;
+        failure.finding = finding.to_string();
+        let label = if failure.count >= tasks::MAX_ATTEMPTS {
             NEEDS_HUMAN_LABEL
         } else {
             gates::TO_REFINE
@@ -4592,8 +4688,48 @@ impl Daemon {
         } else {
             eprintln!("repo.{alias}: cannot start the poller thread");
         }
+        // A shadow repository that already has a poller serves this alias
+        // too, because one theory poll fans out to every alias it serves.
+        if let Some(shadow) = repo.theory_repo().filter(|_| repo.theory.governor.is_on()) {
+            if !self.wake.contains_key(shadow) {
+                match crate::poll::spawn_theory_poller(shadow, self.poll_tx.clone()) {
+                    Some(wake) => {
+                        self.wake.insert(shadow.to_string(), wake);
+                    }
+                    None => eprintln!("repo.{alias}: cannot start the theory poller thread"),
+                }
+            }
+        }
         self.changed = true;
         Ok(())
+    }
+
+    /// Stop the poller of every shadow theory repository the current
+    /// configuration no longer names.
+    ///
+    /// One theory poller serves every alias that names its repository, so
+    /// it stops only when the last of them goes. A wake key is an alias
+    /// or a theory repository, so a key that is neither answers no
+    /// poller any more and its sender goes; the thread ends with it.
+    fn prune_theory_pollers(&mut self) {
+        let live = crate::poll::theory_repos(&self.config);
+        let stale: Vec<String> = self
+            .wake
+            .keys()
+            .filter(|key| !self.config.repos.contains_key(*key) && !live.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.wake.remove(&key);
+        }
+        // An alias that kept its place but dropped its `theory.repo`
+        // reads the code snapshot again, so its theory snapshot goes.
+        self.theory_snapshots.retain(|alias, _| {
+            self.config
+                .repos
+                .get(alias)
+                .is_some_and(|repo| repo.theory_repo().is_some())
+        });
     }
 
     /// Retire one removed repository and every live record it owns.
@@ -4626,8 +4762,12 @@ impl Daemon {
             self.retire_task(id);
         }
         // The wake sender dies with the entry, so the poller thread ends.
+        // The theory poller of the alias serves every other alias that
+        // names its repository, so [`Daemon::prune_theory_pollers`] stops
+        // it after the configuration swap, not here.
         self.wake.remove(alias);
         self.snapshot.repos.remove(alias);
+        self.theory_snapshots.remove(alias);
         self.gates.forget_repo(alias);
         self.trains.remove(alias);
         self.links.remove(alias);
@@ -4685,6 +4825,7 @@ impl Daemon {
         self.config = config;
         self.settings_revision = revision;
         self.changed = true;
+        self.prune_theory_pollers();
         // A repository may have gained or lost its governor, so the
         // theory read model of the last poll no longer answers for it.
         self.refresh_records();
@@ -6309,7 +6450,7 @@ impl Daemon {
     /// titled `<alias>/theory`, found in the memory cache, in the snapshot,
     /// or created. With `theory.repo` set, the record is the issue titled
     /// `<alias>#<n>` (or `<alias>/theory`) in the theory repository, found
-    /// through `gh issue list` or created.
+    /// in the theory snapshot, then through `gh issue list`, or created.
     // The v0.8 chunks call this.
     #[cfg_attr(not(test), allow(dead_code))]
     fn theory_record(&self, alias: &str, key: &RecordKey) -> Result<(String, u64)> {
@@ -6369,6 +6510,21 @@ impl Daemon {
                 return Ok((repo_cfg.owner_repo.clone(), issue.number));
             }
         };
+        // The theory poller of the shadow repository already read every
+        // shadow issue, so a record that exists costs no call at all.
+        if let Some(number) = self
+            .theory_snapshots
+            .get(alias)
+            .and_then(|items| {
+                items
+                    .issues
+                    .values()
+                    .find(|issue| issue.open && issue.title == title)
+            })
+            .map(|issue| issue.number)
+        {
+            return Ok((target_repo, number));
+        }
         let number = self.find_or_create_theory_issue(&target_repo, &title, &body)?;
         Ok((target_repo, number))
     }
@@ -8576,6 +8732,24 @@ impl Daemon {
         } else {
             (String::new(), String::new(), String::new())
         };
+        // Only a shadow-mode repository fills `{why_rule}`, because only
+        // there does the code pull request hide the model.
+        let why_rule = match repo_cfg.theory_repo() {
+            Some(_) if repo_cfg.theory.governor.is_on() => WHY_RULE_SHADOW.to_string(),
+            _ => String::new(),
+        };
+        // A refine that a failed ticket check queued reads what the check
+        // said. In shadow mode the finding comments on the shadow issue,
+        // which the agent never reads, so the prompt carries it. The
+        // whole line lives here, so a healthy ticket renders nothing.
+        let finding = match task.stage {
+            Stage::Refine => self
+                .ticket_check_failures
+                .get(&(task.repo.clone(), task.number))
+                .map(|failure| format!("{TICKET_FINDING_LEAD}: {}", failure.finding))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         Ok(vec![
             ("repo", task.repo.clone()),
             ("owner_repo", repo_cfg.owner_repo.clone()),
@@ -8593,7 +8767,8 @@ impl Daemon {
             ("comparison", String::new()),
             ("skills", skills_text),
             ("rules", String::new()),
-            ("why_rule", String::new()),
+            ("why_rule", why_rule),
+            ("finding", finding),
         ])
     }
 
@@ -26051,7 +26226,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             RecordView {
                 short: Some(short_view("the submit blocks", &["web-checkout"])),
                 full: None,
-                delta: None,
+                ..RecordView::default()
             },
         );
 
@@ -26077,7 +26252,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                     vec!["api-orders"],
                     PredictionTag::Sure,
                 )])),
-                delta: None,
+                ..RecordView::default()
             },
         );
 
@@ -26149,7 +26324,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                     ("failure-modes", vec!["F-1"], PredictionTag::Unsure),
                     (PREDICTION_OTHER_AREAS, Vec::new(), PredictionTag::Unsure),
                 ])),
-                delta: None,
+                ..RecordView::default()
             },
         );
 
@@ -26227,7 +26402,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             RecordView {
                 short: Some(short_view("the submit blocks", &["web-checkout"])),
                 full: None,
-                delta: None,
+                ..RecordView::default()
             },
         );
 
@@ -27429,6 +27604,783 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert!(
             !rig.daemon.table.by_id.contains_key("borsuk/audit-sweep"),
             "no audit task enters the table"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C20: shadow mode
+    // ------------------------------------------------------------------
+
+    /// The theory repository that shadows the rig repository.
+    const SHADOW_REPO: &str = "acme/borsuk-theory";
+
+    /// The shadow record of ticket 142.
+    const SHADOW_TICKET: u64 = 300;
+    /// The shadow record of pull request 5.
+    const SHADOW_PR: u64 = 301;
+    /// The shadow record of the repository itself.
+    const SHADOW_ROOT: u64 = 302;
+
+    /// The finding text of the shadow ticket check.
+    const SHADOW_TICKET_FINDING: &str = "AC-2 check api-orders is not a feature or a measurer";
+    /// The finding text of the shadow fast check.
+    const SHADOW_FAST_FINDING: &str = "fast check failed: checkout exit 1";
+    /// The finding text of the shadow body check.
+    const SHADOW_BODY_FINDING: &str = "PR: the body carries no Why section";
+
+    /// Turn the governor on and shadow `borsuk` into [`SHADOW_REPO`].
+    ///
+    /// The theory checkout stays the rig repository, so the theory read
+    /// scripts the same git steps as [`governed`] and only the GitHub
+    /// target moves.
+    fn shadow_of_the_rig(config: &mut Config) {
+        governed(config);
+        let repo = config.repos.get_mut("borsuk").unwrap();
+        let path = repo.path.clone();
+        repo.theory.theory = Some(crate::config::TheoryRepo {
+            repo: Some(SHADOW_REPO.to_string()),
+            path,
+        });
+    }
+
+    /// One open issue of the shadow theory repository.
+    fn shadow_issue(number: u64, title: &str, labels: &[&str]) -> Issue {
+        let mut one = issue(number, labels);
+        one.title = title.to_string();
+        one
+    }
+
+    /// Apply one poll of the shadow theory repository.
+    fn theory_poll(rig: &mut Rig, issues: Vec<Issue>) {
+        let mut map = BTreeMap::new();
+        for one in issues {
+            map.insert(one.number, one);
+        }
+        rig.daemon.handle(Inbound::Poll(DaemonMsg::TheoryPolled {
+            repo: SHADOW_REPO.to_string(),
+            snapshot: RepoSnapshot {
+                issues: map,
+                prs: BTreeMap::new(),
+            },
+        }));
+    }
+
+    /// The `owner/repo` one `gh` call names, when its arguments carry one.
+    fn gh_repo_of(call: &Call) -> Option<String> {
+        for (index, arg) in call.args.iter().enumerate() {
+            if arg == "--repo" {
+                return call.args.get(index + 1).cloned();
+            }
+            if let Some(rest) = arg.strip_prefix("repos/") {
+                let mut parts = rest.split('/');
+                let owner = parts.next()?;
+                let name = parts.next()?;
+                return Some(format!("{owner}/{name}"));
+            }
+        }
+        None
+    }
+
+    /// The labels one `gh` call names, through either field spelling.
+    fn gh_label_names(call: &Call) -> Vec<&str> {
+        call.args
+            .iter()
+            .filter_map(|arg| {
+                arg.strip_prefix("labels[]=")
+                    .or_else(|| arg.strip_prefix("name="))
+            })
+            .collect()
+    }
+
+    /// Why one `gh` call to the code repository is allowed in shadow
+    /// mode, or `None` when this spec forbids it.
+    ///
+    /// Shadow mode sends every theory comment and every theory label to
+    /// the theory repository. What stays is the v0.6 pipeline: the labels
+    /// the pipeline drives its own tickets with, and the run skill ticket
+    /// the factory creates in the code repository with those labels.
+    fn code_call_reason(call: &Call) -> Option<&'static str> {
+        let url = call.args.iter().find(|arg| arg.starts_with("repos/"))?;
+        let theory = [
+            THEORY_SHORT_LABEL,
+            THEORY_FULL_LABEL,
+            records::DELTA_OPEN_LABEL,
+            EVENT_OPEN_LABEL,
+            MODEL_PR_LABEL,
+        ];
+        if gh_label_names(call)
+            .iter()
+            .any(|label| theory.contains(label))
+        {
+            return None;
+        }
+        let tail: Vec<&str> = url.split('/').skip(3).collect();
+        match tail.as_slice() {
+            ["labels"] => Some("a v0.6 label definition"),
+            ["issues", _, "labels"] | ["issues", _, "labels", _] => Some("a v0.6 label call"),
+            ["issues"] => Some("the run skill ticket"),
+            ["issues", _] => Some("the run skill ticket body"),
+            _ => None,
+        }
+    }
+
+    /// The count of `gh` calls of `rig` that carry `field`.
+    fn field_calls(rig: &Rig, field: &str) -> usize {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh" && call.args.iter().any(|arg| arg == field))
+            .count()
+    }
+
+    /// The count of record comments one repository took.
+    fn record_comments(rig: &Rig, owner_repo: &str) -> usize {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| gh_repo_of(call).as_deref() == Some(owner_repo))
+            .filter(|call| call.args.iter().any(|arg| arg == "POST"))
+            .filter(|call| call.args.iter().any(|arg| arg.ends_with("/comments")))
+            .count()
+    }
+
+    /// The scripted comment step of one shadow record.
+    fn shadow_comment_step(number: u64, body: &str) -> Step {
+        let url = format!("repos/{SHADOW_REPO}/issues/{number}/comments");
+        let field = format!("body={body}");
+        gh_step(
+            &["api", "-X", "POST", url.as_str(), "-f", field.as_str()],
+            CmdOut::ok(""),
+        )
+    }
+
+    /// The scripted comment page of one shadow record.
+    fn shadow_comment_page_step(number: u64, comments: &str) -> Step {
+        let url = format!("repos/{SHADOW_REPO}/issues/{number}/comments?per_page=100");
+        gh_step(
+            &["api", "-i", "-X", "GET", url.as_str()],
+            CmdOut::ok(format!("HTTP/2 200\r\netag: \"c1\"\r\n\r\n{comments}")),
+        )
+    }
+
+    /// The scripted label definition step of the shadow repository.
+    fn shadow_label_step(name: &str, color: &str) -> Step {
+        let url = format!("repos/{SHADOW_REPO}/labels");
+        let name_field = format!("name={name}");
+        let color_field = format!("color={color}");
+        gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                url.as_str(),
+                "-f",
+                name_field.as_str(),
+                "-f",
+                color_field.as_str(),
+            ],
+            CmdOut::ok(format!(
+                "HTTP/2 201\r\n\r\n{{\"name\":\"{name}\",\"color\":\"{color}\"}}"
+            )),
+        )
+    }
+
+    /// The scripted `add_label` step of one issue of `owner_repo`.
+    fn add_label_step(owner_repo: &str, number: u64, label: &str) -> Step {
+        let url = format!("repos/{owner_repo}/issues/{number}/labels");
+        let field = format!("labels[]={label}");
+        gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                url.as_str(),
+                "-f",
+                field.as_str(),
+            ],
+            gh_ok(),
+        )
+    }
+
+    /// The three scripted calls of one `open_event` on a shadow record.
+    fn shadow_event_steps(number: u64, event: &Event) -> Vec<Step> {
+        vec![
+            shadow_comment_step(number, &event_block(event)),
+            shadow_label_step(EVENT_OPEN_LABEL, EVENT_OPEN_COLOR),
+            add_label_step(SHADOW_REPO, number, EVENT_OPEN_LABEL),
+        ]
+    }
+
+    /// The scripted creation of the shadow record of ticket 142.
+    fn shadow_create_steps() -> Vec<Step> {
+        let created = json!({
+            "number": SHADOW_TICKET,
+            "node_id": "node-300",
+            "title": "borsuk#142",
+            "body": "Theory record of acme/borsuk#142",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-10T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk-theory/issues/300"
+        })
+        .to_string();
+        vec![
+            shadow_search_step("borsuk#142", CmdOut::ok("[]")),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk-theory/issues",
+                    "-f",
+                    "title=borsuk#142",
+                    "-f",
+                    "body=Theory record of acme/borsuk#142",
+                ],
+                CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+            ),
+        ]
+    }
+
+    /// The short prediction of the shadow write-site table.
+    fn shadow_short() -> ShortPrediction {
+        ShortPrediction {
+            kind: records::PREDICTION_SHORT.to_string(),
+            text: "block the empty card".to_string(),
+            areas: vec!["web-checkout".to_string()],
+        }
+    }
+
+    /// One theory event of the shadow write-site table.
+    fn shadow_event(kind: &str, text: &str) -> Event {
+        Event {
+            kind: kind.to_string(),
+            text: text.to_string(),
+            area: Some("web-checkout".to_string()),
+            number: None,
+            surface: None,
+        }
+    }
+
+    /// One write site of the shadow write-site table.
+    type ShadowWrite = fn(&mut Rig);
+
+    /// The floor event of the shadow write-site table.
+    fn shadow_floor() -> Event {
+        shadow_event(FLOOR_EVENT, "area web-checkout asks for the tier browser")
+    }
+
+    /// The teach event of the shadow write-site table.
+    fn shadow_teach() -> Event {
+        shadow_event("teach", "the pay button never parks")
+    }
+
+    /// The sweep event of the shadow write-site table.
+    fn shadow_sweep() -> Event {
+        shadow_event("sweep", "INV-9 names a path the code removed")
+    }
+
+    /// Every write site of this spec, in shadow mode, keeps the code
+    /// repository free of theory comments and theory labels, and the
+    /// shadow record of ticket 142 is created once and reused.
+    ///
+    /// The table drives one write site per row. A row whose site needs a
+    /// live task drives the record helper that site calls, with the
+    /// record key that site passes; the v0.8 tests pin which key each
+    /// site uses.
+    #[test]
+    fn every_shadow_write_site_leaves_the_code_repository_to_the_pipeline() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let full = full_prediction(&["web-checkout"]);
+
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        // The short prediction, which creates the shadow record.
+        steps.extend(shadow_create_steps());
+        steps.push(shadow_comment_step(
+            SHADOW_TICKET,
+            &prediction_block(&Prediction::Short(shadow_short())),
+        ));
+        steps.push(shadow_label_step(THEORY_SHORT_LABEL, THEORY_SHORT_COLOR));
+        steps.push(add_label_step(
+            SHADOW_REPO,
+            SHADOW_TICKET,
+            THEORY_SHORT_LABEL,
+        ));
+        steps.push(add_label_step("acme/borsuk", 142, TO_REFINE));
+        // The first sight of the record the theory poll shows.
+        steps.push(shadow_comment_page_step(SHADOW_TICKET, "[]"));
+        // The full prediction.
+        steps.push(shadow_comment_step(
+            SHADOW_TICKET,
+            &prediction_block(&Prediction::Full(full)),
+        ));
+        steps.push(shadow_label_step(THEORY_FULL_LABEL, THEORY_FULL_COLOR));
+        steps.push(add_label_step(
+            SHADOW_REPO,
+            SHADOW_TICKET,
+            THEORY_FULL_LABEL,
+        ));
+        // The ticket check finding.
+        steps.push(shadow_comment_step(
+            SHADOW_TICKET,
+            &format!("ticket: {SHADOW_TICKET_FINDING}"),
+        ));
+        steps.push(add_label_step("acme/borsuk", 142, TO_REFINE));
+        // The fast check finding and the body check finding.
+        steps.push(shadow_comment_step(SHADOW_PR, SHADOW_FAST_FINDING));
+        steps.push(shadow_comment_step(SHADOW_PR, SHADOW_BODY_FINDING));
+        // The floor event, the teach events, and the sweep events.
+        steps.extend(shadow_event_steps(SHADOW_PR, &shadow_floor()));
+        steps.extend(shadow_event_steps(SHADOW_ROOT, &shadow_teach()));
+        steps.extend(shadow_event_steps(SHADOW_ROOT, &shadow_sweep()));
+        // The setup ticket labels.
+        steps.push(verify_skill_label_step());
+        steps.push(skill_issue_step("Create the run skill for borsuk/web", 12));
+        steps.push((
+            Box::new(|call: &Call| {
+                call.program == "gh"
+                    && call.args.iter().any(|arg| arg == "PATCH")
+                    && call
+                        .args
+                        .iter()
+                        .any(|arg| arg == "repos/acme/borsuk/issues/12")
+            }) as Box<dyn Fn(&Call) -> bool + Send + Sync>,
+            CmdOut::ok(format!(
+                "HTTP/2 200\r\n\r\n{}",
+                json!({
+                    "number": 12,
+                    "node_id": "node-12",
+                    "title": "Create the run skill for borsuk/web",
+                    "body": "body",
+                    "state": "open",
+                    "labels": [],
+                    "user": {"login": "piotr"},
+                    "assignees": [],
+                    "updated_at": "2026-09-10T12:00:00Z",
+                    "html_url": "https://github.com/acme/borsuk/issues/12"
+                })
+            )),
+        ));
+
+        let mut rig = Rig::make_in(dir, steps, shadow_of_the_rig);
+        rig.poll(vec![issue(142, &[])], vec![]);
+
+        // The short prediction runs before the first theory poll, so the
+        // daemon searches GitHub for the record and creates it.
+        rig.daemon
+            .accept_short_prediction("borsuk", ItemKind::Issue, 142, Some(shadow_short()));
+        assert_eq!(
+            field_calls(&rig, "title=borsuk#142"),
+            1,
+            "the shadow record is created once"
+        );
+
+        // From here the theory poller answers every record lookup.
+        theory_poll(
+            &mut rig,
+            vec![
+                shadow_issue(SHADOW_TICKET, "borsuk#142", &[THEORY_SHORT_LABEL]),
+                shadow_issue(SHADOW_PR, "borsuk#5", &[]),
+                shadow_issue(SHADOW_ROOT, "borsuk/theory", &[]),
+            ],
+        );
+
+        let table: Vec<(&str, ShadowWrite)> = vec![
+            ("the full prediction", |rig| {
+                rig.act(predict_with(full_prediction(&["web-checkout"])));
+            }),
+            ("the ticket check finding", |rig| {
+                rig.daemon.handle_ticket_finding(
+                    "borsuk",
+                    142,
+                    &contract::Finding::plain(SHADOW_TICKET_FINDING.to_string()),
+                );
+            }),
+            ("the fast check finding", |rig| {
+                rig.daemon
+                    .post_record_comment("borsuk", &RecordKey::Pr(5), SHADOW_FAST_FINDING)
+                    .expect("the fast check finding must post");
+            }),
+            ("the body check finding", |rig| {
+                rig.daemon
+                    .post_record_comment("borsuk", &RecordKey::Pr(5), SHADOW_BODY_FINDING)
+                    .expect("the body check finding must post");
+            }),
+            ("the floor event", |rig| {
+                rig.daemon
+                    .open_event("borsuk", &RecordKey::Pr(5), &shadow_floor())
+                    .expect("the floor event must open");
+            }),
+            ("the teach events", |rig| {
+                rig.daemon
+                    .open_event("borsuk", &RecordKey::Repo, &shadow_teach())
+                    .expect("the teach event must open");
+            }),
+            ("the sweep events", |rig| {
+                rig.daemon
+                    .open_event("borsuk", &RecordKey::Repo, &shadow_sweep())
+                    .expect("the sweep event must open");
+            }),
+            ("the setup ticket labels", |rig| {
+                rig.act(Action::Theory(TheoryAction::Setup {
+                    repo: "borsuk".to_string(),
+                    surface: "web".to_string(),
+                }));
+            }),
+        ];
+        for (name, drive) in table {
+            let before = rig.exec.calls().len();
+            drive(&mut rig);
+            assert!(
+                rig.exec.calls().len() > before,
+                "{name} wrote nothing at all"
+            );
+        }
+
+        for call in rig.exec.calls() {
+            if gh_repo_of(&call).as_deref() != Some("acme/borsuk") {
+                continue;
+            }
+            assert!(
+                code_call_reason(&call).is_some(),
+                "the code repository took {:?}",
+                call.argv()
+            );
+        }
+        assert_eq!(
+            record_comments(&rig, "acme/borsuk"),
+            0,
+            "the code repository takes no comment at all"
+        );
+        assert_eq!(
+            record_comments(&rig, SHADOW_REPO),
+            8,
+            "every record comment lands on the shadow repository"
+        );
+        assert_eq!(
+            field_calls(&rig, "title=borsuk#142"),
+            1,
+            "the shadow record is never created twice"
+        );
+        assert_eq!(
+            field_calls(&rig, "borsuk#142 in:title"),
+            1,
+            "the theory snapshot answers every lookup after the first poll"
+        );
+    }
+
+    /// The implement gate of a shadowed alias reads `theory-full` from
+    /// the theory snapshot, and the v0.6 derivations keep seeing one
+    /// repository per code repository.
+    #[test]
+    fn the_shadow_snapshot_drives_the_gates_and_never_joins_the_code_snapshot() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(shadow_comment_page_step(SHADOW_TICKET, "[]"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, shadow_of_the_rig);
+        // The V7 ticket check runs after this gate, so the body must pass
+        // it for the admission to reach the dispatch.
+        let body = unchecked_ticket_body().replace(
+            "- AC-2 \u{b7} Orders rejects an empty card \u{b7} check: api-orders fast\n",
+            "",
+        );
+        let ticket = || issue_with_body(142, &["refined"], &body);
+
+        // The code ticket carries no theory label at all: in shadow mode
+        // they live on the shadow issue.
+        rig.poll(vec![ticket()], vec![]);
+        assert_eq!(rig.job_count(), 0, "the gate holds without the prediction");
+
+        theory_poll(
+            &mut rig,
+            vec![shadow_issue(
+                SHADOW_TICKET,
+                "borsuk#142",
+                &[THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+            )],
+        );
+
+        assert_eq!(
+            rig.job_count(),
+            1,
+            "the theory poll opens the implement gate itself, with no second code poll"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert_eq!(
+            rig.daemon.snapshot.repos.len(),
+            rig.daemon.config.repos.len(),
+            "the code snapshot holds one entry per code repository"
+        );
+        assert_eq!(
+            rig.daemon.snapshot.repos["borsuk"].issues.len(),
+            1,
+            "the shadow issue never joins the code snapshot"
+        );
+        assert!(
+            !rig.daemon.snapshot.repos["borsuk"]
+                .issues
+                .contains_key(&SHADOW_TICKET),
+            "the shadow number is absent from the code snapshot"
+        );
+        assert_eq!(
+            rig.daemon.theory_snapshots["borsuk"].issues.len(),
+            1,
+            "the shadow issue lives in the theory snapshot"
+        );
+        assert_eq!(
+            rig.daemon
+                .theory_records
+                .labels_of("borsuk", &RecordKey::Issue(142)),
+            [
+                THEORY_SHORT_LABEL.to_string(),
+                THEORY_FULL_LABEL.to_string()
+            ],
+            "the record labels come from the shadow issue"
+        );
+    }
+
+    /// The record view of a shadowed alias ships the shadow labels, so
+    /// the interface reads the theory labels the code ticket never has.
+    #[test]
+    fn the_theory_view_ships_the_shadow_labels_of_each_record() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(shadow_comment_page_step(SHADOW_TICKET, "[]"));
+        let mut rig = Rig::make_in(dir, steps, shadow_of_the_rig);
+
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        theory_poll(
+            &mut rig,
+            vec![shadow_issue(
+                SHADOW_TICKET,
+                "borsuk#142",
+                &[THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+            )],
+        );
+
+        let view = theory_of(&rig);
+        let key = RecordKey::Issue(142).key_text();
+        assert_eq!(
+            view.records[&key].labels,
+            vec![
+                THEORY_SHORT_LABEL.to_string(),
+                THEORY_FULL_LABEL.to_string()
+            ],
+            "the record view carries the shadow labels"
+        );
+        assert!(
+            view.record_carries(&key, &["refined".to_string()], THEORY_FULL_LABEL),
+            "the record answers for the theory label"
+        );
+        assert!(
+            !view.record_carries(&key, &["refined".to_string()], "refined"),
+            "a pipeline label of the code ticket is no record label"
+        );
+        assert!(
+            view.record_carries("issue-9", &["refined".to_string()], "refined"),
+            "an item with no record answers from its own labels"
+        );
+    }
+
+    /// Every stage prompt of a shadow repository names the Why rule, and
+    /// a code-mode repository leaves it empty.
+    #[test]
+    fn only_a_shadow_repository_fills_the_why_rule() {
+        for (shadow, want) in [(true, WHY_RULE_SHADOW), (false, "")] {
+            let dir = temp_root();
+            let repo = rig_repo(&dir);
+            let steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+            let tweak: fn(&mut Config) = if shadow { shadow_of_the_rig } else { governed };
+            let mut rig = Rig::make_in(dir.clone(), steps, tweak);
+            rig.poll(vec![issue(142, &[])], vec![]);
+
+            let task = Task::new(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                PathBuf::new(),
+                T0,
+            );
+            let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+            let values = rig
+                .daemon
+                .placeholder_values(&task, &repo_cfg, &dir)
+                .expect("the implement values must render");
+
+            assert_eq!(
+                placeholder_of(&values, "why_rule"),
+                want,
+                "shadow: {shadow}"
+            );
+        }
+    }
+
+    /// The refine that a failed ticket check queues reads what the check
+    /// said, because in shadow mode the finding comments on the shadow
+    /// issue and the agent never reads it.
+    #[test]
+    fn a_refine_after_a_failed_ticket_check_reads_the_finding() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let body = unchecked_ticket_body();
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(ticket_check_steps(ticket_finding(), "to-refine"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                &body,
+            )],
+            vec![],
+        );
+        assert_eq!(rig.job_count(), 0, "the broken ticket queues no implement");
+
+        rig.poll(
+            vec![issue_with_body(
+                142,
+                &["to-refine", THEORY_SHORT_LABEL],
+                &body,
+            )],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 1, "the finding label queues the refine");
+        assert_eq!(rig.job(0).task, "borsuk/refine-i142");
+        let want = format!(
+            "{TICKET_FINDING_LEAD}: {}",
+            ticket_finding().strip_prefix("ticket: ").unwrap()
+        );
+        assert!(
+            rig.job(0).prompt.contains(&want),
+            "the refine prompt must carry the finding:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    /// A ticket with no failed check behind it renders no finding line
+    /// at all, so the healthy refine prompt never names a check.
+    #[test]
+    fn a_refine_without_a_failed_check_renders_no_finding() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.poll(vec![issue(142, &[])], vec![]);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let refine = Task::new(
+            "borsuk",
+            Stage::Refine,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+
+        let values = rig
+            .daemon
+            .placeholder_values(&refine, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(placeholder_of(&values, "finding"), "");
+        let rendered =
+            prompts::fill_template(prompts::REFINE_PROMPT, &values).expect("the prompt fills");
+        assert!(
+            !rendered.contains(TICKET_FINDING_LEAD),
+            "a healthy ticket names no check:\n{rendered}"
+        );
+
+        rig.daemon.ticket_check_failures.insert(
+            ("borsuk".to_string(), 142),
+            TicketCheckFailure {
+                count: 1,
+                finding: "AC-1 names no check".to_string(),
+            },
+        );
+        let values = rig
+            .daemon
+            .placeholder_values(&refine, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(
+            placeholder_of(&values, "finding"),
+            "The last ticket check said: AC-1 names no check",
+            "the whole line lives in the value"
+        );
+
+        // Only a refine reads the memory; the other stages leave it out.
+        let implement = Task::new(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+        let values = rig
+            .daemon
+            .placeholder_values(&implement, &repo_cfg, &dir)
+            .expect("the implement values must render");
+        assert_eq!(placeholder_of(&values, "finding"), "");
+    }
+
+    /// One theory poller serves every alias that names its repository, so
+    /// it stops only when the last of them goes.
+    #[test]
+    fn the_last_shadowed_alias_stops_the_theory_poller() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), shadow_of_the_rig);
+        let borsuk = rig.daemon.config.repos["borsuk"].clone();
+        let mut second = borsuk.clone();
+        second.alias = "second".to_string();
+        second.owner_repo = "acme/second".to_string();
+        rig.daemon.config.repos.insert("second".to_string(), second);
+        let (wake_tx, _wake_rx) = mpsc::channel();
+        rig.daemon
+            .wake
+            .insert(SHADOW_REPO.to_string(), wake_tx.clone());
+        rig.daemon.wake.insert("second".to_string(), wake_tx);
+        rig.daemon
+            .theory_snapshots
+            .insert("borsuk".to_string(), RepoSnapshot::default());
+
+        // `second` goes; `borsuk` still names the theory repository.
+        rig.daemon.config.repos.remove("second");
+        rig.daemon.wake.remove("second");
+        rig.daemon.prune_theory_pollers();
+
+        assert!(
+            rig.daemon.wake.contains_key(SHADOW_REPO),
+            "one live alias keeps the theory poller"
+        );
+
+        // `borsuk` goes too, so nothing names the theory repository.
+        rig.daemon.config.repos.remove("borsuk");
+        rig.daemon.wake.remove("borsuk");
+        rig.daemon.prune_theory_pollers();
+
+        assert!(
+            !rig.daemon.wake.contains_key(SHADOW_REPO),
+            "the last alias stops the theory poller"
+        );
+        assert!(
+            rig.daemon.theory_snapshots.is_empty(),
+            "the theory snapshot goes with the poller"
         );
     }
 }

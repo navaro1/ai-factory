@@ -1299,8 +1299,11 @@ fn repo_checks(
 ///
 /// One Warn names a repository whose governor is off. One Fail names a
 /// governed theory checkout that is not a git repository, because the
-/// records need Git there. A repository with the governor off gets no
-/// other theory line: v0.6 behaviour holds for it.
+/// records need Git there. One Info names the shadow repository of each
+/// governed repository that has one, because a shadow repository holds
+/// every theory record and the operator sees no theory label at all on
+/// the code repository. A repository with the governor off gets no other
+/// theory line: v0.6 behaviour holds for it.
 fn theory_checks(config: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
     for repo in config.repos.values() {
@@ -1318,6 +1321,13 @@ fn theory_checks(config: &Config) -> Vec<Check> {
                 label: format!("theory {}", repo.alias),
                 status: Status::Fail,
                 detail: format!("{} is not a git repository", checkout.display()),
+            });
+        }
+        if let Some(shadow) = repo.theory_repo() {
+            checks.push(Check {
+                label: format!("theory {}", repo.alias),
+                status: Status::Info,
+                detail: format!("shadow {shadow}"),
             });
         }
     }
@@ -4230,6 +4240,32 @@ mod tests {
         "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"t\"\n",
         "statement = \"s\"\nsides = [\"in\", \"out\"]\npaths = [\"web/**\"]\n",
     );
+
+    /// The doctor names the shadow repository of every governed
+    /// repository that has one, once per repository.
+    #[test]
+    fn theory_checks_print_one_shadow_line_per_shadow_repository() {
+        let dir = temp_dir("theory-shadow");
+        let checkout = dir.join("repo");
+        fs::create_dir_all(checkout.join(".git")).expect("the fake checkout must be creatable");
+        let text = config_text(
+            &[],
+            &format!(
+                "[repo.borsuk]\npath = \"{path}\"\n\
+                 theory = {{ repo = \"navaro1/borsuk-theory\", path = \"{path}\" }}\n\
+                 [repo.plain]\npath = \"{path}\"\n",
+                path = checkout.display()
+            ),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = theory_checks(&config);
+
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].label, "theory borsuk");
+        assert_eq!(checks[0].status, Status::Info);
+        assert_eq!(checks[0].detail, "shadow navaro1/borsuk-theory");
+    }
 
     #[test]
     fn theory_checks_warn_a_governor_off_repository_and_fail_a_missing_git_checkout() {

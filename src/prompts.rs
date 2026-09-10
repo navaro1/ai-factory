@@ -77,6 +77,8 @@ the surface on its own.
 
 {skills}
 
+{finding}
+
 # The ticket body
 
 Rewrite the body of ticket #{number} with `gh` into the sections below, in
@@ -818,14 +820,17 @@ const STAGE_PLACEHOLDERS: &[&str] = &[
     "pr_list",
     "pr_numbers",
     "pr_count",
-    // The theory placeholders. `prediction`, `comparison`, `rules`, and
-    // `why_rule` render empty until their chunks land.
+    // The theory placeholders. `prediction`, `comparison`, and `rules`
+    // render empty until their chunks land; `why_rule` fills for a
+    // shadow-mode repository only.
     "model",
     "prediction",
     "comparison",
     "skills",
     "rules",
     "why_rule",
+    // The last ticket check finding, for a refine that follows one.
+    "finding",
 ];
 
 /// The placeholders the daemon fills in the ticket-creation prompt.

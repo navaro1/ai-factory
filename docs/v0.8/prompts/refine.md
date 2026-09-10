@@ -34,6 +34,8 @@ the surface on its own.
 
 {skills}
 
+{finding}
+
 # The ticket body
 
 Rewrite the body of ticket #{number} with `gh` into the sections below, in
