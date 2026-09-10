@@ -92,7 +92,7 @@ pub fn parse_criteria(body: &str) -> (Vec<Criterion>, Vec<Finding>) {
         match parse_criterion(line) {
             Ok(criterion) => criteria.push(criterion),
             Err(reason) => {
-                let reason: String = match named_no_check(line, reason) {
+                let reason: String = match named_no_check(line, &reason) {
                     Some(text) => text,
                     None => reason.to_string(),
                 };
@@ -153,7 +153,7 @@ fn named_target(
 
 /// The `AC-<n> has no check` reason of a broken line that names its
 /// criterion id.
-fn named_no_check(line: &str, reason: &'static str) -> Option<String> {
+fn named_no_check(line: &str, reason: &str) -> Option<String> {
     if reason != "criterion without a check" {
         return None;
     }
@@ -502,6 +502,19 @@ mod tests {
                 good_body().replace("measure poll_p95", "api-orders fast"),
                 false,
                 "AC-2 check api-orders is not a feature or a measurer",
+            ),
+            (
+                good_body().replace(
+                    "- AC-2 \u{b7} The poll budget holds \u{b7} check: measure poll_p95\n",
+                    "- AC-0 \u{b7} The poll budget holds \u{b7} check: measure poll_p95\n",
+                ),
+                false,
+                "criterion without an AC-<n> id",
+            ),
+            (
+                good_body().replace("check: measure poll_p95", "check:  drive"),
+                false,
+                "AC-2 check names no feature",
             ),
             (planless, false, "plan table missing"),
             (
