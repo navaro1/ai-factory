@@ -199,7 +199,7 @@ All questions are resolved. None waits for clarification.
 Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it stacks on, what that chunk provides, and whether it is built at the date of this spec. `Depends on` lists every C id the chunk uses directly, and every V id. The design record's six groups map to them as: V0 is group V0; V1 to V3 are group V1; V4 is group V3; V5 to V8 are group V4; V9 and V10 are group V2 and the maintenance half of V4; V11 is group V5. `Depends on` names v0.7 chunks by their C ids and chunks of this spec by their V ids.
 
 ### V0 — The stance addendum
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C3 (`docs/STANCE.md` and its vocabulary test over `include_str!`). Built: no.
 **Build:** Extend `docs/STANCE.md` with rules 13 to 23, refusals 4 and 5, the driver ladder table, the six principles with the structure that enforces each, the steering table, and every new term of R1 in the vocabulary table. Extend the C3 vocabulary test so it asserts the new terms, the five tier names, and the label `verify-skill`.
 **AC:**
@@ -208,7 +208,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C3 · **Traces to:** R1
 
 ### V1 — The run skill parser and the AREAS mark
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C1 (the model cache in `apply_poll`, `TheoryView` in the state view, the Theory view shell) and C25 (`src/theory/verify.rs`, `Area`, `VerifyMap::parse`, the AREAS panel). The skills cache sits next to the C1 model cache, `min_tier` joins the C25 `Area`, and the tier mark joins the C25 AREAS row. Built: no.
 **Build:** Add `src/theory/skills.rs` with `Tier`, `RunSkill`, `Feature`, `SkillSet`, `parse_skill`, `parse_feature`, and `lint(set, verify)`. Add `SkillsPath` to `RepoConfig` and `skills = { path }` to `RawRepo`, and `skills_checkout(repo)` that prefers it over `TheoryConfig::checkout`. Add `min_tier` to `Area` in `src/theory/verify.rs`. In `apply_poll`, next to the model read of C1, list `.claude/skills/run-*/` at the skills checkout commit and read each file through `git show`; cache `(commit, Result<SkillSet, String>)`; ship `TheoryView.skills: BTreeMap<String, SurfaceView { tier, features, lint }>` with a serde default. Draw the tier mark on the AREAS row of C25 by `resolve`.
 **AC:**
@@ -220,7 +220,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C1, C25 · **Traces to:** R2, R3, R4, R5, R6, R8, N1, N2
 
 ### V2 — The doctor lines
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C2 (`theory_checks` in `src/doctor.rs`, the per-repository `Warn` and `Fail` lines) and C25 (the areas the floor warning reads). The family warning reads the v0.6 tag routes of `src/routing.rs`, which exist. Built: C2 and C25 no, routing yes.
 **Build:** Add `skill_checks` to `src/doctor.rs`: one line per repository and surface from the skills checkout on disk (`run skill <alias>/<surface>: <tier>` or `missing`), one line per lint finding, one `Warn` per area whose `min_tier` exceeds every mapped surface's tier, and one `Warn` per complexity level whose implement and review routes share a model family. Add `model_family` to `src/routing.rs`: the slug prefix before the first `-` after the vendor, so `claude-opus-5` and `claude-fable-5-1` share `claude`, and `gpt-5.6-sol` and `gpt-6-astra` share `gpt`.
 **AC:**
@@ -231,7 +231,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C2, C25, V1 · **Traces to:** R7
 
 ### V3 — Slicing into `{skills}`
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C10 (`{skills}` in the complete placeholder set of `render_prompt`, `Model::areas_for_paths`, the once-only prompt rewrite) and C28 (the name fill of `{skills}` in the review and implement prompts, which this chunk replaces). Built: no.
 **Build:** Add `slice(stage, areas, verify, set) -> String` to `src/theory/skills.rs` per the table of R9, with the cap of two surfaces and six feature files, rendering `<!-- skills: index only, N files -->` and the paths past the cap. In `placeholder_values`, fill `{skills}` with it for refine, implement, review, and teach, replacing the name fill of C28. A `bug` label on the ticket adds Drive and Logs to the refine slice.
 **AC:**
@@ -242,7 +242,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C10, C28, V1 · **Traces to:** R9
 
 ### V4 — Fast checks at review admission
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C26 (`ScriptRunner`, `TaskPurpose::Measure`, `queue_measure`, `Record`, `parse_lines`), C27 (`tree_hash`, the cache, `compare`), and C28 (the base and head measure tasks at review admission, the `prior_stage_active` hold, `WorktreeKind::Base`). The fast task is one more `queue_measure` call with a synthetic measurer. Built: no.
 **Build:** Add `queue_fast(alias, worktree, features)` in `src/daemon.rs` over `queue_measure` with a synthetic measurer per feature (`mode: pr`, `timeout_s: 120`) and the `exit` unit in `src/theory/measure.rs`. In review admission of a governed PR, after the base and head tasks of C28, queue one fast task per touched feature with a `fast` command and hold the review in `prior_stage_active` until every task ends. When the last one ends, read the fast records: on any non-zero value, cancel the review task, post `fast check failed: <feature> exit <n>` on the theory record, and re-queue the implement task of every linked ticket. Show `fast check failed` in the pipeline hint.
 **AC:**
@@ -253,7 +253,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C26, C27, C28, V1 · **Traces to:** R10, R11, N3, N4
 
 ### V5 — Refine in the issue worktree
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C10 (the refine prompt's `{model}` slice and the pinned `docs/v0.7/prompts/refine.md` this chunk edits). The cwd change itself touches only `workspace(&task)` in `src/daemon.rs:2290-2302`, which exists. Built: C10 no.
 **Build:** Change `workspace(&task)` so `Stage::Refine` on an issue returns `Exclusive(Issue(number))`, except `is_ticket_creation`, which stays `Shared`. `ensure_issue` already cuts the branch from the default base. Update the refine prompt's first paragraph to name `{worktree}` as its own git worktree, and the README table of the four stages.
 **AC:**
@@ -263,7 +263,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C10 · **Traces to:** R12
 
 ### V6 — The refine prompt and the criteria
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C10 (the once-only rewrite rule, the placeholder set, and the `docs/v0.7/prompts/` pin that this chunk moves to `docs/v0.8/prompts/`). Built: no.
 **Build:** Rewrite `REFINE_PROMPT` once: the Restate, Ground, Decisions, and Repro sections of R13 in that order before the plan table; `## Acceptance criteria` as `- AC-<n> · <statement> · check: <target>` lines with the three target forms; the `Fast` column in the plan table; prototype-before-ask under rule 14; repro twice for a `bug` ticket; a criterion the ticket text does not ask for is dropped. Add `parse_criteria` to `src/theory/contract.rs`. Move the pinned copies to `docs/v0.8/prompts/` and re-pin the byte-for-byte test for every stage prompt.
 **AC:**
@@ -273,7 +273,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C10, V3, V5 · **Traces to:** R13, N5
 
 ### V7 — The ticket check
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C9 (the `theory-full` gate on `implement_ready` in `admit_ready`, after which the ticket check runs), C4 (`GhClient::post_comment` and `TheoryRecords`), and C25 (the measurers a `check:` target may name). Built: no.
 **Build:** Add `check_ticket(body, features, measurers) -> Result<(), Finding>` to `src/theory/contract.rs`: the sections of R13 present, every criterion parses, every target names a resolved feature or a measurer, the plan table parses and every owned path is non-empty. In `admit_ready`, for a governed ticket that `implement_ready` admits, run it after the C9 gate and before the task exists; on failure post `ticket: <finding>` and add `to-refine`, so the poll gate queues a refine task.
 **AC:**
@@ -283,7 +283,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C4, C9, C25, V6 · **Traces to:** R14, N3
 
 ### V8 — The Before / After contract and the body check
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C11 (`records::check_pr(body, paths, branch)` and its slot in `dispatch_one` after the cwd exists and before the prompt), C14 (`Daemon::open_event` for the floor failure), and C28 (`WorktreeKind::Base`, which the review prompt's red-on-base step drives). Built: no.
 **Build:** Add `BeforeAfterLine`, `parse_lines`, and `check_body_lines(body, ctx)` to `src/theory/contract.rs` with the seven rules of R15 as one function each and one table test row each. Extend `check_pr` of C11 with a `ContractContext` built from the linked ticket's criteria, the resolved features, the touched areas and their `min_tier`, the plan's owned paths, and the manifest names `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`. On a tier failure also call `open_event` with the area, the floor, and the tier reached. Rewrite `IMPLEMENT_PROMPT` and `REVIEW_PROMPT` once with the paragraphs of R17 and R18 and the body contract with its writing paragraph, and pin `docs/v0.8/prompts/implement.md` and `review.md`.
 **AC:**
@@ -295,7 +295,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C11, C14, C28, V4, V7 · **Traces to:** R15, R16, R17, R18, N3, N5
 
 ### V9 — The setup ticket
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C16 (`PurposeSpec` and the `model-pr` gate skip in `admit_ready`, which `verify-skill` mirrors), C32 (`GhClient::create_issue` with labels), C8 (the inline input precedent of the short prediction), C7 (the commit-push-PR path on the theory checkout that shadow mode reuses), and C20 (shadow mode routing). Built: no.
 **Build:** Add `SETUP_BODY` in `src/prompts.rs` with the eight steps of design §6.2 and the placeholders `{alias}`, `{surface}`, `{skills_dir}`, `{app_path}`. Add `TheoryAction::Setup { repo, surface }` and key `v` on a repository row of the Theory view with an inline input for the surface, like the short prediction of C8. Add `create_skill_ticket` in `src/daemon.rs` that calls `create_issue` with the title and the labels `to-refine` and `verify-skill`. Read `verify-skill` in `admit_ready` next to `model-pr` of C16 and skip both prediction gates for it. In shadow mode, on the implement task's exit, commit and push `{skills_dir}` changes through the C7 path on `aif/<alias>/skills-<n>` and open the PR there.
 **AC:**
@@ -306,7 +306,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C7, C8, C16, C20, C32, V1 · **Traces to:** R19, R20
 
 ### V10 — Drift from the audit sweep
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C24 (`AUDIT_SWEEP_PROMPT`, `AuditJob::Sweep`, the sweep's `<aif-event-v1>` blocks and their `open_event` posting) and C32 (`create_issue` with labels). Built: no.
 **Build:** Add the drift paragraph to `AUDIT_SWEEP_PROMPT` of C24 and a `kind: "skill-drift"` field on the sweep's event block with `surface`. Add `MAINTAIN_BODY` with the eight maintain lines of design §6.3. When the sweep's blocks carry `skill-drift` for a surface with no open issue labelled `verify-skill` whose title names that surface, call `create_skill_ticket(alias, surface, Maintain)`.
 **AC:**
@@ -316,7 +316,7 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 **Depends on:** C24, C32, V9 · **Traces to:** R21
 
 ### V11 — Teach
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C17 (`ChatKey::Theory`, `TheoryAction::Chat`, the chat machinery of the bootstrap), C16 (`PurposeSpec` and `wants_final_block`), C14 (`open_event`), and C22 (cards and the `recall` cause the offer hooks into). Built: no.
 **Build:** Add `TaskPurpose::Teach(TeachKey)` with a `PurposeSpec` under `theory.chat`, id `<alias>/teach-<pr|delta|area>-<key>`, cwd the repository checkout, and `wants_final_block` returning the event tag. Add `TEACH_PROMPT` per design §7 with `{model}`, `{skills}`, `{subject}` (the diff, or the area's entries), and `{history}` (the `git log --oneline` and `gh pr list` lines the daemon renders for the paths of the subject). Add `TheoryAction::Teach { repo, key }` and key `t` on a merged PR row of the pipeline view, a DELTAS row, and an AREAS row; on the answer of a card with cause `recall`, offer `t` in the inbox row. Open one event per block through `open_event` on the record of the PR, else the repository record.
 **AC:**
