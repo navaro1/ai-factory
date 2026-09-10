@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use crate::config::{Config, Weekday};
 use crate::theory::records::{DeltaBlock, DeltaOutcome, PredictionTag};
 
@@ -73,9 +75,15 @@ fn next_utc_midnight(last_ms: u64) -> u64 {
 }
 
 /// The first UTC midnight of `weekday` strictly after `last_ms`.
+///
+/// The walk runs seven steps at most: a week holds every weekday once,
+/// so a longer walk can name no moment.
 fn next_weekday_midnight(last_ms: u64, weekday: Weekday) -> u64 {
     let mut day = last_ms / MS_PER_DAY + 1;
-    while day_of_week(day) != weekday {
+    for _ in 0..7 {
+        if day_of_week(day) == weekday {
+            return day * MS_PER_DAY;
+        }
         day += 1;
     }
     day * MS_PER_DAY
@@ -89,7 +97,9 @@ fn day_of_week(days: u64) -> Weekday {
         1 => Weekday::Tuesday,
         2 => Weekday::Wednesday,
         3 => Weekday::Thursday,
-        _ => Weekday::Friday,
+        4 => Weekday::Friday,
+        5 => Weekday::Saturday,
+        _ => Weekday::Sunday,
     }
 }
 
@@ -106,24 +116,42 @@ pub struct SweepStats {
     pub stale_entries: Vec<String>,
 }
 
-/// The sure hits over the sure slots of the delta blocks.
+/// The calibration tally of one sweep: the sure slots and their hits.
 ///
-/// An unsure slot counts on neither side: only a sure prediction can
-/// prove the model wrong.
-pub fn calibration_share(deltas: &[DeltaBlock]) -> Option<f64> {
-    let mut sure = 0usize;
-    let mut hits = 0usize;
-    for delta in deltas {
-        for slot in &delta.slots {
-            if slot.tag == PredictionTag::Sure {
-                sure += 1;
-                if slot.outcome == DeltaOutcome::Hit {
-                    hits += 1;
+/// A slot whose block carries no tag reads the tag of the record's own
+/// full prediction: the prediction of the same record named the entry,
+/// and the slot of that prediction carries the operator's confidence. A
+/// slot with neither falls out of the tally. An unsure slot counts on
+/// neither side: only a sure prediction can prove the model wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Calibration {
+    sure: usize,
+    hits: usize,
+}
+
+impl Calibration {
+    /// Add the delta blocks of one record.
+    ///
+    /// `tags` maps a model entry id to the confidence tag of the slot
+    /// that named it in the record's own full prediction.
+    pub fn add(&mut self, deltas: &[DeltaBlock], tags: &BTreeMap<String, PredictionTag>) {
+        for delta in deltas {
+            for slot in &delta.slots {
+                let tag = tags.get(&slot.id).copied().or(slot.tag);
+                if tag == Some(PredictionTag::Sure) {
+                    self.sure += 1;
+                    if slot.outcome == DeltaOutcome::Hit {
+                        self.hits += 1;
+                    }
                 }
             }
         }
     }
-    (sure > 0).then(|| hits as f64 / sure as f64)
+
+    /// The sure hits over the sure slots; `None` with no sure slot.
+    pub fn share(&self) -> Option<f64> {
+        (self.sure > 0).then(|| self.hits as f64 / self.sure as f64)
+    }
 }
 
 /// The count of records that carry each ladder label.
@@ -141,27 +169,37 @@ pub fn rung_counts(labels_of_records: &[&[String]]) -> [usize; 3] {
 }
 
 /// The model entries whose id appears in no hunk of the model log.
+///
+/// The log names an id only as a whole token: the log that names
+/// `INV-10` says nothing about `INV-1`.
 pub fn stale_entries(ids: &[String], log: &str) -> Vec<String> {
     ids.iter()
-        .filter(|id| !log.contains(id.as_str()))
+        .filter(|id| !log_names_entry(log, id))
         .cloned()
         .collect()
 }
 
-/// True when one record takes part in the sweep.
+/// True when the log names one id as a whole token.
 ///
-/// A record with a parseable update time takes part when the update is
-/// in the window. A record without one takes part when it carries a
-/// theory label.
-pub fn in_sweep_window(updated_at: &str, labels: &[String], cutoff_ms: u64) -> bool {
-    match rfc3339_ms(updated_at) {
-        Some(updated) => updated >= cutoff_ms,
-        None => labels.iter().any(|label| is_theory_label(label)),
+/// A hit needs a boundary on both sides: neither neighbor may carry a
+/// character of an id, so the text `INV-10` never matches the id
+/// `INV-1`.
+fn log_names_entry(log: &str, id: &str) -> bool {
+    let boundary = |c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_';
+    let mut rest = log;
+    while let Some(at) = rest.find(id) {
+        let after = rest[at + id.len()..].chars().next().is_none_or(boundary);
+        let before = rest[..at].chars().next_back().is_none_or(boundary);
+        if before && after {
+            return true;
+        }
+        rest = &rest[at + id.len()..];
     }
+    false
 }
 
 /// True for every label the theory governor puts on a record.
-fn is_theory_label(label: &str) -> bool {
+pub(crate) fn is_theory_label(label: &str) -> bool {
     use crate::theory::records::{
         DELTA_OPEN_LABEL, EVENT_OPEN_LABEL, MODEL_PR_LABEL, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
     };
@@ -173,6 +211,39 @@ fn is_theory_label(label: &str) -> bool {
             | EVENT_OPEN_LABEL
             | MODEL_PR_LABEL
     ) || label.starts_with("ladder-")
+}
+
+/// Format one moment as `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// The form is the exact RFC 3339 form the GitHub `since` parameter
+/// reads. The moment must sit after the epoch.
+pub(crate) fn ms_rfc3339(ms: u64) -> String {
+    let days = (ms / MS_PER_DAY) as i64;
+    let rest = ms % MS_PER_DAY;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3_600_000,
+        (rest % 3_600_000) / 60_000,
+        (rest % 60_000) / 1_000,
+    )
+}
+
+/// Read one day count as a civil date.
+///
+/// The inverse of [`days_from_civil`], in Howard Hinnant's form.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Convert one GitHub RFC 3339 timestamp to milliseconds since the epoch.
@@ -270,6 +341,46 @@ path = "/tmp/borsuk"
         .expect("the test config parses")
     }
 
+    /// The smallest config whose interview lands on one weekday.
+    fn config_with_interview(weekday: &str) -> Config {
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[stage.refine]
+harness = "claude"
+model = "m"
+
+[stage.implement]
+harness = "claude"
+model = "m"
+
+[stage.review]
+harness = "claude"
+model = "m"
+
+[stage.release]
+harness = "claude"
+model = "m"
+
+[ticket.create]
+harness = "claude"
+model = "m"
+
+[ticket.chat]
+harness = "claude"
+model = "m"
+
+[repo.borsuk]
+path = "/tmp/borsuk"
+
+[repo.borsuk.interview]
+weekday = "{weekday}"
+"#
+        );
+        Config::parse(&toml).expect("the test config parses")
+    }
+
     fn schedule(kind: ScheduleKind, last_ms: Option<u64>) -> Schedule {
         Schedule {
             kind,
@@ -339,6 +450,67 @@ path = "/tmp/borsuk"
     }
 
     #[test]
+    fn the_day_of_week_names_all_seven_days_of_the_week() {
+        // Day 0, 1970-01-01, was a Thursday; the weekend sits in the
+        // middle of the first week of the count.
+        let days = [
+            (0, Weekday::Thursday),
+            (1, Weekday::Friday),
+            (2, Weekday::Saturday),
+            (3, Weekday::Sunday),
+            (4, Weekday::Monday),
+            (5, Weekday::Tuesday),
+            (6, Weekday::Wednesday),
+            (7, Weekday::Thursday),
+            (9, Weekday::Saturday),
+            (10, Weekday::Sunday),
+        ];
+        for (day, want) in days {
+            assert_eq!(day_of_week(day), want, "day {day} of the count");
+        }
+    }
+
+    #[test]
+    fn ms_rfc3339_formats_the_moment_the_parser_reads_back() {
+        let midnight = 1_789_084_800_000;
+        assert_eq!(ms_rfc3339(midnight), "2026-09-11T00:00:00Z");
+        assert_eq!(rfc3339_ms(&ms_rfc3339(midnight)), Some(midnight));
+
+        let noon = 1_789_128_000_000;
+        assert_eq!(ms_rfc3339(noon), "2026-09-11T12:00:00Z");
+        assert_eq!(rfc3339_ms(&ms_rfc3339(noon)), Some(noon));
+    }
+
+    #[test]
+    fn due_interview_waits_for_saturday_and_sunday() {
+        let thursday_noon = rfc3339_ms("2026-09-10T12:00:00Z").unwrap();
+        let saturday = rfc3339_ms("2026-09-12T00:00:00Z").unwrap();
+        let sunday = rfc3339_ms("2026-09-13T00:00:00Z").unwrap();
+
+        let config = config_with_interview("saturday");
+        assert_eq!(
+            due(
+                &[schedule(ScheduleKind::Interview, Some(thursday_noon))],
+                &config,
+                thursday_noon
+            ),
+            Some(saturday),
+            "the interview waits for the midnight of the Saturday"
+        );
+
+        let config = config_with_interview("sunday");
+        assert_eq!(
+            due(
+                &[schedule(ScheduleKind::Interview, Some(thursday_noon))],
+                &config,
+                thursday_noon
+            ),
+            Some(sunday),
+            "the interview waits for the midnight of the Sunday"
+        );
+    }
+
+    #[test]
     fn due_names_no_moment_for_an_unknown_repository_and_the_earliest_of_all() {
         let config = config();
         let now = 1_000;
@@ -352,8 +524,8 @@ path = "/tmp/borsuk"
     }
 
     #[test]
-    fn calibration_share_counts_sure_hits_over_sure_slots() {
-        let slot = |id: &str, outcome: DeltaOutcome, tag: PredictionTag| DeltaSlot {
+    fn calibration_counts_sure_hits_over_sure_slots_and_reads_the_prediction_tags() {
+        let slot = |id: &str, outcome: DeltaOutcome, tag: Option<PredictionTag>| DeltaSlot {
             id: id.to_string(),
             outcome,
             tag,
@@ -370,31 +542,49 @@ path = "/tmp/borsuk"
                     slot(
                         &format!("INV-{index}"),
                         DeltaOutcome::Hit,
-                        PredictionTag::Sure,
+                        Some(PredictionTag::Sure),
                     )
                 })
                 .chain((7..10).map(|index| {
                     slot(
                         &format!("INV-{index}"),
                         DeltaOutcome::Miss,
-                        PredictionTag::Sure,
+                        Some(PredictionTag::Sure),
                     )
                 }))
                 .collect(),
         );
-        let unsure = delta(vec![slot(
-            "INV-0",
-            DeltaOutcome::Miss,
-            PredictionTag::Unsure,
-        )]);
 
+        let mut calibration = Calibration::default();
+        calibration.add(std::slice::from_ref(&seven_of_ten), &BTreeMap::new());
         assert_eq!(
-            calibration_share(&[seven_of_ten, unsure.clone()]),
+            calibration.share(),
             Some(0.7),
-            "the unsure slot counts on neither side"
+            "the tagged block counts seven sure hits over ten sure slots"
         );
-        assert_eq!(calibration_share(&[]), None);
-        assert_eq!(calibration_share(&[unsure]), None);
+
+        // A block with no tags reads each slot tag from the record's own
+        // full prediction, and falls back to the block tag when present.
+        let untagged = delta(vec![
+            slot("INV-3", DeltaOutcome::Hit, None),
+            slot("INV-4", DeltaOutcome::Miss, None),
+            slot("INV-5", DeltaOutcome::Hit, Some(PredictionTag::Sure)),
+        ]);
+        let mut tags = BTreeMap::new();
+        tags.insert("INV-3".to_string(), PredictionTag::Sure);
+        tags.insert("INV-5".to_string(), PredictionTag::Unsure);
+
+        let mut calibration = Calibration::default();
+        calibration.add(&[untagged], &tags);
+        assert_eq!(
+            calibration.share(),
+            Some(1.0),
+            "the prediction tag wins over the block tag; the slot with no tag anywhere falls out"
+        );
+
+        let mut calibration = Calibration::default();
+        calibration.add(&[], &BTreeMap::new());
+        assert_eq!(calibration.share(), None, "no sure slot gives no share");
     }
 
     #[test]
@@ -420,20 +610,15 @@ path = "/tmp/borsuk"
         let log = "+INV-3 stays true on reload\n-INV-3 old form\n";
 
         assert_eq!(stale_entries(&ids, log), vec!["INV-9".to_string()]);
-    }
 
-    #[test]
-    fn the_sweep_window_reads_the_update_time_or_the_labels() {
-        let labels: Vec<String> = vec!["ladder-1".to_string()];
-        let plain: Vec<String> = vec!["bug".to_string()];
+        // The id matches as a whole token: a log line that names INV-10
+        // says nothing about INV-1.
+        let ids: Vec<String> = ["INV-1", "INV-10"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let log = "+id = \"INV-10\" flips\n";
 
-        assert!(in_sweep_window("2026-09-10T00:00:00Z", &plain, 0));
-        assert!(!in_sweep_window("2026-09-10T00:00:00Z", &plain, u64::MAX));
-        assert!(
-            in_sweep_window("", &labels, u64::MAX),
-            "a record without a time joins on its theory label"
-        );
-        assert!(!in_sweep_window("", &plain, 0));
-        assert!(!in_sweep_window("not a time", &plain, 0));
+        assert_eq!(stale_entries(&ids, log), vec!["INV-1".to_string()]);
     }
 }

@@ -322,8 +322,11 @@ pub struct DeltaSlot {
     pub id: String,
     /// How the prediction turned out.
     pub outcome: DeltaOutcome,
-    /// The confidence tag of the slot.
-    pub tag: PredictionTag,
+    /// The confidence tag of the slot, when the block carries one. A
+    /// block with no tags reads the tag of the record's own full
+    /// prediction.
+    #[serde(default)]
+    pub tag: Option<PredictionTag>,
 }
 
 /// One violation a delta block reports.
@@ -1417,12 +1420,12 @@ mod tests {
                 DeltaSlot {
                     id: "INV-3".to_string(),
                     outcome: DeltaOutcome::Hit,
-                    tag: PredictionTag::Sure,
+                    tag: Some(PredictionTag::Sure),
                 },
                 DeltaSlot {
                     id: "INV-9".to_string(),
                     outcome: DeltaOutcome::Miss,
-                    tag: PredictionTag::Unsure,
+                    tag: Some(PredictionTag::Unsure),
                 },
             ],
             touched: vec!["S-1".to_string()],
@@ -1454,7 +1457,27 @@ mod tests {
                 slots: vec![DeltaSlot {
                     id: "INV-3".to_string(),
                     outcome: DeltaOutcome::Hit,
-                    tag: PredictionTag::Sure,
+                    tag: Some(PredictionTag::Sure),
+                }],
+                touched: Vec::new(),
+                violations: Vec::new(),
+                question: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_delta_blocks_reads_a_block_that_carries_no_tags() {
+        let body = r#"{"slots":[{"id":"INV-3","outcome":"hit"}]}"#;
+        let transcript = format!("{DELTA_BLOCK}\n{body}\n{}", close_tag(DELTA_BLOCK));
+
+        assert_eq!(
+            parse_delta_blocks(&transcript),
+            vec![DeltaBlock {
+                slots: vec![DeltaSlot {
+                    id: "INV-3".to_string(),
+                    outcome: DeltaOutcome::Hit,
+                    tag: None,
                 }],
                 touched: Vec::new(),
                 violations: Vec::new(),

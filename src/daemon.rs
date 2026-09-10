@@ -73,11 +73,11 @@ use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
     self, event_block, no_entries, parse_delta_blocks, parse_event_blocks, parse_prediction_blocks,
-    prediction_block, record_labels, skips_prediction_gates, DeltaBlock, Event, FullPrediction,
-    Prediction, RecordKey, ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR,
-    EVENT_OPEN_LABEL, MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS,
-    THEORY_FULL_COLOR, THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL,
-    VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
+    prediction_block, record_labels, skips_prediction_gates, Event, FullPrediction, Prediction,
+    RecordKey, ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
+    MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS, THEORY_FULL_COLOR,
+    THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR,
+    VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
@@ -428,6 +428,9 @@ pub struct Daemon {
     /// The product of the last daily sweep of each repository. Runtime
     /// only: the next sweep re-derives it.
     theory_sweeps: BTreeMap<String, SweepStats>,
+    /// One client held across sweeps, so the second day pays 304s on
+    /// the comment pages the first day fetched. Runtime only.
+    theory_client: Option<GhClient<'static>>,
     /// The theory record labels of every governed repository, rebuilt on
     /// every poll like [`Links`].
     theory_records: TheoryRecords,
@@ -848,6 +851,7 @@ impl Daemon {
             theory_views: BTreeMap::new(),
             cadences,
             theory_sweeps: BTreeMap::new(),
+            theory_client: None,
             ticket_check_failures: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
@@ -2505,10 +2509,12 @@ impl Daemon {
                 {
                     continue;
                 }
+                // The daily sweep only reads, so it fires at first
+                // sight; the other kinds arm at now.
                 self.cadences.push(Schedule {
                     kind,
                     repo: alias.clone(),
-                    last_ms: Some(self.now_ms),
+                    last_ms: (kind != ScheduleKind::Daily).then_some(self.now_ms),
                 });
                 self.changed = true;
             }
@@ -2550,10 +2556,11 @@ impl Daemon {
 
     /// Run the daily sweep of one governed repository.
     ///
-    /// The sweep fetches one comment page of every theory record updated
-    /// in the last `stale_days` days and derives the calibration share
-    /// from the delta blocks, the rung counts from the `ladder-*`
-    /// labels, the events of the last day, and the stale entries: the
+    /// One list call names every record updated in the last `stale_days`
+    /// days, open or closed; rows with a theory label pay one comment
+    /// page each. The sweep derives the calibration share from the delta
+    /// blocks, the rung counts from the `ladder-*` labels of the swept
+    /// records, the events of the last day, and the stale entries: the
     /// model entries whose id has no hunk in the model log of the
     /// window. The result joins the Theory view and is never persisted.
     fn daily_sweep(&mut self, alias: &str) {
@@ -2576,50 +2583,78 @@ impl Daemon {
         let stale_days = repo_cfg.theory.cards.stale_days;
         let theory_path = repo_cfg.theory.checkout(&repo_cfg.path);
         let now = self.now_ms;
-        let cutoff = now.saturating_sub(stale_days.saturating_mul(cadence::MS_PER_DAY));
+        let since =
+            cadence::ms_rfc3339(now.saturating_sub(stale_days.saturating_mul(cadence::MS_PER_DAY)));
         let day_cutoff = now.saturating_sub(cadence::MS_PER_DAY);
-        let (rungs, keys) = {
-            let Some(items) = self.snapshot.repos.get(alias) else {
-                return;
-            };
-            let mut label_sets: Vec<&[String]> = Vec::new();
-            let mut keys: Vec<RecordKey> = Vec::new();
-            for issue in items.issues.values() {
-                label_sets.push(issue.labels.as_slice());
-                if cadence::in_sweep_window(&issue.updated_at, &issue.labels, cutoff) {
-                    keys.push(RecordKey::Issue(issue.number));
-                }
-            }
-            for pr in items.prs.values() {
-                label_sets.push(pr.labels.as_slice());
-                // A pull request carries no update time; its labels decide.
-                if cadence::in_sweep_window("", &pr.labels, cutoff) {
-                    keys.push(RecordKey::Pr(pr.number));
-                }
-            }
-            (cadence::rung_counts(&label_sets), keys)
+        let owner_repo = repo_cfg.owner_repo.clone();
+
+        let rows = {
+            let mut gh = self
+                .theory_client
+                .take()
+                .unwrap_or_else(|| GhClient::new_owned(self.exec.clone()));
+            let rows = gh
+                .fetch_record_rows(&owner_repo, &since)
+                .unwrap_or_default();
+            self.theory_client = Some(gh);
+            rows
         };
-        let mut deltas: Vec<DeltaBlock> = Vec::new();
+        // A record without a theory label stays out of the sweep, as on
+        // the pull-request side before.
+        let rows: Vec<gh::RecordRow> = rows
+            .into_iter()
+            .filter(|row| {
+                row.labels
+                    .iter()
+                    .any(|label| cadence::is_theory_label(label))
+            })
+            .collect();
+        let label_sets: Vec<&[String]> = rows.iter().map(|row| row.labels.as_slice()).collect();
+        let rungs = cadence::rung_counts(&label_sets);
+
+        let mut gh = self
+            .theory_client
+            .take()
+            .unwrap_or_else(|| GhClient::new_owned(self.exec.clone()));
+        let mut calibration = cadence::Calibration::default();
         let mut events_last_day = 0usize;
-        if !keys.is_empty() {
-            let mut gh = GhClient::new(&*self.exec);
-            for key in &keys {
-                let Ok((owner_repo, number)) = self.theory_record(alias, key) else {
-                    continue;
-                };
-                let Ok(page) = gh.fetch_comments(&owner_repo, number) else {
-                    continue;
-                };
-                for comment in &page.comments {
-                    deltas.extend(parse_delta_blocks(&comment.body));
-                    if cadence::rfc3339_ms(&comment.created_at).is_some_and(|at| at >= day_cutoff) {
-                        events_last_day += parse_event_blocks(&comment.body).len();
+        for row in &rows {
+            let key = if row.pull_request {
+                RecordKey::Pr(row.number)
+            } else {
+                RecordKey::Issue(row.number)
+            };
+            let Ok((owner, number)) = self.theory_record(alias, &key) else {
+                continue;
+            };
+            let Ok(page) = gh.fetch_comments(&owner, number) else {
+                continue;
+            };
+            // The tag of each slot comes from the record's own full
+            // prediction when the delta block carries none.
+            let mut tags = BTreeMap::new();
+            let mut deltas = Vec::new();
+            for comment in &page.comments {
+                for block in parse_prediction_blocks(&comment.body) {
+                    if let Prediction::Full(full) = block {
+                        for slot in full.slots {
+                            for id in slot.entries {
+                                tags.insert(id, slot.tag);
+                            }
+                        }
                     }
                 }
+                deltas.extend(parse_delta_blocks(&comment.body));
+                if cadence::rfc3339_ms(&comment.created_at).is_some_and(|at| at >= day_cutoff) {
+                    events_last_day += parse_event_blocks(&comment.body).len();
+                }
             }
+            calibration.add(&deltas, &tags);
         }
+        self.theory_client = Some(gh);
+
         let mut stats = SweepStats {
-            calibration: cadence::calibration_share(&deltas),
+            calibration: calibration.share(),
             rungs,
             events_per_day: events_last_day,
             stale_entries: Vec::new(),
@@ -13648,7 +13683,13 @@ mod tests {
             "message was: {}",
             result.message
         );
-        assert_eq!(rig.exec.calls().len(), 2, "no call follows the failure");
+        let writes = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh" && !is_sweep_list(call))
+            .count();
+        assert_eq!(writes, 2, "no call follows the failure");
     }
 
     #[test]
@@ -14414,7 +14455,13 @@ mod tests {
             repo: "borsuk".to_string(),
         }));
 
-        assert_eq!(rig.exec.calls().len(), 3, "the empty index stops the run");
+        let git_calls = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "git")
+            .count();
+        assert_eq!(git_calls, 3, "the empty index stops the run");
         let Push::TicketResult(result) = rx.try_recv().unwrap() else {
             panic!("the commit must push a Push::TicketResult");
         };
@@ -23640,11 +23687,19 @@ mod tests {
     }
 
     /// The `gh` argument lists of one rig, in call order.
+    /// True when one call is the record list of the daily sweep. A
+    /// governed repository lists its records once, at the first sight
+    /// of the cadence; the tests that pin the traffic of one flow skip
+    /// that one read.
+    fn is_sweep_list(call: &Call) -> bool {
+        call.program == "gh" && call.argv().iter().any(|arg| arg.contains("state=all"))
+    }
+
     fn gh_argv(rig: &Rig) -> Vec<Vec<String>> {
         rig.exec
             .calls()
             .iter()
-            .filter(|call| call.program == "gh")
+            .filter(|call| call.program == "gh" && !is_sweep_list(call))
             .map(|call| call.args.clone())
             .collect()
     }
@@ -24758,7 +24813,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .exec
             .calls()
             .iter()
-            .filter(|call| call.program == "gh")
+            .filter(|call| call.program == "gh" && !is_sweep_list(call))
             .count();
         assert_eq!(
             posted, 3,
@@ -24855,7 +24910,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "no implement task exists for the held ticket"
         );
         assert!(
-            rig.exec.calls().iter().all(|call| call.program != "gh"),
+            rig.exec
+                .calls()
+                .iter()
+                .all(|call| call.program != "gh" || is_sweep_list(call)),
             "the hold posts no comment and no label"
         );
     }
@@ -25587,7 +25645,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .exec
             .calls()
             .iter()
-            .filter(|call| call.program == "gh")
+            .filter(|call| call.program == "gh" && !is_sweep_list(call))
             .count();
         assert_eq!(
             gh_calls, 11,
@@ -25820,7 +25878,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         )
     }
 
-    /// The ten ladder records of the sweep test.
+    /// The ten open ladder records of the sweep snapshot.
     fn sweep_issues() -> Vec<Issue> {
         let rung = |index: u64| match index {
             1..=2 => "ladder-1",
@@ -25836,22 +25894,101 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .collect()
     }
 
+    /// The record list of one sweep: the ten open ladder issues, one
+    /// closed issue with `delta-open`, and one ladder pull request. The
+    /// closed issue and the pull request never enter the open snapshot,
+    /// so only the list brings them to the sweep.
+    fn sweep_rows() -> String {
+        let rung = |index: u64| match index {
+            1..=2 => "ladder-1",
+            3..=7 => "ladder-2",
+            _ => "ladder-3",
+        };
+        let mut rows: Vec<String> = (1..=10)
+            .map(|index| {
+                format!(
+                    "{{\"number\":{index},\"state\":\"open\",\
+                     \"updated_at\":\"2026-09-05T12:00:00Z\",\
+                     \"labels\":[{{\"name\":\"{}\"}}]}}",
+                    rung(index)
+                )
+            })
+            .collect();
+        rows.push(
+            "{\"number\":11,\"state\":\"closed\",\
+             \"updated_at\":\"2026-09-01T08:00:00Z\",\
+             \"labels\":[{\"name\":\"delta-open\"}]}"
+                .to_string(),
+        );
+        rows.push(
+            "{\"number\":12,\"state\":\"open\",\
+             \"updated_at\":\"2026-09-06T09:00:00Z\",\
+             \"labels\":[{\"name\":\"ladder-3\"}],\
+             \"pull_request\":{\"merged_at\":null}}"
+                .to_string(),
+        );
+        format!("[{}]", rows.join(","))
+    }
+
+    /// One record list call of one sweep. The `since` bound is the
+    /// sweep moment minus the stale days.
+    fn sweep_rows_step(since: &str) -> Step {
+        let url = format!("repos/acme/borsuk/issues?state=all&since={since}&per_page=100");
+        gh_step(
+            &["api", "-i", "-X", "GET", &url],
+            CmdOut::ok(format!("HTTP/2 200\r\n\r\n{}", sweep_rows())),
+        )
+    }
+
+    /// One comment page of the second sweep: a 304 that answers the
+    /// `If-None-Match` of the first sweep.
+    fn sweep_304_step(number: u64) -> Step {
+        let url = format!("repos/acme/borsuk/issues/{number}/comments?per_page=100");
+        gh_step(
+            &[
+                "api",
+                "-i",
+                "-H",
+                &format!("If-None-Match: \"c{number}\""),
+                "-X",
+                "GET",
+                &url,
+            ],
+            CmdOut {
+                status: 1,
+                stdout: format!("HTTP/2 304\r\netag: \"c{number}\"\r\n\r\n"),
+                stderr: "gh: HTTP 304\n".to_string(),
+            },
+        )
+    }
+
     #[test]
-    fn the_daily_sweep_reads_one_page_per_record_and_names_the_stale_entry() {
+    fn the_daily_sweep_reads_the_record_list_and_pays_304s_the_next_day() {
         let dir = temp_root();
         let repo = dir.join("repo");
-        // The poll of the evening before the midnight, then the first
-        // poll after the midnight of 2026-09-11.
+        // The poll of 2026-09-10T23:59Z sweeps at first sight. The poll
+        // of 2026-09-11T00:01Z sweeps again and pays 304s on the pages
+        // of the day before.
         let before = 1_789_084_740_000_u64;
         let after = 1_789_084_860_000_u64;
         let mut steps = sweep_theory_steps(&repo, "aaa111");
-        // The poll after the midnight probes the same commit, then the
-        // sweep reads the model log and one comment page of each record.
-        steps.extend(commit_steps(&repo, "aaa111"));
-        // The sweep fetches one comment page of each record first, then
-        // reads the model log for the stale entries.
-        for number in 1..=10 {
+        // The first sweep lists the records, fetches one comment page
+        // of every swept record, and reads the model log.
+        steps.push(sweep_rows_step("2026-08-11T23:59:00Z"));
+        for number in 1..=12 {
             steps.push(sweep_comment_step(number));
+        }
+        steps.push(git_step(
+            &repo,
+            &["log", "--since=30.days.ago", "-p", "--", MODEL_FILE],
+            CmdOut::ok(SWEEP_LOG),
+        ));
+        // The second poll probes the same commit, lists the records
+        // again, pays 304s on every page, and reads the log again.
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.push(sweep_rows_step("2026-08-12T00:01:00Z"));
+        for number in 1..=12 {
+            steps.push(sweep_304_step(number));
         }
         steps.push(git_step(
             &repo,
@@ -25863,42 +26000,67 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rig.set_now(before);
         rig.poll(sweep_issues(), Vec::new());
 
-        let fresh = theory_of(&rig);
-        assert_eq!(fresh.calibration, None, "no sweep ran before midnight");
-        assert_eq!(fresh.rungs, [0, 0, 0]);
-        assert_eq!(fresh.events_per_day, 0);
-        assert!(fresh.stale_entries.is_empty());
-
-        rig.set_now(after);
-        rig.poll(sweep_issues(), Vec::new());
-
         let view = theory_of(&rig);
         assert_eq!(
             view.calibration,
             Some(0.7),
             "seven sure hits over ten sure slots"
         );
-        assert_eq!(view.rungs, [2, 5, 3], "two, five, and three ladder labels");
-        assert_eq!(view.events_per_day, 10, "one event block of the last day");
+        assert_eq!(
+            view.rungs,
+            [2, 5, 4],
+            "the ladder labels of the swept records, pull request twelve in"
+        );
+        assert_eq!(
+            view.events_per_day, 12,
+            "one event block of the last day on every swept record"
+        );
         assert_eq!(
             view.stale_entries,
             vec!["INV-9".to_string()],
             "the entry of no hunk in the window"
         );
 
-        let pages = rig
-            .exec
-            .calls()
+        rig.set_now(after);
+        rig.poll(sweep_issues(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(view.calibration, Some(0.7), "the cached pages still count");
+        assert_eq!(view.rungs, [2, 5, 4]);
+        assert_eq!(view.events_per_day, 12);
+        assert_eq!(view.stale_entries, vec!["INV-9".to_string()]);
+
+        let all = rig.exec.calls();
+        let calls: Vec<&Call> = all.iter().filter(|call| call.program == "gh").collect();
+        let lists = calls
+            .iter()
+            .filter(|call| call.argv().iter().any(|arg| arg.contains("state=all")))
+            .count();
+        assert_eq!(lists, 2, "one record list per sweep");
+        let conditional = calls
             .iter()
             .filter(|call| {
-                call.program == "gh"
-                    && call
-                        .argv()
-                        .iter()
-                        .any(|arg| arg.contains("comments?per_page=100"))
+                call.argv()
+                    .iter()
+                    .any(|arg| arg.starts_with("If-None-Match: \"c"))
             })
             .count();
-        assert_eq!(pages, 10, "one comment page of every swept record");
+        assert_eq!(
+            conditional, 12,
+            "the second sweep sends If-None-Match of every cached page"
+        );
+        let pages = calls
+            .iter()
+            .filter(|call| {
+                call.argv()
+                    .iter()
+                    .any(|arg| arg.contains("comments?per_page=100"))
+            })
+            .count();
+        assert_eq!(
+            pages, 24,
+            "one comment page of every swept record per sweep"
+        );
 
         assert_eq!(rig.daemon.cadences.len(), 3, "one schedule of each kind");
         for kind in [
@@ -25920,9 +26082,38 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             assert_eq!(
                 schedule.last_ms,
                 Some(want),
-                "only the daily sweep fired at the midnight"
+                "only the daily sweep fired again on the second day"
             );
         }
+    }
+
+    #[test]
+    fn the_audit_cadence_queues_one_sweep_after_the_sweep_days() {
+        let dir = temp_root();
+        let t0 = 1_000_000_u64;
+        let day = cadence::MS_PER_DAY;
+        // No scripted steps: the missed calls leave every daily sweep
+        // empty and quiet. Only the audit job of the third poll counts.
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+
+        rig.set_now(t0);
+        rig.poll(sweep_issues(), Vec::new());
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/audit-sweep"),
+            "the audit sweep waits for the sweep days"
+        );
+
+        rig.set_now(t0 + 6 * day);
+        rig.poll(sweep_issues(), Vec::new());
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/audit-sweep"),
+            "no audit sweep before the sweep days pass"
+        );
+
+        rig.set_now(t0 + 7 * day + 60_000);
+        rig.poll(sweep_issues(), Vec::new());
+        assert_eq!(rig.job_count(), 1, "one audit sweep after the sweep days");
+        assert_eq!(rig.job(0).task, "borsuk/audit-sweep");
     }
 
     #[test]
