@@ -1,5 +1,6 @@
 //! The theory governor: the operator's model of one repository.
 
+pub mod measure;
 pub mod model;
 pub mod records;
 pub mod skills;

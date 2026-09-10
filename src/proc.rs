@@ -42,6 +42,14 @@ pub struct RunSpec {
     pub env: Vec<(String, String)>,
     /// The log file every raw output line is teed into.
     pub log: PathBuf,
+    /// True when the child starts as the leader of its own process group.
+    ///
+    /// A shell forks for the command it runs, and that grandchild keeps
+    /// the output pipes open after the shell dies. Its own group lets
+    /// [`ProcHandle::kill_group`] reach the whole tree, so a stop ends the
+    /// run instead of leaving it open. An agent runner keeps this false
+    /// and stays in the daemon's group.
+    pub own_group: bool,
 }
 
 /// One asynchronous report from a supervised child.
@@ -194,6 +202,10 @@ fn spawn_with_exec(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if spec.own_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("task {}: failed to start {}", spec.task, spec.program))?;
@@ -430,6 +442,24 @@ impl ProcHandle {
             .with_context(|| format!("task {}: SIGKILL failed", self.task))
     }
 
+    /// Send SIGKILL to the child and to everything the child started.
+    ///
+    /// A child spawned with `own_group` leads its own process group, so
+    /// `kill -KILL -- -<pid>` through the [`Exec`] trait reaches the shell
+    /// and the command the shell forked. The `--` matters: without it
+    /// `kill` reads the negative group as a second signal. The direct kill
+    /// runs first, so a child that leads no group still dies.
+    pub fn kill_group(&self) -> anyhow::Result<()> {
+        self.kill()?;
+        let group = format!("-{}", self.pid);
+        // A group that already ended reports a non-zero status. That is the
+        // outcome the caller wanted, so only a failure to run is an error.
+        self.exec
+            .run("kill", &["-KILL", "--", group.as_str()], None)
+            .with_context(|| format!("task {}: SIGKILL of the group failed", self.task))?;
+        Ok(())
+    }
+
     /// Whether the child is still running.
     fn is_alive(&self) -> anyhow::Result<bool> {
         let mut guard = self.child.lock().unwrap_or_else(PoisonError::into_inner);
@@ -596,6 +626,7 @@ mod tests {
             .chain(args.iter().cloned())
             .collect();
         RunSpec {
+            own_group: false,
             task: task.to_string(),
             cwd: dir.to_path_buf(),
             program: "/bin/sh".to_string(),
