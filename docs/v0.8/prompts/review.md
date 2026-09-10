@@ -45,6 +45,33 @@ this diff touches, and they are empty when the governor is off.
 
 {skills}
 
+# The prediction
+
+The block below holds what the operator predicted this change would touch. It
+reads `none` when the ticket carries no prediction. Compare the prediction
+with what the diff did. Name every area the diff touched that the prediction
+left out. Name every predicted area the diff never reached. Put both in your
+record comment.
+
+{prediction}
+
+End your report with one `<aif-delta-v1>` block when the prediction above is
+not `none`. Put the block last, on its own lines, and never inside a code
+fence. Its body is one JSON object.
+
+<aif-delta-v1>
+{"slots":[{"id":"behaviours","outcome":"hit"},{"id":"states","outcome":"hit"},{"id":"invariants","outcome":"miss"},{"id":"failure-modes","outcome":"hit"},{"id":"other-areas","outcome":"hit"}],"touched":["INV-3"],"violations":[{"entry":"INV-3","finding":"the retry crosses the boundary"}],"question":"Does the cart keep the token?"}
+</aif-delta-v1>
+
+Write one slot per prediction slot. The five slot ids are `behaviours`,
+`states`, `invariants`, `failure-modes`, and `other-areas`. The outcome is
+`hit` when the change stayed inside the entries the slot named, and `miss`
+when the change reached past them. A path that maps to an area the
+prediction left out is a miss on `other-areas`. List in `touched` every model
+entry id the change reached. Add one violation per model rule the change
+broke. Ask the operator one question. A review whose prediction reads `none`
+ends with no block.
+
 # The base worktree
 
 Create the base worktree once, and only when the re-drive below asks for it.

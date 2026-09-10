@@ -132,13 +132,14 @@ pub struct Calibration {
 impl Calibration {
     /// Add the delta blocks of one record.
     ///
-    /// `tags` maps a model entry id to the confidence tag of the slot
-    /// that named it in the record's own full prediction.
+    /// `tags` maps a slot name to the confidence tag of the slot of
+    /// the same name in the record's own full prediction. The tag of
+    /// the map wins; the tag of the block, which the parser reads as
+    /// `unsure` when the block carries none, falls back.
     pub fn add(&mut self, deltas: &[DeltaBlock], tags: &BTreeMap<String, PredictionTag>) {
         for delta in deltas {
             for slot in &delta.slots {
-                let tag = tags.get(&slot.id).copied().or(slot.tag);
-                if tag == Some(PredictionTag::Sure) {
+                if tags.get(&slot.id).copied().unwrap_or(slot.tag) == PredictionTag::Sure {
                     self.sure += 1;
                     if slot.outcome == DeltaOutcome::Hit {
                         self.hits += 1;
@@ -525,7 +526,7 @@ weekday = "{weekday}"
 
     #[test]
     fn calibration_counts_sure_hits_over_sure_slots_and_reads_the_prediction_tags() {
-        let slot = |id: &str, outcome: DeltaOutcome, tag: Option<PredictionTag>| DeltaSlot {
+        let slot = |id: &str, outcome: DeltaOutcome, tag: PredictionTag| DeltaSlot {
             id: id.to_string(),
             outcome,
             tag,
@@ -534,52 +535,41 @@ weekday = "{weekday}"
             slots,
             touched: Vec::new(),
             violations: Vec::new(),
-            question: None,
+            question: String::new(),
         };
-        let seven_of_ten = delta(
-            (0..7)
-                .map(|index| {
-                    slot(
-                        &format!("INV-{index}"),
-                        DeltaOutcome::Hit,
-                        Some(PredictionTag::Sure),
-                    )
-                })
-                .chain((7..10).map(|index| {
-                    slot(
-                        &format!("INV-{index}"),
-                        DeltaOutcome::Miss,
-                        Some(PredictionTag::Sure),
-                    )
-                }))
-                .collect(),
-        );
+        // Three sure hits, one sure miss, and one unsure miss.
+        let block = delta(vec![
+            slot("behaviours", DeltaOutcome::Hit, PredictionTag::Sure),
+            slot("states", DeltaOutcome::Hit, PredictionTag::Sure),
+            slot("invariants", DeltaOutcome::Hit, PredictionTag::Sure),
+            slot("failure-modes", DeltaOutcome::Miss, PredictionTag::Sure),
+            slot("other-areas", DeltaOutcome::Miss, PredictionTag::Unsure),
+        ]);
 
         let mut calibration = Calibration::default();
-        calibration.add(std::slice::from_ref(&seven_of_ten), &BTreeMap::new());
+        calibration.add(std::slice::from_ref(&block), &BTreeMap::new());
         assert_eq!(
             calibration.share(),
-            Some(0.7),
-            "the tagged block counts seven sure hits over ten sure slots"
+            Some(0.75),
+            "the unsure slot counts on neither side"
         );
 
-        // A block with no tags reads each slot tag from the record's own
-        // full prediction, and falls back to the block tag when present.
+        // A slot tag of the block holds only when the record's own full
+        // prediction names no slot of the same id; the tag of the
+        // prediction wins.
         let untagged = delta(vec![
-            slot("INV-3", DeltaOutcome::Hit, None),
-            slot("INV-4", DeltaOutcome::Miss, None),
-            slot("INV-5", DeltaOutcome::Hit, Some(PredictionTag::Sure)),
+            slot("behaviours", DeltaOutcome::Hit, PredictionTag::Unsure),
+            slot("invariants", DeltaOutcome::Miss, PredictionTag::Sure),
         ]);
         let mut tags = BTreeMap::new();
-        tags.insert("INV-3".to_string(), PredictionTag::Sure);
-        tags.insert("INV-5".to_string(), PredictionTag::Unsure);
+        tags.insert("behaviours".to_string(), PredictionTag::Sure);
 
         let mut calibration = Calibration::default();
         calibration.add(&[untagged], &tags);
         assert_eq!(
             calibration.share(),
-            Some(1.0),
-            "the prediction tag wins over the block tag; the slot with no tag anywhere falls out"
+            Some(0.5),
+            "the map tag counts the hit; the block tag counts the miss"
         );
 
         let mut calibration = Calibration::default();

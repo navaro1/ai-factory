@@ -43,7 +43,7 @@ use crate::gates::{
 };
 use crate::gh::{self, GhClient};
 use crate::links::Links;
-use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
+use crate::model::{Issue, ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{self, RESTART_NOTICE, SETUP_BODY};
 #[cfg(test)]
@@ -59,25 +59,28 @@ use crate::runner::{
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
-    Action, AreaView, AskView, HoldView, InputMode, ModelPath, PauseScope, PromptSource,
-    PromptView, Push, RecordView, SettingsOperation, SettingsResult, SettingsResultStatus,
-    StateInput, StateView, SurfaceView, TheoryAction, TheoryView, TicketAction, TicketDetails,
-    TicketProposal, TicketResult, TicketResultKind, MODEL_COMMIT_REQUEST, PREDICTION_REQUEST,
-    SKILL_TICKET_REQUEST,
+    Action, AreaView, AskView, ChatPurpose, DeltaState, DeltaView, HoldView, InputMode, ModelPath,
+    PauseScope, PromptSource, PromptView, Push, RecordView, SettingsOperation, SettingsResult,
+    SettingsResultStatus, StateInput, StateView, SurfaceView, TheoryAction, TheoryView,
+    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind,
+    MODEL_COMMIT_REQUEST, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
 };
-use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
+use crate::state::{ChatKey, DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::theory::blocks;
 use crate::theory::cadence::{self, Schedule, ScheduleKind, SweepStats};
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
-    self, event_block, no_entries, parse_delta_blocks, parse_event_blocks, parse_prediction_blocks,
-    prediction_block, record_labels, skips_prediction_gates, Event, FullPrediction, Prediction,
-    RecordKey, ShortPrediction, TheoryRecords, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
-    MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS, THEORY_FULL_COLOR,
-    THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR,
-    VERIFY_SKILL_LABEL,
+    self, delta_block, event_block, no_entries, parse_delta, parse_delta_blocks,
+    parse_event_blocks, parse_prediction_blocks, prediction_block, record_labels,
+    skips_prediction_gates, slot_outcome, DeltaBlock, DeltaOutcome, Event, FullPrediction,
+    Prediction, PredictionTag, RecordKey, ShortPrediction, TheoryRecords, DELTA_BLOCK,
+    DELTA_OPEN_COLOR, DELTA_OPEN_LABEL, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
+    MODEL_FILE, MODEL_PROPOSAL_BLOCK, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS,
+    THEORY_FULL_COLOR, THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL,
+    VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
@@ -88,6 +91,10 @@ use crate::worktree::{self, Cleanable, WorktreeKind, WorktreeManager, TRAIN_DIR}
 
 /// How many diff lines one teach subject carries at most.
 const TEACH_DIFF_LINES: usize = 400;
+
+/// Why one governed review fails when its report carries no readable
+/// delta block.
+const NO_DELTA_BLOCK: &str = "no delta block";
 
 /// What one run skill ticket creation produced.
 ///
@@ -479,8 +486,8 @@ pub struct Daemon {
     body_checks: BTreeMap<String, String>,
     /// The controller for every issue review and mutation action.
     ticket_controller: TicketController,
-    /// Active issue conversations, keyed by repository and issue number.
-    ticket_conversations: BTreeMap<(String, u64), TicketConversationState>,
+    /// Active conversations, keyed by repository and subject.
+    ticket_conversations: BTreeMap<(String, ChatKey), TicketConversationState>,
     /// The final-text candidate of each active ticket turn.
     ticket_turn_text: BTreeMap<String, TicketTurnText>,
 
@@ -665,7 +672,7 @@ impl Daemon {
             .filter(|conversation| config.repos.contains_key(&conversation.repo))
             .map(|conversation| {
                 (
-                    (conversation.repo.clone(), conversation.number),
+                    (conversation.repo.clone(), conversation.key.clone()),
                     conversation,
                 )
             })
@@ -1604,6 +1611,9 @@ impl Daemon {
                         Prediction::Full(full) => view.full = Some(full),
                     }
                 }
+                if let Some(delta) = parse_delta_blocks(&comment.body).pop() {
+                    view.delta = Some(delta);
+                }
             }
             read.insert(target, view.clone());
             self.theory_blocks.insert(seen.clone(), view);
@@ -1808,6 +1818,7 @@ impl Daemon {
             .filter(|((alias, _), _)| alias == repo)
             .map(|((_, key), blocks)| (key.clone(), blocks.clone()))
             .collect();
+        view.deltas = self.delta_views(repo);
         // The daily sweep joins the view, but only a sweep that ran
         // leaves its numbers here.
         if let Some(stats) = self.theory_sweeps.get(repo) {
@@ -1817,6 +1828,87 @@ impl Daemon {
             view.stale_entries = stats.stale_entries.clone();
         }
         view
+    }
+
+    /// The DELTAS rows of one repository, by pull request number.
+    ///
+    /// Every pull request record whose comments held a delta block
+    /// contributes one row. The row is open while the record still
+    /// carries `delta-open`, and closed once the operator removed it. The
+    /// entries of a missed slot come from the full prediction of the
+    /// tickets the pull request closes, so a miss names what the operator
+    /// predicted; a slot the prediction left empty names itself.
+    fn delta_views(&self, repo: &str) -> Vec<DeltaView> {
+        let mut rows: Vec<DeltaView> = Vec::new();
+        for ((alias, key), blocks) in &self.theory_blocks {
+            if alias != repo {
+                continue;
+            }
+            let (Some(number), Some(delta)) = (pr_key_number(key), blocks.delta.as_ref()) else {
+                continue;
+            };
+            let open = self
+                .theory_records
+                .labels_of(repo, &RecordKey::Pr(number))
+                .iter()
+                .any(|label| label == DELTA_OPEN_LABEL);
+            let predicted = self.predicted_slots(repo, number);
+            let mut row = DeltaView {
+                number,
+                state: if open {
+                    DeltaState::Open
+                } else {
+                    DeltaState::Closed
+                },
+                violations: delta
+                    .violations
+                    .iter()
+                    .map(|one| (one.entry.clone(), one.finding.clone()))
+                    .collect(),
+                question: delta.question.clone(),
+                ..DeltaView::default()
+            };
+            for slot in &delta.slots {
+                let outcome = slot_outcome(slot);
+                match (slot.outcome, slot.tag) {
+                    (DeltaOutcome::Hit, PredictionTag::Sure) => row.hits += 1,
+                    (DeltaOutcome::Hit, PredictionTag::Unsure) => row.unsure += 1,
+                    (DeltaOutcome::Miss, _) => {
+                        let entries = predicted.get(&slot.id).filter(|list| !list.is_empty());
+                        match entries {
+                            Some(entries) => row.misses.extend(
+                                entries.iter().map(|entry| (outcome.clone(), entry.clone())),
+                            ),
+                            None => row.misses.push((outcome, slot.id.clone())),
+                        }
+                    }
+                }
+            }
+            rows.push(row);
+        }
+        rows.sort_by_key(|row| row.number);
+        rows
+    }
+
+    /// The entries of each full prediction slot of the tickets one pull
+    /// request closes.
+    fn predicted_slots(&self, repo: &str, number: u64) -> BTreeMap<String, Vec<String>> {
+        let mut slots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ticket in self.linked_tickets(repo, number) {
+            let Some(full) = self
+                .record_view(repo, ticket)
+                .and_then(|view| view.full.as_ref())
+            else {
+                continue;
+            };
+            for slot in &full.slots {
+                let list = slots.entry(slot.name.clone()).or_default();
+                for entry in &slot.entries {
+                    push_once(list, entry.clone());
+                }
+            }
+        }
+        slots
     }
 
     /// Cancel restored active tasks whose item is absent from the first
@@ -1858,7 +1950,7 @@ impl Daemon {
                     && work.kind == ItemKind::Issue
                     && self
                         .ticket_conversations
-                        .contains_key(&(work.repo.clone(), work.number)))
+                        .contains_key(&(work.repo.clone(), ChatKey::Ticket(work.number))))
             })
             .collect();
         let changed = !ready.is_empty();
@@ -1907,7 +1999,7 @@ impl Daemon {
     fn cancel_item_tasks(&mut self, repo: &str, kind: ItemKind, number: u64) {
         let ticket_conversation = self
             .ticket_conversations
-            .contains_key(&(repo.to_string(), number));
+            .contains_key(&(repo.to_string(), ChatKey::Ticket(number)));
         let ids: Vec<String> = self
             .table
             .active()
@@ -2630,17 +2722,16 @@ impl Daemon {
             let Ok(page) = gh.fetch_comments(&owner, number) else {
                 continue;
             };
-            // The tag of each slot comes from the record's own full
-            // prediction when the delta block carries none.
+            // The tag of each delta slot comes from the slot of the
+            // same name in the record's own full prediction, which the
+            // same comment page holds.
             let mut tags = BTreeMap::new();
             let mut deltas = Vec::new();
             for comment in &page.comments {
                 for block in parse_prediction_blocks(&comment.body) {
                     if let Prediction::Full(full) = block {
                         for slot in full.slots {
-                            for id in slot.entries {
-                                tags.insert(id, slot.tag);
-                            }
+                            tags.insert(slot.name.clone(), slot.tag);
                         }
                     }
                 }
@@ -3521,12 +3612,11 @@ impl Daemon {
             return;
         };
         task.session_id = None;
-        let ticket_chat = task.purpose == TaskPurpose::TicketChat;
-        let ticket_key = (task.repo.clone(), task.number);
+        let conversation_key = Self::conversation_key(task);
         let marker_task = task.clone();
         self.remove_task_session_marker(&marker_task);
-        if ticket_chat {
-            if let Some(conversation) = self.ticket_conversations.get_mut(&ticket_key) {
+        if let Some(key) = conversation_key {
+            if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
                 conversation.session_id = None;
             }
         }
@@ -3592,8 +3682,9 @@ impl Daemon {
                     return;
                 };
                 task.session_id = Some(session_id.clone());
-                let ticket_key = (task.repo.clone(), task.number);
+                let conversation_key = Self::conversation_key(task);
                 let ticket_chat = task.purpose == TaskPurpose::TicketChat;
+                let alias = task.repo.clone();
                 let marker = self
                     .task_cwd(&task_id)
                     .ok_or_else(|| anyhow!("the task has no worktree"))
@@ -3611,12 +3702,14 @@ impl Daemon {
                     }
                     return;
                 }
-                if ticket_chat {
-                    if let Some(conversation) = self.ticket_conversations.get_mut(&ticket_key) {
+                if let Some(key) = conversation_key {
+                    if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
                         conversation.session_id = Some(session_id);
                     }
-                    if let Some(fresh) = self.snapshot.repos.get(&ticket_key.0).cloned() {
-                        self.reconcile_ticket_conversations(&ticket_key.0, &fresh);
+                }
+                if ticket_chat {
+                    if let Some(fresh) = self.snapshot.repos.get(&alias).cloned() {
+                        self.reconcile_ticket_conversations(&alias, &fresh);
                     }
                 }
                 self.changed = true;
@@ -3649,7 +3742,7 @@ impl Daemon {
                     .table
                     .by_id
                     .get(&task_id)
-                    .is_some_and(|task| Self::wants_final_block(task).is_some())
+                    .is_some_and(|task| self.wants_final_block(task).is_some())
                 {
                     let turn = self.ticket_turn_text.entry(task_id).or_default();
                     if proposal_marker_text(&turn.last) {
@@ -4338,7 +4431,7 @@ impl Daemon {
                     if let Push::TicketDetails(details) = push {
                         details.proposal = self
                             .ticket_conversations
-                            .get(&(details.repo.clone(), details.issue.number))
+                            .get(&(details.repo.clone(), ChatKey::Ticket(details.issue.number)))
                             .and_then(|conversation| conversation.proposal.clone());
                     }
                 }
@@ -4423,8 +4516,9 @@ impl Daemon {
                 if proposal_succeeded {
                     if let Some((request, repo, number, proposal_id)) = proposal_apply {
                         let mut cleared = false;
-                        if let Some(conversation) =
-                            self.ticket_conversations.get_mut(&(repo.clone(), number))
+                        if let Some(conversation) = self
+                            .ticket_conversations
+                            .get_mut(&(repo.clone(), ChatKey::Ticket(number)))
                         {
                             if conversation
                                 .proposal
@@ -4802,7 +4896,7 @@ impl Daemon {
         self.policies.remove(alias);
         self.pending_stacked.remove(alias);
         self.restore_repos.remove(alias);
-        let conversations: Vec<(String, u64)> = self
+        let conversations: Vec<(String, ChatKey)> = self
             .ticket_conversations
             .keys()
             .filter(|(repo, _)| repo == alias)
@@ -5291,7 +5385,8 @@ impl Daemon {
                     && !Self::is_ticket_creation(task)
                     && !Self::is_ticket_chat(task)
                     && !Self::is_teach(task)
-                    && !Self::is_audit(task) =>
+                    && !Self::is_audit(task)
+                    && !Self::is_bootstrap(task) =>
             {
                 Workspace::Exclusive(WorktreeKey::Issue(task.number))
             }
@@ -6334,9 +6429,8 @@ impl Daemon {
     /// the criteria and the plan the contract traces to. Every other pull
     /// request keeps the behaviour it had before the governor.
     ///
-    /// The context comes from the first linked ticket. C11 widens the
-    /// check to the rest of its rules and to a pull request that closes
-    /// several tickets.
+    /// The context unions every linked ticket, because one pull request
+    /// can close several and each carries its own criteria and plan.
     fn body_finding(&self, alias: &str, number: u64) -> Option<contract::Finding> {
         let repo_cfg = self.config.repos.get(alias)?.clone();
         if !repo_cfg.theory.governor.is_on() {
@@ -6344,13 +6438,14 @@ impl Daemon {
         }
         let snapshot = self.snapshot.repos.get(alias)?;
         let pull = snapshot.prs.get(&number)?;
-        let ticket = self
-            .links
-            .get(alias)
-            .map(|links| links.tickets_of(number))
-            .unwrap_or_default()
-            .first()
-            .and_then(|ticket| snapshot.issues.get(ticket))?;
+        let tickets: Vec<&Issue> = self
+            .linked_tickets(alias, number)
+            .iter()
+            .filter_map(|ticket| snapshot.issues.get(ticket))
+            .collect();
+        if tickets.is_empty() {
+            return None;
+        }
         let cache = self.theory_models.get(alias)?;
         let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
             return None;
@@ -6385,15 +6480,29 @@ impl Daemon {
                 }
             }
         }
-        let (criteria, _findings) = contract::parse_criteria(&ticket.body);
+        let mut criteria: Vec<contract::Criterion> = Vec::new();
+        let mut owned_paths: Vec<String> = Vec::new();
+        let mut names_dependency = false;
+        for ticket in &tickets {
+            let (parsed, _findings) = contract::parse_criteria(&ticket.body);
+            for criterion in parsed {
+                if !criteria.iter().any(|seen| seen.id == criterion.id) {
+                    criteria.push(criterion);
+                }
+            }
+            for path in contract::owned_paths(&ticket.body) {
+                push_once(&mut owned_paths, path);
+            }
+            names_dependency |= contract::names_dependency(&ticket.body);
+        }
         let ctx = contract::ContractContext {
             criteria,
             features,
             areas,
-            owned_paths: contract::owned_paths(&ticket.body),
+            owned_paths,
             changed_paths,
             manifests: &contract::MANIFESTS,
-            ticket_names_dependency: contract::names_dependency(&ticket.body),
+            ticket_names_dependency: names_dependency,
         };
         records::check_pr(&pull.body, &pull.head_ref, &ctx).err()
     }
@@ -6947,6 +7056,11 @@ impl Daemon {
             } => self.accept_full_prediction(&repo, number, prediction),
             TheoryAction::EditModel { request, repo } => self.edit_model(&request, &repo),
             TheoryAction::CommitModel { repo } => self.commit_model(&repo),
+            TheoryAction::Chat {
+                repo, purpose, key, ..
+            } => match purpose {
+                ChatPurpose::Bootstrap => self.bootstrap_chat(&repo, &key),
+            },
         }
     }
 
@@ -7356,29 +7470,32 @@ impl Daemon {
             }
         };
         let (kind, message) = match self.push_model_worktree(&repo) {
-            Ok(PushOutcome::Nothing) => (
+            Ok(outcome) => (
                 TicketResultKind::Success,
-                format!("the model of {alias} did not change"),
-            ),
-            Ok(PushOutcome::Pushed(Some(number))) => (
-                TicketResultKind::Success,
-                format!("pushed the model of {alias} to the model pull request {number}"),
-            ),
-            Ok(PushOutcome::Pushed(None)) => (
-                TicketResultKind::Success,
-                format!("pushed the model of {alias} to its open model pull request"),
-            ),
-            Ok(PushOutcome::Opened(Some(number))) => (
-                TicketResultKind::Success,
-                format!("opened the model pull request {number} of {alias}"),
-            ),
-            Ok(PushOutcome::Opened(None)) => (
-                TicketResultKind::Success,
-                format!("opened the model pull request of {alias}, number unknown"),
+                Self::model_push_message(alias, outcome),
             ),
             Err(error) => (TicketResultKind::Failure, format!("{error:#}")),
         };
         self.report_model(alias, kind, message);
+    }
+
+    /// What one model push left on GitHub, as one operator sentence.
+    fn model_push_message(alias: &str, outcome: PushOutcome) -> String {
+        match outcome {
+            PushOutcome::Nothing => format!("the model of {alias} did not change"),
+            PushOutcome::Pushed(Some(number)) => {
+                format!("pushed the model of {alias} to the model pull request {number}")
+            }
+            PushOutcome::Pushed(None) => {
+                format!("pushed the model of {alias} to its open model pull request")
+            }
+            PushOutcome::Opened(Some(number)) => {
+                format!("opened the model pull request {number} of {alias}")
+            }
+            PushOutcome::Opened(None) => {
+                format!("opened the model pull request of {alias}, number unknown")
+            }
+        }
     }
 
     /// Run the commit, the push, and the pull request of one model
@@ -7672,6 +7789,42 @@ impl Daemon {
         }
     }
 
+    /// Queue or reuse one bootstrap conversation about one area.
+    ///
+    /// The chat runs in the theory checkout, because the model file lives
+    /// there. Its item is the ticket-session item, so no worktree and no
+    /// pipeline sweep claims it, and the area alone names the subject. An
+    /// ungoverned repository keeps its v0.6 behaviour and writes no model,
+    /// so it starts no chat.
+    fn bootstrap_chat(&mut self, alias: &str, area: &str) {
+        if let Err(reason) = self.governed_repo(alias) {
+            self.report_model(alias, TicketResultKind::Failure, reason);
+            return;
+        }
+        let log = self
+            .state_dir
+            .join("logs")
+            .join(format!("{alias}__bootstrap-{area}.jsonl"));
+        let queued = self
+            .table
+            .upsert_bootstrap_chat(alias, area, log, self.now_ms);
+        match queued {
+            Ok(_) => {
+                self.ticket_conversations
+                    .entry((alias.to_string(), ChatKey::Theory(area.to_string())))
+                    .or_insert_with(|| TicketConversationState {
+                        repo: alias.to_string(),
+                        key: ChatKey::Theory(area.to_string()),
+                        session_id: None,
+                        handoff_active: false,
+                        proposal: None,
+                    });
+                self.changed = true;
+            }
+            Err(error) => eprintln!("the bootstrap chat of {alias}/{area}: {error:#}"),
+        }
+    }
+
     /// Queue or reuse one issue conversation.
     fn ticket_chat(&mut self, repo: &str, number: u64) {
         let handoff_active = self
@@ -7681,10 +7834,10 @@ impl Daemon {
             .and_then(|snapshot| snapshot.issues.get(&number))
             .is_some_and(|issue| issue.labels.iter().any(|label| label == "to-refine"));
         self.ticket_conversations
-            .entry((repo.to_string(), number))
+            .entry((repo.to_string(), ChatKey::Ticket(number)))
             .or_insert_with(|| TicketConversationState {
                 repo: repo.to_string(),
-                number,
+                key: ChatKey::Ticket(number),
                 session_id: None,
                 handoff_active,
                 proposal: None,
@@ -7704,14 +7857,16 @@ impl Daemon {
 
     /// Restore, hand off, or end each conversation after GitHub changes.
     fn reconcile_ticket_conversations(&mut self, repo: &str, fresh: &RepoSnapshot) {
-        let keys: Vec<(String, u64)> = self
+        let keys: Vec<(String, ChatKey)> = self
             .ticket_conversations
             .keys()
-            .filter(|(conversation_repo, _)| conversation_repo == repo)
+            .filter(|(conversation_repo, key)| conversation_repo == repo && key.ticket().is_some())
             .cloned()
             .collect();
         for key in keys {
-            let number = key.1;
+            let Some(number) = key.1.ticket() else {
+                continue;
+            };
             let issue = fresh.issues.get(&number).filter(|issue| issue.open);
             let ended = issue.is_none()
                 || issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "refined"));
@@ -7774,8 +7929,11 @@ impl Daemon {
     }
 
     /// Stop one issue conversation and remove its private state.
-    fn end_ticket_conversation(&mut self, key: &(String, u64)) {
-        let id = tasks::ticket_chat_id(&key.0, key.1);
+    fn end_ticket_conversation(&mut self, key: &(String, ChatKey)) {
+        let Some(number) = key.1.ticket() else {
+            return;
+        };
+        let id = tasks::ticket_chat_id(&key.0, number);
         self.ticket_turn_text.remove(&id);
         if self.table.by_id.contains_key(&id) {
             self.cancel_task(&id, false);
@@ -7790,18 +7948,93 @@ impl Daemon {
     /// Apply the final block of one finished turn, per the task purpose.
     ///
     /// A ticket chat proposes a rewritten ticket. A teach task opens one
-    /// theory event per contradiction it found. Every other purpose drops
-    /// the buffered text.
+    /// theory event per contradiction it found. A governed review opens
+    /// its delta. Every other purpose drops the buffered text.
     fn finish_final_block_turn(&mut self, id: &str) {
         match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
             Some(TaskPurpose::TicketChat) => self.finish_ticket_proposal_turn(id),
+            Some(TaskPurpose::Bootstrap { .. }) => self.finish_model_proposal_turn(id),
             Some(TaskPurpose::Teach(_)) => self.finish_teach_events(id),
             // An audit sweep keeps its text: the sweep reads it at exit.
             Some(TaskPurpose::Audit(_)) => {}
+            Some(TaskPurpose::Pipeline) => self.finish_review_delta(id),
             _ => {
                 self.ticket_turn_text.remove(id);
             }
         }
+    }
+
+    /// Open the delta of one finished review turn.
+    ///
+    /// The scan reads every assistant text event of the turn with the
+    /// ticket-proposal strictness, so one complete block must end the
+    /// report. A governed review that ends without a readable block fails
+    /// the attempt with the finding `no delta block`, and the task
+    /// re-queues while attempts remain. A turn that wrote no assistant
+    /// text at all fails the same way, because it carried no block
+    /// either. Every other pipeline task drops its text. A failed post
+    /// goes to standard error only, because the review itself succeeded.
+    fn finish_review_delta(&mut self, id: &str) {
+        let Some(task) = self.table.by_id.get(id).cloned() else {
+            return;
+        };
+        let turn = self.ticket_turn_text.remove(id).unwrap_or_default();
+        if !self.wants_delta(&task) {
+            return;
+        }
+        let Some(delta) = crate::theory::blocks::parse_block(DELTA_BLOCK, &turn.all)
+            .ok()
+            .as_deref()
+            .and_then(parse_delta)
+        else {
+            self.fail_run(&task, NO_DELTA_BLOCK);
+            return;
+        };
+        let delta = self.tagged_delta(&task, delta);
+        if let Err(error) = self.open_delta(&task.repo, task.number, &delta) {
+            eprintln!("task {id}: cannot open the delta: {error:#}");
+        }
+    }
+
+    /// Copy the confidence tag of each slot in from the full prediction.
+    ///
+    /// The review reports the outcome of a slot, and the prediction owns
+    /// the tag, so a slot a linked ticket predicted takes the tag the
+    /// operator committed to. Every other slot keeps the tag its own
+    /// block body carried, which is `unsure` when the body named none.
+    fn tagged_delta(&self, task: &Task, mut delta: DeltaBlock) -> DeltaBlock {
+        let mut tags: BTreeMap<String, PredictionTag> = BTreeMap::new();
+        for ticket in self.linked_tickets(&task.repo, task.number) {
+            let Some(full) = self
+                .record_view(&task.repo, ticket)
+                .and_then(|view| view.full.as_ref())
+            else {
+                continue;
+            };
+            for slot in &full.slots {
+                tags.entry(slot.name.clone()).or_insert(slot.tag);
+            }
+        }
+        for slot in &mut delta.slots {
+            if let Some(tag) = tags.get(&slot.id) {
+                slot.tag = *tag;
+            }
+        }
+        delta
+    }
+
+    /// Post one delta on the theory record of one pull request and add
+    /// `delta-open`.
+    ///
+    /// The delta ships as one `<aif-delta-v1>` block comment with a JSON
+    /// body, and the label exists afterwards: the daemon creates it when
+    /// the repository has none, then adds it to the record.
+    fn open_delta(&self, alias: &str, number: u64, delta: &DeltaBlock) -> Result<()> {
+        let (owner_repo, record) = self.theory_record(alias, &RecordKey::Pr(number))?;
+        let gh = GhClient::new(&*self.exec);
+        gh.post_comment(&owner_repo, record, &delta_block(delta))?;
+        gh.create_label_if_missing(&owner_repo, DELTA_OPEN_LABEL, DELTA_OPEN_COLOR)?;
+        gh.add_label(&owner_repo, record, DELTA_OPEN_LABEL)
     }
 
     /// Open one theory event per block of one finished teach turn.
@@ -7917,7 +8150,7 @@ impl Daemon {
         else {
             return;
         };
-        let key = (task.repo.clone(), task.number);
+        let key = (task.repo.clone(), ChatKey::Ticket(task.number));
         let Some(issue) = self
             .snapshot
             .repos
@@ -7948,6 +8181,83 @@ impl Daemon {
                 chat_error: self.config.ticket_chat_model().err(),
             }));
         }
+    }
+
+    /// Apply the model proposal of one finished bootstrap turn.
+    ///
+    /// The block carries the entries of one area. The daemon merges them
+    /// into the model file of the model worktree, validates the whole
+    /// merged file, and runs the commit, the push, and the model pull
+    /// request of the C7 path. A merged model that does not parse is
+    /// refused in the chat, so the agent reads the reason and the entry id
+    /// it must fix, and nothing is committed.
+    fn finish_model_proposal_turn(&mut self, id: &str) {
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        if turn.earlier_marker {
+            return;
+        }
+        let Some(task) = self
+            .table
+            .by_id
+            .get(id)
+            .filter(|task| Self::is_bootstrap(task))
+            .cloned()
+        else {
+            return;
+        };
+        let Ok(body) = blocks::parse_block(MODEL_PROPOSAL_BLOCK, &turn.last) else {
+            return;
+        };
+        let proposal: Model = match serde_json::from_str(&body) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                self.refuse_model_proposal(
+                    &task.repo,
+                    id,
+                    &format!("the block is not one model proposal ({error})"),
+                );
+                return;
+            }
+        };
+        if proposal.entries.is_empty() {
+            self.refuse_model_proposal(&task.repo, id, "the proposal carries no entry");
+            return;
+        }
+        match self.apply_model_proposal(&task.repo, &proposal.entries) {
+            Ok(message) => self.report_model(&task.repo, TicketResultKind::Success, message),
+            Err(reason) => self.refuse_model_proposal(&task.repo, id, &reason),
+        }
+    }
+
+    /// Merge `entries` into the model file and open the model pull request.
+    ///
+    /// The base is the model file of the model worktree, which sits on the
+    /// open model branch, so a second area joins the first instead of
+    /// replacing it. The merged text is validated before it is written,
+    /// which is where a duplicate entry id is caught.
+    fn apply_model_proposal(&mut self, alias: &str, entries: &[Entry]) -> Result<String, String> {
+        let repo = self.governed_repo(alias)?;
+        let worktree = self
+            .prepare_model_worktree(&repo)
+            .map_err(|error| format!("{error:#}"))?;
+        let file = worktree.join(MODEL_FILE);
+        let base = fs::read_to_string(&file)
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        let merged = format!("{}\n\n{}", base.trim_end(), model::render(entries));
+        model::parse(&merged).map_err(|error| format!("{MODEL_FILE}: {error}"))?;
+        fs::write(&file, &merged)
+            .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+        self.push_model_worktree(&repo)
+            .map(|outcome| Self::model_push_message(alias, outcome))
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Tell the chat and the operator why one proposal wrote no model.
+    fn refuse_model_proposal(&mut self, alias: &str, id: &str, reason: &str) {
+        self.chat(id, &format!("AIF refused the model proposal. {reason}"));
+        self.report_model(alias, TicketResultKind::Failure, reason.to_string());
     }
 
     /// Force an early poll of one repository, or of all of them.
@@ -8070,6 +8380,7 @@ impl Daemon {
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
         Some(match self.workspace(task) {
+            Workspace::Shared if Self::is_bootstrap(task) => repo.theory.checkout(&repo.path),
             Workspace::Shared => repo.path.clone(),
             Workspace::Exclusive(WorktreeKey::Issue(number)) => {
                 self.worktrees.issue_path(repo, number)
@@ -8097,6 +8408,25 @@ impl Daemon {
         task.purpose == TaskPurpose::TicketChat
     }
 
+    /// True when the task writes the model of one area with the operator.
+    fn is_bootstrap(task: &Task) -> bool {
+        matches!(task.purpose, TaskPurpose::Bootstrap { .. })
+    }
+
+    /// The conversation one task belongs to, or `None`.
+    ///
+    /// A conversation survives a restart, so the daemon records the session
+    /// identity of every conversation task under this key.
+    fn conversation_key(task: &Task) -> Option<(String, ChatKey)> {
+        match &task.purpose {
+            TaskPurpose::TicketChat => Some((task.repo.clone(), ChatKey::Ticket(task.number))),
+            TaskPurpose::Bootstrap { area } => {
+                Some((task.repo.clone(), ChatKey::Theory(area.clone())))
+            }
+            _ => None,
+        }
+    }
+
     /// True when the task explains one subject to the operator.
     fn is_teach(task: &Task) -> bool {
         matches!(task.purpose, TaskPurpose::Teach(_))
@@ -8113,12 +8443,35 @@ impl Daemon {
     /// the blocks of the turn back. Only the presence of a tag is read
     /// today, because each purpose parses its own blocks; the tag itself
     /// is here for the later chunks that select a parser by it.
-    fn wants_final_block(task: &Task) -> Option<&'static str> {
+    fn wants_final_block(&self, task: &Task) -> Option<&'static str> {
         match task.purpose {
             TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
             TaskPurpose::Teach(_) | TaskPurpose::Audit(_) => Some(EVENT_BLOCK),
-            TaskPurpose::Pipeline | TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
+            TaskPurpose::Bootstrap { .. } => Some(MODEL_PROPOSAL_BLOCK),
+            TaskPurpose::Pipeline => self.wants_delta(task).then_some(DELTA_BLOCK),
+            TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
         }
+    }
+
+    /// True when one review must end its report with a delta block.
+    ///
+    /// The review of a governed pull request takes the delta when a
+    /// ticket the pull request closes carries `theory-full`. A pull
+    /// request with no linked ticket, and every ungoverned repository,
+    /// takes none.
+    fn wants_delta(&self, task: &Task) -> bool {
+        task.purpose == TaskPurpose::Pipeline
+            && task.stage == Stage::Review
+            && self.theory_records.is_governed(&task.repo)
+            && self
+                .linked_tickets(&task.repo, task.number)
+                .into_iter()
+                .any(|ticket| {
+                    self.theory_records
+                        .labels_of(&task.repo, &RecordKey::Issue(ticket))
+                        .iter()
+                        .any(|label| label == THEORY_FULL_LABEL)
+                })
     }
 
     /// Select the execution role for one task purpose.
@@ -8131,6 +8484,8 @@ impl Daemon {
             ExecutionRole::TheoryChat
         } else if Self::is_audit(task) {
             ExecutionRole::TheoryAudit
+        } else if Self::is_bootstrap(task) {
+            ExecutionRole::TheoryChat
         } else {
             match task.stage {
                 Stage::Refine => ExecutionRole::Refine,
@@ -8230,11 +8585,19 @@ impl Daemon {
             return Ok(binding.role.clone());
         }
         let binding = self.current_task_role(task)?;
+        // The model commit is the theory checkout commit the cache was
+        // read at. An ungoverned repository holds no cache, so the
+        // binding keeps `None` and v0.6 behaviour holds.
+        let model_commit = self
+            .theory_models
+            .get(&task.repo)
+            .map(|cache| cache.commit.clone())
+            .filter(|commit| !commit.is_empty());
         self.role_bindings.insert(
             task.id.clone(),
             TaskBinding {
                 role: binding.clone(),
-                model_commit: None,
+                model_commit,
             },
         );
         let state = self.collect_state();
@@ -8359,6 +8722,15 @@ impl Daemon {
             let values = self.audit_values(task, worktree);
             return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
         }
+        if let TaskPurpose::Bootstrap { area } = &task.purpose {
+            let values = vec![
+                ("repo", task.repo.clone()),
+                ("worktree", worktree.display().to_string()),
+                ("area", area.clone()),
+                ("model", self.model_entries(&task.repo)),
+            ];
+            return prompts::fill_template(prompts::BOOTSTRAP_PROMPT, &values);
+        }
         let role = Self::execution_role(task);
         let (name, builtin) = prompts::file_name(role)
             .zip(prompts::builtin(role))
@@ -8461,13 +8833,10 @@ impl Daemon {
         };
         // The theory placeholders render only for a governed repository;
         // with the governor off v0.6 behaviour holds and no git call runs.
-        let (model_text, skills_text) = if repo_cfg.theory.governor.is_on() {
-            (
-                self.model_entries(&task.repo),
-                self.skills_slice(task, &repo_cfg.path, worktree),
-            )
+        let (model_text, prediction_text, skills_text) = if repo_cfg.theory.governor.is_on() {
+            self.theory_values(task, &repo_cfg.path, worktree)
         } else {
-            (String::new(), String::new())
+            (String::new(), String::new(), String::new())
         };
         Ok(vec![
             ("repo", task.repo.clone()),
@@ -8481,8 +8850,8 @@ impl Daemon {
             ("pr_numbers", pr_numbers),
             ("pr_count", pr_count),
             ("model", model_text),
-            // Predictions do not exist yet; the later chunks fill these.
-            ("prediction", String::new()),
+            ("prediction", prediction_text),
+            // The comparison arrives with the delta of C12.
             ("comparison", String::new()),
             ("skills", skills_text),
             ("rules", String::new()),
@@ -8496,36 +8865,193 @@ impl Daemon {
         self.theory_models
             .get(repo)
             .and_then(|cache| cache.model.as_ref().ok())
-            .map(|model| {
-                model
-                    .entries
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "- {} ({}): {}",
-                            entry.id(),
-                            entry.kind_name(),
-                            entry.statement()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
+            .map(entry_lines)
             .unwrap_or_default()
+    }
+
+    /// The `{model}`, `{prediction}`, and `{skills}` values of one task.
+    ///
+    /// One area set feeds the model slice and the skills slice, so both
+    /// blocks of one prompt describe the same areas. A record with no
+    /// prediction keeps the whole model and every area, so a `verify-skill`
+    /// ticket still gets a slice.
+    fn theory_values(
+        &self,
+        task: &Task,
+        repo_path: &Path,
+        worktree: &Path,
+    ) -> (String, String, String) {
+        let names = self.slice_areas(task, repo_path, worktree);
+        let verify = self
+            .theory_models
+            .get(&task.repo)
+            .and_then(|cache| cache.verify.as_ref().ok());
+        let boundaries = names
+            .model
+            .as_ref()
+            .zip(verify)
+            .map(|(names, verify)| resolve_areas(names, verify).1);
+        let areas = names
+            .skills
+            .as_ref()
+            .zip(verify)
+            .map(|(names, verify)| resolve_areas(names, verify).0);
+        (
+            self.model_slice(&task.repo, boundaries.as_deref()),
+            self.prediction_text(task),
+            self.skills_slice(task, areas.as_deref()),
+        )
+    }
+
+    /// The area names the two slices of one stage prompt take.
+    ///
+    /// Refine takes the short prediction's areas for both. Implement
+    /// takes the full prediction's areas for both. Review parts the two:
+    /// the skills slice takes the areas of
+    /// `git diff --name-only <base>...<head>` alone, because requirement
+    /// R9 of v0.8 binds the run skills to what the diff touched, and the
+    /// model slice adds the areas every linked ticket predicted. A review
+    /// whose diff matches no boundary and whose tickets predicted nothing
+    /// leaves the model whole, the way v0.8 rendered it. A name is an
+    /// area of `theory/verify.toml` or a boundary of the model, as a
+    /// prediction writes it.
+    fn slice_areas(&self, task: &Task, repo_path: &Path, worktree: &Path) -> SliceAreas {
+        let Some(cache) = self.theory_models.get(&task.repo) else {
+            return SliceAreas::whole();
+        };
+        let (Ok(model), Ok(verify)) = (&cache.model, &cache.verify) else {
+            return SliceAreas::whole();
+        };
+        match task.stage {
+            Stage::Refine => match self
+                .record_view(&task.repo, task.number)
+                .and_then(|view| view.short.as_ref())
+            {
+                Some(short) => SliceAreas::shared(short.areas.clone()),
+                None => SliceAreas::whole(),
+            },
+            Stage::Implement => match self.record_view(&task.repo, task.number) {
+                Some(view) if view.short.is_some() || view.full.is_some() => {
+                    SliceAreas::shared(predicted_areas(view))
+                }
+                _ => SliceAreas::whole(),
+            },
+            Stage::Review => {
+                let mut union: Vec<String> = Vec::new();
+                for ticket in self.linked_tickets(&task.repo, task.number) {
+                    if let Some(view) = self.record_view(&task.repo, ticket) {
+                        for name in predicted_areas(view) {
+                            push_once(&mut union, name);
+                        }
+                    }
+                }
+                let paths = self.diff_paths(repo_path, worktree);
+                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                let touched: Vec<String> = verify
+                    .areas_for_paths(model, &refs)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                for area in &touched {
+                    push_once(&mut union, area.clone());
+                }
+                SliceAreas {
+                    model: (!union.is_empty()).then_some(union),
+                    skills: Some(touched),
+                }
+            }
+            Stage::Release => SliceAreas::whole(),
+        }
+    }
+
+    /// The theory record blocks of one ticket, when the daemon read them.
+    fn record_view(&self, alias: &str, ticket: u64) -> Option<&RecordView> {
+        self.theory_blocks
+            .get(&(alias.to_string(), RecordKey::Issue(ticket).key_text()))
+    }
+
+    /// The tickets one pull request closes.
+    fn linked_tickets(&self, alias: &str, number: u64) -> Vec<u64> {
+        self.links
+            .get(alias)
+            .map(|links| links.tickets_of(number))
+            .unwrap_or_default()
+    }
+
+    /// The `{model}` value of one task: the cached entries as prompt
+    /// lines, cut to the slice of `boundaries` when the record predicted
+    /// some.
+    fn model_slice(&self, repo: &str, boundaries: Option<&[String]>) -> String {
+        let Some(model) = self
+            .theory_models
+            .get(repo)
+            .and_then(|cache| cache.model.as_ref().ok())
+        else {
+            return String::new();
+        };
+        match boundaries {
+            None => entry_lines(model),
+            Some(names) => {
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                entry_lines(&model.slice(&refs))
+            }
+        }
+    }
+
+    /// The `{prediction}` value of one review task.
+    ///
+    /// Each ticket the pull request closes contributes one block: the
+    /// short claim with its areas, then the five slots of the full
+    /// prediction with their tags. A run with no prediction at all reads
+    /// `none`, and every other stage renders empty.
+    fn prediction_text(&self, task: &Task) -> String {
+        if task.stage != Stage::Review {
+            return String::new();
+        }
+        let mut blocks: Vec<String> = Vec::new();
+        for ticket in self.linked_tickets(&task.repo, task.number) {
+            let Some(view) = self.record_view(&task.repo, ticket) else {
+                continue;
+            };
+            let mut lines = vec![format!("ticket #{ticket}")];
+            if let Some(short) = &view.short {
+                lines.push(format!("short: {}", short.text));
+                lines.push(format!("areas: {}", name_list(&short.areas)));
+            }
+            if let Some(full) = &view.full {
+                for slot in &full.slots {
+                    lines.push(format!(
+                        "{} ({}): {}",
+                        slot.name,
+                        slot.tag.name(),
+                        name_list(&slot.entries)
+                    ));
+                }
+            }
+            if lines.len() > 1 {
+                blocks.push(lines.join("\n"));
+            }
+        }
+        if blocks.is_empty() {
+            return "none".to_string();
+        }
+        blocks.join("\n\n")
     }
 
     /// The `{skills}` value of one task: the slice of requirement R9 over
     /// the areas the stage names.
     ///
-    /// Refine and implement slice over every area of `verify.toml`,
-    /// because predictions do not exist yet. Review slices over the areas
-    /// of the PR diff. A repository whose theory did not read renders an
-    /// empty block.
-    fn skills_slice(&self, task: &Task, repo_path: &Path, worktree: &Path) -> String {
+    /// The areas come from [`Daemon::slice_areas`]. A record with no
+    /// prediction slices over every area of `verify.toml`, and a
+    /// repository whose theory did not read renders an empty block.
+    fn skills_slice(&self, task: &Task, areas: Option<&[String]>) -> String {
         let Some(cache) = self.theory_models.get(&task.repo) else {
             return String::new();
         };
-        let (Ok(model), Ok(verify)) = (&cache.model, &cache.verify) else {
+        if cache.model.is_err() {
+            return String::new();
+        }
+        let Ok(verify) = &cache.verify else {
             return String::new();
         };
         let Some(skills) = self.theory_skills.get(&task.repo) else {
@@ -8534,13 +9060,9 @@ impl Daemon {
         let Ok(set) = &skills.skills else {
             return String::new();
         };
-        let areas: Vec<&str> = match task.stage {
-            Stage::Review => {
-                let paths = self.diff_paths(repo_path, worktree);
-                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-                verify.areas_for_paths(model, &refs)
-            }
-            _ => verify.areas.iter().map(|area| area.id.as_str()).collect(),
+        let areas: Vec<&str> = match areas {
+            Some(names) => names.iter().map(String::as_str).collect(),
+            None => verify.areas.iter().map(|area| area.id.as_str()).collect(),
         };
         let stage = match task.stage {
             Stage::Refine => skills::SliceStage::Refine {
@@ -8967,6 +9489,122 @@ impl Daemon {
     }
 }
 
+/// The area names the model slice and the skills slice of one prompt take.
+///
+/// A `None` field is the v0.8 fallback: the whole model for `model`, and
+/// every area of the verification map for `skills`.
+struct SliceAreas {
+    /// The names the `{model}` slice takes.
+    model: Option<Vec<String>>,
+    /// The names the `{skills}` slice takes.
+    skills: Option<Vec<String>>,
+}
+
+impl SliceAreas {
+    /// The whole model and every area, for a record with no prediction.
+    fn whole() -> Self {
+        Self {
+            model: None,
+            skills: None,
+        }
+    }
+
+    /// One name list for both slices.
+    fn shared(names: Vec<String>) -> Self {
+        Self {
+            model: Some(names.clone()),
+            skills: Some(names),
+        }
+    }
+}
+
+/// The entries of one model as prompt lines.
+fn entry_lines(model: &Model) -> String {
+    model
+        .entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "- {} ({}): {}",
+                entry.id(),
+                entry.kind_name(),
+                entry.statement()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The area names one record predicts.
+///
+/// The short prediction names the areas the change touches, and the
+/// `other-areas` slot of the full prediction names the areas it can also
+/// reach. Their union is the full prediction's areas, and a record with
+/// no full prediction leaves the short prediction's areas alone.
+fn predicted_areas(view: &RecordView) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for short in view.short.iter() {
+        for area in &short.areas {
+            push_once(&mut names, area.clone());
+        }
+    }
+    for slot in view.full.iter().flat_map(|full| full.slots.iter()) {
+        if slot.name == PREDICTION_OTHER_AREAS {
+            for area in &slot.entries {
+                push_once(&mut names, area.clone());
+            }
+        }
+    }
+    names
+}
+
+/// The verification areas and the model boundaries a set of predicted
+/// names covers, each list in first-sight order and without a repeat.
+///
+/// A name is an area of `theory/verify.toml` or a boundary of the model.
+/// An area name carries its boundary, and a boundary name carries every
+/// area that guards it.
+fn resolve_areas(names: &[String], verify: &VerifyMap) -> (Vec<String>, Vec<String>) {
+    let mut areas: Vec<String> = Vec::new();
+    let mut boundaries: Vec<String> = Vec::new();
+    for name in names {
+        match verify.areas.iter().find(|area| &area.id == name) {
+            Some(area) => {
+                push_once(&mut areas, area.id.clone());
+                push_once(&mut boundaries, area.boundary.clone());
+            }
+            None => {
+                push_once(&mut boundaries, name.clone());
+                for area in verify.areas.iter().filter(|area| &area.boundary == name) {
+                    push_once(&mut areas, area.id.clone());
+                }
+            }
+        }
+    }
+    (areas, boundaries)
+}
+
+/// Append one value when the list does not carry it yet.
+fn push_once(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// One comma list, or `none` for an empty one.
+fn name_list(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names.join(", ")
+}
+
+/// The pull request number of one record key, `None` for every other
+/// key. [`RecordKey::key_text`] writes a pull request key as `pr-<n>`.
+fn pr_key_number(key: &str) -> Option<u64> {
+    key.strip_prefix("pr-")?.parse().ok()
+}
+
 /// The task id of one run event.
 fn event_task(event: &RunEvent) -> &str {
     match event {
@@ -9134,12 +9772,15 @@ mod tests {
         ExecutionRole, Governor, Harness, RoleOverride, RoleSettings, StageConfig,
     };
     use crate::exec::{Call, CmdOut, ScriptExec};
-    use crate::model::{Issue, Pr, RepoSnapshot};
+    use crate::model::{Pr, RepoSnapshot};
     use crate::prompts::{
         scan_placeholders, IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT,
     };
     use crate::tasks::MAX_ATTEMPTS;
-    use crate::theory::records::{parse_event_blocks, THEORY_FULL_LABEL, THEORY_SHORT_LABEL};
+    use crate::theory::records::{
+        parse_event_blocks, DeltaSlot, DeltaViolation, PredictionSlot, PredictionTag,
+        THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
+    };
     use crate::theory::verify::Tier;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10646,7 +11287,7 @@ mod tests {
             number: 7,
         }));
         rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
-        let key = ("borsuk".to_string(), 7);
+        let key = ("borsuk".to_string(), ChatKey::Ticket(7));
         let conversation = |rig: &Rig| rig.daemon.ticket_conversations[&key].session_id.clone();
         let checkout = rig.repo.clone();
         let marker = |rig: &Rig| {
@@ -14668,6 +15309,351 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // The bootstrap chat
+    // ------------------------------------------------------------------
+
+    /// One boundary entry and one invariant entry, as the agent proposes
+    /// them.
+    const TWO_ENTRIES: &str = concat!(
+        r#"[{"kind":"boundary","id":"B-gh","title":"The gh boundary","#,
+        r#""statement":"Every call leaves through one client.","#,
+        r#""sides":["daemon","github"],"paths":["src/gh.rs"]},"#,
+        r#"{"kind":"invariant","id":"I-one-client","title":"One client","#,
+        r#""statement":"No other module runs gh.","constrains":["B-gh"]}]"#
+    );
+
+    /// One state entry and one failure entry, as a second turn proposes
+    /// them.
+    const TWO_MORE_ENTRIES: &str = concat!(
+        r#"[{"kind":"state","id":"S-open","title":"Open","#,
+        r#""statement":"The client holds one token."},"#,
+        r#"{"kind":"failure","id":"F-timeout","title":"Timeout","#,
+        r#""statement":"The call never answers.","crosses":"B-gh"}]"#
+    );
+
+    /// One model proposal block that carries `entries`.
+    fn model_proposal(entries: &str) -> String {
+        format!(
+            "{}\n{{\"entries\":{entries}}}\n</aif-model-proposal-v1>",
+            MODEL_PROPOSAL_BLOCK
+        )
+    }
+
+    /// Start the bootstrap chat of the `gh` area on `rig`.
+    fn start_bootstrap(rig: &mut Rig) {
+        rig.act(Action::Theory(TheoryAction::Chat {
+            request: "chat-gh".to_string(),
+            repo: "borsuk".to_string(),
+            purpose: ChatPurpose::Bootstrap,
+            key: "gh".to_string(),
+        }));
+    }
+
+    /// The entry ids of the model file in the model worktree.
+    fn model_ids(dir: &Path) -> Vec<String> {
+        let text = fs::read_to_string(model_wt(dir).join("theory/model.toml"))
+            .expect("the model worktree holds a model file");
+        model::parse(&text)
+            .expect("the merged model validates")
+            .entries
+            .iter()
+            .map(|entry| entry.id().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_bootstrap_key_starts_one_theory_chat_task_of_the_area() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+
+        start_bootstrap(&mut rig);
+
+        let task = rig.task("borsuk/bootstrap-gh");
+        assert_eq!(
+            task.purpose,
+            TaskPurpose::Bootstrap {
+                area: "gh".to_string()
+            }
+        );
+        assert_eq!(Daemon::execution_role(&task), ExecutionRole::TheoryChat);
+        let roles = rig.roles.lock().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, ExecutionRole::TheoryChat);
+        drop(roles);
+        let jobs = rig.jobs.lock().unwrap();
+        assert_eq!(jobs[0].task, "borsuk/bootstrap-gh");
+        assert!(
+            jobs[0].prompt.contains("the area gh"),
+            "the prompt names the area: {}",
+            jobs[0].prompt
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_proposal_writes_the_model_and_opens_the_labelled_pull_request() {
+        let dir = temp_root();
+        let steps: Vec<Step> = vec![model_derive_step("acme/borsuk", "[]")]
+            .into_iter()
+            .chain(fresh_model_steps(&dir, &rig_repo(&dir)))
+            .chain(model_commit_steps(&dir, "acme/borsuk", "[]"))
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        start_bootstrap(&mut rig);
+        rig.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+
+        assert_eq!(model_ids(&dir), vec!["B-gh", "I-one-client"]);
+        let calls = rig.exec.calls();
+        let order: Vec<String> = calls
+            .iter()
+            .filter_map(|call| match call.program.as_str() {
+                "git" if call.args.iter().any(|arg| arg == "commit") => Some("commit".to_string()),
+                "git" if call.args.iter().any(|arg| arg == "push") => Some("push".to_string()),
+                "gh" if call.args.first().is_some_and(|arg| arg == "pr")
+                    && call.args.get(1).is_some_and(|arg| arg == "create") =>
+                {
+                    Some("pr create".to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["commit", "push", "pr create"]);
+        let create = calls
+            .iter()
+            .find(|call| call.program == "gh" && call.args.get(1).is_some_and(|a| a == "create"))
+            .expect("the proposal opens one pull request");
+        assert_eq!(create.argv().last().copied(), Some(MODEL_PR_LABEL));
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the proposal must push a Push::TicketResult");
+        };
+        assert_eq!(result.kind, TicketResultKind::Success);
+        assert_eq!(result.message, "opened the model pull request 12 of borsuk");
+    }
+
+    #[test]
+    fn a_second_bootstrap_proposal_adds_its_entries_to_the_open_model_branch() {
+        let dir = temp_root();
+        let worktree = model_wt(&dir);
+        // The second turn finds the worktree of the first on the open
+        // model branch, so it reuses it and pushes to the same request.
+        let second_turn: Vec<Step> = vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":12,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(
+                &rig_repo(&dir),
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(format!("worktree {}\n", worktree.display())),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(&dir)),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(&worktree, &["add", "theory/model.toml"], CmdOut::ok("")),
+            git_step(&worktree, &["diff", "--cached", "--quiet"], refused()),
+            git_step(
+                &worktree,
+                &["commit", "-m", "Update the model"],
+                CmdOut::ok(""),
+            ),
+            git_step(
+                &worktree,
+                &["push", "-u", "origin", RIG_MODEL_BRANCH],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    "acme/borsuk",
+                    "--head",
+                    RIG_MODEL_BRANCH,
+                    "--json",
+                    "number",
+                ],
+                CmdOut::ok("[{\"number\":12}]"),
+            ),
+        ];
+        let steps: Vec<Step> = vec![model_derive_step("acme/borsuk", "[]")]
+            .into_iter()
+            .chain(fresh_model_steps(&dir, &rig_repo(&dir)))
+            .chain(model_commit_steps(&dir, "acme/borsuk", "[]"))
+            .chain(second_turn)
+            .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+        start_bootstrap(&mut rig);
+        rig.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+        assert_eq!(model_ids(&dir), vec!["B-gh", "I-one-client"]);
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_MORE_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+
+        assert_eq!(
+            model_ids(&dir),
+            vec!["B-gh", "I-one-client", "S-open", "F-timeout"],
+            "the second turn adds to the first, it does not replace it"
+        );
+        let creates = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh" && call.args.get(1).is_some_and(|a| a == "create"))
+            .count();
+        assert_eq!(creates, 1, "the open model pull request takes both turns");
+        let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|push| match push {
+                Push::TicketResult(result) => Some(result.message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "opened the model pull request 12 of borsuk".to_string(),
+                "pushed the model of borsuk to the model pull request 12".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_proposal_that_repeats_an_id_is_refused_in_the_chat() {
+        let dir = temp_root();
+        let worktree = model_wt(&dir);
+        fs::create_dir_all(worktree.join("theory")).unwrap();
+        let file = worktree.join("theory/model.toml");
+        let held = "[[entry]]\nkind = \"state\"\nid = \"B-gh\"\n\
+                    title = \"Held\"\nstatement = \"The model already holds it.\"\n";
+        fs::write(&file, held).unwrap();
+        let steps = vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":9,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(
+                &rig_repo(&dir),
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(format!("worktree {}\n", worktree.display())),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(&dir)),
+        ];
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        start_bootstrap(&mut rig);
+        let session = rig.session(0);
+        rig.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+
+        rig.event(RunEvent::Text {
+            task: "borsuk/bootstrap-gh".to_string(),
+            text: model_proposal(TWO_ENTRIES),
+        });
+        rig.event(turn_ended("borsuk/bootstrap-gh"));
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            held,
+            "a refused proposal writes no model"
+        );
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "commit")),
+            "a refused proposal commits nothing"
+        );
+        let sends = session.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1, "the refusal reaches the chat: {sends:?}");
+        assert!(
+            sends[0].contains("B-gh") && sends[0].contains("duplicate entry id"),
+            "the refusal names the id: {}",
+            sends[0]
+        );
+    }
+
+    #[test]
+    fn a_restart_resumes_the_bootstrap_chat_under_its_theory_key() {
+        let dir = temp_root();
+        {
+            let mut first = Rig::make_in(dir.clone(), Vec::new(), governed);
+            start_bootstrap(&mut first);
+            first.event(started("borsuk/bootstrap-gh", "session-bootstrap-gh"));
+            assert_eq!(
+                first.daemon.ticket_conversations
+                    [&("borsuk".to_string(), ChatKey::Theory("gh".to_string()))]
+                    .session_id
+                    .as_deref(),
+                Some("session-bootstrap-gh")
+            );
+        }
+
+        let mut second = Rig::make_in(dir, Vec::new(), governed);
+
+        assert_eq!(
+            second.daemon.ticket_conversations
+                [&("borsuk".to_string(), ChatKey::Theory("gh".to_string()))]
+                .session_id
+                .as_deref(),
+            Some("session-bootstrap-gh"),
+            "the theory key survives the restart"
+        );
+        second.poll(Vec::new(), Vec::new());
+
+        assert_eq!(second.job_count(), 1);
+        let resumed = second.job(0);
+        assert_eq!(resumed.task, "borsuk/bootstrap-gh");
+        assert_eq!(resumed.resume.as_deref(), Some("session-bootstrap-gh"));
+    }
+
+    #[test]
+    fn an_ungoverned_repository_starts_no_bootstrap_chat() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), |_| {});
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        start_bootstrap(&mut rig);
+
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/bootstrap-gh"));
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("a refused chat must push a Push::TicketResult");
+        };
+        assert_eq!(result.message, "the governor of borsuk is off");
+    }
+
     /// The `gh issue list` search of one shadow theory repository.
     fn shadow_search_step(title: &str, out: CmdOut) -> Step {
         let search = format!("{title} in:title");
@@ -16593,7 +17579,7 @@ mod tests {
         assert!(!rig
             .daemon
             .ticket_conversations
-            .contains_key(&("borsuk".to_string(), 7)));
+            .contains_key(&("borsuk".to_string(), ChatKey::Ticket(7))));
         assert_eq!(
             rig.daemon.ticket_controller.last_mutation_ms("borsuk"),
             None
@@ -17124,7 +18110,10 @@ mod tests {
         rig.event(started("borsuk/ticket-i7", "session-ticket-7"));
 
         assert_eq!(session.sends.lock().unwrap().len(), 1);
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .handoff_active
+        );
     }
 
     #[test]
@@ -17184,7 +18173,10 @@ mod tests {
             1,
             "the active refine never blocks the handoff"
         );
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)].handoff_active);
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .handoff_active
+        );
     }
 
     #[test]
@@ -17287,7 +18279,7 @@ mod tests {
         });
         rig.event(turn_ended("borsuk/ticket-i7"));
 
-        let proposal = rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+        let proposal = rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
             .proposal
             .as_ref()
             .unwrap();
@@ -17311,7 +18303,7 @@ mod tests {
         });
         rig.event(turn_ended("borsuk/ticket-i7"));
         assert_eq!(
-            rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
                 .proposal
                 .as_ref()
                 .unwrap()
@@ -17334,7 +18326,7 @@ mod tests {
         });
         rig.event(turn_ended("borsuk/ticket-i7"));
         assert_eq!(
-            rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
                 .proposal
                 .as_ref()
                 .unwrap()
@@ -17489,7 +18481,7 @@ mod tests {
         let session = rig.session(0);
         rig.daemon
             .ticket_conversations
-            .get_mut(&("borsuk".to_string(), 7))
+            .get_mut(&("borsuk".to_string(), ChatKey::Ticket(7)))
             .unwrap()
             .proposal = Some(TicketProposal {
             id: "proposal-7".to_string(),
@@ -17519,9 +18511,11 @@ mod tests {
         let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
         assert_eq!(confirmed.title, "Proposed title");
         assert_eq!(confirmed.labels, vec!["ui".to_string()]);
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
-            .proposal
-            .is_none());
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .proposal
+                .is_none()
+        );
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 1);
         assert!(sends[0].contains("proposal"));
@@ -17622,7 +18616,7 @@ mod tests {
         session.fail_send.store(true, Ordering::SeqCst);
         rig.daemon
             .ticket_conversations
-            .get_mut(&("borsuk".to_string(), 7))
+            .get_mut(&("borsuk".to_string(), ChatKey::Ticket(7)))
             .unwrap()
             .proposal = Some(TicketProposal {
             id: "proposal-7".to_string(),
@@ -17654,9 +18648,11 @@ mod tests {
 
         let confirmed = &rig.daemon.snapshot.repos["borsuk"].issues[&7];
         assert_eq!(confirmed.title, "Proposed title");
-        assert!(rig.daemon.ticket_conversations[&("borsuk".to_string(), 7)]
-            .proposal
-            .is_none());
+        assert!(
+            rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
+                .proposal
+                .is_none()
+        );
         let pushes: Vec<Push> = push_rx.try_iter().collect();
         assert!(pushes.iter().any(|push| {
             matches!(
@@ -18321,7 +19317,7 @@ mod tests {
         assert!(rig
             .daemon
             .ticket_conversations
-            .contains_key(&("borsuk".to_string(), 7)));
+            .contains_key(&("borsuk".to_string(), ChatKey::Ticket(7))));
 
         rig.poll(vec![], vec![]);
 
@@ -22202,6 +23198,512 @@ mod tests {
         assert_eq!(rig.job(0).task, "borsuk/review-p7");
     }
 
+    // ------------------------------------------------------------------
+    // The delta of one governed review
+    // ------------------------------------------------------------------
+
+    /// The full prediction of ticket 142 in the delta tests. The
+    /// `invariants` slot is sure and names one entry.
+    fn delta_prediction() -> FullPrediction {
+        FullPrediction {
+            kind: records::PREDICTION_FULL.to_string(),
+            slots: vec![
+                PredictionSlot {
+                    name: "behaviours".to_string(),
+                    entries: vec!["T-pay".to_string()],
+                    tag: PredictionTag::Sure,
+                },
+                PredictionSlot {
+                    name: "invariants".to_string(),
+                    entries: vec!["INV-3".to_string()],
+                    tag: PredictionTag::Sure,
+                },
+            ],
+        }
+    }
+
+    /// The refined ticket of the delta tests: the contract ticket with
+    /// `theory-full` on it.
+    fn delta_ticket() -> Issue {
+        let mut ticket = contract_ticket();
+        ticket.labels = vec![THEORY_FULL_LABEL.to_string()];
+        ticket
+    }
+
+    /// One comment page that holds one block.
+    fn block_page(block: &str) -> String {
+        serde_json::to_string(&serde_json::json!([{
+            "user": {"login": "operator"},
+            "created_at": "2026-09-01T10:00:00Z",
+            "body": block,
+        }]))
+        .unwrap()
+    }
+
+    /// The delta the review of the delta tests reports: `behaviours` hit,
+    /// `invariants` missed, one violation, one question.
+    fn reported_delta() -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![
+                DeltaSlot {
+                    id: "behaviours".to_string(),
+                    outcome: DeltaOutcome::Hit,
+                    tag: PredictionTag::Unsure,
+                },
+                DeltaSlot {
+                    id: "invariants".to_string(),
+                    outcome: DeltaOutcome::Miss,
+                    tag: PredictionTag::Unsure,
+                },
+            ],
+            touched: vec!["INV-3".to_string()],
+            violations: vec![DeltaViolation {
+                entry: "INV-3".to_string(),
+                finding: "the retry crosses the boundary".to_string(),
+            }],
+            question: "Does the cart keep the token?".to_string(),
+        }
+    }
+
+    /// The same delta after the daemon copied the prediction tags in.
+    fn tagged_delta_block() -> DeltaBlock {
+        let mut delta = reported_delta();
+        for slot in &mut delta.slots {
+            slot.tag = PredictionTag::Sure;
+        }
+        delta
+    }
+
+    /// One review report that ends with `delta` as its last block.
+    fn delta_report(delta: &DeltaBlock) -> String {
+        format!("The diff meets every criterion.\n\n{}", delta_block(delta))
+    }
+
+    /// The scripted comment, label creation, and label call of one delta
+    /// on the record of pull request 7.
+    fn open_delta_steps(delta: &DeltaBlock) -> Vec<Step> {
+        let body = format!("body={}", delta_block(delta));
+        vec![
+            gh_step(
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/comments",
+                    "-f",
+                    body.as_str(),
+                ],
+                CmdOut::ok(""),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=delta-open",
+                    "-f",
+                    "color=fbca04",
+                ],
+                CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"delta-open\",\"color\":\"fbca04\"}"),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=delta-open",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// The scripted steps of one governed poll that dispatches the review
+    /// of pull request 7 over the delta fixtures.
+    fn delta_review_steps(dir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(delta_prediction()))),
+        ));
+        steps.extend(body_admission_steps(
+            &repo,
+            &pr_wt(dir, 7),
+            7,
+            &rig_gitdir(dir),
+            "web/pay.ts",
+        ));
+        let issue_worktree = issue_wt(dir, 142);
+        steps.extend(fresh_issue_steps(
+            &repo,
+            &issue_worktree,
+            142,
+            &rig_gitdir(dir),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &issue_worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        steps
+    }
+
+    /// The pull request body every delta test ships.
+    fn delta_pr_body() -> String {
+        LOW_TIER_BODY.replace("\u{b7} http \u{b7}", "\u{b7} browser \u{b7}")
+    }
+
+    /// Every delta block the rig posted, in call order.
+    fn posted_deltas(rig: &Rig) -> Vec<DeltaBlock> {
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .filter_map(|call| call.args.iter().find(|arg| arg.starts_with("body=")))
+            .flat_map(|field| parse_delta_blocks(field.strip_prefix("body=").unwrap_or(field)))
+            .collect()
+    }
+
+    /// A governed review whose ticket carries `theory-full` ends with one
+    /// delta block. The daemon posts it on the record of the pull
+    /// request, with the prediction tags in, and adds `delta-open`.
+    #[test]
+    fn a_governed_review_delta_posts_the_block_and_adds_the_label() {
+        let dir = temp_root();
+        let mut steps = delta_review_steps(&dir);
+        steps.extend(open_delta_steps(&tagged_delta_block()));
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: delta_report(&reported_delta()),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(posted_deltas(&rig), vec![tagged_delta_block()]);
+        assert_eq!(label_calls(&rig, DELTA_OPEN_LABEL), 1);
+        assert_eq!(
+            rig.task(id).state,
+            TaskState::Running,
+            "the review waits for its transition, it did not fail"
+        );
+
+        // The next poll shows the label, reads the record comments, and
+        // the Theory view carries the row.
+        let mut labelled = contract_pr(&delta_pr_body());
+        labelled.labels = vec![DELTA_OPEN_LABEL.to_string()];
+        rig.poll(vec![delta_ticket()], vec![labelled]);
+
+        assert_eq!(
+            theory_of(&rig).deltas,
+            vec![DeltaView {
+                number: 7,
+                state: DeltaState::Open,
+                misses: vec![("sure-miss".to_string(), "INV-3".to_string())],
+                hits: 1,
+                unsure: 0,
+                violations: vec![(
+                    "INV-3".to_string(),
+                    "the retry crosses the boundary".to_string()
+                )],
+                question: "Does the cart keep the token?".to_string(),
+            }]
+        );
+    }
+
+    /// A delta whose record lost `delta-open` reads closed, and the
+    /// cached block still carries its violation.
+    #[test]
+    fn a_record_that_lost_the_label_reads_closed_in_the_theory_view() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(delta_prediction()))),
+        ));
+        steps.push(comment_page_step(
+            7,
+            &block_page(&delta_block(&tagged_delta_block())),
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // A closed pull request admits no review, so the poll reads the
+        // record alone.
+        let mut merged = contract_pr(&delta_pr_body());
+        merged.open = false;
+        merged.draft = false;
+        merged.labels = vec![DELTA_OPEN_LABEL.to_string()];
+
+        rig.poll(vec![delta_ticket()], vec![merged.clone()]);
+
+        assert_eq!(theory_of(&rig).deltas[0].state, DeltaState::Open);
+
+        merged.labels.clear();
+        rig.poll(vec![delta_ticket()], vec![merged]);
+
+        let rows = theory_of(&rig).deltas;
+        assert_eq!(rows[0].state, DeltaState::Closed, "the label is gone");
+        assert_eq!(
+            rows[0].violations,
+            vec![(
+                "INV-3".to_string(),
+                "the retry crosses the boundary".to_string()
+            )],
+            "the cached block keeps the violation"
+        );
+    }
+
+    /// One delta whose only slot missed.
+    fn missed_slot_delta(id: &str, tag: PredictionTag) -> DeltaBlock {
+        DeltaBlock {
+            slots: vec![DeltaSlot {
+                id: id.to_string(),
+                outcome: DeltaOutcome::Miss,
+                tag,
+            }],
+            touched: Vec::new(),
+            violations: Vec::new(),
+            question: String::new(),
+        }
+    }
+
+    /// The DELTAS rows of one poll that shows `prediction` on ticket 142
+    /// and `delta` on the record of the merged pull request 7.
+    ///
+    /// A closed pull request admits no review, so the poll reads the two
+    /// records and nothing else.
+    fn delta_rows_of(prediction: FullPrediction, delta: &DeltaBlock) -> Vec<DeltaView> {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = body_theory_steps(&repo);
+        steps.push(comment_page_step(
+            142,
+            &block_page(&prediction_block(&Prediction::Full(prediction))),
+        ));
+        steps.push(comment_page_step(7, &block_page(&delta_block(delta))));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let mut merged = contract_pr(&delta_pr_body());
+        merged.open = false;
+        merged.draft = false;
+        merged.labels = vec![DELTA_OPEN_LABEL.to_string()];
+
+        rig.poll(vec![delta_ticket()], vec![merged]);
+
+        theory_of(&rig).deltas
+    }
+
+    /// A missed slot the prediction left empty names itself, so the row
+    /// still reaches the panel.
+    #[test]
+    fn a_missed_slot_without_predicted_entries_names_the_slot() {
+        let rows = delta_rows_of(
+            full_view(&[("invariants", Vec::new(), PredictionTag::Sure)]),
+            &missed_slot_delta("invariants", PredictionTag::Sure),
+        );
+
+        assert_eq!(
+            rows[0].misses,
+            vec![("sure-miss".to_string(), "invariants".to_string())]
+        );
+        assert_eq!(rows[0].hits, 0);
+        assert_eq!(rows[0].unsure, 0);
+    }
+
+    /// A missed slot draws one row per entry the prediction named.
+    #[test]
+    fn a_missed_slot_draws_one_row_per_predicted_entry() {
+        let rows = delta_rows_of(
+            full_view(&[("invariants", vec!["INV-3", "INV-4"], PredictionTag::Unsure)]),
+            &missed_slot_delta("invariants", PredictionTag::Unsure),
+        );
+
+        assert_eq!(
+            rows[0].misses,
+            vec![
+                ("unsure-miss".to_string(), "INV-3".to_string()),
+                ("unsure-miss".to_string(), "INV-4".to_string()),
+            ]
+        );
+    }
+
+    /// A review of a pull request with no linked ticket expects no block.
+    /// The turn ends without one, the task keeps running towards its
+    /// transition, and no label call goes out.
+    #[test]
+    fn a_review_of_a_pr_without_a_linked_ticket_needs_no_delta_block() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok(
+                "refs/remotes/origin/main
+",
+            ),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(
+                "docs/notes.md
+",
+            ),
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The diff meets every criterion.".to_string(),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(rig.task(id).state, TaskState::Running, "the review holds");
+        assert_eq!(label_calls(&rig, DELTA_OPEN_LABEL), 0);
+        assert_eq!(posted_deltas(&rig), Vec::new());
+    }
+
+    /// A governed review that ends with no block fails the attempt and
+    /// re-queues while attempts remain.
+    #[test]
+    fn a_governed_review_without_a_delta_block_fails_the_attempt() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+        let before = rig.exec.calls().len();
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The diff meets every criterion.".to_string(),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(
+            rig.task(id).state,
+            TaskState::Queued,
+            "the attempt re-queues"
+        );
+        assert_eq!(rig.task(id).attempt, 2);
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a failed attempt posts nothing"
+        );
+    }
+
+    /// A governed review whose turn wrote no assistant text at all fails
+    /// the same way. An empty buffer is a report with no block in it.
+    #[test]
+    fn a_governed_review_turn_without_any_text_fails_the_attempt() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        assert_eq!(rig.task(id).state, TaskState::Running);
+        let before = rig.exec.calls().len();
+
+        rig.event(turn_ended(id));
+
+        assert_eq!(rig.task(id).state, TaskState::Queued);
+        assert_eq!(rig.task(id).attempt, 2);
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a silent turn posts nothing"
+        );
+    }
+
+    /// The finding of the missing block reaches the operator: the last
+    /// attempt fails with it and the stuck row names the task.
+    #[test]
+    fn a_review_with_no_delta_block_fails_with_the_no_delta_block_finding() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        // The run is on its last attempt, so the failure is terminal and
+        // the state keeps the finding.
+        rig.daemon.table.by_id.get_mut(id).unwrap().attempt = MAX_ATTEMPTS;
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: "The diff meets every criterion.".to_string(),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(
+            rig.task(id).state,
+            TaskState::Failed("no delta block".to_string())
+        );
+        assert!(rig
+            .decision(&format!("stuck:{id}:{MAX_ATTEMPTS}"))
+            .is_some());
+    }
+
+    /// A block whose slot id names no prediction slot fails the parse, so
+    /// the attempt fails with the same finding.
+    #[test]
+    fn a_delta_block_with_an_unknown_slot_fails_the_attempt() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir.clone(), delta_review_steps(&dir), governed);
+        rig.poll(vec![delta_ticket()], vec![contract_pr(&delta_pr_body())]);
+        let id = "borsuk/review-p7";
+        let mut broken = reported_delta();
+        broken.slots[0].id = "bananas".to_string();
+        let before = rig.exec.calls().len();
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: delta_report(&broken),
+        });
+        rig.event(turn_ended(id));
+
+        assert_eq!(rig.task(id).state, TaskState::Queued);
+        assert_eq!(rig.task(id).attempt, 2);
+        assert_eq!(
+            rig.exec.calls().len(),
+            before,
+            "a broken block posts nothing"
+        );
+    }
+
     /// The two git steps of one poll that re-reads the head commit of the
     /// theory checkout and finds the cached skills behind it.
     fn cached_theory_steps(repo: &Path) -> Vec<Step> {
@@ -22346,6 +23848,117 @@ mod tests {
             "the body check runs after the last green fast check"
         );
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+    }
+
+    /// The second refined ticket of the widening tests. It carries `AC-2`
+    /// and its plan owns the api paths.
+    fn second_ticket() -> Issue {
+        let mut ticket = issue(143, &[]);
+        ticket.body = contract_ticket()
+            .body
+            .replace(
+                "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive",
+                "- AC-2 \u{b7} An empty card field shows a message \u{b7} check: checkout drive",
+            )
+            .replace("| web/** |", "| api/** |");
+        ticket
+    }
+
+    /// One draft pull request that closes both tickets.
+    fn two_ticket_pr(body: &str) -> Pr {
+        let mut pull = linked_draft(7);
+        pull.body = format!("Closes #142\nCloses #143\n\n{body}");
+        pull
+    }
+
+    /// A body whose two lines answer one criterion of each ticket.
+    const TWO_TICKET_BODY: &str = concat!(
+        "## Why\n",
+        "The checkout accepts an empty card field.\n",
+        "\n",
+        "## Before / After\n",
+        "- AC-1 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the submit blocks\n",
+        "- AC-2 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the field shows a message\n",
+    );
+
+    #[test]
+    fn the_body_check_unions_the_criteria_and_the_paths_of_every_linked_ticket() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts\napi/orders/new.rs",
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        // The paused lane keeps the review queued, so the admission runs
+        // the body check and no dispatch follows it.
+        rig.daemon
+            .paused
+            .lanes
+            .insert((Stage::Review, "borsuk".to_string()), true);
+
+        rig.poll(
+            vec![contract_ticket(), second_ticket()],
+            vec![two_ticket_pr(TWO_TICKET_BODY)],
+        );
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "AC-2 of the second ticket and its owned paths both count"
+        );
+        assert_eq!(findings(&rig, "PR: "), 0, "a clean body posts no finding");
+    }
+
+    #[test]
+    fn a_body_without_the_why_section_stops_the_review_and_requeues_every_ticket() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let finding = "section Why missing";
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts\napi/orders/new.rs",
+        ));
+        steps.push(record_comment_step(&format!("PR: {finding}")));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![contract_ticket(), second_ticket()],
+            vec![two_ticket_pr(&TWO_TICKET_BODY.replace("## Why\n", ""))],
+        );
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed(format!("PR: {finding}")),
+            "the missing section cancels the review"
+        );
+        assert_eq!(findings(&rig, &format!("PR: {finding}")), 1);
+        // The check queues one implement per linked ticket. The lane
+        // limit of the rig dispatches the first one and holds the second.
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(rig.task("borsuk/implement-i143").state, TaskState::Queued);
+        assert!(
+            !rig.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.task == "borsuk/review-p7"),
+            "a failed body check dispatches no review"
+        );
     }
 
     #[test]
@@ -24635,14 +26248,377 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "the untouched area stays out:\n{}",
             placeholder_of(&values, "skills")
         );
+        // C10 cuts the model block to the slice of the touched area, so
+        // the untouched boundary leaves the block with the untouched
+        // feature file.
         assert_eq!(
             placeholder_of(&values, "model"),
-            "- B-checkout (boundary): the cart pays\n- B-orders (boundary): the order lands"
+            "- B-orders (boundary): the order lands"
         );
-        assert_eq!(placeholder_of(&values, "prediction"), "");
+        assert_eq!(
+            git_calls(&rig, "diff"),
+            1,
+            "the review slice reads the head diff once"
+        );
+        assert_eq!(placeholder_of(&values, "prediction"), "none");
         assert_eq!(placeholder_of(&values, "comparison"), "");
         assert_eq!(placeholder_of(&values, "rules"), "");
         assert_eq!(placeholder_of(&values, "why_rule"), "");
+        let filled = prompts::fill_template(prompts::REVIEW_PROMPT, &values)
+            .expect("the review prompt must accept every value");
+        assert!(
+            filled.contains("- B-orders (boundary): the order lands"),
+            "the prompt carries the sliced entry"
+        );
+    }
+
+    /// One short prediction over `areas`.
+    fn short_view(text: &str, areas: &[&str]) -> ShortPrediction {
+        ShortPrediction {
+            kind: records::PREDICTION_SHORT.to_string(),
+            text: text.to_string(),
+            areas: areas.iter().map(|area| area.to_string()).collect(),
+        }
+    }
+
+    /// One full prediction over the named slots, in the given order.
+    fn full_view(slots: &[(&str, Vec<&str>, PredictionTag)]) -> FullPrediction {
+        FullPrediction {
+            kind: records::PREDICTION_FULL.to_string(),
+            slots: slots
+                .iter()
+                .map(|(name, entries, tag)| PredictionSlot {
+                    name: (*name).to_string(),
+                    entries: entries.iter().map(|id| id.to_string()).collect(),
+                    tag: *tag,
+                })
+                .collect(),
+        }
+    }
+
+    /// Store one record view under the issue key of `ticket`.
+    fn store_view(rig: &mut Rig, ticket: u64, view: RecordView) {
+        rig.daemon.theory_blocks.insert(
+            ("borsuk".to_string(), RecordKey::Issue(ticket).key_text()),
+            view,
+        );
+    }
+
+    /// The placeholder values of one pipeline task of the rig repository.
+    fn values_of(
+        rig: &Rig,
+        stage: Stage,
+        kind: ItemKind,
+        number: u64,
+    ) -> Vec<(&'static str, String)> {
+        let task = Task::new("borsuk", stage, kind, number, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        rig.daemon
+            .placeholder_values(&task, &repo_cfg, &PathBuf::new())
+            .expect("the values must render")
+    }
+
+    /// Both model boundaries as the model block writes them.
+    const BOTH_ENTRIES: &str =
+        "- B-checkout (boundary): the cart pays\n- B-orders (boundary): the order lands";
+
+    #[test]
+    fn the_refine_and_implement_slices_follow_the_prediction_areas() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut rig = Rig::make_in(dir, slice_steps(&repo, "aaa111"), governed);
+        rig.poll(Vec::new(), Vec::new());
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: None,
+                delta: None,
+            },
+        );
+
+        let refine = values_of(&rig, Stage::Refine, ItemKind::Issue, 142);
+        assert_eq!(
+            placeholder_of(&refine, "model"),
+            "- B-checkout (boundary): the cart pays",
+            "refine slices over the short prediction's areas"
+        );
+        assert!(placeholder_of(&refine, "skills").contains("run-web"));
+        assert!(
+            !placeholder_of(&refine, "skills").contains("run-api"),
+            "the unpredicted area stays out of the skills slice"
+        );
+
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: Some(full_view(&[(
+                    PREDICTION_OTHER_AREAS,
+                    vec!["api-orders"],
+                    PredictionTag::Sure,
+                )])),
+                delta: None,
+            },
+        );
+
+        let implement = values_of(&rig, Stage::Implement, ItemKind::Issue, 142);
+        assert_eq!(
+            placeholder_of(&implement, "model"),
+            BOTH_ENTRIES,
+            "implement adds the areas the full prediction reaches"
+        );
+        assert!(placeholder_of(&implement, "skills").contains("# Orders"));
+    }
+
+    #[test]
+    fn a_record_with_no_prediction_keeps_the_whole_model_and_every_area() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut rig = Rig::make_in(dir, slice_steps(&repo, "aaa111"), governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        for (stage, template) in [
+            (Stage::Refine, prompts::REFINE_PROMPT),
+            (Stage::Implement, prompts::IMPLEMENT_PROMPT),
+        ] {
+            let values = values_of(&rig, stage, ItemKind::Issue, 142);
+            assert_eq!(placeholder_of(&values, "model"), BOTH_ENTRIES, "{stage}");
+            let skills = placeholder_of(&values, "skills");
+            assert!(
+                skills.contains("run-web") && skills.contains("run-api"),
+                "{stage}"
+            );
+            assert_eq!(placeholder_of(&values, "prediction"), "", "{stage}");
+            prompts::fill_template(template, &values)
+                .unwrap_or_else(|error| panic!("{stage}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn the_review_prediction_block_renders_the_short_claim_and_the_slots() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(git_step(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &pr_worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        let mut snapshot = RepoSnapshot::default();
+        snapshot.prs.insert(7, contract_pr("## Why\n"));
+        rig.daemon
+            .links
+            .insert("borsuk".to_string(), Links::derive("borsuk", &snapshot));
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: Some(full_view(&[
+                    ("behaviours", vec!["T-1"], PredictionTag::Sure),
+                    ("states", Vec::new(), PredictionTag::Unsure),
+                    ("invariants", vec!["I-1"], PredictionTag::Sure),
+                    ("failure-modes", vec!["F-1"], PredictionTag::Unsure),
+                    (PREDICTION_OTHER_AREAS, Vec::new(), PredictionTag::Unsure),
+                ])),
+                delta: None,
+            },
+        );
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        assert_eq!(
+            placeholder_of(&values, "prediction"),
+            concat!(
+                "ticket #142\n",
+                "short: the submit blocks\n",
+                "areas: web-checkout\n",
+                "behaviours (sure): T-1\n",
+                "states (unsure): none\n",
+                "invariants (sure): I-1\n",
+                "failure-modes (unsure): F-1\n",
+                "other-areas (unsure): none",
+            ),
+            "the block keeps the five slots in their template order"
+        );
+        assert_eq!(
+            placeholder_of(&values, "model"),
+            "- B-checkout (boundary): the cart pays",
+            "the review slice unions the implement areas with the diff areas"
+        );
+        prompts::fill_template(prompts::REVIEW_PROMPT, &values)
+            .expect("the review prompt must accept every value");
+    }
+
+    /// The rig steps of one review slice test: the theory read, then the
+    /// head diff of pull request 7.
+    fn review_slice_steps(dir: &Path, repo: &Path, diff: &str) -> Vec<Step> {
+        let mut steps = slice_steps(repo, "aaa111");
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &pr_wt(dir, 7),
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps
+    }
+
+    /// Link pull request 7 to ticket 142 in the rig.
+    fn link_pr_seven(rig: &mut Rig) {
+        let mut snapshot = RepoSnapshot::default();
+        snapshot.prs.insert(7, contract_pr("## Why\n"));
+        rig.daemon
+            .links
+            .insert("borsuk".to_string(), Links::derive("borsuk", &snapshot));
+    }
+
+    /// Requirement R9 of v0.8 binds the run skills to what the diff
+    /// touched. A predicted area the diff never reached widens the model
+    /// block and must leave the skills block alone.
+    #[test]
+    fn the_review_skills_slice_ignores_a_predicted_area_the_diff_never_touched() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = review_slice_steps(&dir, &repo, "api/orders/new.rs");
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        link_pr_seven(&mut rig);
+        store_view(
+            &mut rig,
+            142,
+            RecordView {
+                short: Some(short_view("the submit blocks", &["web-checkout"])),
+                full: None,
+                delta: None,
+            },
+        );
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        let skills = placeholder_of(&values, "skills");
+        assert!(
+            skills.contains("# Orders"),
+            "the diff area's file:\n{skills}"
+        );
+        assert!(
+            !skills.contains("# Checkout"),
+            "the predicted area the diff never touched stays out:\n{skills}"
+        );
+        assert!(
+            !skills.contains("index only"),
+            "the diff area's files stay inline:\n{skills}"
+        );
+        assert_eq!(
+            placeholder_of(&values, "model"),
+            BOTH_ENTRIES,
+            "the model block still unions the predicted area with the diff area"
+        );
+    }
+
+    /// A `verify-skill` pull request changes no area. The model block
+    /// keeps every entry, the way v0.8 rendered it.
+    #[test]
+    fn a_review_with_no_prediction_and_no_touched_area_keeps_the_whole_model() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let pr_worktree = pr_wt(&dir, 7);
+        let steps = review_slice_steps(&dir, &repo, "docs/readme.md");
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+        link_pr_seven(&mut rig);
+
+        let task = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &pr_worktree)
+            .expect("the review values must render");
+
+        assert_eq!(placeholder_of(&values, "model"), BOTH_ENTRIES);
+        assert_eq!(
+            placeholder_of(&values, "skills"),
+            "",
+            "no touched area leaves the skills block empty"
+        );
+        assert_eq!(placeholder_of(&values, "prediction"), "none");
+    }
+
+    #[test]
+    fn a_governed_dispatch_binds_the_model_commit_and_the_task_end_drops_it() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(comment_page_step(142, "[]"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![issue(142, &["to-refine", THEORY_SHORT_LABEL])], vec![]);
+
+        let id = "borsuk/refine-i142";
+        assert_eq!(
+            rig.daemon.role_bindings[id].model_commit.as_deref(),
+            Some("aaa111"),
+            "the dispatch pins the cached model commit"
+        );
+
+        rig.event(turn_finished(id, true, "refined"));
+        rig.poll(vec![issue(142, &["refined", THEORY_SHORT_LABEL])], vec![]);
+        assert_eq!(rig.task(id).state, TaskState::Done);
+
+        // The ticket leaves GitHub, so the row retires and takes the
+        // binding with it.
+        rig.poll(vec![], vec![]);
+
+        assert!(
+            !rig.daemon.role_bindings.contains_key(id),
+            "the task end drops the binding and its model commit"
+        );
+    }
+
+    #[test]
+    fn an_ungoverned_dispatch_binds_no_model_commit() {
+        let dir = temp_root();
+        let steps = fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        );
+        let mut rig = Rig::make_in(dir, steps, |_| {});
+
+        rig.poll(vec![issue(142, &["to-refine"])], vec![]);
+
+        assert_eq!(
+            rig.daemon.role_bindings["borsuk/refine-i142"].model_commit,
+            None
+        );
     }
 
     #[test]
@@ -25786,26 +27762,51 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         "+id = \"INV-8\"\n",
     );
 
-    /// The comment body of one swept record: ten sure slots with seven
-    /// hits, and one event of the last day.
+    /// The comment body of one swept record: three sure hits, one sure
+    /// miss, one unsure miss, and one event of the last day.
     const SWEEP_COMMENT: &str = concat!(
         "<aif-delta-v1>\n",
         "{\"slots\":[",
-        "{\"id\":\"INV-1\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-2\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-3\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-4\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-5\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-6\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-7\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-8\",\"outcome\":\"miss\",\"tag\":\"sure\"},",
-        "{\"id\":\"INV-9\",\"outcome\":\"miss\",\"tag\":\"sure\"},",
-        "{\"id\":\"B-checkout\",\"outcome\":\"miss\",\"tag\":\"sure\"}]}",
+        "{\"id\":\"behaviours\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"states\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"invariants\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"failure-modes\",\"outcome\":\"miss\",\"tag\":\"sure\"},",
+        "{\"id\":\"other-areas\",\"outcome\":\"miss\",\"tag\":\"unsure\"}]}",
         "\n</aif-delta-v1>\n",
         "<aif-event-v1>\n",
         "{\"kind\":\"violation\",\"text\":\"the cart reset on reload\"}",
         "\n</aif-event-v1>",
     );
+
+    /// The comment body of the closed `delta-open` issue: a full
+    /// prediction whose tags feed the delta slots, a delta block with
+    /// no tags at all, and one event of the last day. The prediction
+    /// tags four slots sure and one unsure, so the page counts the same
+    /// three sure hits over four sure slots as [`SWEEP_COMMENT`].
+    fn sweep_prediction_comment() -> String {
+        concat!(
+            "<aif-prediction-v1>\n",
+            "{\"kind\":\"full\",\"slots\":[",
+            "{\"name\":\"behaviours\",\"entries\":[\"B-checkout\"],\"tag\":\"sure\"},",
+            "{\"name\":\"states\",\"entries\":[\"B-checkout\"],\"tag\":\"sure\"},",
+            "{\"name\":\"invariants\",\"entries\":[\"B-checkout\"],\"tag\":\"sure\"},",
+            "{\"name\":\"failure-modes\",\"entries\":[\"B-checkout\"],\"tag\":\"sure\"},",
+            "{\"name\":\"other-areas\",\"entries\":[],\"tag\":\"unsure\"}]}",
+            "\n</aif-prediction-v1>\n",
+            "<aif-delta-v1>\n",
+            "{\"slots\":[",
+            "{\"id\":\"behaviours\",\"outcome\":\"hit\"},",
+            "{\"id\":\"states\",\"outcome\":\"hit\"},",
+            "{\"id\":\"invariants\",\"outcome\":\"hit\"},",
+            "{\"id\":\"failure-modes\",\"outcome\":\"miss\"},",
+            "{\"id\":\"other-areas\",\"outcome\":\"miss\"}]}",
+            "\n</aif-delta-v1>\n",
+            "<aif-event-v1>\n",
+            "{\"kind\":\"violation\",\"text\":\"the cart reset on reload\"}",
+            "\n</aif-event-v1>",
+        )
+        .to_string()
+    }
 
     /// The theory read of the sweep test at one commit. The model is
     /// [`SWEEP_MODEL`]; the verify map and the skill are the shared ones.
@@ -25860,15 +27861,20 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         ]
     }
 
-    /// One comment page of one swept record.
+    /// One comment page of one swept record. The closed `delta-open`
+    /// issue 11 carries the prediction page instead.
     fn sweep_comment_step(number: u64) -> Step {
+        let raw = if number == 11 {
+            sweep_prediction_comment()
+        } else {
+            SWEEP_COMMENT.to_string()
+        };
         let url = format!("repos/acme/borsuk/issues/{number}/comments?per_page=100");
         let body = format!(
             "[{{\"user\":{{\"login\":\"agent\"}},\
              \"created_at\":\"2026-09-10T20:00:00Z\",\
              \"body\":\"{}\"}}]",
-            SWEEP_COMMENT
-                .replace('\\', "\\\\")
+            raw.replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace('\n', "\\n")
         );
@@ -26003,8 +28009,8 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let view = theory_of(&rig);
         assert_eq!(
             view.calibration,
-            Some(0.7),
-            "seven sure hits over ten sure slots"
+            Some(0.75),
+            "three sure hits over four sure slots"
         );
         assert_eq!(
             view.rungs,
@@ -26025,7 +28031,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rig.poll(sweep_issues(), Vec::new());
 
         let view = theory_of(&rig);
-        assert_eq!(view.calibration, Some(0.7), "the cached pages still count");
+        assert_eq!(view.calibration, Some(0.75), "the cached pages still count");
         assert_eq!(view.rungs, [2, 5, 4]);
         assert_eq!(view.events_per_day, 12);
         assert_eq!(view.stale_entries, vec!["INV-9".to_string()]);

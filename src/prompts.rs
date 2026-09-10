@@ -442,6 +442,33 @@ this diff touches, and they are empty when the governor is off.
 
 {skills}
 
+# The prediction
+
+The block below holds what the operator predicted this change would touch. It
+reads `none` when the ticket carries no prediction. Compare the prediction
+with what the diff did. Name every area the diff touched that the prediction
+left out. Name every predicted area the diff never reached. Put both in your
+record comment.
+
+{prediction}
+
+End your report with one `<aif-delta-v1>` block when the prediction above is
+not `none`. Put the block last, on its own lines, and never inside a code
+fence. Its body is one JSON object.
+
+<aif-delta-v1>
+{"slots":[{"id":"behaviours","outcome":"hit"},{"id":"states","outcome":"hit"},{"id":"invariants","outcome":"miss"},{"id":"failure-modes","outcome":"hit"},{"id":"other-areas","outcome":"hit"}],"touched":["INV-3"],"violations":[{"entry":"INV-3","finding":"the retry crosses the boundary"}],"question":"Does the cart keep the token?"}
+</aif-delta-v1>
+
+Write one slot per prediction slot. The five slot ids are `behaviours`,
+`states`, `invariants`, `failure-modes`, and `other-areas`. The outcome is
+`hit` when the change stayed inside the entries the slot named, and `miss`
+when the change reached past them. A path that maps to an area the
+prediction left out is a miss on `other-areas`. List in `touched` every model
+entry id the change reached. Add one violation per model rule the change
+broke. Ask the operator one question. A review whose prediction reads `none`
+ends with no block.
+
 # The base worktree
 
 Create the base worktree once, and only when the re-drive below asks for it.
@@ -700,6 +727,56 @@ A drift block names its surface and takes this form.
 
 Put valid JSON between the markers. Do not quote a block. Do not put a
 block in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The built-in prompt of one bootstrap chat.
+///
+/// The operator dictates a stream of memory about one area, and the agent
+/// turns it into model entries. The agent adds no claim the operator did
+/// not state, because a model the operator did not write is not the
+/// operator's theory. The placeholders are `{repo}`, `{worktree}`,
+/// `{area}`, and `{model}`.
+pub const BOOTSTRAP_PROMPT: &str = r#"You write the model of the area {area}
+in the repository {repo} with the operator. You work in {worktree}, the
+theory checkout. Read the files you need. Change no file.
+
+The model so far
+
+{model}
+
+The operator dictates a stream of memory about the area. The operator is the
+only source. Add no claim the operator did not state. Take no claim from the
+code. Read the code only to name a path or a file the operator points at.
+
+Ask short questions. Ask one question per turn. Ask only what an entry needs.
+An entry needs an id, a kind, a title, and a statement. Say back what you
+understood in one short sentence.
+
+An entry takes one of five kinds. Each kind takes its own keys.
+
+- state names one region of the system. It takes no other key.
+- boundary names the two regions it separates in sides, and the path globs
+  that cross it in paths.
+- transition names the state it leaves in from, and the state it reaches
+  in to.
+- invariant names a claim that always holds, and the states or the
+  boundaries it holds over in constrains.
+- failure names one way the system breaks, and the boundary it breaks
+  through in crosses.
+
+Give each entry a short id the operator recognises. Reuse no id the model so
+far already holds.
+
+The operator ends the interview with the word done. End that turn with one
+block that carries every entry you collected. Write no text after it. A turn
+the operator did not end takes no block.
+
+<aif-model-proposal-v1>
+{"entries":[{"kind":"state","id":"checkout","title":"Checkout","statement":"The buyer pays."}]}
+</aif-model-proposal-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
 "#;
 
 /// The body of one run skill maintain ticket, before the daemon fills it.
@@ -1112,6 +1189,37 @@ mod tests {
     }
 
     #[test]
+    fn the_bootstrap_prompt_names_exactly_its_four_placeholders() {
+        assert_eq!(
+            scan_placeholders(BOOTSTRAP_PROMPT),
+            vec!["area", "repo", "worktree", "model"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(BOOTSTRAP_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(BOOTSTRAP_PROMPT, &values).expect("the bootstrap prompt fills");
+        assert!(filled.contains("<area>"));
+        assert!(filled.contains("<model>"));
+        assert!(
+            filled.contains(
+                r#"{"entries":[{"kind":"state","id":"checkout","title":"Checkout","statement":"The buyer pays."}]}"#
+            ),
+            "the proposal block stays literal:\n{filled}"
+        );
+        assert!(
+            filled.contains(crate::theory::records::MODEL_PROPOSAL_BLOCK),
+            "the prompt names the block tag the daemon parses:\n{filled}"
+        );
+        for key in ["sides", "paths", "constrains", "from", "to", "crosses"] {
+            assert!(
+                filled.contains(&format!(" in {key}")),
+                "the prompt names the required key {key}:\n{filled}"
+            );
+        }
+    }
+
+    #[test]
     fn the_audit_sweep_prompt_names_exactly_its_four_placeholders() {
         assert_eq!(
             scan_placeholders(AUDIT_SWEEP_PROMPT),
@@ -1466,6 +1574,11 @@ mod tests {
             "no criterion needs",
             "{model}",
             "{skills}",
+            "{prediction}",
+            "Compare the prediction",
+            "<aif-delta-v1>",
+            "The five slot ids are",
+            "ends with no block",
         ] {
             assert!(
                 REVIEW_PROMPT.contains(required),

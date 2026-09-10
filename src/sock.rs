@@ -41,7 +41,9 @@ use crate::sched::{Limits, Paused};
 use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
 use crate::theory::model::Model;
-use crate::theory::records::{FullPrediction, ShortPrediction};
+use crate::theory::records::{DeltaBlock, FullPrediction, ShortPrediction};
+#[cfg(test)]
+use crate::theory::records::{DeltaOutcome, DeltaSlot, DeltaViolation, PredictionTag};
 use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
@@ -176,6 +178,52 @@ pub struct TheoryView {
     /// The model entries no change touched in `stale_days` days.
     #[serde(default)]
     pub stale_entries: Vec<String>,
+    /// One row per pull request whose record holds a delta, by pull
+    /// request number.
+    #[serde(default)]
+    pub deltas: Vec<DeltaView>,
+}
+
+/// Whether one delta still waits for the operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaState {
+    /// The record still carries `delta-open`.
+    #[default]
+    Open,
+    /// The operator removed the label, so the delta is through.
+    Closed,
+}
+
+/// One delta of one pull request, as the DELTAS panel draws it.
+///
+/// The daemon rebuilds it on every poll from the record blocks and the
+/// record labels, so a delta the operator closed leaves the panel at the
+/// next poll.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaView {
+    /// The pull request the delta belongs to.
+    #[serde(default)]
+    pub number: u64,
+    /// Whether the delta still waits for the operator.
+    #[serde(default)]
+    pub state: DeltaState,
+    /// One row per entry of a missed slot: the outcome name, one of
+    /// `sure-miss` and `unsure-miss`, and the entry the slot named.
+    #[serde(default)]
+    pub misses: Vec<(String, String)>,
+    /// The count of `sure-hit` slots.
+    #[serde(default)]
+    pub hits: usize,
+    /// The count of `unsure-hit` slots.
+    #[serde(default)]
+    pub unsure: usize,
+    /// The model rules the change broke: the entry and the finding.
+    #[serde(default)]
+    pub violations: Vec<(String, String)>,
+    /// The one question the review asked.
+    #[serde(default)]
+    pub question: String,
 }
 
 /// One item the governor holds out of a stage.
@@ -209,6 +257,9 @@ pub struct RecordView {
     /// The last full prediction of the record.
     #[serde(default)]
     pub full: Option<FullPrediction>,
+    /// The last delta of the record.
+    #[serde(default)]
+    pub delta: Option<DeltaBlock>,
 }
 
 /// One row of the AREAS panel.
@@ -1306,6 +1357,26 @@ pub enum TheoryAction {
         /// The repository alias.
         repo: String,
     },
+    /// Start or reuse one theory conversation.
+    Chat {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// What the conversation is for.
+        purpose: ChatPurpose,
+        /// The subject of the conversation. A bootstrap chat names its
+        /// area.
+        key: String,
+    },
+}
+
+/// What one theory conversation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatPurpose {
+    /// Write the entries of one area the model does not cover.
+    Bootstrap,
 }
 
 /// The model worktree of one repository, as one edit-model reply.
@@ -2502,6 +2573,12 @@ mod tests {
             Action::Theory(TheoryAction::CommitModel {
                 repo: "borsuk".to_string(),
             }),
+            Action::Theory(TheoryAction::Chat {
+                request: "chat-gh".to_string(),
+                repo: "borsuk".to_string(),
+                purpose: ChatPurpose::Bootstrap,
+                key: "gh".to_string(),
+            }),
             Action::Stop,
         ]
     }
@@ -2819,12 +2896,43 @@ mod tests {
                         paths: vec!["web/**".to_string()],
                     }],
                 },
+                deltas: vec![DeltaView {
+                    number: 7,
+                    state: DeltaState::Open,
+                    misses: vec![("sure-miss".to_string(), "INV-3".to_string())],
+                    hits: 4,
+                    unsure: 0,
+                    violations: vec![(
+                        "INV-3".to_string(),
+                        "the retry crosses the boundary".to_string(),
+                    )],
+                    question: "Does the cart keep the token?".to_string(),
+                }],
                 holds: vec![HoldView {
                     number: 142,
                     reason: "awaits full prediction".to_string(),
                     stage: Stage::Implement,
                 }],
-                records: BTreeMap::new(),
+                records: BTreeMap::from([(
+                    "pr-7".to_string(),
+                    RecordView {
+                        short: None,
+                        full: None,
+                        delta: Some(DeltaBlock {
+                            slots: vec![DeltaSlot {
+                                id: "invariants".to_string(),
+                                outcome: DeltaOutcome::Miss,
+                                tag: PredictionTag::Sure,
+                            }],
+                            touched: vec!["INV-3".to_string()],
+                            violations: vec![DeltaViolation {
+                                entry: "INV-3".to_string(),
+                                finding: "the retry crosses the boundary".to_string(),
+                            }],
+                            question: "Does the cart keep the token?".to_string(),
+                        }),
+                    },
+                )]),
                 areas: vec![AreaView {
                     id: "web-checkout".to_string(),
                     tier: Tier::Browser,
@@ -2874,6 +2982,10 @@ mod tests {
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert!(text.contains("\"usage\":["), "line: {text}");
         assert!(text.contains("\"tier\":\"browser\""), "line: {text}");
+        assert!(text.contains("\"sure-miss\""), "line: {text}");
+        assert!(text.contains("\"state\":\"open\""), "line: {text}");
+        assert!(text.contains("\"outcome\":\"miss\""), "line: {text}");
+        assert!(text.contains("\"tag\":\"sure\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
     }
 
