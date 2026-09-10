@@ -134,6 +134,7 @@ mod tests {
     /// A fresh temporary directory for one test.
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aif-editor-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
         fs::create_dir(&dir).unwrap();
         dir
     }
