@@ -217,6 +217,9 @@ pub struct Daemon {
 
     /// The last snapshot of every polled repository.
     snapshot: Snapshot,
+    /// The resolved code-mode repository records, per alias. The snapshot
+    /// knows an issue only after the next poll; this cache closes the gap.
+    theory_repo_issues: std::cell::RefCell<BTreeMap<String, u64>>,
     /// The edge-triggered readiness gates.
     gates: GateTracker,
     /// Ready work the gates reported, until the next drive admits it.
@@ -578,6 +581,7 @@ impl Daemon {
             paused,
             policies,
             snapshot: Snapshot::default(),
+            theory_repo_issues: std::cell::RefCell::new(BTreeMap::new()),
             gates: GateTracker::new(),
             pending_ready: Vec::new(),
             pending_stacked: BTreeSet::new(),
@@ -4796,10 +4800,10 @@ impl Daemon {
     ///
     /// In code mode, with no `theory.repo`, an issue or a pull request is
     /// its own record, and the record of the whole repository is the issue
-    /// titled `<alias>/theory`, found in the snapshot or created. With
-    /// `theory.repo` set, the record is the issue titled `<alias>#<n>` (or
-    /// `<alias>/theory`) in the theory repository, found through
-    /// `gh issue list` or created.
+    /// titled `<alias>/theory`, found in the memory cache, in the snapshot,
+    /// or created. With `theory.repo` set, the record is the issue titled
+    /// `<alias>#<n>` (or `<alias>/theory`) in the theory repository, found
+    /// through `gh issue list` or created.
     // The v0.8 chunks call this.
     #[cfg_attr(not(test), allow(dead_code))]
     fn theory_record(&self, alias: &str, key: &RecordKey) -> Result<(String, u64)> {
@@ -4828,6 +4832,9 @@ impl Daemon {
                 format!("Theory record of {alias}"),
             ),
             (None, RecordKey::Repo) => {
+                if let Some(number) = self.theory_repo_issues.borrow().get(alias) {
+                    return Ok((repo_cfg.owner_repo.clone(), *number));
+                }
                 let title = format!("{alias}/theory");
                 if let Some(number) = self
                     .snapshot
@@ -4850,10 +4857,14 @@ impl Daemon {
                     &format!("Theory record of {alias}"),
                     &[],
                 )?;
+                self.theory_repo_issues
+                    .borrow_mut()
+                    .insert(alias.to_string(), issue.number);
                 return Ok((repo_cfg.owner_repo.clone(), issue.number));
             }
         };
-        self.find_or_create_theory_issue(&target_repo, &title, &body)
+        let number = self.find_or_create_theory_issue(&target_repo, &title, &body)?;
+        Ok((target_repo, number))
     }
 
     /// Find one open issue by exact title, or create it.
@@ -4866,7 +4877,7 @@ impl Daemon {
         owner_repo: &str,
         title: &str,
         body: &str,
-    ) -> Result<(String, u64)> {
+    ) -> Result<u64> {
         let search = format!("{title} in:title");
         let args = [
             "issue",
@@ -4875,8 +4886,6 @@ impl Daemon {
             owner_repo,
             "--search",
             search.as_str(),
-            "--state",
-            "open",
             "--json",
             "number,title",
         ];
@@ -4904,11 +4913,11 @@ impl Daemon {
             .and_then(|hit| hit.get("number"))
             .and_then(serde_json::Value::as_u64)
         {
-            return Ok((owner_repo.to_string(), number));
+            return Ok(number);
         }
         let gh = GhClient::new(&*self.exec);
         let issue = gh.create_issue(owner_repo, title, body, &[])?;
-        Ok((owner_repo.to_string(), issue.number))
+        Ok(issue.number)
     }
 
     /// Post one comment on the theory record of one item.
@@ -10159,8 +10168,6 @@ mod tests {
                 "acme/borsuk-theory",
                 "--search",
                 &search,
-                "--state",
-                "open",
                 "--json",
                 "number,title",
             ],
@@ -10239,6 +10246,53 @@ mod tests {
         let mut record = issue(7, &[]);
         record.title = "borsuk/theory".to_string();
         rig.poll(vec![record], vec![]);
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Repo)
+                .unwrap(),
+            ("acme/borsuk".to_string(), 7)
+        );
+        assert_eq!(rig.exec.calls().len(), 1, "the create ran once");
+    }
+
+    #[test]
+    fn theory_record_caches_the_repo_issue_across_calls() {
+        let created = json!({
+            "number": 7,
+            "node_id": "node-7",
+            "title": "borsuk/theory",
+            "body": "Theory record of borsuk",
+            "state": "open",
+            "labels": [],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-10T12:00:00Z",
+            "html_url": "https://github.com/acme/borsuk/issues/7"
+        })
+        .to_string();
+        let steps = vec![gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=borsuk/theory",
+                "-f",
+                "body=Theory record of borsuk",
+            ],
+            CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+        )];
+        let rig = Rig::make(steps);
+        assert_eq!(
+            rig.daemon
+                .theory_record("borsuk", &RecordKey::Repo)
+                .unwrap(),
+            ("acme/borsuk".to_string(), 7)
+        );
+        // No poll has run, so the second call reads the memory cache and
+        // creates nothing.
         assert_eq!(
             rig.daemon
                 .theory_record("borsuk", &RecordKey::Repo)

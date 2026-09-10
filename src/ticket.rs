@@ -694,12 +694,14 @@ impl TicketController {
             match gh.create_label_if_missing(&repo_config.owner_repo, &name, &color) {
                 Ok(found) => found,
                 Err(error) => {
+                    // The error text is the full operator message; the
+                    // three v0.6 texts live in `create_label_if_missing`.
                     pushes.push(Push::TicketResult(result(
                         request,
                         repo,
                         number,
                         TicketResultKind::Failure,
-                        &format!("GitHub rejected label creation: {error:#}"),
+                        &format!("{error:#}"),
                     )));
                     return TicketEffects {
                         pushes,

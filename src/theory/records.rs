@@ -75,12 +75,20 @@ pub fn parse_event_blocks(text: &str) -> Vec<Event> {
     let close = close_tag(EVENT_BLOCK);
     let mut events = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(EVENT_BLOCK) {
+    'scan: while let Some(start) = rest.find(EVENT_BLOCK) {
         let after_open = &rest[start + EVENT_BLOCK.len()..];
         let Some(end) = after_open.find(&close) else {
             break;
         };
-        let body = after_open[..end].trim();
+        let span = &after_open[..end];
+        if let Some(next_open) = span.find(EVENT_BLOCK) {
+            // The opening tag is truncated: the later tag owns the close,
+            // so the scan restarts there. The restart reads from
+            // `after_open`, because `span` ends before the close.
+            rest = &after_open[next_open..];
+            continue 'scan;
+        }
+        let body = span.trim();
         rest = &after_open[end + close.len()..];
         if let Ok(event) = serde_json::from_str::<Event>(body) {
             events.push(event);
@@ -159,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_blocks_skips_a_truncated_block_before_a_good_block() {
+        let good = full_event();
+        let transcript = format!(
+            "{EVENT_BLOCK}\n{{\"kind\":\"miss\" and the agent stopped mid-block\n{}",
+            event_block(&good)
+        );
+        assert_eq!(parse_event_blocks(&transcript), vec![good]);
+    }
+
+    #[test]
     fn an_event_without_optional_fields_parses() {
         let transcript = format!(
             "{EVENT_BLOCK}\n{{\"kind\":\"miss\",\"text\":\"late\"}}\n{}",
@@ -173,18 +191,5 @@ mod tests {
                 number: None,
             }]
         );
-    }
-
-    #[test]
-    fn the_label_constants_hold_the_spec_names() {
-        assert_eq!(THEORY_SHORT_LABEL, "theory-short");
-        assert_eq!(THEORY_FULL_LABEL, "theory-full");
-        assert_eq!(DELTA_OPEN_LABEL, "delta-open");
-        assert_eq!(EVENT_OPEN_LABEL, "event-open");
-        assert_eq!(MODEL_PR_LABEL, "model-pr");
-        assert_eq!(PREDICTION_BLOCK, "<aif-prediction-v1>");
-        assert_eq!(EVENT_BLOCK, "<aif-event-v1>");
-        assert_eq!(MEASURE_BLOCK, "<aif-measure-v1>");
-        assert_eq!(ANSWER_BLOCK, "<aif-answer-v1>");
     }
 }

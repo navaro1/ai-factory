@@ -329,7 +329,8 @@ impl<'a> GhClient<'a> {
     /// GitHub answers HTTP 422 when the label exists; the method then
     /// fetches the catalog and returns the existing label together with
     /// the refreshed catalog, so the caller can refresh its cache. A
-    /// fresh creation carries no catalog.
+    /// fresh creation carries no catalog. Every error carries the
+    /// operator message of the ticket controller as its text.
     pub fn create_label_if_missing(
         &self,
         owner_repo: &str,
@@ -339,16 +340,22 @@ impl<'a> GhClient<'a> {
         match self.create_label(owner_repo, name, color) {
             Ok(label) => Ok((label, None)),
             Err(error) if error.to_string().contains("HTTP 422") => {
-                let labels = self.fetch_labels(owner_repo).with_context(|| {
-                    "GitHub reported an existing label, but the catalog refresh failed"
+                let labels = self.fetch_labels(owner_repo).map_err(|refresh_error| {
+                    anyhow!(
+                        "GitHub reported an existing label, but the catalog refresh failed: {refresh_error:#}"
+                    )
                 })?;
-                let label = labels
+                match labels
                     .iter()
                     .find(|label| label.name.eq_ignore_ascii_case(name))
-                    .ok_or_else(|| anyhow!("the refreshed catalog has no matching label"))?;
-                Ok((label.clone(), Some(labels)))
+                {
+                    Some(label) => Ok((label.clone(), Some(labels))),
+                    None => Err(anyhow!(
+                        "GitHub rejected label creation, and the refreshed catalog has no matching label"
+                    )),
+                }
             }
-            Err(error) => Err(error),
+            Err(error) => Err(anyhow!("GitHub rejected label creation: {error:#}")),
         }
     }
 
@@ -2119,7 +2126,10 @@ mod tests {
         let error = client
             .create_label_if_missing("acme/borsuk", "triage", "55e6ff")
             .unwrap_err();
-        assert!(error.to_string().contains("no matching label"));
+        assert_eq!(
+            error.to_string(),
+            "GitHub rejected label creation, and the refreshed catalog has no matching label"
+        );
     }
 
     #[test]
