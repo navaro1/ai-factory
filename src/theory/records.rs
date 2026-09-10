@@ -53,6 +53,8 @@ pub const EVENT_BLOCK: &str = "<aif-event-v1>";
 pub const MEASURE_BLOCK: &str = "<aif-measure-v1>";
 /// The opening tag of one answer block.
 pub const ANSWER_BLOCK: &str = "<aif-answer-v1>";
+/// The opening tag of one model proposal block.
+pub const MODEL_PROPOSAL_BLOCK: &str = "<aif-model-proposal-v1>";
 
 /// The model file of one repository, relative to the theory checkout.
 pub const MODEL_FILE: &str = "theory/model.toml";
@@ -398,7 +400,18 @@ pub fn no_entries(area: &str) -> String {
 /// The Theory view offers the bootstrap action on such a hold alone,
 /// because bootstrapping fixes nothing else.
 pub fn names_empty_area(reason: &str) -> bool {
-    reason.starts_with("area ") && reason.ends_with(" has no entries")
+    empty_area(reason).is_some()
+}
+
+/// The area one refusal reason names, when the reason reports no entries.
+///
+/// The bootstrap chat takes this area as its key, so the reason alone
+/// carries every value the Theory view needs.
+pub fn empty_area(reason: &str) -> Option<&str> {
+    let area = reason
+        .strip_prefix("area ")?
+        .strip_suffix(" has no entries")?;
+    (!area.is_empty()).then_some(area)
 }
 
 /// The template of one full prediction, for the areas of the short one.
@@ -957,6 +970,9 @@ mod tests {
         assert_eq!(parsed.slots[4].entries, vec!["gh".to_string()]);
         assert!(names_empty_area(&no_entries("gh")));
         assert!(!names_empty_area("model error"));
+        assert_eq!(empty_area(&no_entries("gh")), Some("gh"));
+        assert_eq!(empty_area("model error"), None);
+        assert_eq!(empty_area("area  has no entries"), None);
     }
 
     /// One event with every field set.

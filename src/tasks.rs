@@ -102,6 +102,11 @@ pub enum TaskPurpose {
     Teach(TeachKey),
     /// One audit sweep over the model and the run skills.
     Audit(AuditJob),
+    /// An interactive conversation that writes the model of one area.
+    Bootstrap {
+        /// The area the conversation covers.
+        area: String,
+    },
 }
 
 /// One stage of one item in one repository.
@@ -180,6 +185,19 @@ impl Task {
         task.purpose = TaskPurpose::TicketChat;
         task
     }
+
+    /// Create one queued bootstrap conversation for an area.
+    ///
+    /// The item is the ticket-session item, so no worktree and no pipeline
+    /// sweep claims the task, and the area alone names the subject.
+    fn bootstrap_chat(repo: &str, area: &str, log_path: PathBuf, now_ms: u64) -> Self {
+        let mut task = Self::new(repo, Stage::Refine, ItemKind::Issue, 0, log_path, now_ms);
+        task.id = bootstrap_id(repo, area);
+        task.purpose = TaskPurpose::Bootstrap {
+            area: area.to_string(),
+        };
+        task
+    }
 }
 
 /// The identity of one queued task under an explicit id.
@@ -218,6 +236,11 @@ pub fn ticket_chat_id(repo: &str, number: u64) -> String {
 /// The task id for one teach task: `<repo>/teach-<key>`.
 pub fn teach_id(repo: &str, key: &TeachKey) -> String {
     format!("{repo}/teach-{}", key.slug())
+}
+
+/// The task id for one bootstrap chat: `<repo>/bootstrap-<area>`.
+pub fn bootstrap_id(repo: &str, area: &str) -> String {
+    format!("{repo}/bootstrap-{area}")
 }
 
 /// The task id for one audit task: `<repo>/audit-sweep`.
@@ -332,6 +355,29 @@ impl TaskTable {
         now_ms: u64,
     ) -> Result<&mut Task> {
         let id = ticket_chat_id(repo, number);
+        self.upsert_chat(id, || Task::ticket_chat(repo, number, log_path, now_ms))
+    }
+
+    /// Queue one bootstrap conversation or reuse its active task.
+    pub fn upsert_bootstrap_chat(
+        &mut self,
+        repo: &str,
+        area: &str,
+        log_path: PathBuf,
+        now_ms: u64,
+    ) -> Result<&mut Task> {
+        let id = bootstrap_id(repo, area);
+        self.upsert_chat(id, || Task::bootstrap_chat(repo, area, log_path, now_ms))
+    }
+
+    /// Return the live conversation under `id`, or insert what `build`
+    /// makes.
+    ///
+    /// A conversation outlives one turn, so a task that is still open
+    /// returns as it stands. Only a terminal task is replaced, which is
+    /// how a closed chat starts again under the same id. `build` runs
+    /// only for that second case.
+    fn upsert_chat(&mut self, id: String, build: impl FnOnce() -> Task) -> Result<&mut Task> {
         if self
             .by_id
             .get(&id)
@@ -342,8 +388,7 @@ impl TaskTable {
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("task \"{id}\" vanished before reuse"));
         }
-        let task = Task::ticket_chat(repo, number, log_path, now_ms);
-        self.insert_task(id.clone(), task)
+        self.insert_task(id, build())
     }
 
     /// Move one task to the back of the insertion order.
@@ -622,6 +667,11 @@ mod tests {
             teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
             "borsuk/teach-area-web-checkout"
         );
+    }
+
+    #[test]
+    fn a_bootstrap_id_names_the_area() {
+        assert_eq!(bootstrap_id("borsuk", "gh"), "borsuk/bootstrap-gh");
     }
 
     #[test]
