@@ -77,6 +77,14 @@ impl TeachKey {
     }
 }
 
+/// Which audit one audit task runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditJob {
+    /// The drift sweep over every model entry and every run skill.
+    Sweep,
+}
+
 /// The workflow purpose of one task.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +100,8 @@ pub enum TaskPurpose {
     Measure,
     /// A one-shot explanation of one subject against the model.
     Teach(TeachKey),
+    /// One audit sweep over the model and the run skills.
+    Audit(AuditJob),
 }
 
 /// One stage of one item in one repository.
@@ -208,6 +218,13 @@ pub fn ticket_chat_id(repo: &str, number: u64) -> String {
 /// The task id for one teach task: `<repo>/teach-<key>`.
 pub fn teach_id(repo: &str, key: &TeachKey) -> String {
     format!("{repo}/teach-{}", key.slug())
+}
+
+/// The task id for one audit task: `<repo>/audit-sweep`.
+pub fn audit_id(repo: &str, job: &AuditJob) -> String {
+    match job {
+        AuditJob::Sweep => format!("{repo}/audit-sweep"),
+    }
 }
 
 /// All tasks of the daemon, in insertion order.
@@ -605,6 +622,11 @@ mod tests {
             teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
             "borsuk/teach-area-web-checkout"
         );
+    }
+
+    #[test]
+    fn an_audit_id_names_the_sweep() {
+        assert_eq!(audit_id("borsuk", &AuditJob::Sweep), "borsuk/audit-sweep");
     }
 
     #[test]

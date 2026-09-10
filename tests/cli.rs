@@ -73,7 +73,25 @@ fn aif_doctor_help_lists_the_clean_options() {
     assert!(stdout(&output).contains("--config <CONFIG>"));
     assert!(stdout(&output).contains("--clean"));
     assert!(stdout(&output).contains("--yes"));
+    assert!(stdout(&output).contains("--audit <ALIAS>"));
     assert!(!stdout(&output).contains("--paused"));
+}
+
+#[test]
+fn aif_doctor_audit_without_a_daemon_fails_with_a_clear_message() {
+    let dir = temp_dir("no-daemon-audit");
+    let result = run_with_env(
+        env!("CARGO_BIN_EXE_aif"),
+        &["doctor", "--audit", "borsuk"],
+        &[("XDG_RUNTIME_DIR", &dir)],
+    );
+
+    assert_eq!(result.status.code(), Some(1));
+    assert!(
+        stderr(&result).contains("no daemon is listening"),
+        "stderr: {}",
+        stderr(&result)
+    );
 }
 
 #[test]

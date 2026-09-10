@@ -65,7 +65,7 @@ use crate::sock::{
     TicketResultKind, SKILL_TICKET_REQUEST,
 };
 use crate::state::{DaemonState, RuntimeState, TicketConversationState};
-use crate::tasks::{self, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
@@ -3084,6 +3084,7 @@ impl Daemon {
                 self.on_turn_end(&task_id, ok, &summary);
             }
             RunEvent::Exit { ok, detail, .. } => {
+                self.finish_audit_sweep(&task_id);
                 self.ticket_turn_text.remove(&task_id);
                 self.on_exit_event(&task_id, ok, &detail);
             }
@@ -3103,9 +3104,10 @@ impl Daemon {
         if task.state != TaskState::Running || !self.task_capabilities(&task).live_input {
             return;
         }
-        // A teach task runs one turn. It shares the refine stage with the
-        // parked sessions, so it must not park with them.
-        if task.stage == Stage::Refine && !Self::is_teach(&task) {
+        // A teach task and an audit sweep run one turn. They share the
+        // refine stage with the parked sessions, so they must not park
+        // with them.
+        if task.stage == Stage::Refine && !Self::is_teach(&task) && !Self::is_audit(&task) {
             let transitioned = self
                 .snapshot
                 .repos
@@ -3420,7 +3422,7 @@ impl Daemon {
         // `Done`. The process would still hold a live slot of the stage,
         // and a release task keeps one id across batches, so the next batch
         // could never start. The refine path stops its session the same way.
-        if (task.purpose == TaskPurpose::Pipeline || Self::is_teach(task))
+        if (task.purpose == TaskPurpose::Pipeline || Self::is_teach(task) || Self::is_audit(task))
             && self.task_capabilities(task).live_input
         {
             self.stop_session(&task.id, "cannot stop the completed session");
@@ -4674,7 +4676,8 @@ impl Daemon {
                 if task.kind == ItemKind::Issue
                     && !Self::is_ticket_creation(task)
                     && !Self::is_ticket_chat(task)
-                    && !Self::is_teach(task) =>
+                    && !Self::is_teach(task)
+                    && !Self::is_audit(task) =>
             {
                 Workspace::Exclusive(WorktreeKey::Issue(task.number))
             }
@@ -5863,6 +5866,7 @@ impl Daemon {
         match action {
             TheoryAction::Setup { repo, surface } => self.setup_skill_ticket(&repo, &surface),
             TheoryAction::Teach { repo, key } => self.teach(&repo, key),
+            TheoryAction::Sweep { repo } => self.sweep(&repo),
         }
     }
 
@@ -6319,6 +6323,46 @@ impl Daemon {
         }
     }
 
+    /// Queue one audit sweep task for one repository.
+    ///
+    /// The task runs one turn in the repository checkout, like a teach
+    /// task. Its item is the ticket-session item, so no worktree and no
+    /// pipeline sweep claims it.
+    fn sweep(&mut self, repo: &str) {
+        if !self.config.repos.contains_key(repo) {
+            eprintln!("the audit request for {repo}: no such repository");
+            return;
+        }
+        if self.config.repos[repo].theory.governor != Governor::On {
+            eprintln!("the theory governor of {repo} is off");
+            return;
+        }
+        let id = tasks::audit_id(repo, &AuditJob::Sweep);
+        let log = self
+            .state_dir
+            .join("logs")
+            .join(format!("{repo}__audit-sweep.jsonl"));
+        let queued = self.table.upsert_with_id(
+            ScopedTask {
+                id: &id,
+                repo,
+                stage: Stage::Refine,
+                kind: ItemKind::Issue,
+                number: TICKET_NUMBER,
+            },
+            log,
+            self.now_ms,
+        );
+        match queued {
+            Ok(task) => {
+                task.purpose = TaskPurpose::Audit(AuditJob::Sweep);
+                self.role_bindings.remove(&id);
+                self.changed = true;
+            }
+            Err(error) => eprintln!("the audit task {id}: {error:#}"),
+        }
+    }
+
     /// Queue one teach task for one subject.
     ///
     /// The task runs one turn in the repository checkout. Its item is the
@@ -6479,6 +6523,8 @@ impl Daemon {
         match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
             Some(TaskPurpose::TicketChat) => self.finish_ticket_proposal_turn(id),
             Some(TaskPurpose::Teach(_)) => self.finish_teach_events(id),
+            // An audit sweep keeps its text: the sweep reads it at exit.
+            Some(TaskPurpose::Audit(_)) => {}
             _ => {
                 self.ticket_turn_text.remove(id);
             }
@@ -6511,6 +6557,72 @@ impl Daemon {
                 eprintln!("task {id}: cannot open the theory event: {error:#}");
             }
         }
+    }
+
+    /// Open one theory event per block of one finished audit sweep, and
+    /// create one maintain ticket per drifted surface.
+    ///
+    /// The scan reads every assistant text event of the turn, and every
+    /// block opens on the repository record. A `skill-drift` block names
+    /// its surface. A surface whose repository already holds an open
+    /// `verify-skill` ticket takes no second ticket, and two blocks for
+    /// one surface still create one ticket. A failed post or a failed
+    /// creation goes to standard error only, because the sweep itself
+    /// succeeded.
+    fn finish_audit_sweep(&mut self, id: &str) {
+        let Some(task) = self
+            .table
+            .by_id
+            .get(id)
+            .filter(|task| Self::is_audit(task))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        let mut asked: BTreeSet<String> = BTreeSet::new();
+        let mut drifts: Vec<String> = Vec::new();
+        for event in parse_event_blocks(&turn.all) {
+            let surface = match event.kind.as_str() {
+                "skill-drift" => event.surface.clone(),
+                _ => None,
+            };
+            if let Err(error) = self.open_event(&task.repo, &RecordKey::Repo, &event) {
+                eprintln!("task {id}: cannot open the theory event: {error:#}");
+            }
+            if let Some(surface) = surface {
+                if asked.insert(surface.clone()) {
+                    drifts.push(surface);
+                }
+            }
+        }
+        for surface in drifts {
+            if self.has_open_skill_ticket(&task.repo, &surface) {
+                continue;
+            }
+            if let Err(error) = self.create_skill_ticket(
+                &task.repo,
+                &surface,
+                SkillTicket::Maintain,
+                crate::prompts::MAINTAIN_BODY,
+            ) {
+                eprintln!("task {id}: cannot create the maintain ticket for {surface}: {error:#}");
+            }
+        }
+    }
+
+    /// True when the snapshot holds an open `verify-skill` ticket whose
+    /// title names `surface`.
+    fn has_open_skill_ticket(&self, repo: &str, surface: &str) -> bool {
+        self.snapshot.repos.get(repo).is_some_and(|snapshot| {
+            snapshot.issues.values().any(|issue| {
+                issue.open
+                    && issue.labels.iter().any(|label| label == VERIFY_SKILL_LABEL)
+                    && skills::ticket_surface(&issue.title) == Some(surface)
+            })
+        })
     }
 
     /// Accept one strict final proposal block and refresh the focus data.
@@ -6717,6 +6829,11 @@ impl Daemon {
         matches!(task.purpose, TaskPurpose::Teach(_))
     }
 
+    /// True when the task audits the model and the run skills.
+    fn is_audit(task: &Task) -> bool {
+        matches!(task.purpose, TaskPurpose::Audit(_))
+    }
+
     /// The block tag one task must end its turn with, or `None`.
     ///
     /// A task with a tag buffers its assistant text, so the daemon reads
@@ -6726,7 +6843,7 @@ impl Daemon {
     fn wants_final_block(task: &Task) -> Option<&'static str> {
         match task.purpose {
             TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
-            TaskPurpose::Teach(_) => Some(EVENT_BLOCK),
+            TaskPurpose::Teach(_) | TaskPurpose::Audit(_) => Some(EVENT_BLOCK),
             TaskPurpose::Pipeline | TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
         }
     }
@@ -6739,6 +6856,8 @@ impl Daemon {
             ExecutionRole::TicketChat
         } else if Self::is_teach(task) {
             ExecutionRole::TheoryChat
+        } else if Self::is_audit(task) {
+            ExecutionRole::TheoryAudit
         } else {
             match task.stage {
                 Stage::Refine => ExecutionRole::Refine,
@@ -6957,6 +7076,10 @@ impl Daemon {
             let values = self.teach_values(task, key, repo_cfg, worktree)?;
             return prompts::fill_template(prompts::TEACH_PROMPT, &values);
         }
+        if let TaskPurpose::Audit(_) = &task.purpose {
+            let values = self.audit_values(task, worktree);
+            return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
+        }
         let role = Self::execution_role(task);
         let template = self.prompt_template(role)?;
         // A crash between the write and the rename can leave a blank file.
@@ -7153,6 +7276,38 @@ impl Daemon {
             Stage::Release => return String::new(),
         };
         skills::slice(stage, &areas, verify, set)
+    }
+
+    /// The placeholder values of one audit sweep task.
+    ///
+    /// The model and the skills blocks render empty for a repository whose
+    /// theory did not read, and the turn still runs.
+    fn audit_values(&self, task: &Task, worktree: &Path) -> Vec<(&'static str, String)> {
+        vec![
+            ("repo", task.repo.clone()),
+            ("worktree", worktree.display().to_string()),
+            ("model", self.model_entries(&task.repo)),
+            ("skills", self.audit_skills(task)),
+        ]
+    }
+
+    /// The `{skills}` value of one audit sweep: the implement-shaped slice
+    /// over every area of the verification map.
+    fn audit_skills(&self, task: &Task) -> String {
+        let Some(cache) = self.theory_models.get(&task.repo) else {
+            return String::new();
+        };
+        let Ok(verify) = &cache.verify else {
+            return String::new();
+        };
+        let Some(skills) = self.theory_skills.get(&task.repo) else {
+            return String::new();
+        };
+        let Ok(set) = &skills.skills else {
+            return String::new();
+        };
+        let areas: Vec<&str> = verify.areas.iter().map(|area| area.id.as_str()).collect();
+        skills::slice(skills::SliceStage::Implement, &areas, verify, set)
     }
 
     /// The placeholder values of one teach task.
@@ -12778,6 +12933,7 @@ mod tests {
             text: "INV-3 broke: the poller never parked.".to_string(),
             area: Some("poll".to_string()),
             number: Some(142),
+            surface: None,
         };
         let body = format!("body={}", event_block(&event));
         let steps = vec![
@@ -21414,6 +21570,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             text: text.to_string(),
             area: Some("web-checkout".to_string()),
             number: None,
+            surface: None,
         }
     }
 
@@ -21662,5 +21819,309 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 "{name} must render empty"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Audit sweep
+    // ------------------------------------------------------------------
+
+    /// One audit sweep action for the rig repository.
+    fn sweep_action() -> Action {
+        Action::Theory(TheoryAction::Sweep {
+            repo: "borsuk".to_string(),
+        })
+    }
+
+    /// One drift event of one surface.
+    fn drift_event(surface: &str, text: &str) -> Event {
+        Event {
+            kind: "skill-drift".to_string(),
+            text: text.to_string(),
+            area: None,
+            number: None,
+            surface: Some(surface.to_string()),
+        }
+    }
+
+    /// Every create_issue call of the maintain ticket, in call order.
+    fn maintain_creates(rig: &Rig) -> Vec<Call> {
+        const TITLE: &str = "title=Maintain the run skill for borsuk/web";
+        rig.exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh" && call.args.iter().any(|arg| arg == TITLE))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn an_audit_sweep_dispatch_runs_in_the_repository_checkout() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut rig = Rig::make_in(dir, slice_steps(&repo, "aaa111"), governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(sweep_action());
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/audit-sweep");
+        assert_eq!(job.cwd, repo);
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("dead handles"),
+            "the drift paragraph is in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("skill-drift"),
+            "the drift block form is in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- B-checkout (boundary): the cart pays"),
+            "the model entries are in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("### .claude/skills/run-web/SKILL.md"),
+            "the whole skill file of each surface is in:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("### .claude/skills/run-api/features/orders.md"),
+            "the feature file of every area is in:\n{prompt}"
+        );
+        assert_eq!(
+            rig.roles.lock().unwrap()[0].role,
+            ExecutionRole::TheoryAudit
+        );
+        assert_eq!(
+            rig.purposes.lock().unwrap()[0],
+            TaskPurpose::Audit(AuditJob::Sweep)
+        );
+    }
+
+    #[test]
+    fn two_drift_blocks_for_one_surface_create_one_maintain_ticket() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let first = drift_event(
+            "web",
+            "The Run command names scripts/serve.ts, which the code removed.",
+        );
+        let second = drift_event("web", "The handle pay-now answers no route.");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(open_event_steps(&first));
+        steps.extend(open_event_steps(&second));
+        steps.push(verify_skill_label_step());
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(sweep_action());
+        let id = "borsuk/audit-sweep";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: format!("{}\n{}", event_block(&first), event_block(&second)),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(
+            opened_events(&rig),
+            vec![first, second],
+            "one event per block"
+        );
+        let creates = maintain_creates(&rig);
+        assert_eq!(
+            creates.len(),
+            1,
+            "two blocks for one surface create one ticket"
+        );
+        assert!(
+            creates[0]
+                .args
+                .iter()
+                .any(|arg| arg == "labels[]=to-refine"),
+            "args: {:?}",
+            creates[0].args
+        );
+        assert!(
+            creates[0]
+                .args
+                .iter()
+                .any(|arg| arg == "labels[]=verify-skill"),
+            "args: {:?}",
+            creates[0].args
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn an_open_verify_skill_ticket_stops_the_maintain_ticket_for_its_surface() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let first = drift_event(
+            "web",
+            "The Run command names scripts/serve.ts, which the code removed.",
+        );
+        let second = drift_event("web", "The handle pay-now answers no route.");
+        let third = drift_event(
+            "api",
+            "The Fast check names bin/serve.py, which the code renamed.",
+        );
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(open_event_steps(&first));
+        steps.extend(open_event_steps(&second));
+        steps.extend(open_event_steps(&third));
+        steps.push(verify_skill_label_step());
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let mut closed = issue(41, &[VERIFY_SKILL_LABEL]);
+        closed.title = SkillTicket::Maintain.title("borsuk", "web");
+        closed.open = false;
+        let mut open = issue(44, &[VERIFY_SKILL_LABEL]);
+        open.title = SkillTicket::Maintain.title("borsuk", "api");
+        rig.poll(vec![theory_issue(), closed, open], Vec::new());
+        rig.act(sweep_action());
+        let id = "borsuk/audit-sweep";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: format!(
+                "{}\n{}\n{}",
+                event_block(&first),
+                event_block(&second),
+                event_block(&third)
+            ),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![first, second, third]);
+        let creates = maintain_creates(&rig);
+        assert_eq!(
+            creates.len(),
+            1,
+            "a closed web ticket and an open api ticket stop no web ticket"
+        );
+        assert!(
+            creates[0]
+                .args
+                .iter()
+                .any(|arg| arg == "labels[]=to-refine"),
+            "args: {:?}",
+            creates[0].args
+        );
+        assert!(
+            creates[0]
+                .args
+                .iter()
+                .any(|arg| arg == "labels[]=verify-skill"),
+            "args: {:?}",
+            creates[0].args
+        );
+        let gh_calls = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .count();
+        assert_eq!(
+            gh_calls, 11,
+            "three events, one label, one create, and no api attempt"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn an_audit_sweep_with_no_drift_block_opens_its_events_and_creates_nothing() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let event = Event {
+            kind: "sweep".to_string(),
+            text: "INV-9 names a path that the code removed.".to_string(),
+            area: Some("web-checkout".to_string()),
+            number: None,
+            surface: None,
+        };
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(open_event_steps(&event));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(sweep_action());
+        let id = "borsuk/audit-sweep";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&event),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![event], "the sweep event opens");
+        assert!(
+            maintain_creates(&rig).is_empty(),
+            "no drift means no ticket"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_drift_block_without_a_surface_opens_its_event_and_creates_no_ticket() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let event = Event {
+            kind: "skill-drift".to_string(),
+            text: "The handle pay-now answers no route.".to_string(),
+            area: None,
+            number: None,
+            surface: None,
+        };
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(open_event_steps(&event));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(sweep_action());
+        let id = "borsuk/audit-sweep";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&event),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![event], "the drift event opens");
+        assert!(
+            maintain_creates(&rig).is_empty(),
+            "a drift without a surface creates no ticket"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn an_audit_sweep_of_a_repository_with_the_governor_off_queues_nothing() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), |_| {});
+
+        rig.act(sweep_action());
+
+        assert_eq!(
+            rig.job_count(),
+            0,
+            "an ungoverned repository queues no sweep"
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "an ungoverned repository is quiet"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/audit-sweep"),
+            "no audit task enters the table"
+        );
     }
 }
