@@ -4781,6 +4781,7 @@ mod tests {
                 }),
                 full: None,
                 labels: labels.iter().map(|label| label.to_string()).collect(),
+                ..crate::sock::RecordView::default()
             },
         );
         App {
