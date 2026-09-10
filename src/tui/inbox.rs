@@ -51,6 +51,7 @@ use crate::decisions::{Decision, DecisionKind, Response};
 use crate::mentions;
 use crate::model::ItemKind;
 use crate::sock::{Action, AskView, Client, ItemView, StateView, TicketAction, TicketMentions};
+use crate::theory::cadence::rfc3339_ms;
 
 /// The maximum task log section that one detail draw reads.
 const CONTEXT_LOG_BYTES: u64 = 128 * 1024;
@@ -2043,59 +2044,6 @@ fn github_link(state: &StateView, repo: &str, number: u64) -> Option<String> {
         .map(|view| view.owner_repo.as_str())
         .filter(|owner_repo| !owner_repo.is_empty())?;
     Some(format!("https://github.com/{owner_repo}/issues/{number}"))
-}
-
-/// Convert one GitHub RFC 3339 timestamp to milliseconds since the epoch.
-///
-/// The parser accepts the exact `YYYY-MM-DDTHH:MM:SSZ` form that GitHub
-/// reports. Any other form gives `None`.
-fn rfc3339_ms(text: &str) -> Option<u64> {
-    let bytes = text.as_bytes();
-    let shaped = bytes.len() == 20
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[10] == b'T'
-        && bytes[13] == b':'
-        && bytes[16] == b':'
-        && bytes[19] == b'Z';
-    if !shaped {
-        return None;
-    }
-    let year: i64 = text.get(0..4)?.parse().ok()?;
-    let month: i64 = text.get(5..7)?.parse().ok()?;
-    let day: i64 = text.get(8..10)?.parse().ok()?;
-    let hour: i64 = text.get(11..13)?.parse().ok()?;
-    let minute: i64 = text.get(14..16)?.parse().ok()?;
-    let second: i64 = text.get(17..19)?.parse().ok()?;
-    let in_range = (1..=12).contains(&month)
-        && (1..=31).contains(&day)
-        && (0..=23).contains(&hour)
-        && (0..=59).contains(&minute)
-        && (0..=59).contains(&second);
-    if !in_range {
-        return None;
-    }
-    let days = days_from_civil(year, month, day)?;
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    u64::try_from(seconds)
-        .ok()
-        .map(|seconds| seconds.saturating_mul(1_000))
-}
-
-/// Count the days from 1970-01-01 to one civil date.
-///
-/// The formula is the proleptic Gregorian day count of Howard
-/// Hinnant's date algorithm. An extreme date gives `None`.
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era.checked_mul(146_097)?
-        .checked_add(day_of_era)?
-        .checked_sub(719_468)
 }
 
 /// The bordered title and body lines of one repository item detail.

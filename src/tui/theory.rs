@@ -447,6 +447,10 @@ mod tests {
                 entries: vec![crate::sock::EntryView::default(); entries],
                 areas,
                 skills: BTreeMap::new(),
+                calibration: None,
+                rungs: [0; 3],
+                events_per_day: 0,
+                stale_entries: Vec::new(),
             },
         );
         StateView {

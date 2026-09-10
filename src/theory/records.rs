@@ -46,6 +46,8 @@ pub const EVENT_BLOCK: &str = "<aif-event-v1>";
 pub const MEASURE_BLOCK: &str = "<aif-measure-v1>";
 /// The opening tag of one answer block.
 pub const ANSWER_BLOCK: &str = "<aif-answer-v1>";
+/// The opening tag of one delta block.
+pub const DELTA_BLOCK: &str = "<aif-delta-v1>";
 
 /// The model file of one repository, relative to the theory checkout.
 pub const MODEL_FILE: &str = "theory/model.toml";
@@ -242,6 +244,63 @@ fn parse_prediction(body: &str) -> Option<Prediction> {
         }
     }
     None
+}
+
+/// The outcome of one delta slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeltaOutcome {
+    /// The predicted entry was in play.
+    Hit,
+    /// The predicted entry was not in play.
+    Miss,
+}
+
+/// One slot of a delta block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaSlot {
+    /// The model entry the slot named.
+    pub id: String,
+    /// How the prediction turned out.
+    pub outcome: DeltaOutcome,
+    /// The confidence tag of the slot.
+    pub tag: PredictionTag,
+}
+
+/// One violation a delta block reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaViolation {
+    /// The model entry the violation touches.
+    pub entry: String,
+    /// What the agent observed, in one sentence.
+    pub finding: String,
+}
+
+/// One delta, as one `<aif-delta-v1>` block holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaBlock {
+    /// The slot outcomes of the prediction.
+    pub slots: Vec<DeltaSlot>,
+    /// The model entries the change touched.
+    #[serde(default)]
+    pub touched: Vec<String>,
+    /// The violations the change revealed.
+    #[serde(default)]
+    pub violations: Vec<DeltaViolation>,
+    /// The open question the delta leaves, when it leaves one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+}
+
+/// Parse every complete `<aif-delta-v1>` block of one text.
+///
+/// A block whose body does not parse as a delta, and a block with no
+/// closing tag, is skipped. The order of the blocks is kept.
+pub fn parse_delta_blocks(text: &str) -> Vec<DeltaBlock> {
+    scan_block_bodies(text, DELTA_BLOCK)
+        .into_iter()
+        .filter_map(|body| serde_json::from_str::<DeltaBlock>(body).ok())
+        .collect()
 }
 
 /// The bodies of every complete block of one tag, in text order.
@@ -855,6 +914,59 @@ mod tests {
                     areas: vec![],
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_delta_blocks_reads_one_block_and_skips_a_broken_one() {
+        let delta = DeltaBlock {
+            slots: vec![
+                DeltaSlot {
+                    id: "INV-3".to_string(),
+                    outcome: DeltaOutcome::Hit,
+                    tag: PredictionTag::Sure,
+                },
+                DeltaSlot {
+                    id: "INV-9".to_string(),
+                    outcome: DeltaOutcome::Miss,
+                    tag: PredictionTag::Unsure,
+                },
+            ],
+            touched: vec!["S-1".to_string()],
+            violations: vec![DeltaViolation {
+                entry: "INV-3".to_string(),
+                finding: "the cart reset on reload".to_string(),
+            }],
+            question: Some("why did the cart reset?".to_string()),
+        };
+        let body = serde_json::to_string(&delta).unwrap();
+        let transcript = format!(
+            "{DELTA_BLOCK}\n{body}\n{}\nprose\n{DELTA_BLOCK}\n{{\"slots\":\"no\"}}\n{}\n\
+             {DELTA_BLOCK}\nnever closed",
+            close_tag(DELTA_BLOCK),
+            close_tag(DELTA_BLOCK),
+        );
+
+        assert_eq!(parse_delta_blocks(&transcript), vec![delta]);
+    }
+
+    #[test]
+    fn parse_delta_blocks_accepts_a_block_with_only_slots() {
+        let body = r#"{"slots":[{"id":"INV-3","outcome":"hit","tag":"sure"}]}"#;
+        let transcript = format!("{DELTA_BLOCK}\n{body}\n{}", close_tag(DELTA_BLOCK));
+
+        assert_eq!(
+            parse_delta_blocks(&transcript),
+            vec![DeltaBlock {
+                slots: vec![DeltaSlot {
+                    id: "INV-3".to_string(),
+                    outcome: DeltaOutcome::Hit,
+                    tag: PredictionTag::Sure,
+                }],
+                touched: Vec::new(),
+                violations: Vec::new(),
+                question: None,
+            }]
         );
     }
 }

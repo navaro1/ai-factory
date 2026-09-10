@@ -19,6 +19,7 @@ use crate::model::Stage;
 use crate::runner::AllowedPermission;
 use crate::sock::TicketProposal;
 use crate::tasks::{Task, MAX_ATTEMPTS};
+use crate::theory::cadence::Schedule;
 use crate::usage::{SpendTotals, UsageRecord};
 
 /// One issue conversation that survives a daemon restart.
@@ -188,6 +189,9 @@ struct StateFile {
     /// The last fire stamp of each train, by repository alias.
     #[serde(default)]
     last_fire_ms: BTreeMap<String, u64>,
+    /// The theory cadences of the governed repositories.
+    #[serde(default)]
+    cadences: Vec<Schedule>,
     /// Active issue conversations.
     #[serde(default)]
     ticket_conversations: Vec<TicketConversationState>,
@@ -213,6 +217,8 @@ pub struct DaemonState {
     pub policies: BTreeMap<String, ReleasePolicy>,
     /// The last fire stamp of each train, by repository alias.
     pub last_fire_ms: BTreeMap<String, u64>,
+    /// The theory cadences of the governed repositories.
+    pub cadences: Vec<Schedule>,
     /// Active issue conversations.
     pub ticket_conversations: Vec<TicketConversationState>,
     /// Immutable role bindings, by stable task identity.
@@ -265,6 +271,7 @@ impl DaemonState {
                         .collect(),
                     policies: file.policies,
                     last_fire_ms: file.last_fire_ms,
+                    cadences: file.cadences,
                     ticket_conversations: file.ticket_conversations,
                     role_bindings: file.role_bindings,
                     runtime: file.runtime,
@@ -299,6 +306,7 @@ impl DaemonState {
                 .collect(),
             policies: self.policies.clone(),
             last_fire_ms: self.last_fire_ms.clone(),
+            cadences: self.cadences.clone(),
             ticket_conversations: self.ticket_conversations.clone(),
             role_bindings: self.role_bindings.clone(),
             runtime: self.runtime.clone(),
@@ -715,6 +723,7 @@ mod tests {
                 ReleasePolicy::Interval { minutes: 5 },
             )]),
             last_fire_ms: BTreeMap::from([("borsuk".to_string(), 1_000)]),
+            cadences: Vec::new(),
             ticket_conversations: vec![TicketConversationState {
                 repo: "borsuk".to_string(),
                 number: 42,
@@ -750,6 +759,34 @@ mod tests {
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);
         assert_eq!(loaded, state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_cadence_last_fire_times_survive_a_restart() {
+        use crate::theory::cadence::ScheduleKind;
+        let dir = temp_dir("cadence-round-trip");
+        let path = dir.join("state.json");
+        let state = DaemonState {
+            cadences: vec![
+                Schedule {
+                    kind: ScheduleKind::Daily,
+                    repo: "borsuk".to_string(),
+                    last_ms: Some(1_788_091_200_000),
+                },
+                Schedule {
+                    kind: ScheduleKind::Audit,
+                    repo: "borsuk".to_string(),
+                    last_ms: None,
+                },
+            ],
+            ..DaemonState::default()
+        };
+
+        state.save(&path).unwrap();
+        let loaded = DaemonState::load(&path);
+        assert_eq!(loaded.cadences, state.cadences);
+        assert_eq!(loaded.cadences[0].last_ms, Some(1_788_091_200_000));
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -66,13 +66,14 @@ use crate::sock::{
 };
 use crate::state::{DaemonState, RuntimeState, TaskBinding, TicketConversationState};
 use crate::tasks::{self, AuditJob, ScopedTask, Task, TaskPurpose, TaskState, TaskTable, TeachKey};
+use crate::theory::cadence::{self, Schedule, ScheduleKind, SweepStats};
 use crate::theory::contract;
 use crate::theory::measure::{self, FastRun, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
-    self, event_block, parse_event_blocks, Event, RecordKey, EVENT_BLOCK, EVENT_OPEN_COLOR,
-    EVENT_OPEN_LABEL, MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL, VERIFY_SKILL_COLOR,
-    VERIFY_SKILL_LABEL,
+    self, event_block, parse_delta_blocks, parse_event_blocks, DeltaBlock, Event, RecordKey,
+    EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL, MODEL_FILE, MODEL_PR_COLOR, MODEL_PR_LABEL,
+    VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
@@ -417,6 +418,12 @@ pub struct Daemon {
     theory_skills: BTreeMap<String, SkillCache>,
     /// The Theory view of each repository, rebuilt on every poll.
     theory_views: BTreeMap<String, TheoryView>,
+    /// The theory cadences of the governed repositories, persisted in the
+    /// state file next to `last_fire_ms`.
+    cadences: Vec<Schedule>,
+    /// The product of the last daily sweep of each repository. Runtime
+    /// only: the next sweep re-derives it.
+    theory_sweeps: BTreeMap<String, SweepStats>,
     /// The ticket-check failure count of each issue. The count bounds the
     /// refine re-queue of a failing ticket: at `MAX_ATTEMPTS` the failure
     /// asks for a human instead of `to-refine`. The map is runtime only:
@@ -755,6 +762,18 @@ impl Daemon {
                 train.last_fire_ms = Some(*stamp);
             }
         }
+        // The cadence contract: a restart keeps the last fire of every
+        // schedule, and the governor off leaves no schedule behind.
+        let cadences: Vec<Schedule> = stored
+            .cadences
+            .into_iter()
+            .filter(|schedule| {
+                config
+                    .repos
+                    .get(&schedule.repo)
+                    .is_some_and(|repo| repo.theory.governor.is_on())
+            })
+            .collect();
         // A restored release task re-links to its train, so its batch
         // behaves like an active train: no second fire, and one exact
         // finish.
@@ -805,6 +824,8 @@ impl Daemon {
             fast_results: BTreeMap::new(),
             body_checks: BTreeMap::new(),
             theory_views: BTreeMap::new(),
+            cadences,
+            theory_sweeps: BTreeMap::new(),
             ticket_check_failures: BTreeMap::new(),
             confirming: BTreeMap::new(),
             review_tickets,
@@ -998,6 +1019,7 @@ impl Daemon {
         self.admit_ready();
         self.rebuild_stacked();
         self.fire_due_trains();
+        self.fire_due_cadences();
         self.refresh_release_gates();
         self.reconcile_trains();
         self.reap_idle_sessions();
@@ -1077,6 +1099,12 @@ impl Daemon {
                     None => *at,
                 });
             }
+        }
+        if let Some(at) = cadence::due(&self.cadences, &self.config, self.now_ms) {
+            earliest = Some(match earliest {
+                Some(so_far) => so_far.min(at),
+                None => at,
+            });
         }
         earliest.map(|at| Duration::from_millis(at.saturating_sub(self.now_ms)))
     }
@@ -1675,6 +1703,14 @@ impl Daemon {
                     .any(|name| findings.iter().any(|one| &one.surface == name)),
             })
             .collect();
+        // The daily sweep joins the view, but only a sweep that ran
+        // leaves its numbers here.
+        if let Some(stats) = self.theory_sweeps.get(repo) {
+            view.calibration = stats.calibration;
+            view.rungs = stats.rungs;
+            view.events_per_day = stats.events_per_day;
+            view.stale_entries = stats.stale_entries.clone();
+        }
         view
     }
 
@@ -2342,6 +2378,198 @@ impl Daemon {
             if let Some(prs) = due {
                 self.fire_train(&alias, &prs, true);
             }
+        }
+    }
+
+    /// Fire every cadence whose moment passed, and arm the missing ones.
+    ///
+    /// One schedule of each kind exists per governed repository. A new
+    /// schedule is born with its last fire at the current moment, so a
+    /// newly governed repository sweeps at its first midnight and its
+    /// first audit waits one `sweep.days` interval. A schedule of a
+    /// repository whose governor turned off is dropped, so no cadence
+    /// exists for it.
+    fn fire_due_cadences(&mut self) {
+        self.cadences.retain(|schedule| {
+            self.config
+                .repos
+                .get(&schedule.repo)
+                .is_some_and(|repo| repo.theory.governor.is_on())
+        });
+        for alias in self.config.repos.keys() {
+            if !self
+                .config
+                .repos
+                .get(alias)
+                .is_some_and(|repo| repo.theory.governor.is_on())
+            {
+                continue;
+            }
+            for kind in [
+                ScheduleKind::Daily,
+                ScheduleKind::Interview,
+                ScheduleKind::Audit,
+            ] {
+                if self
+                    .cadences
+                    .iter()
+                    .any(|schedule| schedule.kind == kind && schedule.repo == *alias)
+                {
+                    continue;
+                }
+                self.cadences.push(Schedule {
+                    kind,
+                    repo: alias.clone(),
+                    last_ms: Some(self.now_ms),
+                });
+                self.changed = true;
+            }
+        }
+        let due: Vec<(ScheduleKind, String)> = self
+            .cadences
+            .iter()
+            .filter(|schedule| {
+                cadence::schedule_due(schedule, &self.config, self.now_ms)
+                    .is_some_and(|at| at <= self.now_ms)
+            })
+            .map(|schedule| (schedule.kind, schedule.repo.clone()))
+            .collect();
+        for (kind, repo) in due {
+            self.fire_cadence(kind, &repo);
+        }
+    }
+
+    /// Fire one cadence of one repository and stamp its last fire.
+    ///
+    /// The stamp lands even when the work fails: a failed sweep retries
+    /// at the next cadence moment, not on every poll.
+    fn fire_cadence(&mut self, kind: ScheduleKind, repo: &str) {
+        match kind {
+            ScheduleKind::Daily => self.daily_sweep(repo),
+            // The interview waits for its chunk; the fire marks the week.
+            ScheduleKind::Interview => {}
+            ScheduleKind::Audit => self.sweep(repo),
+        }
+        if let Some(schedule) = self
+            .cadences
+            .iter_mut()
+            .find(|schedule| schedule.kind == kind && schedule.repo == repo)
+        {
+            schedule.last_ms = Some(self.now_ms);
+        }
+        self.changed = true;
+    }
+
+    /// Run the daily sweep of one governed repository.
+    ///
+    /// The sweep fetches one comment page of every theory record updated
+    /// in the last `stale_days` days and derives the calibration share
+    /// from the delta blocks, the rung counts from the `ladder-*`
+    /// labels, the events of the last day, and the stale entries: the
+    /// model entries whose id has no hunk in the model log of the
+    /// window. The result joins the Theory view and is never persisted.
+    fn daily_sweep(&mut self, alias: &str) {
+        let Some(repo_cfg) = self.config.repos.get(alias) else {
+            return;
+        };
+        if !repo_cfg.theory.governor.is_on() {
+            return;
+        }
+        // The records of a shadowed repository live in the theory
+        // repository, whose snapshot no poller ships yet.
+        let shadowed = repo_cfg
+            .theory
+            .theory
+            .as_ref()
+            .is_some_and(|theory| theory.repo.is_some());
+        if shadowed {
+            return;
+        }
+        let stale_days = repo_cfg.theory.cards.stale_days;
+        let theory_path = repo_cfg.theory.checkout(&repo_cfg.path);
+        let now = self.now_ms;
+        let cutoff = now.saturating_sub(stale_days.saturating_mul(cadence::MS_PER_DAY));
+        let day_cutoff = now.saturating_sub(cadence::MS_PER_DAY);
+        let (rungs, keys) = {
+            let Some(items) = self.snapshot.repos.get(alias) else {
+                return;
+            };
+            let mut label_sets: Vec<&[String]> = Vec::new();
+            let mut keys: Vec<RecordKey> = Vec::new();
+            for issue in items.issues.values() {
+                label_sets.push(issue.labels.as_slice());
+                if cadence::in_sweep_window(&issue.updated_at, &issue.labels, cutoff) {
+                    keys.push(RecordKey::Issue(issue.number));
+                }
+            }
+            for pr in items.prs.values() {
+                label_sets.push(pr.labels.as_slice());
+                // A pull request carries no update time; its labels decide.
+                if cadence::in_sweep_window("", &pr.labels, cutoff) {
+                    keys.push(RecordKey::Pr(pr.number));
+                }
+            }
+            (cadence::rung_counts(&label_sets), keys)
+        };
+        let mut deltas: Vec<DeltaBlock> = Vec::new();
+        let mut events_last_day = 0usize;
+        if !keys.is_empty() {
+            let mut gh = GhClient::new(&*self.exec);
+            for key in &keys {
+                let Ok((owner_repo, number)) = self.theory_record(alias, key) else {
+                    continue;
+                };
+                let Ok(page) = gh.fetch_comments(&owner_repo, number) else {
+                    continue;
+                };
+                for comment in &page.comments {
+                    deltas.extend(parse_delta_blocks(&comment.body));
+                    if cadence::rfc3339_ms(&comment.created_at).is_some_and(|at| at >= day_cutoff) {
+                        events_last_day += parse_event_blocks(&comment.body).len();
+                    }
+                }
+            }
+        }
+        let mut stats = SweepStats {
+            calibration: cadence::calibration_share(&deltas),
+            rungs,
+            events_per_day: events_last_day,
+            stale_entries: Vec::new(),
+        };
+        if let Some(cache) = self.theory_models.get(alias) {
+            if let Ok(model) = &cache.model {
+                let ids: Vec<String> = model
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id().to_string())
+                    .collect();
+                if !ids.is_empty() {
+                    let log = worktree::git(
+                        self.exec.as_ref(),
+                        &theory_path,
+                        &[
+                            "log",
+                            &format!("--since={stale_days}.days.ago"),
+                            "-p",
+                            "--",
+                            MODEL_FILE,
+                        ],
+                    )
+                    .map(|out| out.stdout)
+                    .unwrap_or_default();
+                    stats.stale_entries = cadence::stale_entries(&ids, &log);
+                }
+            }
+        }
+        if self.theory_sweeps.get(alias) != Some(&stats) {
+            self.theory_sweeps.insert(alias.to_string(), stats);
+            // The stored view predates the sweep, so the sweep joins it
+            // here and the socket answers with the fresh numbers.
+            let view = self.theory_view(alias, true);
+            if self.theory_views.get(alias) != Some(&view) {
+                self.theory_views.insert(alias.to_string(), view);
+            }
+            self.changed = true;
         }
     }
 
@@ -8216,6 +8444,7 @@ impl Daemon {
             lanes,
             policies: self.policies.clone(),
             last_fire_ms,
+            cadences: self.cadences.clone(),
             ticket_conversations: self.ticket_conversations.values().cloned().collect(),
             role_bindings: self
                 .role_bindings
@@ -24126,6 +24355,271 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert!(
             !rig.daemon.table.by_id.contains_key("borsuk/audit-sweep"),
             "no audit task enters the table"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The daily sweep and the cadences
+    // ------------------------------------------------------------------
+
+    /// The model of the sweep test: one boundary and nine invariants.
+    const SWEEP_MODEL: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"checkout\"\n",
+        "statement = \"the cart pays\"\nsides = [\"web\", \"api\"]\npaths = [\"web/**\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-1\"\ntitle = \"cart\"\n",
+        "statement = \"the cart persists\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-2\"\ntitle = \"pay\"\n",
+        "statement = \"the pay lands\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-3\"\ntitle = \"order\"\n",
+        "statement = \"the order lands\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-4\"\ntitle = \"ship\"\n",
+        "statement = \"the ship lands\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-5\"\ntitle = \"stock\"\n",
+        "statement = \"the stock counts\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-6\"\ntitle = \"refund\"\n",
+        "statement = \"the refund lands\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-7\"\ntitle = \"login\"\n",
+        "statement = \"the login holds\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-8\"\ntitle = \"quote\"\n",
+        "statement = \"the quote holds\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-9\"\ntitle = \"export\"\n",
+        "statement = \"the export holds\"\nconstrains = [\"B-checkout\"]\n",
+    );
+
+    /// The model log of the sweep window. Every entry shows a hunk but
+    /// INV-9, whose last touch lies 31 days back.
+    const SWEEP_LOG: &str = concat!(
+        "commit 111\n",
+        "diff --git a/theory/model.toml b/theory/model.toml\n",
+        "+id = \"B-checkout\"\n",
+        "+id = \"INV-1\"\n",
+        "+id = \"INV-2\"\n",
+        "+id = \"INV-3\"\n",
+        "+id = \"INV-4\"\n",
+        "+id = \"INV-5\"\n",
+        "+id = \"INV-6\"\n",
+        "+id = \"INV-7\"\n",
+        "+id = \"INV-8\"\n",
+    );
+
+    /// The comment body of one swept record: ten sure slots with seven
+    /// hits, and one event of the last day.
+    const SWEEP_COMMENT: &str = concat!(
+        "<aif-delta-v1>\n",
+        "{\"slots\":[",
+        "{\"id\":\"INV-1\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-2\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-3\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-4\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-5\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-6\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-7\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-8\",\"outcome\":\"miss\",\"tag\":\"sure\"},",
+        "{\"id\":\"INV-9\",\"outcome\":\"miss\",\"tag\":\"sure\"},",
+        "{\"id\":\"B-checkout\",\"outcome\":\"miss\",\"tag\":\"sure\"}]}",
+        "\n</aif-delta-v1>\n",
+        "<aif-event-v1>\n",
+        "{\"kind\":\"violation\",\"text\":\"the cart reset on reload\"}",
+        "\n</aif-event-v1>",
+    );
+
+    /// The theory read of the sweep test at one commit. The model is
+    /// [`SWEEP_MODEL`]; the verify map and the skill are the shared ones.
+    fn sweep_theory_steps(repo: &Path, commit: &str) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok(format!("{commit}\n")),
+            ),
+            git_step(
+                repo,
+                &["show", &format!("{commit}:theory/model.toml")],
+                CmdOut::ok(SWEEP_MODEL),
+            ),
+            git_step(
+                repo,
+                &["show", &format!("{commit}:theory/verify.toml")],
+                CmdOut::ok(THEORY_VERIFY),
+            ),
+            git_step(
+                repo,
+                &["ls-tree", "-r", "--name-only", commit, SKILLS_DIR],
+                CmdOut::ok(SKILLS_TREE),
+            ),
+            git_step(
+                repo,
+                &["show", &format!("{commit}:.claude/skills/run-web/SKILL.md")],
+                CmdOut::ok(run_skill("browser")),
+            ),
+            git_step(
+                repo,
+                &[
+                    "show",
+                    &format!("{commit}:.claude/skills/run-web/features/README.md"),
+                ],
+                CmdOut::ok(RUN_INDEX),
+            ),
+            git_step(
+                repo,
+                &[
+                    "show",
+                    &format!("{commit}:.claude/skills/run-web/features/checkout.md"),
+                ],
+                CmdOut::ok(RUN_FEATURE),
+            ),
+        ]
+    }
+
+    /// One comment page of one swept record.
+    fn sweep_comment_step(number: u64) -> Step {
+        let url = format!("repos/acme/borsuk/issues/{number}/comments?per_page=100");
+        let body = format!(
+            "[{{\"user\":{{\"login\":\"agent\"}},\
+             \"created_at\":\"2026-09-10T20:00:00Z\",\
+             \"body\":\"{}\"}}]",
+            SWEEP_COMMENT
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        );
+        gh_step(
+            &["api", "-i", "-X", "GET", &url],
+            CmdOut::ok(format!("HTTP/2 200\r\netag: \"c{number}\"\r\n\r\n{body}")),
+        )
+    }
+
+    /// The ten ladder records of the sweep test.
+    fn sweep_issues() -> Vec<Issue> {
+        let rung = |index: u64| match index {
+            1..=2 => "ladder-1",
+            3..=7 => "ladder-2",
+            _ => "ladder-3",
+        };
+        (1..=10)
+            .map(|index| {
+                let mut one = issue(index, &[rung(index)]);
+                one.updated_at = "2026-09-05T12:00:00Z".to_string();
+                one
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_daily_sweep_reads_one_page_per_record_and_names_the_stale_entry() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        // The poll of the evening before the midnight, then the first
+        // poll after the midnight of 2026-09-11.
+        let before = 1_789_084_740_000_u64;
+        let after = 1_789_084_860_000_u64;
+        let mut steps = sweep_theory_steps(&repo, "aaa111");
+        // The poll after the midnight probes the same commit, then the
+        // sweep reads the model log and one comment page of each record.
+        steps.extend(commit_steps(&repo, "aaa111"));
+        // The sweep fetches one comment page of each record first, then
+        // reads the model log for the stale entries.
+        for number in 1..=10 {
+            steps.push(sweep_comment_step(number));
+        }
+        steps.push(git_step(
+            &repo,
+            &["log", "--since=30.days.ago", "-p", "--", MODEL_FILE],
+            CmdOut::ok(SWEEP_LOG),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.set_now(before);
+        rig.poll(sweep_issues(), Vec::new());
+
+        let fresh = theory_of(&rig);
+        assert_eq!(fresh.calibration, None, "no sweep ran before midnight");
+        assert_eq!(fresh.rungs, [0, 0, 0]);
+        assert_eq!(fresh.events_per_day, 0);
+        assert!(fresh.stale_entries.is_empty());
+
+        rig.set_now(after);
+        rig.poll(sweep_issues(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(
+            view.calibration,
+            Some(0.7),
+            "seven sure hits over ten sure slots"
+        );
+        assert_eq!(view.rungs, [2, 5, 3], "two, five, and three ladder labels");
+        assert_eq!(view.events_per_day, 10, "one event block of the last day");
+        assert_eq!(
+            view.stale_entries,
+            vec!["INV-9".to_string()],
+            "the entry of no hunk in the window"
+        );
+
+        let pages = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.program == "gh"
+                    && call
+                        .argv()
+                        .iter()
+                        .any(|arg| arg.contains("comments?per_page=100"))
+            })
+            .count();
+        assert_eq!(pages, 10, "one comment page of every swept record");
+
+        assert_eq!(rig.daemon.cadences.len(), 3, "one schedule of each kind");
+        for kind in [
+            ScheduleKind::Daily,
+            ScheduleKind::Interview,
+            ScheduleKind::Audit,
+        ] {
+            let schedule = rig
+                .daemon
+                .cadences
+                .iter()
+                .find(|one| one.kind == kind && one.repo == "borsuk")
+                .unwrap_or_else(|| panic!("the {kind:?} schedule exists"));
+            let want = if kind == ScheduleKind::Daily {
+                after
+            } else {
+                before
+            };
+            assert_eq!(
+                schedule.last_ms,
+                Some(want),
+                "only the daily sweep fired at the midnight"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repository_with_the_governor_off_holds_no_cadence() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), |_| {});
+
+        rig.set_now(1_789_084_860_000);
+        let mut one = issue(1, &["ladder-1"]);
+        one.updated_at = "2026-09-05T12:00:00Z".to_string();
+        rig.poll(vec![one], Vec::new());
+
+        assert!(
+            rig.daemon.cadences.is_empty(),
+            "the governor off leaves no schedule behind"
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "an ungoverned repository makes no calls"
+        );
+        assert!(
+            !rig.daemon.theory_sweeps.contains_key("borsuk"),
+            "an ungoverned repository sweeps nothing"
         );
     }
 }
