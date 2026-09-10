@@ -164,6 +164,7 @@ impl Runner for OpenCodeRunner {
             .map(|value| vec![(PERMISSION_ENV.to_string(), value)])
             .unwrap_or_default();
         let spec = RunSpec {
+            own_group: false,
             task: job.task.clone(),
             cwd: job.cwd.clone(),
             program: self.settings.program.clone(),
@@ -684,6 +685,7 @@ not json at all
             yolo: true,
             allowed_tools: None,
             allowed_permissions: Vec::new(),
+            timeout_s: None,
         }
     }
 

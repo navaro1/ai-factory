@@ -11,6 +11,7 @@
 use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
+use crate::daemon::FAST_CHECK_FAILED;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView};
 use crate::tasks::TaskState;
@@ -447,6 +448,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, sink: &mut impl ActionSin
         KeyCode::Char(' ') => stack_selected_pr(app, sink),
         KeyCode::Char('g') => ask_release(app),
         KeyCode::Char('s') => cycle_policy(app, sink),
+        KeyCode::Char('t') => teach_selected_pr(app, sink),
         KeyCode::Enter => open_selected_task(app),
         _ => {}
     }
@@ -803,6 +805,25 @@ fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
 }
 
 /// Stack or unstack the selected pull request in a waiting release queue.
+/// Send one teach request for the selected release pull request.
+///
+/// The board holds no merged pull request of its own, so the train rows
+/// are the pull requests a release merges. Every other row sends nothing.
+fn teach_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
+    let Some(Row::ReleasePr { repo, pr }) = selected_row(app) else {
+        return;
+    };
+    emit(
+        app,
+        sink,
+        Action::Theory(crate::sock::TheoryAction::Teach {
+            repo: repo.clone(),
+            key: crate::tasks::TeachKey::Pr(pr),
+        }),
+        format!("sent teach #{pr} {repo}"),
+    );
+}
+
 fn stack_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
     let found = {
         let Some(state) = app.state.as_ref() else {
@@ -968,10 +989,11 @@ pub(super) fn footer_hints(app: &App) -> String {
     match row {
         Row::Stage { .. } => "+ - limit · p pause · ? help".to_string(),
         Row::Repo { .. } => "+ - lane · n new · p pause · ? help".to_string(),
-        Row::Ticket { index } => match state.tasks.get(index) {
-            Some(task) if matches!(task.state, TaskState::Failed(_)) => {
-                "enter open · x abort · R retry · ? help".to_string()
+        Row::Ticket { index } => match state.tasks.get(index).map(|task| &task.state) {
+            Some(TaskState::Failed(reason)) if reason.starts_with(FAST_CHECK_FAILED) => {
+                format!("{FAST_CHECK_FAILED} · enter open · x abort · R retry · ? help")
             }
+            Some(TaskState::Failed(_)) => "enter open · x abort · R retry · ? help".to_string(),
             _ => "enter open · r refine · x abort · ? help".to_string(),
         },
         Row::Train { .. } => "g release · s policy · ? help".to_string(),
@@ -982,9 +1004,9 @@ pub(super) fn footer_hints(app: &App) -> String {
                 .find(|train| train.repo == repo)
                 .is_some_and(|train| train.queue.contains(&pr) && !train.batch.contains(&pr));
             if stackable {
-                "space stack · enter details · ? help".to_string()
+                "space stack · t teach · enter details · ? help".to_string()
             } else {
-                "enter details · p pause · ? help".to_string()
+                "t teach · enter details · p pause · ? help".to_string()
             }
         }
     }
@@ -4866,14 +4888,14 @@ mod tests {
                     repo: "borsuk".to_string(),
                     pr: 7,
                 },
-                "space stack · enter details · ? help",
+                "space stack · t teach · enter details · ? help",
             ),
             (
                 Row::ReleasePr {
                     repo: "borsuk".to_string(),
                     pr: 5,
                 },
-                "enter details · p pause · ? help",
+                "t teach · enter details · p pause · ? help",
             ),
         ];
         for (row, expected) in cases {
@@ -4884,5 +4906,17 @@ mod tests {
             );
             assert_eq!(footer_hints(&app), expected, "row {row:?}");
         }
+    }
+
+    /// A review a fast check cancelled names the check in its hint.
+    #[test]
+    fn the_hint_of_a_failed_fast_check_names_the_check() {
+        let mut state = sample_view();
+        state.tasks[7].state = TaskState::Failed(format!("{FAST_CHECK_FAILED}: checkout exit 1"));
+        let app = app_with_state_and_row(state, Row::Ticket { index: 7 });
+        let expected = "fast check failed · enter open · x abort · R retry · ? help";
+
+        assert_eq!(footer_hints(&app), expected);
+        assert!(expected.chars().count() <= crate::tui::HINT_CAP);
     }
 }

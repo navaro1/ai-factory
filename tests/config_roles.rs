@@ -560,3 +560,34 @@ fn legacy_field_names_are_valid_repository_aliases() {
         Config::parse(&text).expect("a repository alias must not be read as a legacy field");
     }
 }
+
+#[test]
+fn the_measure_table_sets_the_limit_and_defaults_to_two() {
+    let default = Config::parse(ROLES).expect("the base configuration must parse");
+    assert_eq!(default.measure.limit, 2);
+
+    let set = Config::parse(&format!("{ROLES}\n[measure]\nlimit = 2\n"))
+        .expect("the measure table must parse");
+    assert_eq!(set.measure.limit, 2);
+
+    let raised = Config::parse(&format!("{ROLES}\n[measure]\nlimit = 5\n"))
+        .expect("the measure table must parse");
+    assert_eq!(raised.measure.limit, 5);
+
+    let unknown = Config::parse(&format!("{ROLES}\n[measure]\nlimit = 2\nsize = 3\n"))
+        .expect_err("an unknown measure field must fail");
+    assert!(
+        format!("{unknown:#}").contains("unknown field"),
+        "error was: {unknown:#}"
+    );
+}
+
+#[test]
+fn the_script_harness_stays_out_of_every_role_table() {
+    let error = Config::parse(&ROLES.replacen("harness = \"claude\"", "harness = \"script\"", 1))
+        .expect_err("a script harness must fail");
+    assert!(
+        format!("{error:#}").contains("script"),
+        "error was: {error:#}"
+    );
+}

@@ -57,8 +57,28 @@ impl fmt::Display for TaskState {
     }
 }
 
+/// What one teach task explains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeachKey {
+    /// One merged pull request.
+    Pr(u64),
+    /// One area of the verification map.
+    Area(String),
+}
+
+impl TeachKey {
+    /// The id fragment of one key: `pr-7` or `area-web-checkout`.
+    pub fn slug(&self) -> String {
+        match self {
+            TeachKey::Pr(number) => format!("pr-{number}"),
+            TeachKey::Area(id) => format!("area-{id}"),
+        }
+    }
+}
+
 /// The workflow purpose of one task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPurpose {
     /// A normal pipeline task.
@@ -68,6 +88,10 @@ pub enum TaskPurpose {
     TicketCreate,
     /// A read-only conversation about one open issue.
     TicketChat,
+    /// One measurer or fast check: a shell command, not an agent.
+    Measure,
+    /// A one-shot explanation of one subject against the model.
+    Teach(TeachKey),
 }
 
 /// One stage of one item in one repository.
@@ -179,6 +203,11 @@ pub fn scoped_id(repo: &str, scope: &str) -> String {
 /// The task id for one issue conversation.
 pub fn ticket_chat_id(repo: &str, number: u64) -> String {
     format!("{repo}/ticket-i{number}")
+}
+
+/// The task id for one teach task: `<repo>/teach-<key>`.
+pub fn teach_id(repo: &str, key: &TeachKey) -> String {
+    format!("{repo}/teach-{}", key.slug())
 }
 
 /// All tasks of the daemon, in insertion order.
@@ -423,16 +452,26 @@ impl TaskTable {
     /// The number of running tasks of each stage.
     ///
     /// Queued, awaiting, and terminal tasks do not use a scheduler slot.
-    /// Every stage appears, with 0 when nothing runs.
+    /// Every stage appears, with 0 when nothing runs. A measure task
+    /// carries a stage for its worktree only and answers to the `measure`
+    /// limit, so it counts nowhere here.
     pub fn counts_by_stage(&self) -> BTreeMap<Stage, usize> {
         let mut counts: BTreeMap<Stage, usize> =
             Stage::ALL.iter().map(|stage| (*stage, 0)).collect();
         for task in self.by_id.values() {
-            if task.state == TaskState::Running {
+            if task.state == TaskState::Running && task.purpose != TaskPurpose::Measure {
                 *counts.entry(task.stage).or_insert(0) += 1;
             }
         }
         counts
+    }
+
+    /// The number of running measure tasks.
+    pub fn running_measure(&self) -> usize {
+        self.by_id
+            .values()
+            .filter(|task| task.state == TaskState::Running && task.purpose == TaskPurpose::Measure)
+            .count()
     }
 
     /// The number of running tasks per repository and stage.
@@ -449,7 +488,7 @@ impl TaskTable {
             }
         }
         for task in self.by_id.values() {
-            if task.state == TaskState::Running {
+            if task.state == TaskState::Running && task.purpose != TaskPurpose::Measure {
                 *counts.entry((task.repo.clone(), task.stage)).or_default() += 1;
             }
         }
@@ -556,6 +595,15 @@ mod tests {
         assert_eq!(
             table.by_id["borsuk/ticket-i42"].purpose,
             TaskPurpose::TicketChat
+        );
+    }
+
+    #[test]
+    fn a_teach_id_names_the_pull_request_or_the_area() {
+        assert_eq!(teach_id("borsuk", &TeachKey::Pr(7)), "borsuk/teach-pr-7");
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
+            "borsuk/teach-area-web-checkout"
         );
     }
 

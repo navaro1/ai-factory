@@ -220,6 +220,18 @@ minutes = 10
   1440. The default is `10`. A failed probe doubles the wait of its identity
   up to 60 minutes.
 
+The optional `[measure]` table caps the measure tasks:
+
+```toml
+[measure]
+limit = 2
+```
+
+- `limit` is how many measure tasks may run at once, over every repository.
+  The default is `2`. A measure task runs one shell command, not an agent,
+  so it holds no stage slot. A fast check of a governed pull request is one
+  measure task.
+
 The daemon derives one billed identity per plan: `claude`, `codex`, and one
 identity per OpenCode provider segment of a model, such as
 `zai-coding-plan`. Subscription plans show the percent LEFT of each quota

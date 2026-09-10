@@ -172,7 +172,7 @@ docs/v0.8/prompts/       the pinned copies
 
 ## 5. Boundaries
 
-- ✅ **Always:** every check is a pure function the daemon runs with no harness; every derivation rebuilds per poll; the operator's `verify.toml` wins over a feature's front matter; the code repository in shadow mode receives no skill file, label, or comment; `./check.sh` stays green after every chunk.
+- ✅ **Always:** every check is a pure function the daemon runs with no harness; every derivation rebuilds per poll; the operator's `verify.toml` wins over a feature's front matter; the code repository in shadow mode receives no skill file and no comment, and the only labels it receives are the ticket's own pipeline labels (`to-refine`, `verify-skill`, and the v0.6 stage labels), because the daemon polls only the code repository and a ticket elsewhere would never reach refine or implement; `./check.sh` stays green after every chunk.
 - ⚠️ **Ask-first:** the setup ticket is created only on the operator's `v`; a maintain ticket is created only when the sweep reports drift; a skill PR merges through the release train and its policy.
 - 🚫 **Never:** an agent installs a driver; an agent edits `theory/verify.toml`; the factory names a browser-profile integration in any prompt; a verifier subagent runs by default; a Before / After line is written by the daemon from agent claims.
 

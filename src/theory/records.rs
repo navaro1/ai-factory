@@ -21,6 +21,12 @@ pub const MODEL_PR_LABEL: &str = "model-pr";
 /// The color GitHub renders `event-open` with, as six hex digits.
 pub const EVENT_OPEN_COLOR: &str = "d4c5f9";
 
+/// The label that marks a run skill ticket and its pull request.
+pub const VERIFY_SKILL_LABEL: &str = "verify-skill";
+
+/// The color GitHub renders `verify-skill` with, as six hex digits.
+pub const VERIFY_SKILL_COLOR: &str = "0e8a16";
+
 /// The opening tag of one prediction block.
 pub const PREDICTION_BLOCK: &str = "<aif-prediction-v1>";
 /// The opening tag of one theory event block.
@@ -99,7 +105,7 @@ pub fn parse_event_blocks(text: &str) -> Vec<Event> {
 
 /// The closing tag of one opening tag: `<aif-event-v1>` closes as
 /// `</aif-event-v1>`.
-fn close_tag(open: &str) -> String {
+pub fn close_tag(open: &str) -> String {
     format!("</{}>", open.trim_start_matches('<').trim_end_matches('>'))
 }
 

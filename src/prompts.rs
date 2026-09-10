@@ -449,6 +449,87 @@ Put valid JSON between the markers. Do not quote the block. Do not put the
 block in a code fence. Include no text after the closing marker.
 "#;
 
+/// The built-in prompt of one teach task.
+///
+/// The theory roles carry no prompt file, so a teach task fills this
+/// template directly. The placeholders are `{repo}`, `{worktree}`,
+/// `{subject}`, `{history}`, `{model}`, and `{skills}`.
+pub const TEACH_PROMPT: &str = r#"You explain one subject of the repository {repo}
+to the operator. You work in {worktree}, the repository checkout. Read the
+files you need. Change no file.
+
+The subject
+
+{subject}
+
+The history
+
+{history}
+
+The model
+
+{model}
+
+The skills
+
+{skills}
+
+Explain how the subject works and why it works that way. Use the model, the
+skills, and the history. Give the smallest complete answer first. Then add
+one layer at a time. Build the picture in steps, one part per step.
+
+Keep the confidence of what you found. Name the history when the history
+shows a fact. Say that you infer a step when you reason it out. Print no
+framing label. Ask the operator no question. Set no quiz.
+
+End the turn with one block per contradiction you find between the code and
+the model. A subject that matches the model ends with no block. Each block
+takes this form.
+
+<aif-event-v1>
+{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The body of one run skill ticket, before the daemon fills it.
+///
+/// The eight steps are section 6.2 of the verification toolbelt design
+/// record. The daemon fills `{alias}`, `{surface}`, `{skills_dir}`, and
+/// `{app_path}` when it creates the ticket, so the refine agent and the
+/// implement agent read one complete recipe.
+pub const SETUP_BODY: &str = r#"Write the run skill of the {surface} surface of {alias}.
+
+The application lives at {app_path}. Write every skill file under
+{skills_dir}. Never edit `theory/verify.toml`.
+
+1. Interview the repository, not the operator. Find the surface, the run
+command, the drivers that are already installed, the evidence a run leaves
+behind, and how a run isolates its state.
+2. Probe the driver ladder. Pick the highest tier that is already present.
+Install nothing.
+3. Fix a checkout that does not start. Report the failure precisely when you
+cannot fix it. Do this before you write any skill file.
+4. Write `SKILL.md` with the front matter keys `name`, `description`,
+`surface`, `driver`, `tier`, and `blind`, and with the sections Run, Fast,
+Auth or seed, Drive, Logs, and Gotchas. Measure the Fast path and record how
+long it takes. Under Claude Code the bundled `run-skill-generator` skill
+writes the first draft.
+5. Seed the `features/` directory from `theory/verify.toml`. Write the index
+first. Then write one file per area that maps to this surface and needs a
+drive recipe. Write the top three to five areas only.
+6. Prove it once end to end. Run the application, run the fast command, drive
+one feature, read the logs, and stop the application. Confirm that the
+evidence file still exists.
+7. Write the PR body to the contract of the implement prompt. The Before and
+After line of a setup PR states `before: no run skill`. Its after text is
+what step 6 proved.
+8. Propose the `skills` entry of `theory/verify.toml` as text in the PR body.
+Never edit `theory/verify.toml`.
+"#;
+
 /// The placeholders the daemon fills in a stage prompt.
 const STAGE_PLACEHOLDERS: &[&str] = &[
     "repo",
@@ -800,6 +881,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_teach_prompt_names_exactly_its_six_placeholders() {
+        assert_eq!(
+            scan_placeholders(TEACH_PROMPT),
+            vec!["repo", "worktree", "subject", "history", "model", "skills"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(TEACH_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(TEACH_PROMPT, &values).expect("the teach prompt fills");
+        assert!(filled.contains("<subject>"));
+        assert!(filled.contains("<history>"));
+        assert!(
+            filled.contains(
+                r#"{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}"#
+            ),
+            "the event block stays literal:\n{filled}"
+        );
     }
 
     /// The theory roles carry no template yet. Every prompt entry point

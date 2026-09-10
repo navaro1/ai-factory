@@ -47,6 +47,10 @@ pub enum WorktreeKind {
     Issue,
     /// The worktree of one PR: the `pr-<n>` directory.
     Pr,
+    /// The skills worktree of one run skill ticket: the `skills-<n>`
+    /// directory. It is cut from the skills checkout, not from the code
+    /// repository.
+    Skills,
 }
 
 impl WorktreeKind {
@@ -55,13 +59,15 @@ impl WorktreeKind {
         match self {
             WorktreeKind::Issue => "issue-",
             WorktreeKind::Pr => "pr-",
+            WorktreeKind::Skills => "skills-",
         }
     }
 }
 
 /// The worktree kinds the manager owns. The doctor asks for this list, so
 /// the manager is the single source of the directory names.
-pub const WORKTREE_KINDS: [WorktreeKind; 2] = [WorktreeKind::Issue, WorktreeKind::Pr];
+pub const WORKTREE_KINDS: [WorktreeKind; 3] =
+    [WorktreeKind::Issue, WorktreeKind::Pr, WorktreeKind::Skills];
 
 /// The directory name of the train worktree. The manager owns this name,
 /// so every caller that prints it reads this const.
@@ -98,7 +104,13 @@ impl WorktreeManager {
         self.path(repo, WorktreeKind::Pr, number)
     }
 
-    /// The worktree path of one kind: `issue-<n>` or `pr-<n>`.
+    /// The skills worktree path: `<state_dir>/worktrees/<alias>/skills-<n>`.
+    pub fn skills_path(&self, repo: &RepoConfig, number: u64) -> PathBuf {
+        self.path(repo, WorktreeKind::Skills, number)
+    }
+
+    /// The worktree path of one kind: `issue-<n>`, `pr-<n>`, or
+    /// `skills-<n>`.
     pub fn path(&self, repo: &RepoConfig, kind: WorktreeKind, number: u64) -> PathBuf {
         self.state_dir
             .join("worktrees")
@@ -122,6 +134,11 @@ impl WorktreeManager {
     /// The PR branch name: `aif/<alias>/pr-<n>`.
     pub fn pr_branch(repo: &RepoConfig, number: u64) -> String {
         format!("aif/{}/pr-{number}", repo.alias)
+    }
+
+    /// The skills branch name: `aif/<alias>/skills-<n>`.
+    pub fn skills_branch(repo: &RepoConfig, number: u64) -> String {
+        format!("aif/{}/skills-{number}", repo.alias)
     }
 
     /// The train branch name: `aif/<alias>/train`.
@@ -170,9 +187,9 @@ impl WorktreeManager {
     /// branch without `-b`, so the old work survives the loss of the
     /// directory.
     pub fn ensure_issue(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
-        self.ensure_on(
+        self.ensure_from(
             exec,
-            repo,
+            &repo.path,
             &self.issue_path(repo, number),
             &Self::issue_branch(repo, number),
         )
@@ -189,7 +206,7 @@ impl WorktreeManager {
     /// reset never reads.
     pub fn ensure_pr(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
         let path = self.pr_path(repo, number);
-        let worktree = self.ensure_on(exec, repo, &path, &Self::pr_branch(repo, number))?;
+        let worktree = self.ensure_from(exec, &repo.path, &path, &Self::pr_branch(repo, number))?;
         let reference = format!("pull/{number}/head");
         let out = git(exec, &worktree, &["fetch", "origin", reference.as_str()])?;
         require_zero(out, "git fetch")?;
@@ -198,42 +215,65 @@ impl WorktreeManager {
         Ok(worktree)
     }
 
-    /// Return the worktree at `path` on `branch`, and create it when missing.
+    /// Return the skills worktree of one run skill ticket, and create it
+    /// when missing.
     ///
-    /// When the path exists and git registers it, the worktree returns as it
-    /// stands, so work resumes in place. Otherwise the create path first
-    /// recovers a broken previous worktree (see [`WorktreeManager::recover`]),
-    /// and then cuts the branch from the default branch: `origin/HEAD`
-    /// resolved through `git symbolic-ref`, else the repository's own
-    /// `HEAD`. When the branch already exists, the worktree is added on that
-    /// branch without `-b`, so the old work survives the loss of the
-    /// directory.
-    fn ensure_on(
+    /// The worktree sits at `<state_dir>/worktrees/<alias>/skills-<n>` on
+    /// the branch `aif/<alias>/skills-<n>`, cut from the default branch of
+    /// the skills checkout. In shadow mode that checkout is the theory
+    /// repository, so the code repository never holds a skill file.
+    pub fn ensure_skills(
         &self,
         exec: &dyn Exec,
         repo: &RepoConfig,
+        number: u64,
+    ) -> Result<PathBuf> {
+        self.ensure_from(
+            exec,
+            &repo.skills_checkout(),
+            &self.skills_path(repo, number),
+            &Self::skills_branch(repo, number),
+        )
+    }
+
+    /// Return the worktree at `path` on `branch`, and create it when missing.
+    ///
+    /// `source` is the checkout the worktree is cut from: the code
+    /// repository for a ticket or a PR, the skills checkout for a run
+    /// skill. When the path exists and git registers it, the worktree
+    /// returns as it stands, so work resumes in place. Otherwise the create
+    /// path first recovers a broken previous worktree (see
+    /// [`WorktreeManager::recover`]), and then cuts the branch from the
+    /// default branch: `origin/HEAD` resolved through `git symbolic-ref`,
+    /// else the source checkout's own `HEAD`. When the branch already
+    /// exists, the worktree is added on that branch without `-b`, so the
+    /// old work survives the loss of the directory.
+    fn ensure_from(
+        &self,
+        exec: &dyn Exec,
+        source: &Path,
         path: &Path,
         branch: &str,
     ) -> Result<PathBuf> {
-        if path.exists() && self.registered(exec, &repo.path, path)? {
+        if path.exists() && self.registered(exec, source, path)? {
             self.prepare(exec, path)?;
             return Ok(path.to_path_buf());
         }
 
-        self.recover(exec, &repo.path, path)?;
+        self.recover(exec, source, path)?;
         let path_text = path.to_string_lossy().into_owned();
-        if self.branch_exists(exec, &repo.path, branch)? {
+        if self.branch_exists(exec, source, branch)? {
             let out = git(
                 exec,
-                &repo.path,
+                source,
                 &["worktree", "add", path_text.as_str(), branch],
             )?;
             require_zero(out, "git worktree add")?;
         } else {
-            let base = self.default_base(exec, &repo.path)?;
+            let base = self.default_base(exec, source)?;
             let out = git(
                 exec,
-                &repo.path,
+                source,
                 &[
                     "worktree",
                     "add",
@@ -346,9 +386,9 @@ impl WorktreeManager {
             Cleanable::MergedOrClosed => {}
         }
 
-        self.remove_on(
+        self.remove_from(
             exec,
-            repo,
+            &repo.path,
             &self.issue_path(repo, number),
             &Self::issue_branch(repo, number),
         )
@@ -367,30 +407,47 @@ impl WorktreeManager {
         match proof {
             Cleanable::MergedOrClosed => {}
         }
-        self.remove_on(
+        self.remove_from(
             exec,
-            repo,
+            &repo.path,
             &self.pr_path(repo, number),
             &Self::pr_branch(repo, number),
         )
     }
 
-    /// Remove the worktree at `path` and delete `branch`.
-    fn remove_on(
+    /// Remove the skills worktree of one run skill ticket and delete its
+    /// branch.
+    ///
+    /// The proof contract matches [`WorktreeManager::remove_issue`]. The
+    /// removal runs in the skills checkout, which owns the worktree.
+    pub fn remove_skills(
         &self,
         exec: &dyn Exec,
         repo: &RepoConfig,
-        path: &Path,
-        branch: &str,
+        number: u64,
+        proof: Cleanable,
     ) -> Result<()> {
+        match proof {
+            Cleanable::MergedOrClosed => {}
+        }
+        self.remove_from(
+            exec,
+            &repo.skills_checkout(),
+            &self.skills_path(repo, number),
+            &Self::skills_branch(repo, number),
+        )
+    }
+
+    /// Remove the worktree at `path` and delete `branch` in `source`.
+    fn remove_from(&self, exec: &dyn Exec, source: &Path, path: &Path, branch: &str) -> Result<()> {
         let path_text = path.to_string_lossy().into_owned();
         let out = git(
             exec,
-            &repo.path,
+            source,
             &["worktree", "remove", "--force", path_text.as_str()],
         )?;
         require_zero(out, "git worktree remove")?;
-        let out = git(exec, &repo.path, &["branch", "-D", branch])?;
+        let out = git(exec, source, &["branch", "-D", branch])?;
         require_zero(out, "git branch -D")?;
         Ok(())
     }
