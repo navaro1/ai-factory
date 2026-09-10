@@ -265,7 +265,10 @@ pub struct RecordView {
     /// The last delta of the record.
     #[serde(default)]
     pub delta: Option<DeltaBlock>,
-    /// The open theory events of the record, in comment order.
+    /// Every theory event block of the record, in comment order.
+    ///
+    /// An answered event stays here. The answers say which event blocks
+    /// still wait for the operator.
     #[serde(default)]
     pub events: Vec<Event>,
     /// The answers the operator posted on the record, in comment order.

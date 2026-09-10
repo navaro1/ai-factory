@@ -1478,7 +1478,7 @@ fn feed_message(decision: &Decision) -> String {
             format!("Release {} PRs: {}?", prs.len(), pr_list(prs))
         }
         DecisionKind::DeltaHit { kind, number, hits } => format!(
-            "{} #{number}: the delta hit every slot of {hits}. Confirm it?",
+            "{} #{number}: all {hits} slots hit. Confirm it?",
             kind.title_noun()
         ),
         DecisionKind::TheoryEvent {

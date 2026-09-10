@@ -102,6 +102,16 @@ const DELTA_CONFIRMED: &str = "The operator confirmed the delta. Every slot hit.
 /// The prefix of the comment one `pr` answer posts on the record.
 const PR_BROKE_THE_MODEL: &str = "the pull request broke";
 
+/// True when one diff line of the model file names `entry`.
+///
+/// A changed line starts with `+` or `-`. The `+++` and `---` file
+/// headers start the same way and name no entry, so they stay out.
+fn diff_names(line: &str, entry: &str) -> bool {
+    let changed = (line.starts_with('+') && !line.starts_with("+++"))
+        || (line.starts_with('-') && !line.starts_with("---"));
+    changed && line.contains(entry)
+}
+
 /// The record key of one item of a repository.
 fn record_key(kind: ItemKind, number: u64) -> RecordKey {
     match kind {
@@ -1755,7 +1765,9 @@ impl Daemon {
     ///
     /// The read is one `git log` of the default branch of the theory
     /// checkout, limited to the model file and to the commits after the
-    /// answer. An added line that names the entry closes the answer.
+    /// answer. An added or a removed line that names the entry closes the
+    /// answer, because the operator can delete a wrong entry as well as
+    /// correct it.
     fn model_change_landed(&self, alias: &str, answer: &AnswerBlock) -> bool {
         let Some(config) = self.config.repos.get(alias) else {
             return false;
@@ -1770,9 +1782,10 @@ impl Daemon {
             return false;
         };
         out.status == 0
-            && out.stdout.lines().any(|line| {
-                line.starts_with('+') && !line.starts_with("+++") && line.contains(&answer.entry)
-            })
+            && out
+                .stdout
+                .lines()
+                .any(|line| diff_names(line, &answer.entry))
     }
 
     /// Remove one theory label from the record of one item.
@@ -24285,6 +24298,42 @@ mod tests {
         rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
 
         assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+    }
+
+    /// The operator can delete a wrong entry instead of correcting it, so
+    /// a removed line that names the entry closes the `model` answer too.
+    #[test]
+    fn a_model_answer_closes_when_the_model_file_loses_the_entry() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = first_delta_poll_steps(&repo, &violation_delta());
+        steps.push(answer_comment_step(
+            Cause::Model,
+            "INV-3",
+            2,
+            "violation:INV-3",
+            T0,
+        ));
+        steps.extend(cached_theory_steps(&repo));
+        steps.extend(model_log_step(
+            &repo,
+            T0,
+            "commit abc\n--- a/theory/model.toml\n+++ b/theory/model.toml\n-statement = \"the cart keeps the token of INV-3\"\n",
+        ));
+        steps.push(remove_label_step(DELTA_OPEN_LABEL));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(theory_answer(
+            "theory:borsuk:p7:violation:INV-3",
+            Cause::Model,
+            "INV-3",
+            2,
+        ));
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        assert_eq!(label_delete_calls(&rig, DELTA_OPEN_LABEL), 1);
+        assert!(theory_row_ids(&rig).is_empty());
     }
 
     /// A hit-only delta opens one `DELTA` row, and the confirmation posts
