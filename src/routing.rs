@@ -141,6 +141,19 @@ pub fn level_from_label(stage: TagRouteStage, label: &str) -> Option<ComplexityL
         .find(|candidate| label == format!("{}{}", stage.label_prefix(), candidate.as_str()))
 }
 
+/// The vendor family of one model slug: the text before the first `-`.
+///
+/// `claude-opus-5` and `claude-fable-5-1` share `claude`, and
+/// `gpt-5.6-sol` and `gpt-6-astra` share `gpt`. The doctor warns when the
+/// implement and review routes of one complexity level resolve to the
+/// same family.
+pub fn model_family(slug: &str) -> &str {
+    match slug.split_once('-') {
+        Some((family, _)) => family,
+        None => slug,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +212,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn model_family_is_the_text_before_the_first_dash() {
+        assert_eq!(model_family("claude-opus-5"), "claude");
+        assert_eq!(model_family("claude-fable-5-1"), "claude");
+        assert_eq!(model_family("gpt-5.6-sol"), "gpt");
+        assert_eq!(model_family("gpt-6-astra"), "gpt");
+        assert_eq!(model_family("codex"), "codex");
     }
 }
