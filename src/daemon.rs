@@ -6333,6 +6333,10 @@ impl Daemon {
             eprintln!("the audit request for {repo}: no such repository");
             return;
         }
+        if self.config.repos[repo].theory.governor != Governor::On {
+            eprintln!("the theory governor of {repo} is off");
+            return;
+        }
         let id = tasks::audit_id(repo, &AuditJob::Sweep);
         let log = self
             .state_dir
@@ -7290,13 +7294,16 @@ impl Daemon {
     /// The `{skills}` value of one audit sweep: the implement-shaped slice
     /// over every area of the verification map.
     fn audit_skills(&self, task: &Task) -> String {
-        let Some((_, verify)) = self.theory_pair(&task.repo) else {
+        let Some(cache) = self.theory_models.get(&task.repo) else {
             return String::new();
         };
-        let Some(cache) = self.theory_skills.get(&task.repo) else {
+        let Ok(verify) = &cache.verify else {
             return String::new();
         };
-        let Ok(set) = &cache.skills else {
+        let Some(skills) = self.theory_skills.get(&task.repo) else {
+            return String::new();
+        };
+        let Ok(set) = &skills.skills else {
             return String::new();
         };
         let areas: Vec<&str> = verify.areas.iter().map(|area| area.id.as_str()).collect();
@@ -21959,27 +21966,73 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "The Run command names scripts/serve.ts, which the code removed.",
         );
         let second = drift_event("web", "The handle pay-now answers no route.");
+        let third = drift_event(
+            "api",
+            "The Fast check names bin/serve.py, which the code renamed.",
+        );
         let mut steps = slice_steps(&repo, "aaa111");
         steps.extend(open_event_steps(&first));
         steps.extend(open_event_steps(&second));
+        steps.extend(open_event_steps(&third));
+        steps.push(verify_skill_label_step());
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
         let mut rig = Rig::make_in(dir, steps, governed);
-        let mut ticket = issue(41, &[VERIFY_SKILL_LABEL]);
-        ticket.title = SkillTicket::Setup.title("borsuk", "web");
-        rig.poll(vec![theory_issue(), ticket], Vec::new());
+        let mut closed = issue(41, &[VERIFY_SKILL_LABEL]);
+        closed.title = SkillTicket::Maintain.title("borsuk", "web");
+        closed.open = false;
+        let mut open = issue(44, &[VERIFY_SKILL_LABEL]);
+        open.title = SkillTicket::Maintain.title("borsuk", "api");
+        rig.poll(vec![theory_issue(), closed, open], Vec::new());
         rig.act(sweep_action());
         let id = "borsuk/audit-sweep";
 
         rig.event(RunEvent::Text {
             task: id.to_string(),
-            text: format!("{}\n{}", event_block(&first), event_block(&second)),
+            text: format!(
+                "{}\n{}\n{}",
+                event_block(&first),
+                event_block(&second),
+                event_block(&third)
+            ),
         });
         rig.event(turn_ended(id));
         rig.event(exited(id, true, ""));
 
-        assert_eq!(opened_events(&rig), vec![first, second]);
+        assert_eq!(opened_events(&rig), vec![first, second, third]);
+        let creates = maintain_creates(&rig);
+        assert_eq!(
+            creates.len(),
+            1,
+            "a closed web ticket and an open api ticket stop no web ticket"
+        );
         assert!(
-            maintain_creates(&rig).is_empty(),
-            "an open verify-skill ticket for the surface stops the ticket"
+            creates[0]
+                .args
+                .iter()
+                .any(|arg| arg == "labels[]=to-refine"),
+            "args: {:?}",
+            creates[0].args
+        );
+        assert!(
+            creates[0]
+                .args
+                .iter()
+                .any(|arg| arg == "labels[]=verify-skill"),
+            "args: {:?}",
+            creates[0].args
+        );
+        let gh_calls = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "gh")
+            .count();
+        assert_eq!(
+            gh_calls, 11,
+            "three events, one label, one create, and no api attempt"
         );
         assert_eq!(rig.task(id).state, TaskState::Done);
     }
@@ -22015,5 +22068,60 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "no drift means no ticket"
         );
         assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_drift_block_without_a_surface_opens_its_event_and_creates_no_ticket() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let event = Event {
+            kind: "skill-drift".to_string(),
+            text: "The handle pay-now answers no route.".to_string(),
+            area: None,
+            number: None,
+            surface: None,
+        };
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(open_event_steps(&event));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(vec![theory_issue()], Vec::new());
+        rig.act(sweep_action());
+        let id = "borsuk/audit-sweep";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&event),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![event], "the drift event opens");
+        assert!(
+            maintain_creates(&rig).is_empty(),
+            "a drift without a surface creates no ticket"
+        );
+        assert_eq!(rig.task(id).state, TaskState::Done);
+    }
+
+    #[test]
+    fn an_audit_sweep_of_a_repository_with_the_governor_off_queues_nothing() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), |_| {});
+
+        rig.act(sweep_action());
+
+        assert_eq!(
+            rig.job_count(),
+            0,
+            "an ungoverned repository queues no sweep"
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "an ungoverned repository is quiet"
+        );
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/audit-sweep"),
+            "no audit task enters the table"
+        );
     }
 }
