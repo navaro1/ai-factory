@@ -77,7 +77,7 @@ the surface on its own.
 
 {skills}
 
-The last ticket check said: {finding}
+{finding}
 
 # The ticket body
 

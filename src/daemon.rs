@@ -234,6 +234,12 @@ struct TicketCheckFailure {
     finding: String,
 }
 
+/// What the `{finding}` line of a refine prompt opens with.
+///
+/// The whole line lives in the value, so a ticket behind no failed
+/// check renders nothing at all.
+pub const TICKET_FINDING_LEAD: &str = "The last ticket check said";
+
 /// The `{why_rule}` line of a shadow-mode repository.
 ///
 /// The model lives in the theory repository, so an entry ID means
@@ -8547,12 +8553,13 @@ impl Daemon {
         };
         // A refine that a failed ticket check queued reads what the check
         // said. In shadow mode the finding comments on the shadow issue,
-        // which the agent never reads, so the prompt carries it.
+        // which the agent never reads, so the prompt carries it. The
+        // whole line lives here, so a healthy ticket renders nothing.
         let finding = match task.stage {
             Stage::Refine => self
                 .ticket_check_failures
                 .get(&(task.repo.clone(), task.number))
-                .map(|failure| failure.finding.clone())
+                .map(|failure| format!("{TICKET_FINDING_LEAD}: {}", failure.finding))
                 .unwrap_or_default(),
             _ => String::new(),
         };
@@ -27558,7 +27565,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert_eq!(rig.job_count(), 1, "the finding label queues the refine");
         assert_eq!(rig.job(0).task, "borsuk/refine-i142");
         let want = format!(
-            "The last ticket check said: {}",
+            "{TICKET_FINDING_LEAD}: {}",
             ticket_finding().strip_prefix("ticket: ").unwrap()
         );
         assert!(
@@ -27568,8 +27575,8 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         );
     }
 
-    /// A ticket with no failed check behind it renders no finding, and a
-    /// passing check forgets the one it had.
+    /// A ticket with no failed check behind it renders no finding line
+    /// at all, so the healthy refine prompt never names a check.
     #[test]
     fn a_refine_without_a_failed_check_renders_no_finding() {
         let dir = temp_root();
@@ -27592,6 +27599,12 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .placeholder_values(&refine, &repo_cfg, &dir)
             .expect("the refine values must render");
         assert_eq!(placeholder_of(&values, "finding"), "");
+        let rendered =
+            prompts::fill_template(prompts::REFINE_PROMPT, &values).expect("the prompt fills");
+        assert!(
+            !rendered.contains(TICKET_FINDING_LEAD),
+            "a healthy ticket names no check:\n{rendered}"
+        );
 
         rig.daemon.ticket_check_failures.insert(
             ("borsuk".to_string(), 142),
@@ -27604,7 +27617,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .daemon
             .placeholder_values(&refine, &repo_cfg, &dir)
             .expect("the refine values must render");
-        assert_eq!(placeholder_of(&values, "finding"), "AC-1 names no check");
+        assert_eq!(
+            placeholder_of(&values, "finding"),
+            "The last ticket check said: AC-1 names no check",
+            "the whole line lives in the value"
+        );
 
         // Only a refine reads the memory; the other stages leave it out.
         let implement = Task::new(
