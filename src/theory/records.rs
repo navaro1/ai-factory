@@ -204,7 +204,7 @@ pub fn prediction_block(prediction: &Prediction) -> String {
         Prediction::Short(value) => serde_json::to_string(value),
         Prediction::Full(value) => serde_json::to_string(value),
     }
-    .expect("a prediction serializes");
+    .unwrap_or_default();
     let close = close_tag(PREDICTION_BLOCK);
     format!("{PREDICTION_BLOCK}\n{body}\n{close}")
 }

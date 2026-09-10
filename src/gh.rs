@@ -2141,7 +2141,11 @@ mod tests {
                 "GET",
                 "repos/acme/borsuk/issues/9/comments?per_page=100",
             ]),
-            CmdOut::ok(response("HTTP/2 304", &["etag: \"c9\""], "")),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 304", &["etag: \"c9\""], ""),
+                stderr: "gh: HTTP 304\n".to_string(),
+            },
         );
         let mut client = GhClient::new(&exec);
         let error = client.fetch_comments("acme/borsuk", 9).unwrap_err();
