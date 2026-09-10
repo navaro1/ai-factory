@@ -137,7 +137,7 @@ pub struct StateView {
 ///
 /// The daemon rebuilds it on every poll from the theory checkout commit,
 /// so it never outlives the files it describes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TheoryView {
     /// Whether the governor runs for this repository.
     #[serde(default)]
@@ -166,6 +166,19 @@ pub struct TheoryView {
     /// The blocks of each theory record the daemon read, by record key.
     #[serde(default)]
     pub records: BTreeMap<String, RecordView>,
+    /// The calibration share of the last daily sweep: the sure hits over
+    /// the sure slots. `None` until a sweep sees a sure slot.
+    #[serde(default)]
+    pub calibration: Option<f64>,
+    /// The record count that carries each ladder label, in rung order.
+    #[serde(default)]
+    pub rungs: [usize; 3],
+    /// The theory events of the last day, from the daily sweep.
+    #[serde(default)]
+    pub events_per_day: usize,
+    /// The model entries no change touched in `stale_days` days.
+    #[serde(default)]
+    pub stale_entries: Vec<String>,
     /// One row per pull request whose record holds a delta, by pull
     /// request number.
     #[serde(default)]
@@ -3006,6 +3019,10 @@ mod tests {
                     },
                 )]),
                 window: (2, 3),
+                calibration: Some(0.7),
+                rungs: [2, 5, 3],
+                events_per_day: 4,
+                stale_entries: vec!["INV-9".to_string()],
             },
         );
         let view = StateView {
@@ -3061,6 +3078,10 @@ mod tests {
         assert!(one.areas.is_empty());
         assert!(one.skills.is_empty());
         assert_eq!(one.error, "");
+        assert_eq!(one.calibration, None);
+        assert_eq!(one.rungs, [0, 0, 0]);
+        assert_eq!(one.events_per_day, 0);
+        assert!(one.stale_entries.is_empty());
     }
 
     #[test]
