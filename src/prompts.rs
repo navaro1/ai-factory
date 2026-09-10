@@ -741,8 +741,9 @@ const STAGE_PLACEHOLDERS: &[&str] = &[
     "pr_list",
     "pr_numbers",
     "pr_count",
-    // The theory placeholders. `prediction`, `comparison`, `rules`, and
-    // `why_rule` render empty until their chunks land.
+    // The theory placeholders. `prediction`, `comparison`, and `rules`
+    // render empty until their chunks land; `why_rule` fills for a
+    // shadow-mode repository only.
     "model",
     "prediction",
     "comparison",

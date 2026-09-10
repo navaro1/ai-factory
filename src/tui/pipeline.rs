@@ -792,10 +792,15 @@ fn send_refine(
 
 /// True while one ticket of a governed repository still owes its short
 /// prediction.
+///
+/// The theory label sits on the theory record, which is the shadow issue
+/// in shadow mode, so the record view answers for it. The gate skip
+/// reads the ticket, because `verify-skill` and `model-pr` label the
+/// ticket itself in both modes.
 fn wants_prediction(state: &StateView, repo: &str, number: u64) -> bool {
-    if !state.theory.get(repo).is_some_and(|theory| theory.governor) {
+    let Some(theory) = state.theory.get(repo).filter(|theory| theory.governor) else {
         return false;
-    }
+    };
     let Some(ticket) = state
         .tickets
         .iter()
@@ -803,10 +808,8 @@ fn wants_prediction(state: &StateView, repo: &str, number: u64) -> bool {
     else {
         return false;
     };
-    !ticket
-        .labels
-        .iter()
-        .any(|label| label == THEORY_SHORT_LABEL)
+    let key = RecordKey::Issue(number).key_text();
+    !theory.record_carries(&key, &ticket.labels, THEORY_SHORT_LABEL)
         && !skips_prediction_gates(&ticket.labels)
 }
 
@@ -943,7 +946,8 @@ fn predict_ticket_with(
 /// unblocks the work. A ticket a refine agent still reshapes carries
 /// `to-refine` and takes the pause key instead. A `model-pr` or
 /// `verify-skill` ticket writes no prediction, and neither does a pull
-/// request row.
+/// request row. The theory label sits on the theory record, so a shadow
+/// repository reads it from the record view instead of the ticket.
 fn full_prediction_target(app: &App) -> Option<(String, u64)> {
     let state = app.state.as_ref()?;
     let Row::Ticket { index } = selected_row(app)? else {
@@ -965,10 +969,12 @@ fn full_prediction_target(app: &App) -> Option<(String, u64)> {
         .iter()
         .find(|ticket| ticket.repo == task.repo && ticket.number == task.number)?;
     let carries = |label: &str| ticket.labels.iter().any(|one| one == label);
+    let theory = state.theory.get(&task.repo)?;
+    let key = RecordKey::Issue(task.number).key_text();
     if skips_prediction_gates(&ticket.labels)
         || !carries(REFINED)
         || carries(TO_REFINE)
-        || carries(THEORY_FULL_LABEL)
+        || theory.record_carries(&key, &ticket.labels, THEORY_FULL_LABEL)
     {
         return None;
     }
@@ -4705,6 +4711,45 @@ mod tests {
     // The full prediction
     // ------------------------------------------------------------------
 
+    /// In shadow mode the theory labels sit on the shadow issue, so the
+    /// code ticket keeps only its pipeline labels and the record view
+    /// decides both prediction keys.
+    #[test]
+    fn the_record_labels_decide_the_prediction_keys_in_shadow_mode() {
+        let mut app = refined_app(&[REFINED]);
+        let key = RecordKey::Issue(140).key_text();
+        let record = |app: &mut App, labels: &[&str]| {
+            let state = app.state.as_mut().expect("the state");
+            let theory = state.theory.get_mut("borsuk").expect("the repository");
+            theory.records.get_mut(&key).expect("the record").labels =
+                labels.iter().map(|label| label.to_string()).collect();
+        };
+
+        record(&mut app, &[]);
+        let state = app.state.as_ref().expect("the state");
+        assert!(
+            wants_prediction(state, "borsuk", 140),
+            "a record without theory-short still owes the short prediction"
+        );
+        assert_eq!(
+            full_prediction_target(&app),
+            Some(("borsuk".to_string(), 140)),
+            "a record without theory-full owes the full prediction"
+        );
+
+        record(&mut app, &[THEORY_SHORT_LABEL, THEORY_FULL_LABEL]);
+        let state = app.state.as_ref().expect("the state");
+        assert!(
+            !wants_prediction(state, "borsuk", 140),
+            "the shadow label answers the short prediction"
+        );
+        assert_eq!(
+            full_prediction_target(&app),
+            None,
+            "the shadow label answers the full prediction"
+        );
+    }
+
     /// The model of the full prediction tests: one boundary named
     /// `web-checkout` and one invariant over it.
     fn full_model() -> crate::theory::model::Model {
@@ -4719,6 +4764,9 @@ mod tests {
 
     /// The sample app whose ticket 140 is refined and governed, with the
     /// short prediction of `web-checkout` on its record.
+    ///
+    /// The repository runs in code mode, so the record labels repeat the
+    /// ticket labels, the way the daemon stamps them.
     fn refined_app(labels: &[&str]) -> App {
         let mut state = governed_view(labels, "", Vec::new());
         let theory = state.theory.get_mut("borsuk").expect("the repository");
@@ -4732,6 +4780,7 @@ mod tests {
                     areas: vec!["web-checkout".to_string()],
                 }),
                 full: None,
+                labels: labels.iter().map(|label| label.to_string()).collect(),
             },
         );
         App {
