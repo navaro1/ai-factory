@@ -738,6 +738,7 @@ impl App {
                     theory::Outcome::Send(action, toast) => {
                         emit(self, sink, *action, toast);
                     }
+                    theory::Outcome::Reject(reason) => self.show_toast(&reason),
                     theory::Outcome::Pass => match key.code {
                         KeyCode::Char('1') => self.view = View::Pipeline,
                         KeyCode::Char('2') => self.enter_session(),

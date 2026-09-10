@@ -27,6 +27,8 @@ pub(super) enum Outcome {
     None,
     /// The view took no interest in the key, so the shell owns it.
     Pass,
+    /// The key produced no action, and the operator must read a reason.
+    Reject(String),
     /// The key produced one action and the toast that announces it.
     Send(Box<Action>, String),
 }
@@ -128,6 +130,10 @@ impl Theory {
     }
 
     /// Close the input and send the setup action it names.
+    ///
+    /// A surface that is not a plain directory name sends nothing and
+    /// reports the reason, because the surface becomes the directory
+    /// `run-<surface>` of the skills checkout.
     fn send_setup(&mut self, state: &StateView) -> Outcome {
         let surface = self.input.take().unwrap_or_default().trim().to_string();
         let Some(repo) = self.current(state) else {
@@ -135,6 +141,11 @@ impl Theory {
         };
         if surface.is_empty() {
             return Outcome::None;
+        }
+        if !plain_name(&surface) {
+            return Outcome::Reject(format!(
+                "the surface {surface} takes letters, digits, - and _ only"
+            ));
         }
         let toast = format!("asked for the run skill of {repo}/{surface}");
 
@@ -158,6 +169,16 @@ impl Theory {
         let next = (at as isize + delta).clamp(0, aliases.len() as isize - 1) as usize;
         self.marked = Some(aliases[next].clone());
     }
+}
+
+/// True when `surface` is a plain directory name.
+///
+/// The name becomes the directory `run-<surface>`, so a slash, a space,
+/// and a dot all stay out of it.
+fn plain_name(surface: &str) -> bool {
+    surface
+        .chars()
+        .all(|one| one.is_ascii_alphanumeric() || one == '-' || one == '_')
 }
 
 /// Draw the Theory view.
@@ -460,6 +481,46 @@ mod tests {
         assert_eq!(pane.handle_key(&state, press(KeyCode::Esc)), Outcome::None);
         assert!(!pane.typing(), "esc closes the input");
         assert!(pane.footer_hints().contains("v run skill"));
+    }
+
+    #[test]
+    fn a_surface_that_is_not_a_plain_directory_name_sends_nothing() {
+        let state = view(Vec::new(), 0);
+        let mut pane = Theory::default();
+
+        pane.handle_key(&state, press(KeyCode::Char('v')));
+        for character in "a/b".chars() {
+            pane.handle_key(&state, press(KeyCode::Char(character)));
+        }
+
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Enter)),
+            Outcome::Reject("the surface a/b takes letters, digits, - and _ only".to_string())
+        );
+        assert!(!pane.typing(), "a rejected surface closes the input");
+
+        for bad in ["a b", "a.b", "../x"] {
+            pane.handle_key(&state, press(KeyCode::Char('v')));
+            for character in bad.chars() {
+                pane.handle_key(&state, press(KeyCode::Char(character)));
+            }
+            assert!(
+                matches!(
+                    pane.handle_key(&state, press(KeyCode::Enter)),
+                    Outcome::Reject(_)
+                ),
+                "{bad} must not reach the daemon"
+            );
+        }
+
+        pane.handle_key(&state, press(KeyCode::Char('v')));
+        for character in "web-2_x".chars() {
+            pane.handle_key(&state, press(KeyCode::Char(character)));
+        }
+        assert!(matches!(
+            pane.handle_key(&state, press(KeyCode::Enter)),
+            Outcome::Send(_, _)
+        ));
     }
 
     #[test]

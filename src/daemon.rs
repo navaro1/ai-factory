@@ -32,8 +32,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{
-    self, Config, ExecutionRole, Harness, ReleasePolicy, RepoConfig, ResolvedRoleSettings,
-    SettingsEdit, SettingsSource,
+    self, Config, ExecutionRole, Governor, Harness, ReleasePolicy, RepoConfig,
+    ResolvedRoleSettings, SettingsEdit, SettingsSource,
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{CmdOut, Exec, RealExec};
@@ -43,7 +43,7 @@ use crate::gates::{
 };
 use crate::gh::GhClient;
 use crate::links::Links;
-use crate::model::{Issue, ItemKind, RepoSnapshot, Snapshot, Stage};
+use crate::model::{ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
 use crate::prompts::{self, RESTART_NOTICE, SETUP_BODY};
 #[cfg(test)]
@@ -77,6 +77,19 @@ use crate::ticket::TicketController;
 use crate::trains::{Train, STACKED_LABEL};
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
 use crate::worktree::{self, WorktreeKind, WorktreeManager, TRAIN_DIR};
+
+/// What one run skill ticket creation produced.
+///
+/// GitHub holds the ticket whenever this value exists. `update_error`
+/// carries the shadow-mode body update failure, where the live ticket keeps
+/// the provisional body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillTicketCreated {
+    /// The created ticket number.
+    number: u64,
+    /// The body update failure, when shadow mode could not patch the body.
+    update_error: Option<String>,
+}
 
 /// What one shadow-mode run skill task writes to the theory repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1841,7 +1854,6 @@ impl Daemon {
     // Drive steps
     // ------------------------------------------------------------------
 
-    /// Move gated ready work into the task table and the train queues.
     /// True when the labels of one item skip both prediction gates.
     ///
     /// A `model-pr` changes the model itself, and a `verify-skill` ticket
@@ -1856,6 +1868,7 @@ impl Daemon {
             .any(|label| label == MODEL_PR_LABEL || label == VERIFY_SKILL_LABEL)
     }
 
+    /// Move gated ready work into the task table and the train queues.
     fn admit_ready(&mut self) {
         let ready = std::mem::take(&mut self.pending_ready);
         for work in ready {
@@ -5291,18 +5304,34 @@ impl Daemon {
     /// report the outcome to the interfaces.
     ///
     /// The report rides [`Push::TicketResult`], the one result channel a
-    /// GitHub mutation already has. A failure creates nothing and its
-    /// message is the `gh` error.
+    /// GitHub mutation already has. A failed creation creates nothing and
+    /// its message is the `gh` error. A creation whose body update failed
+    /// reports a partial failure with the created number, because the
+    /// ticket is live and only its body is stale.
     fn setup_skill_ticket(&mut self, alias: &str, surface: &str) {
-        let (kind, number, message) =
-            match self.create_skill_ticket(alias, surface, SkillTicket::Setup, SETUP_BODY) {
-                Ok(issue) => (
+        let (kind, number, message) = match self.create_skill_ticket(
+            alias,
+            surface,
+            SkillTicket::Setup,
+            SETUP_BODY,
+        ) {
+            Ok(created) => match created.update_error {
+                None => (
                     TicketResultKind::Success,
-                    issue.number,
-                    format!("created the run skill ticket {alias}#{}", issue.number),
+                    created.number,
+                    format!("created the run skill ticket {alias}#{}", created.number),
                 ),
-                Err(error) => (TicketResultKind::Failure, 0, format!("{error:#}")),
-            };
+                Some(error) => (
+                    TicketResultKind::PartialFailure,
+                    created.number,
+                    format!(
+                        "created the run skill ticket {alias}#{}, but its body is stale: {error}",
+                        created.number
+                    ),
+                ),
+            },
+            Err(error) => (TicketResultKind::Failure, 0, format!("{error:#}")),
+        };
         let Some(pusher) = self.ticket_pusher.as_ref() else {
             return;
         };
@@ -5317,7 +5346,7 @@ impl Daemon {
         }));
     }
 
-    /// Create one run skill ticket of `surface` and return GitHub's issue.
+    /// Create one run skill ticket of `surface` on GitHub.
     ///
     /// `body_template` is the recipe the agent follows;
     /// [`crate::prompts::SETUP_BODY`] is the setup one. The ticket carries
@@ -5325,7 +5354,8 @@ impl Daemon {
     /// so [`skips_prediction_gates`] lets it through both prediction gates.
     /// The daemon creates the `verify-skill` label first, because
     /// `create_issue` fails on a label the repository does not have. A
-    /// failed `create_issue` creates nothing.
+    /// repository with the governor off creates nothing, and so does a
+    /// failed `create_issue`.
     ///
     /// In shadow mode the body names the skills worktree, whose number is
     /// the ticket itself, so the daemon fills the body once more with the
@@ -5336,12 +5366,15 @@ impl Daemon {
         surface: &str,
         kind: SkillTicket,
         body_template: &str,
-    ) -> Result<Issue> {
+    ) -> Result<SkillTicketCreated> {
         let repo_cfg = self
             .config
             .repos
             .get(alias)
             .ok_or_else(|| anyhow!("no such repository: {alias}"))?;
+        if repo_cfg.theory.governor != Governor::On {
+            bail!("the theory governor of {alias} is off");
+        }
         let title = kind.title(alias, surface);
         let gh = GhClient::new(&*self.exec);
         gh.create_label_if_missing(&repo_cfg.owner_repo, VERIFY_SKILL_LABEL, VERIFY_SKILL_COLOR)?;
@@ -5354,9 +5387,22 @@ impl Daemon {
         )?;
         let body = self.skill_ticket_body(repo_cfg, surface, issue.number, body_template)?;
         if body == provisional {
-            return Ok(issue);
+            return Ok(SkillTicketCreated {
+                number: issue.number,
+                update_error: None,
+            });
         }
-        gh.update_issue(&repo_cfg.owner_repo, issue.number, &title, &body)
+        // The ticket is live from here on. A failed update leaves its body
+        // stale, so the number travels with the error instead of the error
+        // hiding it.
+        let update_error = gh
+            .update_issue(&repo_cfg.owner_repo, issue.number, &title, &body)
+            .err()
+            .map(|error| format!("{error:#}"));
+        Ok(SkillTicketCreated {
+            number: issue.number,
+            update_error,
+        })
     }
 
     /// Fill one run skill ticket body for `surface` and ticket `number`.
@@ -5407,12 +5453,14 @@ impl Daemon {
     /// repository.
     ///
     /// The answer is `None` for every other task: another stage, another
-    /// purpose, a repository in code mode, a ticket without `verify-skill`,
-    /// or a title that names no surface.
+    /// purpose, a repository with the governor off, a repository in code
+    /// mode, a ticket without `verify-skill`, or a title that names no
+    /// surface.
     fn skill_target(&self, task: &Task, repo: &RepoConfig) -> Option<SkillTarget> {
         if task.stage != Stage::Implement
             || task.kind != ItemKind::Issue
             || task.purpose != TaskPurpose::Pipeline
+            || repo.theory.governor != Governor::On
         {
             return None;
         }
@@ -10932,6 +10980,12 @@ mod tests {
     // Run skill tickets and the skills worktree
     // ------------------------------------------------------------------
 
+    /// Turn the governor on and point the theory at a shadow repository.
+    fn shadow_governed(config: &mut Config) {
+        governed(config);
+        use_shadow_theory(config);
+    }
+
     /// The `create_label` step of the `verify-skill` label.
     fn verify_skill_label_step() -> Step {
         gh_step(
@@ -11010,7 +11064,7 @@ mod tests {
             verify_skill_label_step(),
             skill_issue_step("Create the run skill for borsuk/web", 12),
         ];
-        let mut rig = Rig::make(steps);
+        let mut rig = Rig::make_with(steps, governed);
         rig.daemon
             .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
 
@@ -11068,7 +11122,7 @@ mod tests {
                 },
             ),
         ];
-        let mut rig = Rig::make(steps);
+        let mut rig = Rig::make_with(steps, governed);
         rig.daemon
             .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
 
@@ -11121,7 +11175,7 @@ mod tests {
                 CmdOut::ok(format!("HTTP/2 200\r\n\r\n{updated}")),
             ),
         ];
-        let mut rig = Rig::make_in(dir.clone(), steps, use_shadow_theory);
+        let mut rig = Rig::make_in(dir.clone(), steps, shadow_governed);
 
         rig.act(Action::Theory(TheoryAction::Setup {
             repo: "borsuk".to_string(),
@@ -11138,6 +11192,98 @@ mod tests {
         assert!(
             issue_body(&patch).contains(&want),
             "the body must name {want}"
+        );
+    }
+
+    #[test]
+    fn the_governor_off_creates_no_ticket_and_cuts_no_skills_worktree() {
+        let (tx, rx) = mpsc::channel();
+        let dir = temp_root();
+        // The rig scripts the issue worktree only. A skills worktree call
+        // or a gh call would fail the run as an unexpected command.
+        let steps = fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 42), 42, &rig_gitdir(&dir));
+        let mut rig = Rig::make_in(dir.clone(), steps, use_shadow_theory);
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::Setup {
+            repo: "borsuk".to_string(),
+            surface: "web".to_string(),
+        }));
+
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the setup action must push one ticket result");
+        };
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(result.number, 0);
+        assert!(
+            result.message.contains("governor of borsuk is off"),
+            "message was: {}",
+            result.message
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "an ungoverned repository is quiet"
+        );
+
+        // The implement task of a verify-skill ticket cuts no skills
+        // worktree and opens no theory pull request either.
+        let mut ticket = issue(42, &["refined", VERIFY_SKILL_LABEL]);
+        ticket.title = SkillTicket::Setup.title("borsuk", "web");
+        rig.poll(vec![ticket], vec![]);
+        assert_eq!(rig.job(0).task, "borsuk/implement-i42");
+        rig.event(exited("borsuk/implement-i42", true, ""));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.program == "gh" || call.args.iter().any(|arg| arg == "commit")),
+            "calls were: {:?}",
+            rig.exec.calls()
+        );
+        assert!(
+            !skills_wt(&dir, 42).exists(),
+            "no skills worktree marker directory appears"
+        );
+    }
+
+    #[test]
+    fn a_failed_body_update_reports_a_partial_failure_with_the_created_number() {
+        let (tx, rx) = mpsc::channel();
+        let dir = temp_root();
+        let steps = vec![
+            verify_skill_label_step(),
+            skill_issue_step("Create the run skill for borsuk/web", 12),
+            (
+                Box::new(|call: &Call| {
+                    call.program == "gh" && call.args.iter().any(|arg| arg == "PATCH")
+                }) as Box<dyn Fn(&Call) -> bool + Send + Sync>,
+                CmdOut {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "gh: rate limited".to_string(),
+                },
+            ),
+        ];
+        let mut rig = Rig::make_in(dir, steps, shadow_governed);
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.act(Action::Theory(TheoryAction::Setup {
+            repo: "borsuk".to_string(),
+            surface: "web".to_string(),
+        }));
+
+        let Push::TicketResult(result) = rx.try_recv().unwrap() else {
+            panic!("the setup action must push one ticket result");
+        };
+        assert_eq!(result.kind, TicketResultKind::PartialFailure);
+        assert_eq!(result.number, 12, "the live ticket keeps its number");
+        assert!(
+            result.message.contains("its body is stale"),
+            "message was: {}",
+            result.message
         );
     }
 
@@ -11271,7 +11417,7 @@ mod tests {
                 .chain(fresh_skills_steps(&dir, 42))
                 .chain(skills_pr_steps(&dir, 42, "[]"))
                 .collect();
-        let mut rig = Rig::make_in(dir.clone(), steps, use_shadow_theory);
+        let mut rig = Rig::make_in(dir.clone(), steps, shadow_governed);
         let mut ticket = issue(42, &["refined", VERIFY_SKILL_LABEL]);
         ticket.title = SkillTicket::Setup.title("borsuk", "web");
 
