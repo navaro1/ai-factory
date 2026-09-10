@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -61,6 +63,23 @@ pub struct IssueComment {
     pub body: String,
 }
 
+/// One row of the repository record list: one issue or one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordRow {
+    /// The issue or pull request number.
+    pub number: u64,
+    /// The label names on the record.
+    pub labels: Vec<String>,
+    /// Whether the row is a pull request.
+    pub pull_request: bool,
+    /// The merge moment of a merged pull request, as GitHub reports it.
+    /// `None` for an issue and for a pull request that never merged.
+    pub merged_at: Option<String>,
+    /// The body of the record, empty when the row carries none. A pull
+    /// request body names the tickets the merge closes.
+    pub body: String,
+}
+
 /// One comment page with the ETag the next call sends back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommentPage {
@@ -113,6 +132,25 @@ struct CachedComments {
     comments: Vec<IssueComment>,
 }
 
+/// The exec a client runs its calls through.
+///
+/// A poller borrows its exec for the length of one poll. A holder that
+/// keeps a client alive across calls, such as the daemon's theory client,
+/// owns the exec as an [`Arc`] instead.
+enum ExecSource<'a> {
+    Borrowed(&'a dyn Exec),
+    Owned(Arc<dyn Exec>),
+}
+
+impl Exec for ExecSource<'_> {
+    fn run(&self, program: &str, args: &[&str], cwd: Option<&Path>) -> anyhow::Result<CmdOut> {
+        match self {
+            Self::Borrowed(exec) => exec.run(program, args, cwd),
+            Self::Owned(exec) => exec.run(program, args, cwd),
+        }
+    }
+}
+
 /// A GitHub reader for one poller thread.
 ///
 /// The client runs `gh api` through the [`Exec`] indirection and remembers,
@@ -120,7 +158,7 @@ struct CachedComments {
 /// The next request for that page sends
 /// `If-None-Match`. A page that answers 304 keeps its cache entry.
 pub struct GhClient<'a> {
-    exec: &'a dyn Exec,
+    exec: ExecSource<'a>,
     issue_pages: BTreeMap<(String, u64), CachedPage<Issue>>,
     pull_pages: BTreeMap<(String, u64), CachedPage<Pr>>,
     comment_pages: BTreeMap<(String, u64), CachedComments>,
@@ -130,11 +168,39 @@ impl<'a> GhClient<'a> {
     /// A client with an empty page cache.
     pub fn new(exec: &'a dyn Exec) -> Self {
         GhClient {
-            exec,
+            exec: ExecSource::Borrowed(exec),
             issue_pages: BTreeMap::new(),
             pull_pages: BTreeMap::new(),
             comment_pages: BTreeMap::new(),
         }
+    }
+
+    /// A client that owns its exec, so a caller can hold it across calls.
+    pub fn new_owned(exec: Arc<dyn Exec>) -> GhClient<'static> {
+        GhClient {
+            exec: ExecSource::Owned(exec),
+            issue_pages: BTreeMap::new(),
+            pull_pages: BTreeMap::new(),
+            comment_pages: BTreeMap::new(),
+        }
+    }
+
+    /// The GitHub login of the account the `gh` CLI runs as.
+    ///
+    /// One call answers `gh api user`. The caller caches the answer, so
+    /// the login costs one call per daemon run.
+    pub fn viewer_login(&self) -> Result<String> {
+        let out = self
+            .exec
+            .run("gh", &["api", "user"], None)
+            .context("gh api user failed to run")?;
+        if out.status != 0 {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            bail!("gh api user exited with status {}: {detail}", out.status);
+        }
+        let body: Value =
+            serde_json::from_str(&out.stdout).context("gh api user returned a broken body")?;
+        Ok(str_field(&body, "login")?.to_string())
     }
 
     /// Fetch the open issues of `owner_repo` and follow pagination.
@@ -144,7 +210,7 @@ impl<'a> GhClient<'a> {
     /// on while the cached flags of that page know a next page.
     pub fn fetch_issues(&mut self, owner_repo: &str) -> Result<Collection<Issue>> {
         Self::fetch_list(
-            self.exec,
+            &self.exec,
             &mut self.issue_pages,
             owner_repo,
             ListKind::Issues,
@@ -155,7 +221,7 @@ impl<'a> GhClient<'a> {
     /// Fetch the open pull requests of `owner_repo` and follow pagination.
     pub fn fetch_pulls(&mut self, owner_repo: &str) -> Result<Collection<Pr>> {
         Self::fetch_list(
-            self.exec,
+            &self.exec,
             &mut self.pull_pages,
             owner_repo,
             ListKind::Pulls,
@@ -345,6 +411,39 @@ impl<'a> GhClient<'a> {
             etag: response.etag,
             comments,
         })
+    }
+
+    /// Fetch one page of every issue and pull request updated since
+    /// `since`, an RFC 3339 timestamp.
+    ///
+    /// The GitHub issues list serves both kinds in `state=all`: a row that
+    /// carries a `pull_request` key is a pull request. The caller filters
+    /// the rows to its theory records; the method maps only what the row
+    /// shares.
+    pub fn fetch_record_rows(&mut self, owner_repo: &str, since: &str) -> Result<Vec<RecordRow>> {
+        let mut rows = Vec::new();
+        let mut page: u64 = 1;
+        loop {
+            let url = format!(
+                "repos/{owner_repo}/issues?state=all&since={since}&per_page={PAGE_SIZE}&page={page}"
+            );
+            let args = ["api", "-i", "-X", "GET", url.as_str()];
+            let out = self
+                .exec
+                .run("gh", &args, None)
+                .context("gh api failed to run")?;
+            let response = checked_response(&out)?;
+            let values: Vec<Value> = serde_json::from_str(&response.body)
+                .context("gh api returned a broken record list body")?;
+            for value in &values {
+                rows.push(record_row_from_value(value)?);
+            }
+            // A full page whose head names `rel="next"` has one more.
+            if values.len() < PAGE_SIZE || !response.link_next {
+                return Ok(rows);
+            }
+            page += 1;
+        }
     }
 
     /// Post one comment on an issue or pull request.
@@ -874,6 +973,24 @@ fn ensure_ok(response: &Response, stderr: &str) -> Result<()> {
     let status = response.status;
     let detail = stderr.lines().next().unwrap_or("no stderr");
     bail!("gh api returned HTTP {status}: {detail}")
+}
+
+/// Map one GitHub object of the record list to a [`RecordRow`].
+fn record_row_from_value(value: &Value) -> Result<RecordRow> {
+    Ok(RecordRow {
+        number: u64_field(value, "number")?,
+        labels: label_names(value)?,
+        pull_request: value.get("pull_request").is_some(),
+        merged_at: value
+            .pointer("/pull_request/merged_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 /// Map one GitHub object to an [`Issue`]; `None` for a pull request object.
@@ -2058,6 +2175,126 @@ mod tests {
                 "GET",
                 "repos/acme/borsuk/issues/9/comments?per_page=100&page=1"
             ]
+        );
+    }
+
+    #[test]
+    fn fetch_record_rows_walks_a_link_next_page_and_merges_in_order() {
+        let next_link = "link: <https://api.github.com/repositories/1/issues?page=2>\
+             ; rel=\"next\", <https://api.github.com/repositories/1/issues?page=2>\
+             ; rel=\"last\"";
+        let full = format!(
+            "[{}]",
+            (0..100)
+                .map(|index| {
+                    format!(
+                        "{{\"number\":{index},\"state\":\"open\",\
+                         \"labels\":[{{\"name\":\"ladder-1\"}}]}}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c1\"", next_link],
+                    &full,
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=2",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c2\""],
+                    "[{\"number\":100,\"state\":\"open\",\"pull_request\":{},\
+                     \"labels\":[{\"name\":\"ladder-2\"}]}]",
+                )),
+            );
+        let mut client = GhClient::new(&exec);
+        let rows = client
+            .fetch_record_rows("acme/borsuk", "2026-08-11T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows[0].number, 0);
+        assert_eq!(rows[99].number, 99);
+        assert_eq!(rows[100].number, 100);
+        assert!(rows[100].pull_request);
+        assert_eq!(
+            rows[100].merged_at, None,
+            "an open pull request never merged"
+        );
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn a_record_row_reports_the_merge_moment_of_a_merged_pull_request() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response(
+                "HTTP/2 200",
+                &[],
+                "[{\"number\":7,\"state\":\"closed\",\"labels\":[],\
+                 \"body\":\"Closes #142\",\
+                 \"pull_request\":{\"merged_at\":\"2026-09-10T10:00:00Z\"}},\
+                 {\"number\":9,\"state\":\"closed\",\"labels\":[],\"body\":null,\
+                 \"pull_request\":{\"merged_at\":null}}]",
+            )),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let rows = client
+            .fetch_record_rows("acme/borsuk", "2026-08-11T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(rows[0].merged_at.as_deref(), Some("2026-09-10T10:00:00Z"));
+        assert_eq!(rows[0].body, "Closes #142", "the body names the ticket");
+        assert_eq!(
+            rows[1].merged_at, None,
+            "a closed pull request never merged"
+        );
+        assert_eq!(rows[1].body, "", "a null body reads as no body");
+    }
+
+    #[test]
+    fn the_viewer_login_names_the_account_the_cli_runs_as() {
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "user"]),
+            CmdOut::ok("{\"login\":\"piotr\",\"id\":42}"),
+        );
+
+        assert_eq!(
+            GhClient::new(&exec).viewer_login().unwrap(),
+            "piotr".to_string()
+        );
+
+        let broken = ScriptExec::new().expect(gh(&["api", "user"]), CmdOut::ok("{\"id\":42}"));
+        let error = GhClient::new(&broken).viewer_login().unwrap_err();
+        assert!(
+            error.to_string().contains("login"),
+            "the error names the missing field: {error}"
         );
     }
 

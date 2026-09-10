@@ -740,8 +740,13 @@ mod tests {
                 skills: BTreeMap::new(),
                 holds: Vec::new(),
                 records: BTreeMap::new(),
+                calibration: None,
+                rungs: [0; 3],
+                events_per_day: 0,
+                stale_entries: Vec::new(),
                 deltas: Vec::new(),
                 window: (0, 0),
+                cards: Vec::new(),
             },
         );
         StateView {

@@ -282,7 +282,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** — · **Traces to:** R1
 
 ### C4 — Prep: records, blocks, comments, labels
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `src/theory/blocks.rs` with `parse_block(tag, text) -> Result<String, BlockError>` (`Absent`, `Malformed(&'static str)`) that holds the ticket-proposal rules, and make `parse_ticket_proposal` map it to `Option` (`src/ticket.rs:619-658`). Add `GhClient::post_comment` and replace the hand-rolled call in `Daemon::post_issue_comment` (`src/daemon.rs:2583-2605`). Extract `GhClient::create_label_if_missing(owner_repo, name, color)` from `TicketController::create_label` (`src/ticket.rs:498-540`) and make the controller call it. Add `GhClient::fetch_comments(owner_repo, number, etag)` with one page of 100 and a 304 path. Add `src/theory/records.rs`: the label and block constants, `RecordKey`, `TheoryRecords::derive(config, snapshots, theory_snapshots: &BTreeMap<String, RepoSnapshot>)` where the map is keyed by alias and stays empty until C20, `labels_of`, `open_count`, and the `<aif-prediction-v1>` builder and parser for `{ kind, text, areas }` and `{ kind, slots }`.
 **AC:**
 - `parse_block` returns `Absent` for text without a block and `Malformed` with a reason for a fenced block, a second block, or a block not at the end; `proposal_parser_accepts_only_one_final_complete_unquoted_block` still passes unchanged.
@@ -292,7 +292,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C0 · **Traces to:** R9, R13, R14, N2
 
 ### C5 — Prep: the daemon seams
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Replace the `is_ticket_chat` gate on the text buffer (`src/daemon.rs:1474-1488`) with `wants_final_block(task) -> Option<&'static str>`, which returns the ticket-proposal tag for ticket chat today. Replace `prompt_template(stage)` and `ticket_chat_prompt_template` (`src/daemon.rs:3211-3230`) with one `prompt_template(name, builtin)`. Add `derive_label_rows(repo, records, label, make_row)` and make `derive_needs_human` (`src/daemon.rs:760-793`) call it. Add `Daemon::theory_record(alias, key)` for code-repository mode: an item returns itself; `Repo` finds or creates the issue `<alias>/theory` in the code repository. Add `TaskBinding { role, model_commit: Option<String> }` in place of the bare role value in `role_bindings` and `StateFile` with serde defaults (`src/state.rs:71-73`, `src/daemon.rs:3049-3066`).
 **AC:**
 - The ticket proposal tests still pass through `wants_final_block`; a pipeline task with no expected block buffers nothing.
@@ -303,7 +303,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C4 · **Traces to:** R7, R13, R16
 
 ### C6 — The editor bridge
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `src/tui/editor.rs`: `edit_file_with(path, editor: &[String], restore: impl FnOnce() -> Result<()>, enable: impl FnOnce() -> Result<()>) -> Result<EditorOutcome>` that calls `restore`, runs the editor with inherited stdio, and calls `enable` in a guard that runs on every path; `EditorOutcome::{Saved, Unchanged, Failed(String)}`; and `edit_file(path)` that wraps it with `restore_terminal_with`, `enable_terminal_with` (`src/tui/mod.rs:760-801`), and `$EDITOR` with the fallback `vi`. Add the scratch directory `<state_dir>/edit/`.
 **AC:**
 - A test passes closures that push `restore` and `enable` into a shared `Vec` and a fake editor script that writes the file; it asserts `Saved` and the order `[restore, enable]`; the same with a script that exits 1 asserts `Failed` and the same order; an unchanged file asserts `Unchanged`.
@@ -311,7 +311,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C1 · **Traces to:** R18, N5
 
 ### C7 — The edit-model flow
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `WorktreeKind::Model` to `WORKTREE_KINDS` with the path `worktrees/<alias>/model` and a cleanable rule (`src/worktree.rs:44-63`). Derive the open model branch per poll: the open PR whose `head_ref` starts with `aif/<alias>/model-`, else a new `aif/<alias>/model-<uuid8>`. Add `e` in the Theory view: `TheoryAction::EditModel { request, repo }` asks the daemon to ensure the model worktree on that branch through `ensure_on` (`src/worktree.rs:201-239`) and reply with `Push::ModelPath { request, repo, path }`; the TUI runs the editor bridge on `theory/model.toml` there, validates with `Model::parse`, and sends `TheoryAction::CommitModel { repo }`; the daemon commits with the message `Update the model`, pushes, opens the PR through `gh pr create --label model-pr` when none is open, and reports the number on a toast. A repository without `theory/` starts from a template with one comment line.
 **AC:**
 - A TUI test with a fake editor that edits the file sends `CommitModel`; a fake editor that breaks the TOML shows the error toast and sends nothing.
@@ -322,7 +322,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C4, C6 · **Traces to:** R18, N3
 
 ### C8 — The short prediction and the refine gate
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** In the pipeline view, `r` (`src/tui/pipeline.rs:685`) on a governed ticket opens a one-line inbox-style input for the short prediction before it sends `Action::Refine`; the action gains `prediction: Option<ShortPrediction>`, the `{ kind, text, areas }` wire struct of C4. In the daemon, `Action::Refine` on a governed repository validates the named areas against the cached model, posts the comment through `post_comment` on the theory record, adds `theory-short` through `create_label_if_missing` plus `add_label`, then adds `to-refine` through `add_label`, and does not call `upsert_queued`; the poll gate queues the task. On a repository with the governor off the v0.6 path stays (`src/daemon.rs:1652-1679`); a missing area or a model in error refuses with the reason on a toast, writes nothing, and records the hold in `TheoryView.holds: Vec<HoldView>` (serde default, daemon memory until a prediction posts). Make `refine_ready` take `&TheoryRecords` and require `theory-short` on a governed ticket (`src/gates.rs:36-38`); add the row hints `awaits short prediction` and `model error`. Add the first-sight fetch: when a poll first shows a theory label on a record, fetch its comments once and ship `RecordView` in `TheoryView.records`. Add the chat lock: `c` on a ticket that awaits a prediction shows the reason (`src/tui/tickets.rs:373-394`).
 **AC:**
 - A daemon test asserts the `gh` call order: comment, `theory-short`, `to-refine`; a prediction that names area `gh` with no boundary `gh` posts nothing, adds nothing, and the toast reads `area gh has no entries`.
@@ -333,7 +333,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C5, C7 · **Traces to:** R3, R9, R11, R12, N2, N3
 
 ### C9 — The full prediction and the implement gate
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add the template writer: five `[slot]` tables with `entries = []` and `tag = "unsure"`, a comment line per slot listing the candidate IDs of the areas from `records[key].short.areas` in the state view. Add `p` in the pipeline view on a `refined` row: write the template under `<state_dir>/edit/<alias>-<n>-prediction.toml`, run the editor bridge, parse, reject with the entry and reason on a toast, and send `TheoryAction::Predict { repo, number, prediction }`. The daemon validates the areas, posts the `<aif-prediction-v1>` block `{ kind: "full", slots }` on the theory record, and adds `theory-full`. Make `implement_ready` take `&TheoryRecords` and require `theory-full` on a governed ticket (`src/gates.rs:41-49`). Extend the chat lock to the `refined` window. Show `area <id> has no entries · b bootstrap` in the Theory view for a held prediction.
 **AC:**
 - A template test writes five slots with the candidate IDs of area `daemon`; a parse test rejects an unknown entry id, an unknown tag, and a missing slot, naming each.
@@ -344,7 +344,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C8 · **Traces to:** R3, R10, R11, R12, N3
 
 ### C10 — The placeholders, the slices, and the binding
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `Model::slice(areas)` and `Model::areas_for_paths(paths)` with `globset`. Introduce the complete placeholder set in `render_prompt` (`src/daemon.rs:3193-3207`) for every stage prompt: `{model}`, `{prediction}`, `{comparison}`, `{skills}`, `{rules}`, `{why_rule}`, each rendered empty except `{model}`: refine gets the short prediction's areas, implement the full prediction's areas, review the implement slice plus the areas of `git diff --name-only <base>...<head>` run in the worktree. Rewrite the four stage prompts once: a `{model}` section, `{prediction}` in review, `## Why` and `## Evidence` and no `## How` in implement with `{why_rule}`, `{skills}` and `{rules}` everywhere, and save the `docs/v0.7/prompts/*.md` copies pinned by the byte-for-byte test (`src/prompts.rs:196-221`). Bind `model_commit` in `TaskBinding` at dispatch.
 **AC:**
 - A slice test on a model with two areas and one cross-area invariant returns the predicted area, the invariant, and the boundary it touches, and not the other area's states.
@@ -355,7 +355,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C9 · **Traces to:** R7, R8, R30
 
 ### C11 — The PR check
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `records::check_pr(body, paths, branch) -> Result<(), Finding>`: require `## Why`; forbid `## How` and any heading that starts with `Implementation`; forbid `theory/model.toml`, `theory/verify.toml`, and `theory/rules.md` in the path list off a model branch. In `dispatch_one` (`src/daemon.rs:1230-1299`), for a governed review after the cwd exists and before the prompt, run the check on the polled body and on `git diff --name-only` in the worktree; a finding posts one comment `PR: <finding>` on the theory record, cancels the review task with the finding, and re-queues implement through `upsert_queued(repo, Implement, Issue, ticket)` for every ticket in `Links::tickets_of(pr)`.
 **AC:**
 - A check test accepts a body with `## Why` and `## Evidence`, and rejects a body without `## Why`, a body with `## How`, a body with `## Implementation notes`, and a diff that lists `theory/model.toml` off a model branch, each with the finding text; the same diff on `aif/borsuk/model-1` passes.
@@ -363,7 +363,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C10 · **Traces to:** R3, R27
 
 ### C12 — The delta in review
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Make `wants_final_block` return the delta tag for a governed review whose ticket carries `theory-full`. Instruct the reviewer to end with one `<aif-delta-v1>` block `{ slots: [{ id, outcome }], touched: [ids], violations: [{ entry, finding }], question }`. On a successful `TurnEnd`, parse the buffered text; post the block on the theory record, add `delta-open`, and compute the four outcomes from the slot tags. A governed review that ends without the block is a failed attempt with the finding `no delta block`. A review of a PR without `theory-full` renders `{prediction}` as `none` and expects no block. Ship `TheoryView.deltas: Vec<DeltaView>` and draw the DELTAS panel: `#n ● SURE-MISS  <entry>` for a miss row, `#n ○ OPEN  <hits> hit <unsure> unsure` for a hit-only record, `#n ✓ CLOSED` once closed.
 **AC:**
 - A daemon test feeds a review report with a valid block and asserts the comment, the label, and the state view row with `sure-miss` for a slot tagged `sure` and marked `miss`.
@@ -373,7 +373,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C11 · **Traces to:** R13, R33
 
 ### C13 — The window
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `Reason::WindowFull` to `sched` and a `window: &BTreeMap<String, (usize, usize)>` parameter to `can_start` (`src/sched.rs:159-196`); the daemon builds the map from `open_count` and `TheoryConfig.window`. Add `#[serde(default)] hold: Option<String>` to `TaskView` (`src/sock.rs:895-921`) and set it to `window full` on a refused implement task. Ship `TheoryView.window: (open, cap)` and draw the gauge `WINDOW ▮▮▯ 2/3` in the strip, with `IMPLEMENT ▸ PAUSED` when full. Add the `window full` hint on the pipeline row.
 **AC:**
 - A `can_start` test with `(3, 3)` for `borsuk` returns `No(WindowFull)` for an implement task and `Yes` for a review task; `(2, 3)` returns `Yes`.
@@ -382,7 +382,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C12 · **Traces to:** R3, R14, R33
 
 ### C14 — Closing a delta: hits, misses, violations, causes, rungs
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `DecisionKind::DeltaHit { kind, number, hits }`, `DecisionKind::TheoryEvent { kind, number, slot, entry, tag, question, source }`, `DecisionKind::Card { source, prompt }`, `DecisionKind::FirstRun { area, measurer, sample }` (`src/decisions.rs:20-67`), `Response::Confirm` and `Response::Theory { cause, entry, rung, area, note }`, and the `validate` pairs: `DeltaHit` takes `Confirm`; `TheoryEvent` takes `Theory`; `Card` takes `Text`; `FirstRun` takes `Confirm` and `Cancel` (`src/decisions.rs:274-300`). Replace the five inbox matches and `inbox_row_owns` with `presentation(&DecisionKind)`. Add `Daemon::open_event(alias, key, event)` as the only writer of `<aif-event-v1>` and `event-open`. Derive the rows each poll through `derive_label_rows` from `delta-open` and `event-open` records and the shipped `RecordView`; one `THEORY` row per miss and one per violation. Inbox: `DELTA` rows close on `y`; `THEORY` rows take `m`/`p`/`r`, a typed entry id validated against the model, `1`/`2`/`3`, an area pre-filled when the entry maps to one area and asked when it maps to several, then `s`, using the `picks` pattern (`src/tui/inbox.rs:785-872`). Daemon: post `<aif-answer-v1>`, then: `recall` needs nothing more; `pr` posts the finding as a comment, cancels a live review task, and re-queues implement through `upsert_queued` for every ticket in `Links::tickets_of(pr)`; `model` records the answer time in the block. The label `delta-open` leaves only when every miss and violation of the record has an answer in `RecordView.answers` and no `model` answer stays open; each poll runs `git log --since=<answer> -p -- theory/model.toml` on the theory checkout's default branch and removes the label when a diff hunk contains the entry id.
 **AC:**
 - `validate` accepts exactly the five new pairs and rejects `Confirm` for `TheoryEvent`.
@@ -413,7 +413,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C10, C14 · **Traces to:** R2, R6
 
 ### C17 — The bootstrap chat
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `ChatKey::{Ticket, Theory}` and key the conversation state by it (`src/state.rs:20-36`). Add `BOOTSTRAP_PROMPT`: take the operator's stream about area `{area}`, ask short questions, add no claim the operator did not state, and end a turn with one `<aif-model-proposal-v1>` block `{ entries: [...] }` when the operator says done. Add `TaskPurpose::Bootstrap` with the id `<alias>/bootstrap-<area>` under `theory.chat`, and make `[theory.chat]` required with its migration line. Add `TheoryAction::Chat { request, repo, purpose, key }`. Add `b` in the Theory view on an `area X has no entries` line: send it with purpose `Bootstrap` and the area as key, and open the session view like the ticket chat (`src/tui/tickets.rs:373-394`). On a proposal block, the daemon validates the merged model, writes it to the model worktree, and runs the C7 commit-push-PR path. The Theory view shows `◇ proposal · a apply` like the ticket proposal offer (`src/tui/tickets.rs:886-898`).
 **AC:**
 - A config test rejects a file without `[theory.chat]` with `theory.chat is required; see docs/v0.7/MIGRATION.md`.
@@ -440,7 +440,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C16, C18 · **Traces to:** R7, R16
 
 ### C20 — Shadow mode
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Honour `theory = { repo, path }`: `theory_record` returns the shadow issue of `repo` titled `<alias>#<n>`, found in the shadow snapshot or created through `create_issue` with the body `Theory record of <owner_repo>#<n>`. Spawn one more poller per shadow repository (`src/poll.rs:90-115`) that sends `DaemonMsg::TheoryPolled` into `Daemon.theory_snapshots`, never into `Snapshot.repos`. `TheoryRecords::derive` reads the shadow labels for shadowed aliases, so the gates, the window, and the rows follow. Fill `{why_rule}` with `name behaviours in words, not entry IDs` in shadow mode. Add a doctor line per shadow repository.
 **AC:**
 - A table-driven daemon test runs every write site of this spec so far in shadow mode, the short and full predictions, the delta, the answer, the events, and asserts that every `gh` call to the code `owner_repo` is a v0.6 label call, and that `borsuk#142` is created once and reused.
@@ -449,7 +449,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C14 · **Traces to:** R19
 
 ### C21 — Cadences and the daily sweep
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** Add `src/theory/cadence.rs`: `Schedule { kind, repo, last_ms }`, `ScheduleKind::{Daily, Interview, Audit}`, `due(schedules, config, now) -> Option<u64>`, persisted in `StateFile` next to `last_fire_ms` (`src/state.rs:65-67`); `next_deadline` (`src/daemon.rs:475-505`) adds the one `due` value. Add `Daemon::fire_cadence(kind, repo)`. The `Daily` kind runs the sweep: fetch the comments of the theory records updated in the last `stale_days` days, one page each, and derive the calibration share from the delta blocks, the rung counts from the `ladder-*` labels, the events per day, and the stale entries; ship `TheoryView.calibration`, `rungs`, `events_per_day`, `stale_entries`.
 **AC:**
 - A `due` test with no `last_ms` is due at once; with `last_ms` at noon UTC it is due at the first poll after UTC midnight; a restart keeps `last_ms`.
@@ -458,7 +458,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C19 · **Traces to:** R3, R20, R32, N1
 
 ### C22 — Cards
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
 **Build:** In the daily sweep, build at most `cards.per_day` cards per repository: source one, a PR merged since `last_ms` none of whose linked tickets, from `Links::tickets_of`, carries an `<aif-prediction-v1>` comment authored by the operator (the `gh` login from `gh api user`, cached per daemon run); source two, the stale entries. The day's cards live in daemon memory; a restart drops them until the next sweep. A miss on a source-two card opens its event on the repository record. Add the `CARD` inbox rows through `presentation`. The answer, a `Text`, queues one `AuditJob::Card` task with `AUDIT_CARD_PROMPT`, the card, the answer, and the diff or the entry, whose `<aif-event-v1>` block, empty for a pass, opens an event on a miss.
 **AC:**
 - A merged PR whose ticket carries no operator prediction yields a source-one card, and one whose ticket carries an operator prediction yields none; an entry untouched for 31 days yields a source-two card; an entry touched 5 days ago yields none; a fourth card in one day is not shown.
