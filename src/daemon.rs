@@ -94,6 +94,10 @@ use crate::worktree::{self, Cleanable, WorktreeKind, WorktreeManager, TRAIN_DIR}
 /// How many diff lines one teach subject carries at most.
 const TEACH_DIFF_LINES: usize = 400;
 
+/// How many merged pull requests the pipeline board of one repository
+/// keeps, newest first.
+const MERGED_BOARD_CAP: usize = 10;
+
 /// Why one governed review fails when its report carries no readable
 /// delta block.
 const NO_DELTA_BLOCK: &str = "no delta block";
@@ -525,6 +529,10 @@ pub struct Daemon {
     /// answered card. Runtime only: the next daily sweep replaces the
     /// batch, and a restart drops it until that sweep.
     theory_cards: BTreeMap<String, Vec<CardState>>,
+    /// The merged pull requests the sweeps saw, per repository, with the
+    /// merge time. Runtime only: a restart drops it until the next sweep
+    /// rebuilds it.
+    theory_merged: BTreeMap<String, Vec<(u64, u64)>>,
     /// The GitHub login the `gh` CLI runs as, as the one call of this
     /// daemon run answered it. `Some(None)` records a failed call, so a
     /// later sweep asks no second time. Runtime only.
@@ -960,6 +968,7 @@ impl Daemon {
             theory_sweeps: BTreeMap::new(),
             theory_client: None,
             theory_cards: BTreeMap::new(),
+            theory_merged: BTreeMap::new(),
             gh_login: None,
             card_answers: BTreeMap::new(),
             ticket_check_failures: BTreeMap::new(),
@@ -1689,6 +1698,7 @@ impl Daemon {
         } else {
             self.theory_models.remove(repo);
             self.theory_skills.remove(repo);
+            self.theory_merged.remove(repo);
         }
         self.refresh_records();
         self.first_sight(repo);
@@ -2381,6 +2391,11 @@ impl Daemon {
             .theory_cards
             .get(repo)
             .map(|batch| batch.iter().map(|held| held.card.clone()).collect())
+            .unwrap_or_default();
+        view.merged = self
+            .theory_merged
+            .get(repo)
+            .map(|board| board.iter().map(|(number, _)| *number).collect())
             .unwrap_or_default();
         view
     }
@@ -3271,13 +3286,16 @@ impl Daemon {
         // asks a second card on the next one. The tickets of a merge
         // come from its own body, because the link table holds the open
         // pull requests only.
-        fn merged_of(rows: &[gh::RecordRow], last_ms: Option<u64>) -> Vec<(u64, BTreeSet<u64>)> {
+        fn merged_of(
+            rows: &[gh::RecordRow],
+            last_ms: Option<u64>,
+        ) -> Vec<(u64, u64, BTreeSet<u64>)> {
             rows.iter()
                 .filter_map(|row| {
                     let at = row.merged_at.as_deref().and_then(cadence::rfc3339_ms)?;
                     last_ms
                         .is_none_or(|last| at > last)
-                        .then(|| (row.number, links::closing_tickets(&row.body)))
+                        .then(|| (row.number, at, links::closing_tickets(&row.body)))
                 })
                 .collect()
         }
@@ -3306,6 +3324,9 @@ impl Daemon {
         } else {
             merged_of(&rows, last_ms)
         };
+        // The merged board learns the merges of this sweep even when the
+        // card sourcing stops, so the pipeline keeps its rows.
+        self.remember_merged(alias, &merged);
         // A record without a theory label stays out of the sweep, as on
         // the pull-request side before.
         let rows: Vec<gh::RecordRow> = rows
@@ -3438,14 +3459,14 @@ impl Daemon {
         // link table still holds.
         let unpredicted: Vec<u64> = merged
             .into_iter()
-            .filter(|(number, closes)| {
+            .filter(|(number, _at, closes)| {
                 closes
                     .iter()
                     .copied()
                     .chain(self.linked_tickets(alias, *number))
                     .all(|ticket| !predicted.contains(&ticket))
             })
-            .map(|(number, _)| number)
+            .map(|(number, _, _)| number)
             .collect();
         let batch: Vec<CardState> = cards::build(&unpredicted, &stats.stale_entries, per_day)
             .into_iter()
@@ -3471,6 +3492,26 @@ impl Daemon {
             }
             self.changed = true;
         }
+    }
+
+    /// Add the merges of one sweep to the merged board of the alias.
+    ///
+    /// The board keeps the newest [`MERGED_BOARD_CAP`] merges, newest
+    /// first, and one merge keeps its newest time. Runtime only: a
+    /// restart drops the board until the next sweep rebuilds it.
+    fn remember_merged(&mut self, alias: &str, merged: &[(u64, u64, BTreeSet<u64>)]) {
+        if merged.is_empty() {
+            return;
+        }
+        let board = self.theory_merged.entry(alias.to_string()).or_default();
+        for (number, at, _) in merged {
+            match board.iter_mut().find(|(held, _)| held == number) {
+                Some((_, held_at)) => *held_at = *at,
+                None => board.push((*number, *at)),
+            }
+        }
+        board.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+        board.truncate(MERGED_BOARD_CAP);
     }
 
     /// The ticket number one swept record belongs to.
@@ -8772,10 +8813,12 @@ impl Daemon {
     ///
     /// A `merged-pr` card names its pull request. A `stale-entry` card
     /// names one entry, and the teach of an area covers it when the
-    /// model slice of that area's boundary holds the entry.
+    /// model slice of that area's boundary holds the entry. The teach of
+    /// the entry itself covers it when the card names the same entry.
     fn card_teaches(&self, repo: &str, card: &CardView, key: &TeachKey) -> bool {
         match key {
             TeachKey::Pr(number) | TeachKey::Delta(number) => card.number == Some(*number),
+            TeachKey::Entry(id) => card.entry.as_deref() == Some(id.as_str()),
             TeachKey::Area(id) => {
                 let Some(entry) = card.entry.as_deref() else {
                     return false;
@@ -9066,7 +9109,7 @@ impl Daemon {
         };
         let record = match key {
             TeachKey::Pr(number) | TeachKey::Delta(number) => RecordKey::Pr(*number),
-            TeachKey::Area(_) => RecordKey::Repo,
+            TeachKey::Area(_) | TeachKey::Entry(_) => RecordKey::Repo,
         };
         for event in parse_event_blocks(&turn.all) {
             if let Err(error) = self.open_event(&task.repo, &record, &event) {
@@ -10269,6 +10312,15 @@ impl Daemon {
                 (self.teach_delta_subject(task, *number, diff), paths)
             }
             TeachKey::Area(id) => (self.teach_area_subject(task, id), self.area_paths(task, id)),
+            TeachKey::Entry(id) => {
+                // An entry that touches no boundary takes the history of
+                // the model file, because the entry lives in it.
+                let mut paths = self.entry_paths(&task.repo, id);
+                if paths.is_empty() {
+                    paths = vec![MODEL_FILE.to_string()];
+                }
+                (self.teach_entry_subject(&task.repo, id), paths)
+            }
         };
         Ok(vec![
             ("repo", task.repo.clone()),
@@ -10294,6 +10346,7 @@ impl Daemon {
         worktree: &Path,
     ) -> Result<(String, Vec<String>)> {
         let (base, head) = self.teach_pr_range(repo_cfg, number)?;
+        self.fetch_missing_commits(worktree, [&base, &head])?;
         let range = format!("{base}...{head}");
         let names = self.teach_git(worktree, &["diff", "--name-only", &range])?;
         let diff = self.teach_git(worktree, &["diff", &range])?;
@@ -10362,6 +10415,23 @@ impl Daemon {
             );
         }
         Ok(out.stdout)
+    }
+
+    /// Fetch the two pull request commits when the checkout misses one.
+    ///
+    /// A squash merge rewrites the commits and a merged branch may be
+    /// deleted, so the range diff fails until the checkout holds both
+    /// commits. One fetch covers the pair.
+    fn fetch_missing_commits(&self, worktree: &Path, shas: [&str; 2]) -> Result<()> {
+        let known = |sha: &str| {
+            self.teach_git(worktree, &["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                .is_ok()
+        };
+        if known(shas[0]) && known(shas[1]) {
+            return Ok(());
+        }
+        self.teach_git(worktree, &["fetch", "origin", shas[0], shas[1]])?;
+        Ok(())
     }
 
     /// The base and head commits of one pull request, as GitHub records
@@ -10445,6 +10515,41 @@ impl Daemon {
             .unwrap_or_default()
     }
 
+    /// The path globs of the boundaries one model entry touches.
+    fn entry_paths(&self, repo: &str, id: &str) -> Vec<String> {
+        let Some((model, _)) = self.theory_pair(repo) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<String> = Vec::new();
+        for boundary in entry_boundaries(model, id) {
+            for entry in &model.entries {
+                if let Entry::Boundary {
+                    id, paths: globs, ..
+                } = entry
+                {
+                    if *id == boundary {
+                        paths.extend(globs.iter().cloned());
+                    }
+                }
+            }
+        }
+        paths
+    }
+
+    /// The statement of one model entry, rendered as TOML.
+    ///
+    /// A missing entry renders empty, so the teach turn still starts and
+    /// the agent says so from the empty subject.
+    fn teach_entry_subject(&self, repo: &str, id: &str) -> String {
+        let Some((model, _)) = self.theory_pair(repo) else {
+            return String::new();
+        };
+        let Some(entry) = model.entries.iter().find(|entry| entry.id() == id) else {
+            return String::new();
+        };
+        model::render(std::slice::from_ref(entry))
+    }
+
     /// The `{history}` value of one teach task.
     ///
     /// The block holds the recent commits of the subject's paths and the
@@ -10513,6 +10618,15 @@ impl Daemon {
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         let areas: Vec<&str> = match key {
             TeachKey::Area(id) => vec![id.as_str()],
+            TeachKey::Entry(id) => {
+                let boundaries = entry_boundaries(model, id);
+                verify
+                    .areas
+                    .iter()
+                    .filter(|area| boundaries.contains(&area.boundary))
+                    .map(|area| area.id.as_str())
+                    .collect()
+            }
             TeachKey::Pr(_) | TeachKey::Delta(_) => verify.areas_for_paths(model, &refs),
         };
         skills::slice(skills::SliceStage::Teach, &areas, verify, set)
@@ -10817,6 +10931,32 @@ fn cap_diff(text: &str) -> String {
         head.join("\n"),
         total - TEACH_DIFF_LINES
     )
+}
+
+/// The boundary ids one model entry touches.
+///
+/// A boundary names itself, a failure names the boundary it crosses, and
+/// an invariant names the boundaries it constrains. A state or a
+/// transition names no boundary, and a missing entry names none.
+fn entry_boundaries(model: &Model, id: &str) -> Vec<String> {
+    let Some(entry) = model.entries.iter().find(|entry| entry.id() == id) else {
+        return Vec::new();
+    };
+    match entry {
+        Entry::Boundary { id, .. } => vec![id.clone()],
+        Entry::Failure { crosses, .. } => vec![crosses.clone()],
+        Entry::Invariant { constrains, .. } => constrains
+            .iter()
+            .filter(|name| {
+                model
+                    .entries
+                    .iter()
+                    .any(|one| matches!(one, Entry::Boundary { id, .. } if *id == **name))
+            })
+            .cloned()
+            .collect(),
+        Entry::State { .. } | Entry::Transition { .. } => Vec::new(),
+    }
 }
 
 /// True when assistant text contains a full or partial proposal marker.
@@ -26795,6 +26935,34 @@ mod tests {
         rig.daemon.theory_views["borsuk"].clone()
     }
 
+    /// The daily sweep feeds the merged board, so the view carries the
+    /// newest merges of the sweep rows.
+    #[test]
+    fn the_daily_sweep_feeds_the_merged_board_of_the_pipeline() {
+        let dir = temp_root();
+        let rig = card_rig(dir, Vec::new());
+        assert_eq!(theory_of(&rig).merged, vec![9, 7]);
+    }
+
+    /// The merged board keeps one row per pull request, newest first,
+    /// and caps at the board size.
+    #[test]
+    fn remember_merged_keeps_the_newest_merges_within_the_cap() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let one = |number: u64, at: u64| (number, at, BTreeSet::new());
+        rig.daemon
+            .remember_merged("borsuk", &[one(3, 500), one(4, 700), one(3, 900)]);
+        assert_eq!(rig.daemon.theory_merged["borsuk"], vec![(3, 900), (4, 700)]);
+        let many: Vec<(u64, u64, BTreeSet<u64>)> = (0..MERGED_BOARD_CAP as u64 + 4)
+            .map(|n| one(n, n))
+            .collect();
+        rig.daemon.remember_merged("borsuk", &many);
+        let board = &rig.daemon.theory_merged["borsuk"];
+        assert_eq!(board.len(), MERGED_BOARD_CAP);
+        assert_eq!(board[0].0, MERGED_BOARD_CAP as u64 + 3);
+    }
+
     #[test]
     fn a_governed_poll_reads_every_skill_file_once_per_commit() {
         let dir = temp_root();
@@ -29068,6 +29236,16 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             ),
             git_step(
                 repo,
+                &["cat-file", "-e", "base111^{commit}"],
+                CmdOut::ok("base111 commit\n"),
+            ),
+            git_step(
+                repo,
+                &["cat-file", "-e", "head222^{commit}"],
+                CmdOut::ok("head222 commit\n"),
+            ),
+            git_step(
+                repo,
                 &["diff", "--name-only", "base111...head222"],
                 CmdOut::ok("web/pay.ts\n"),
             ),
@@ -29111,6 +29289,173 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert!(
             prompt.contains("### .claude/skills/run-web/features/checkout.md"),
             "the feature file of the area the diff touches:\n{prompt}"
+        );
+    }
+
+    /// A teach of a pull request whose head commit the checkout misses
+    /// fetches both commits from origin first, so a squash merge with a
+    /// deleted branch still teaches its diff.
+    #[test]
+    fn a_teach_of_a_missing_commit_fetches_the_range_first() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.push(gh_step(
+            &[
+                "pr",
+                "view",
+                "7",
+                "--repo",
+                "acme/borsuk",
+                "--json",
+                "baseRefOid,headRefOid",
+            ],
+            CmdOut::ok(r#"{"baseRefOid":"base111","headRefOid":"head222"}"#),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["cat-file", "-e", "base111^{commit}"],
+            CmdOut::ok("base111 commit\n"),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["cat-file", "-e", "head222^{commit}"],
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "fatal: Not a valid object name head222\n".to_string(),
+            },
+        ));
+        steps.push(git_step(
+            &repo,
+            &["fetch", "origin", "base111", "head222"],
+            CmdOut::ok(""),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["diff", "--name-only", "base111...head222"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["diff", "base111...head222"],
+            CmdOut::ok(TEACH_PR_DIFF),
+        ));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Pr(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let prompt = rig.job(0).prompt;
+        assert!(
+            prompt.contains("+const retries = 3;"),
+            "the diff after the fetch:\n{prompt}"
+        );
+        let fetches = rig
+            .exec
+            .calls()
+            .iter()
+            .filter(|call| call.program == "git" && call.args.iter().any(|arg| arg == "fetch"))
+            .count();
+        assert_eq!(fetches, 1, "{:?}", rig.exec.calls());
+    }
+
+    /// A teach of a pull request whose commits the checkout holds runs
+    /// no fetch, so the diff reads from the local objects alone.
+    #[test]
+    fn a_teach_of_present_commits_runs_no_fetch() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_pr_steps(&repo));
+        steps.extend(teach_history_steps(&repo, "web/pay.ts"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Pr(7),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "fetch")),
+            "{:?}",
+            rig.exec.calls()
+        );
+    }
+
+    /// A teach of one model entry renders the entry as TOML and takes
+    /// the history of the boundary paths the entry touches.
+    #[test]
+    fn an_entry_teach_renders_the_model_entry_and_the_boundary_history() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_history_steps(&repo, "web/**"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Entry("B-checkout".to_string()),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-entry-B-checkout");
+        let prompt = job.prompt;
+        assert!(
+            prompt.contains("id = \"B-checkout\"")
+                && prompt.contains("statement = \"the cart pays\""),
+            "the model entry as TOML:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- aaa1111 add the pay button"),
+            "the history of the boundary paths:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("### .claude/skills/run-web/features/checkout.md"),
+            "the feature file of the area of the boundary:\n{prompt}"
+        );
+    }
+
+    /// A teach of an entry that touches no boundary takes the history of
+    /// the model file, because the entry lives in it.
+    #[test]
+    fn an_entry_that_touches_no_boundary_takes_the_history_of_the_model_file() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let mut steps = slice_steps(&repo, "aaa111");
+        steps.extend(teach_history_steps(&repo, MODEL_FILE));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), Vec::new());
+
+        rig.act(Action::Theory(TheoryAction::Teach {
+            repo: "borsuk".to_string(),
+            key: TeachKey::Entry("INV-NOPE".to_string()),
+        }));
+
+        assert_eq!(rig.job_count(), 1);
+        let job = rig.job(0);
+        assert_eq!(job.task, "borsuk/teach-entry-INV-NOPE");
+        assert!(
+            !job.prompt.contains("[[entry]]"),
+            "a missing entry renders no model:\n{}",
+            job.prompt
+        );
+        assert!(
+            job.prompt.contains("- aaa1111 add the pay button"),
+            "the history of the model file:\n{}",
+            job.prompt
         );
     }
 
