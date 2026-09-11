@@ -744,6 +744,7 @@ mod tests {
                 rungs: [0; 3],
                 events_per_day: 0,
                 stale_entries: Vec::new(),
+                merged: Vec::new(),
                 deltas: Vec::new(),
                 window: (0, 0),
                 cards: Vec::new(),
