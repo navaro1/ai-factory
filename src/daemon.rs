@@ -25147,6 +25147,19 @@ mod tests {
             TaskState::Failed("fast check failed: checkout exit 124".to_string())
         );
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        // The deadline is the record of the check, not a crash: the
+        // one-shot task ends done at its first attempt, and no stuck row
+        // opens for a retry the daemon must not make.
+        assert_eq!(rig.task(&checkout).state, TaskState::Done);
+        assert_eq!(rig.task(&checkout).attempt, 1);
+        assert!(
+            rig.daemon
+                .decisions
+                .open()
+                .iter()
+                .all(|row| !matches!(row.kind, DecisionKind::Stuck { .. })),
+            "a timed out check opens no stuck row"
+        );
     }
 
     #[test]
@@ -29329,12 +29342,34 @@ mod tests {
     /// The scripted git steps of one theory read at `commit`, with no
     /// rule file.
     fn theory_steps(repo: &Path, commit: &str, skill: &str) -> Vec<Step> {
-        theory_steps_with_rules(repo, commit, skill, refused())
+        theory_steps_with_feature(repo, commit, skill, RUN_FEATURE)
+    }
+
+    /// The theory steps of one read whose checkout carries `feature`.
+    fn theory_steps_with_feature(
+        repo: &Path,
+        commit: &str,
+        skill: &str,
+        feature: &str,
+    ) -> Vec<Step> {
+        theory_steps_with(repo, commit, skill, refused(), feature)
     }
 
     /// The scripted git steps of one theory read at `commit` whose rule
     /// file answers `rules`.
     fn theory_steps_with_rules(repo: &Path, commit: &str, skill: &str, rules: CmdOut) -> Vec<Step> {
+        theory_steps_with(repo, commit, skill, rules, RUN_FEATURE)
+    }
+
+    /// The scripted git steps of one theory read whose rule file and
+    /// feature file are both chosen.
+    fn theory_steps_with(
+        repo: &Path,
+        commit: &str,
+        skill: &str,
+        rules: CmdOut,
+        feature: &str,
+    ) -> Vec<Step> {
         vec![
             git_step(
                 repo,
@@ -29381,7 +29416,7 @@ mod tests {
                     "show",
                     &format!("{commit}:.claude/skills/run-web/features/checkout.md"),
                 ],
-                CmdOut::ok(RUN_FEATURE),
+                CmdOut::ok(feature),
             ),
         ]
     }
@@ -34605,6 +34640,150 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert!(
             rig.daemon.theory_snapshots.is_empty(),
             "the theory snapshot goes with the poller"
+        );
+    }
+
+    /// A feature that names an unknown area lints the state view, and the
+    /// daemon keeps reading after the finding.
+    #[test]
+    fn an_unknown_feature_area_lints_the_view_and_the_daemon_keeps_running() {
+        let dir = temp_root();
+        let repo = dir.join("repo");
+        let nope = RUN_FEATURE.replace("area: web-checkout", "area: nope");
+        let mut steps = theory_steps_with_feature(&repo, "aaa111", &run_skill("browser"), &nope);
+        steps.extend(theory_steps(&repo, "bbb222", &run_skill("browser")));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(Vec::new(), Vec::new());
+
+        let view = theory_of(&rig);
+        assert_eq!(view.error, "", "a lint finding never becomes a read error");
+        assert_eq!(
+            view.skills["web"].lint,
+            vec!["features/checkout.md: area nope unknown".to_string()]
+        );
+        rig.drive();
+        rig.poll(Vec::new(), Vec::new());
+
+        let fixed = theory_of(&rig);
+        assert!(
+            fixed.skills["web"].lint.is_empty(),
+            "the daemon keeps reading"
+        );
+    }
+
+    /// A closed delta record frees a seat of the window: the hold goes
+    /// away, and the queued implement task starts.
+    #[test]
+    fn a_closed_delta_record_clears_the_window_hold_and_implement_starts() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = theory_steps(&repo, "aaa111", &run_skill("browser"));
+        steps.push(comment_page_step(142, "[]"));
+        steps.push(comment_page_step(201, "[]"));
+        steps.push(comment_page_step(202, "[]"));
+        steps.push(comment_page_step(203, "[]"));
+        steps.extend(commit_steps(&repo, "aaa111"));
+        steps.extend(fresh_issue_steps(&repo, &issue_wt(&dir, 142), 142, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+        // The V7 ticket check runs before the dispatch, so the body must
+        // pass it and the window stays the only hold.
+        let body = unchecked_ticket_body().replace(
+            "- AC-2 \u{b7} Orders rejects an empty card \u{b7} check: api-orders fast\n",
+            "",
+        );
+
+        rig.poll(
+            vec![
+                issue_with_body(
+                    142,
+                    &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                    &body,
+                ),
+                issue(201, &[DELTA_OPEN_LABEL]),
+                issue(202, &[DELTA_OPEN_LABEL]),
+                issue(203, &[DELTA_OPEN_LABEL]),
+            ],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 0, "the window holds the implement task");
+        assert_eq!(
+            rig.task("borsuk/implement-i142").state,
+            TaskState::Queued,
+            "the task waits instead of starting"
+        );
+        let view = last_view(&push_rx);
+        assert_eq!(
+            pushed_task(&view, "borsuk/implement-i142").hold.as_deref(),
+            Some(WINDOW_FULL_HOLD)
+        );
+        assert_eq!(theory_of(&rig).window, (3, 3));
+
+        // Record 203 closes: its label goes, and the window holds two of
+        // three open records.
+        rig.poll(
+            vec![
+                issue_with_body(
+                    142,
+                    &["refined", THEORY_SHORT_LABEL, THEORY_FULL_LABEL],
+                    &body,
+                ),
+                issue(201, &[DELTA_OPEN_LABEL]),
+                issue(202, &[DELTA_OPEN_LABEL]),
+                issue(203, &[]),
+            ],
+            vec![],
+        );
+
+        assert_eq!(rig.job_count(), 1, "the closed record frees a seat");
+        assert_eq!(rig.job(0).task, "borsuk/implement-i142");
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert_eq!(theory_of(&rig).window, (2, 3));
+        assert!(theory_of(&rig).holds.is_empty(), "the hold goes away");
+    }
+
+    /// The audit cadence survives a restart: the restored schedule keeps
+    /// its last fire, so the second daemon waits a full `sweep.days`.
+    #[test]
+    fn the_audit_cadence_survives_a_restart_and_waits_for_the_next_sweep_days() {
+        let dir = temp_root();
+        let t0 = 1_000_000_u64;
+        let day = cadence::MS_PER_DAY;
+        // No scripted steps: the missed calls leave every daily sweep
+        // empty and quiet. Only the audit job of the second poll counts.
+        {
+            let mut rig = Rig::make_in(dir.clone(), Vec::new(), governed);
+            rig.set_now(t0);
+            rig.poll(Vec::new(), Vec::new());
+            rig.set_now(t0 + 7 * day + 60_000);
+            rig.poll(Vec::new(), Vec::new());
+            assert_eq!(rig.job_count(), 1, "the first daemon fires the sweep");
+            assert_eq!(rig.job(0).task, "borsuk/audit-sweep");
+            // The sweep runs to its end, so the restart inherits no
+            // running task: only a cadence can start a job there.
+            rig.event(turn_ended("borsuk/audit-sweep"));
+            rig.event(exited("borsuk/audit-sweep", true, ""));
+        }
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        rig.set_now(t0 + 7 * day + 120_000);
+        rig.poll(Vec::new(), Vec::new());
+
+        assert_eq!(rig.job_count(), 0, "the restored cadence waits");
+        let audit = rig
+            .daemon
+            .cadences
+            .iter()
+            .find(|schedule| schedule.kind == ScheduleKind::Audit)
+            .expect("the restart restores the audit schedule");
+        assert_eq!(
+            audit.last_ms,
+            Some(t0 + 7 * day + 60_000),
+            "the restored schedule keeps the first fire, not the restart"
         );
     }
 }
