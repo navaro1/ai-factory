@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::config::{Config, Weekday};
-use crate::theory::records::{DeltaBlock, DeltaOutcome, PredictionTag};
+use crate::theory::records::{DeltaBlock, DeltaOutcome, PredictionTag, LADDER_LABELS};
 
 /// One day in milliseconds.
 pub(crate) const MS_PER_DAY: u64 = 86_400_000;
@@ -157,10 +157,9 @@ impl Calibration {
 
 /// The count of records that carry each ladder label.
 pub fn rung_counts(labels_of_records: &[&[String]]) -> [usize; 3] {
-    let names = ["ladder-1", "ladder-2", "ladder-3"];
     let mut rungs = [0usize; 3];
     for labels in labels_of_records {
-        for (rung, name) in names.iter().enumerate() {
+        for (rung, name) in LADDER_LABELS.iter().enumerate() {
             if labels.iter().any(|label| label == name) {
                 rungs[rung] += 1;
             }
@@ -219,15 +218,22 @@ pub(crate) fn is_theory_label(label: &str) -> bool {
 /// The form is the exact RFC 3339 form the GitHub `since` parameter
 /// reads. The moment must sit after the epoch.
 pub(crate) fn ms_rfc3339(ms: u64) -> String {
-    let days = (ms / MS_PER_DAY) as i64;
     let rest = ms % MS_PER_DAY;
-    let (year, month, day) = civil_from_days(days);
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        "{}T{:02}:{:02}:{:02}Z",
+        ms_date(ms),
         rest / 3_600_000,
         (rest % 3_600_000) / 60_000,
         (rest % 60_000) / 1_000,
     )
+}
+
+/// Format one moment as the UTC date `YYYY-MM-DD`.
+///
+/// A rule line carries this date. The moment must sit after the epoch.
+pub(crate) fn ms_date(ms: u64) -> String {
+    let (year, month, day) = civil_from_days((ms / MS_PER_DAY) as i64);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Read one day count as a civil date.

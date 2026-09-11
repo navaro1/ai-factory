@@ -1559,6 +1559,13 @@ pub const MODEL_COMMIT_REQUEST: &str = "model-commit:";
 /// the Theory view and no ticket row waits for it.
 pub const SKILL_TICKET_REQUEST: &str = "skill-ticket:";
 
+/// The request identity prefix of one ladder refusal.
+///
+/// The rung of a theory answer runs with no ticket row behind it, so a
+/// rung the daemon cannot climb reports through [`Push::TicketResult`]
+/// and the UI toasts the reason.
+pub const LADDER_REQUEST: &str = "ladder:";
+
 /// The request identity prefix of one prediction result.
 ///
 /// The result rides [`Push::TicketResult`] like a run skill ticket does,
