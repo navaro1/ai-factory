@@ -1289,16 +1289,27 @@ pub(super) fn footer_hints(app: &App) -> String {
     match row {
         Row::Stage { .. } => "+ - limit · p pause · ? help".to_string(),
         Row::Repo { .. } => "+ - lane · n new · p pause · ? help".to_string(),
-        Row::Ticket { index } => match state.tasks.get(index).map(|task| &task.state) {
-            Some(TaskState::Failed(reason)) if reason.starts_with(FAST_CHECK_FAILED) => {
-                format!("{FAST_CHECK_FAILED} · enter open · x abort · R retry · ? help")
+        Row::Ticket { index } => {
+            let task = state.tasks.get(index);
+            if task
+                .and_then(|task| task.hold.as_deref())
+                .is_some_and(|hold| hold.starts_with(FAST_CHECK_FAILED))
+            {
+                // The held implement waits for its review, so the retry
+                // key has nothing to retry yet.
+                format!("{FAST_CHECK_FAILED} · enter open · x abort · ? help")
+            } else {
+                match task.map(|task| &task.state) {
+                    Some(TaskState::Failed(_)) => {
+                        "enter open · x abort · R retry · ? help".to_string()
+                    }
+                    _ if full_prediction_target(app).is_some() => {
+                        "enter open · p predict · x abort · ? help".to_string()
+                    }
+                    _ => "enter open · r refine · x abort · ? help".to_string(),
+                }
             }
-            Some(TaskState::Failed(_)) => "enter open · x abort · R retry · ? help".to_string(),
-            _ if full_prediction_target(app).is_some() => {
-                "enter open · p predict · x abort · ? help".to_string()
-            }
-            _ => "enter open · r refine · x abort · ? help".to_string(),
-        },
+        }
         Row::Train { .. } => "g release · s policy · ? help".to_string(),
         Row::ReleasePr { repo, pr } => {
             let stackable = state
@@ -5722,15 +5733,24 @@ mod tests {
         }
     }
 
-    /// A review a fast check cancelled names the check in its hint.
+    /// The implement task a failed fast check holds names the check in
+    /// its hint, and the failed review row itself takes the plain hint.
     #[test]
     fn the_hint_of_a_failed_fast_check_names_the_check() {
         let mut state = sample_view();
-        state.tasks[7].state = TaskState::Failed(format!("{FAST_CHECK_FAILED}: checkout exit 1"));
-        let app = app_with_state_and_row(state, Row::Ticket { index: 7 });
-        let expected = "fast check failed · enter open · x abort · R retry · ? help";
+        state.tasks[3].hold = Some(format!("{FAST_CHECK_FAILED}: checkout"));
+        let app = app_with_state_and_row(state, Row::Ticket { index: 3 });
+        let expected = "fast check failed · enter open · x abort · ? help";
 
         assert_eq!(footer_hints(&app), expected);
         assert!(expected.chars().count() <= crate::tui::HINT_CAP);
+
+        let mut state = sample_view();
+        state.tasks[7].state = TaskState::Failed(format!("{FAST_CHECK_FAILED}: checkout exit 1"));
+        let app = app_with_state_and_row(state, Row::Ticket { index: 7 });
+        assert_eq!(
+            footer_hints(&app),
+            "enter open · x abort · R retry · ? help"
+        );
     }
 }

@@ -31,13 +31,19 @@ pub enum EditorOutcome {
 ///
 /// Uses `$EDITOR` split on whitespace, with `vi` as the fallback.
 pub fn edit_file(path: &Path) -> Result<EditorOutcome> {
-    edit_file_with(path, &editor_command(), restore_terminal, || {
-        enable_terminal_with(
-            enable_raw_mode,
-            || execute!(stdout(), EnterAlternateScreen),
-            restore_terminal,
-        )
-    })
+    let value = std::env::var("EDITOR").ok();
+    edit_file_with(
+        path,
+        &editor_command(value.as_deref()),
+        restore_terminal,
+        || {
+            enable_terminal_with(
+                enable_raw_mode,
+                || execute!(stdout(), EnterAlternateScreen),
+                restore_terminal,
+            )
+        },
+    )
 }
 
 /// Run `editor` over `path` with the real terminal handed to the editor.
@@ -89,10 +95,12 @@ pub fn edit_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The editor command: `$EDITOR` split on whitespace, else `vi`.
-fn editor_command() -> Vec<String> {
-    std::env::var("EDITOR")
-        .ok()
+/// The editor command: `value` split on whitespace, else `vi`.
+///
+/// `value` is the `$EDITOR` setting. `None` and a blank value both fall
+/// back to `vi`, so the caller owns the environment read.
+fn editor_command(value: Option<&str>) -> Vec<String> {
+    value
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.split_whitespace().map(str::to_string).collect())
         .unwrap_or_else(|| vec!["vi".to_string()])
@@ -252,6 +260,16 @@ mod tests {
             matches!(outcome, EditorOutcome::Failed(reason) if reason.contains("aif-no-such-editor"))
         );
         assert_eq!(*order.borrow(), vec!["restore", "enable"]);
+    }
+
+    #[test]
+    fn the_editor_command_splits_the_value_and_falls_back_to_vi() {
+        assert_eq!(
+            editor_command(Some("code --wait")),
+            vec!["code".to_string(), "--wait".to_string()]
+        );
+        assert_eq!(editor_command(Some("   ")), vec!["vi".to_string()]);
+        assert_eq!(editor_command(None), vec!["vi".to_string()]);
     }
 
     #[test]

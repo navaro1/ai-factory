@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ItemKind, Stage};
 use crate::tasks::Task;
-use crate::theory::answers::{Cause, TheoryRow};
+use crate::theory::answers::Cause;
 use crate::theory::cards::CardView;
 
 /// One condition that waits for a human answer.
@@ -285,24 +285,30 @@ impl Decision {
     }
 
     /// Build one theory row from the parts its record derived.
-    pub fn theory_event(repo: &str, row: TheoryRow, opened_ms: u64) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn theory_event(
+        repo: &str,
+        kind: ItemKind,
+        number: u64,
+        slot: String,
+        entry: String,
+        tag: String,
+        question: String,
+        source: String,
+        opened_ms: u64,
+    ) -> Self {
         Self::from_parts(
-            format!(
-                "theory:{repo}:{}{}:{}",
-                row.kind.as_str(),
-                row.number,
-                row.slot
-            ),
+            format!("theory:{repo}:{}{number}:{slot}", kind.as_str()),
             repo.to_string(),
             None,
             DecisionKind::TheoryEvent {
-                kind: row.kind,
-                number: row.number,
-                slot: row.slot,
-                entry: row.entry,
-                tag: row.tag,
-                question: row.question,
-                source: row.source,
+                kind,
+                number,
+                slot,
+                entry,
+                tag,
+                question,
+                source,
             },
             opened_ms,
         )
@@ -590,15 +596,13 @@ mod tests {
             Decision::delta_hit("borsuk", ItemKind::Pr, 7, 4, NOW),
             Decision::theory_event(
                 "borsuk",
-                TheoryRow {
-                    kind: ItemKind::Pr,
-                    number: 7,
-                    slot: "invariants".to_string(),
-                    entry: "INV-3".to_string(),
-                    tag: "sure-miss".to_string(),
-                    question: "which entry is wrong?".to_string(),
-                    source: "miss".to_string(),
-                },
+                ItemKind::Pr,
+                7,
+                "invariants".to_string(),
+                "INV-3".to_string(),
+                "sure-miss".to_string(),
+                "which entry is wrong?".to_string(),
+                "miss".to_string(),
                 NOW,
             ),
             Decision::card(
