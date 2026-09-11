@@ -48,6 +48,19 @@ pub const VERIFY_SKILL_LABEL: &str = "verify-skill";
 /// The color GitHub renders `verify-skill` with, as six hex digits.
 pub const VERIFY_SKILL_COLOR: &str = "0e8a16";
 
+/// The label of a record whose answer took rung 1 of the ladder.
+pub const LADDER_1_LABEL: &str = "ladder-1";
+/// The label of a record whose answer took rung 2 of the ladder.
+pub const LADDER_2_LABEL: &str = "ladder-2";
+/// The label of a record whose answer took rung 3 of the ladder.
+pub const LADDER_3_LABEL: &str = "ladder-3";
+
+/// The three ladder labels, rung 1 first.
+pub const LADDER_LABELS: [&str; 3] = [LADDER_1_LABEL, LADDER_2_LABEL, LADDER_3_LABEL];
+
+/// The color GitHub renders every ladder label with, as six hex digits.
+pub const LADDER_COLOR: &str = "006b75";
+
 /// The opening tag of one prediction block.
 pub const PREDICTION_BLOCK: &str = "<aif-prediction-v1>";
 /// The opening tag of one theory event block.
@@ -64,8 +77,11 @@ pub const MODEL_PROPOSAL_BLOCK: &str = "<aif-model-proposal-v1>";
 /// The model file of one repository, relative to the theory checkout.
 pub const MODEL_FILE: &str = "theory/model.toml";
 
+/// The rule file of one repository, relative to the theory checkout.
+pub const RULES_FILE: &str = "theory/rules.md";
+
 /// The theory files only a model branch may change.
-pub const MODEL_FILES: [&str; 3] = [MODEL_FILE, "theory/verify.toml", "theory/rules.md"];
+pub const MODEL_FILES: [&str; 3] = [MODEL_FILE, "theory/verify.toml", RULES_FILE];
 
 /// The heading one pull request body must carry.
 pub const SECTION_WHY: &str = "## Why";

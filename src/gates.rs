@@ -468,6 +468,7 @@ impl GateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theory::records::LADDER_1_LABEL;
 
     fn names() -> LabelNames {
         LabelNames::default()
@@ -623,6 +624,43 @@ mod tests {
                 &names()
             ),
             Some(AWAITS_SHORT_HINT)
+        );
+    }
+
+    /// A ticket the ladder opened is a ticket like any other: `ladder-1`
+    /// does not skip the prediction gates, so the refine waits for the
+    /// short prediction and moves once it lands.
+    #[test]
+    fn the_refine_gate_holds_a_ladder_ticket_until_its_short_prediction() {
+        let opened = issue(1, &["to-refine", LADDER_1_LABEL]);
+        assert!(
+            !refine_ready(
+                &opened,
+                "borsuk",
+                &records_of("on", &opened, false),
+                &names()
+            ),
+            "a rung 1 ticket waits like any ticket"
+        );
+        assert_eq!(
+            refine_hold(
+                &opened,
+                "borsuk",
+                &records_of("on", &opened, false),
+                &names()
+            ),
+            Some(AWAITS_SHORT_HINT)
+        );
+
+        let predicted = issue(1, &["to-refine", LADDER_1_LABEL, THEORY_SHORT_LABEL]);
+        assert!(
+            refine_ready(
+                &predicted,
+                "borsuk",
+                &records_of("on", &predicted, false),
+                &names()
+            ),
+            "the short prediction opens the gate"
         );
     }
 
