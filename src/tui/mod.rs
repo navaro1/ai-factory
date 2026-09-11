@@ -1313,6 +1313,7 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
                 .request
                 .starts_with(crate::sock::SKILL_TICKET_REQUEST)
                 || result.request.starts_with(crate::sock::PREDICTION_REQUEST)
+                || result.request.starts_with(crate::sock::LADDER_REQUEST)
                 || result
                     .request
                     .starts_with(crate::sock::MODEL_COMMIT_REQUEST)

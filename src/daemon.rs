@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -60,7 +61,7 @@ use crate::sock::{
     Action, AreaView, AskView, ChatPurpose, DeltaState, DeltaView, HoldView, InputMode, ModelPath,
     PauseScope, PromptSource, PromptView, Push, RecordView, SettingsOperation, SettingsResult,
     SettingsResultStatus, StateInput, StateView, SurfaceView, TheoryAction, TheoryView,
-    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind,
+    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind, LADDER_REQUEST,
     MODEL_COMMIT_REQUEST, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
 };
 use crate::state::{ChatKey, DaemonState, RuntimeState, TaskBinding, TicketConversationState};
@@ -198,6 +199,30 @@ fn model_repo(repo: &RepoConfig) -> &str {
     repo.theory_repo().unwrap_or(&repo.owner_repo)
 }
 
+/// The body of one ladder ticket: the event text, then the note.
+fn ladder_body(question: &str, note: &str) -> String {
+    if note.is_empty() {
+        question.to_string()
+    } else {
+        format!("{question}\n\n{note}")
+    }
+}
+
+/// The body of one rung 1 ticket.
+///
+/// The ticket leaves its record behind, so the first line names the
+/// record, the slot, and the entry the answer took. The event text and
+/// the note follow.
+fn eliminate_body(key: &RecordKey, question: &str, answer: &AnswerBlock) -> String {
+    format!(
+        "Record {}. Slot {}. Entry {}.\n\n{}",
+        key.key_text(),
+        answer.slot,
+        answer.entry,
+        ladder_body(question, &answer.note)
+    )
+}
+
 /// One rule line of the ladder, dated in UTC.
 fn rule_line(now_ms: u64, answer: &AnswerBlock) -> String {
     format!(
@@ -212,9 +237,17 @@ fn rule_line(now_ms: u64, answer: &AnswerBlock) -> String {
 /// absent.
 ///
 /// The file is a list, so the line starts on its own row whatever the
-/// last byte of the file is.
+/// last byte of the file is. Only a missing file starts an empty list.
+/// Any other read error fails the rung, so the pull request never drops
+/// the rules the file already holds.
 fn append_rule(file: &Path, line: &str) -> Result<()> {
-    let mut text = fs::read_to_string(file).unwrap_or_default();
+    let mut text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!("cannot read {}", file.display())))
+        }
+    };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
@@ -2171,9 +2204,11 @@ impl Daemon {
     ///
     /// Rung 1 opens a ticket that eliminates the class, rung 2 a ticket
     /// for a measurer of the area, and rung 3 records one rule on the
-    /// model branch. A repository with the governor off climbs nothing,
-    /// and a failure reports itself and leaves the answer standing: the
-    /// block is already on the record.
+    /// model branch. Rung 2 needs an area and rung 3 needs a note, so an
+    /// answer that carries neither climbs nothing. A repository with the
+    /// governor off climbs nothing either, and a failure reports itself
+    /// and leaves the answer standing: the block is already on the
+    /// record.
     fn climb_ladder(&self, alias: &str, key: &RecordKey, question: &str, answer: &AnswerBlock) {
         let Ok(repo) = self.governed_repo(alias) else {
             return;
@@ -2183,27 +2218,47 @@ impl Daemon {
                 &repo,
                 &format!("Eliminate: {} \u{2014} {}", answer.entry, question),
                 LADDER_1_LABEL,
-                question,
-                answer,
+                &eliminate_body(key, question, answer),
             ),
             2 if answer.area.is_empty() => Err(anyhow!("the answer names no area")),
             2 => self.ladder_ticket(
                 &repo,
                 &format!("Measure: {} \u{2014} {}", answer.area, answer.entry),
                 LADDER_2_LABEL,
-                question,
-                answer,
+                &ladder_body(question, &answer.note),
             ),
+            3 if answer.note.is_empty() => Err(anyhow!("the answer writes no rule")),
             3 => self.record_rule(&repo, key, answer),
             _ => return,
         };
         if let Err(error) = climbed {
-            eprintln!(
+            let reason = format!(
                 "rung {} of {alias} {}: {error:#}",
                 answer.rung,
                 key.key_text()
             );
+            eprintln!("{reason}");
+            self.report_ladder(alias, reason);
         }
+    }
+
+    /// Send one ladder refusal to every interface as a toast.
+    ///
+    /// No ticket row waits for a rung, so the operator reads the reason
+    /// the same way a model commit reports itself.
+    fn report_ladder(&self, alias: &str, message: String) {
+        let Some(pusher) = self.ticket_pusher.as_ref() else {
+            return;
+        };
+        pusher(Push::TicketResult(TicketResult {
+            request: format!("{LADDER_REQUEST}{alias}"),
+            repo: alias.to_string(),
+            number: 0,
+            kind: TicketResultKind::Failure,
+            message,
+            issue: None,
+            conflict: None,
+        }));
     }
 
     /// Open one ladder ticket on the code repository.
@@ -2211,28 +2266,21 @@ impl Daemon {
     /// The ticket carries the configured `to-refine` name, so the v0.6
     /// refine gate picks it up, and the rung label, so the daily sweep
     /// counts it. The daemon creates the rung label first, because
-    /// `create_issue` fails on a label the repository does not have. The
-    /// body holds the event text and the note the operator added.
+    /// `create_issue` fails on a label the repository does not have.
     fn ladder_ticket(
         &self,
         repo: &RepoConfig,
         title: &str,
         rung_label: &str,
-        question: &str,
-        answer: &AnswerBlock,
+        body: &str,
     ) -> Result<()> {
         let gh = GhClient::new(&*self.exec);
         gh.create_label_if_missing(&repo.owner_repo, rung_label, LADDER_COLOR)?;
         let names = self.config.resolved_labels(Some(&repo.alias));
-        let body = if answer.note.is_empty() {
-            question.to_string()
-        } else {
-            format!("{question}\n\n{}", answer.note)
-        };
         gh.create_issue(
             &repo.owner_repo,
             title,
-            &body,
+            body,
             &[names.get(LabelKey::ToRefine), rung_label],
         )?;
         Ok(())
@@ -25236,7 +25284,7 @@ mod tests {
         steps.push(ladder_label_step("ladder-1"));
         steps.push(ladder_issue_step(
             "Eliminate: T-pay \u{2014} Which entry is wrong?",
-            "Which entry is wrong?",
+            "Record pr-7. Slot behaviours. Entry T-pay.\n\nWhich entry is wrong?",
             "ladder-1",
             81,
         ));
@@ -25251,7 +25299,7 @@ mod tests {
         steps.push(ladder_label_step("ladder-1"));
         steps.push(ladder_issue_step(
             "Eliminate: INV-3 \u{2014} Which entry is wrong?",
-            "Which entry is wrong?",
+            "Record pr-7. Slot invariants. Entry INV-3.\n\nWhich entry is wrong?",
             "ladder-1",
             82,
         ));
@@ -25505,7 +25553,10 @@ mod tests {
         steps.push(ladder_label_step("ladder-1"));
         steps.push(ladder_issue_step(
             "Eliminate: B-checkout \u{2014} INV-9 names a path the code removed",
-            "INV-9 names a path the code removed",
+            concat!(
+                "Record repo. Slot event:0. Entry B-checkout.\n\n",
+                "INV-9 names a path the code removed"
+            ),
             "ladder-1",
             86,
         ));
@@ -25632,7 +25683,7 @@ mod tests {
         steps.push(ladder_label_step("ladder-1"));
         steps.push(ladder_issue_step(
             "Eliminate: B-checkout \u{2014} the area asks for a higher tier",
-            "the area asks for a higher tier",
+            "Record pr-7. Slot event:0. Entry B-checkout.\n\nthe area asks for a higher tier",
             "ladder-1",
             87,
         ));
@@ -25705,8 +25756,21 @@ mod tests {
     /// The step pins the title, the body, and both labels, in the order
     /// `create_issue` sends them.
     fn ladder_issue_step(title: &str, body: &str, rung_label: &str, number: u64) -> Step {
+        ladder_issue_step_named(title, body, "to-refine", rung_label, number)
+    }
+
+    /// The `create_issue` step of one ladder ticket whose repository
+    /// renamed `to-refine`.
+    fn ladder_issue_step_named(
+        title: &str,
+        body: &str,
+        refine_label: &str,
+        rung_label: &str,
+        number: u64,
+    ) -> Step {
         let title_field = format!("title={title}");
         let body_field = format!("body={body}");
+        let refine_field = format!("labels[]={refine_label}");
         let rung_field = format!("labels[]={rung_label}");
         let created = json!({
             "number": number,
@@ -25714,7 +25778,7 @@ mod tests {
             "title": title,
             "body": body,
             "state": "open",
-            "labels": [{"name": "to-refine"}, {"name": rung_label}],
+            "labels": [{"name": refine_label}, {"name": rung_label}],
             "user": {"login": "piotr"},
             "assignees": [],
             "updated_at": "2026-09-11T12:00:00Z",
@@ -25733,7 +25797,7 @@ mod tests {
                 "-f",
                 body_field.as_str(),
                 "-f",
-                "labels[]=to-refine",
+                refine_field.as_str(),
                 "-f",
                 rung_field.as_str(),
             ],
@@ -25802,7 +25866,10 @@ mod tests {
         steps.push(ladder_label_step("ladder-1"));
         steps.push(ladder_issue_step(
             "Eliminate: INV-3 \u{2014} Which entry is wrong?",
-            "Which entry is wrong?\n\nthe retry needs a queue",
+            concat!(
+                "Record pr-7. Slot invariants. Entry INV-3.\n\n",
+                "Which entry is wrong?\n\nthe retry needs a queue"
+            ),
             "ladder-1",
             77,
         ));
@@ -25822,7 +25889,10 @@ mod tests {
                 "-f",
                 "title=Eliminate: INV-3 \u{2014} Which entry is wrong?",
                 "-f",
-                "body=Which entry is wrong?\n\nthe retry needs a queue",
+                concat!(
+                    "body=Record pr-7. Slot invariants. Entry INV-3.\n\n",
+                    "Which entry is wrong?\n\nthe retry needs a queue"
+                ),
                 "-f",
                 "labels[]=to-refine",
                 "-f",
@@ -26020,6 +26090,272 @@ mod tests {
             placeholder_of(&values, "rules"),
             rule,
             "the next prompt carries the rule"
+        );
+    }
+
+    /// The label and the record label of one rung 3 answer.
+    fn rung_three_label_steps() -> Vec<Step> {
+        vec![
+            ladder_label_step("ladder-3"),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=ladder-3",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// The git calls of a model worktree that already sits on the model
+    /// branch: the derive, the branch it holds, its registration, and the
+    /// exclude file.
+    fn reused_model_steps(dir: &Path, source: &Path) -> Vec<Step> {
+        let worktree = model_wt(dir);
+        let listing = format!("worktree {}\n", worktree.display());
+        vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":12,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(
+                source,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(listing),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(dir)),
+        ]
+    }
+
+    /// The rule file keeps what it holds, so a second rung 3 answer adds
+    /// its line under the first one.
+    #[test]
+    fn two_rung_three_answers_append_two_lines_to_the_rule_file() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let first = noted_answer(
+            "T-pay",
+            3,
+            "web-checkout",
+            "name the token in the model",
+            "behaviours",
+        );
+        let second = noted_answer(
+            "INV-3",
+            3,
+            "web-checkout",
+            "the retry keeps the boundary",
+            "invariants",
+        );
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&first)));
+        steps.extend(rung_three_label_steps());
+        steps.push(model_derive_step("acme/borsuk", "[]"));
+        steps.extend(fresh_model_steps(&dir, &repo));
+        steps.extend(push_model_steps(
+            &dir,
+            "acme/borsuk",
+            "[]",
+            "theory/rules.md",
+            "Add a rule",
+        ));
+        steps.push(record_comment_step(&answers::answer_block(&second)));
+        steps.extend(rung_three_label_steps());
+        steps.extend(reused_model_steps(&dir, &repo));
+        // The model pull request is open, so the second push opens none
+        // and the label and create steps of the helper stay unused.
+        steps.extend(
+            push_model_steps(
+                &dir,
+                "acme/borsuk",
+                "[{\"number\":12}]",
+                "theory/rules.md",
+                "Add a rule",
+            )
+            .into_iter()
+            .take(6),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.set_now(LADDER_NOW);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &first));
+        rig.act(send_answer("theory:borsuk:p7:invariants", &second));
+
+        assert_eq!(
+            fs::read_to_string(model_wt(&dir).join("theory/rules.md")).unwrap(),
+            concat!(
+                "- 2026-09-11 T-pay: name the token in the model\n",
+                "- 2026-09-11 INV-3: the retry keeps the boundary\n"
+            )
+        );
+        assert_eq!(
+            rig.exec
+                .calls()
+                .iter()
+                .filter(|call| call.args.iter().any(|arg| arg == "Add a rule"))
+                .count(),
+            2,
+            "each answer commits its own rule"
+        );
+    }
+
+    /// A rule needs words, so rung 3 with no note writes nothing and
+    /// tells the operator why.
+    #[test]
+    fn a_rung_three_answer_with_no_note_writes_no_rule() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("T-pay", 3, "web-checkout", "", "behaviours");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &answer));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg.contains("ladder-3"))),
+            "a rung with no rule names no label"
+        );
+        let Push::TicketResult(result) = rx.try_recv().expect("the refusal must toast") else {
+            panic!("the refusal must push a Push::TicketResult");
+        };
+        assert_eq!(result.request, "ladder:borsuk");
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(
+            result.message,
+            "rung 3 of borsuk pr-7: the answer writes no rule"
+        );
+    }
+
+    /// A rule file the daemon cannot read is not an empty rule file, so
+    /// the rung fails and the pull request never drops the rules the
+    /// file holds.
+    #[test]
+    fn an_unreadable_rule_file_fails_the_rung_and_commits_nothing() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("T-pay", 3, "web-checkout", "name the token", "behaviours");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        steps.extend(rung_three_label_steps());
+        steps.extend(reused_model_steps(&dir, &repo));
+        // A directory answers every read with an error that is not
+        // `NotFound`, which is the case an empty list must not swallow.
+        fs::create_dir_all(model_wt(&dir).join("theory/rules.md")).unwrap();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &answer));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "Add a rule")),
+            "an unreadable file commits nothing"
+        );
+        let Push::TicketResult(result) = rx.try_recv().expect("the failure must toast") else {
+            panic!("the failure must push a Push::TicketResult");
+        };
+        assert!(
+            result.message.contains("cannot read"),
+            "the toast names the read: {}",
+            result.message
+        );
+    }
+
+    /// The ladder belongs to the governor, so a repository with the
+    /// governor off answers its open row and climbs nothing.
+    #[test]
+    fn the_ladder_stays_quiet_with_the_governor_off() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("INV-3", 1, "web-checkout", "", "invariants");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.daemon
+            .config
+            .repos
+            .get_mut("borsuk")
+            .unwrap()
+            .theory
+            .governor = Governor::Off;
+        rig.act(send_answer("theory:borsuk:p7:invariants", &answer));
+
+        assert!(
+            posted_bodies(&rig)
+                .iter()
+                .any(|body| body.contains("\"slot\":\"invariants\"")),
+            "the answer still posts on the record"
+        );
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg.contains("ladder-"))),
+            "the governor is off, so no rung runs"
+        );
+    }
+
+    /// The refine label is configuration, so the ladder ticket carries
+    /// the name the repository chose.
+    #[test]
+    fn a_renamed_to_refine_label_reaches_the_ladder_ticket() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("INV-3", 1, "web-checkout", "", "invariants");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step_named(
+            "Eliminate: INV-3 \u{2014} Which entry is wrong?",
+            "Record pr-7. Slot invariants. Entry INV-3.\n\nWhich entry is wrong?",
+            "needs-refining",
+            "ladder-1",
+            79,
+        ));
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            governed(config);
+            config
+                .repos
+                .get_mut("borsuk")
+                .unwrap()
+                .label_overrides
+                .insert(LabelKey::ToRefine, "needs-refining".to_string());
+        });
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:invariants", &answer));
+
+        assert!(
+            issue_call(&rig)
+                .args
+                .contains(&"labels[]=needs-refining".to_string()),
+            "the ticket carries the configured name"
         );
     }
 
@@ -32017,7 +32353,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         extra.push(ladder_label_step("ladder-1"));
         extra.push(ladder_issue_step(
             "Eliminate: B-checkout \u{2014} The answer misses the new retry count.",
-            "The answer misses the new retry count.",
+            concat!(
+                "Record pr-7. Slot event:0. Entry B-checkout.\n\n",
+                "The answer misses the new retry count."
+            ),
             "ladder-1",
             88,
         ));
