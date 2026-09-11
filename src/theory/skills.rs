@@ -355,22 +355,19 @@ fn has_heading(body: &str, title: &str) -> bool {
 
 /// True when the index names `id`.
 ///
-/// A line names a feature when, after the list marker, the line starts
-/// with the id and the id ends there: the next character is the end of
-/// the line, a colon, or whitespace. A description that merely contains
-/// the id as a word does not count.
+/// Only a `- ` bullet names a feature. The line names one when the text
+/// after the bullet starts with the id and the id ends there: the next
+/// character is the end of the line, a colon, or whitespace. A
+/// description that merely contains the id as a word does not count.
 fn index_lists(index: &str, id: &str) -> bool {
     index.lines().any(|line| {
-        let line = line.trim_start();
-        let line = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .or_else(|| line.strip_prefix("+ "))
-            .unwrap_or(line);
-        let Some(rest) = line.strip_prefix(id) else {
+        let Some(rest) = line.trim_start().strip_prefix("- ") else {
             return false;
         };
-        matches!(rest.chars().next(), None | Some(':')) || rest.starts_with(char::is_whitespace)
+        let Some(tail) = rest.strip_prefix(id) else {
+            return false;
+        };
+        matches!(tail.chars().next(), None | Some(':')) || tail.starts_with(char::is_whitespace)
     })
 }
 

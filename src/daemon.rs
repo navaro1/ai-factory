@@ -8159,6 +8159,7 @@ impl Daemon {
         {
             eprintln!("the skill finding of {}: {error:#}", task.id);
         }
+        self.append_task_log(task, &format!("aif: {finding}\n"));
         self.fail_run(task, &finding.to_string());
         true
     }
