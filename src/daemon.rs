@@ -34249,6 +34249,49 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         assert_eq!(placeholder_of(&values, "finding"), "");
     }
 
+    /// The rules cache of a governed repository renders into the rules
+    /// section of the refine prompt, so the agent reads the rules of
+    /// `theory/rules.md` without a git call of its own.
+    #[test]
+    fn the_refine_prompt_renders_the_cached_rule_line() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let rule = "- 2026-09-11 T-pay: name the token in the model";
+        let steps = theory_steps_with_rules(
+            &repo,
+            "aaa111",
+            &run_skill("browser"),
+            CmdOut::ok(format!("{rule}\n")),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.poll(vec![issue(142, &[])], vec![]);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let refine = Task::new(
+            "borsuk",
+            Stage::Refine,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+
+        let values = rig
+            .daemon
+            .placeholder_values(&refine, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(placeholder_of(&values, "rules"), rule);
+        let rendered =
+            prompts::fill_template(prompts::REFINE_PROMPT, &values).expect("the prompt fills");
+        assert!(
+            rendered.contains("# The rules"),
+            "the refine prompt carries the rules section:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(rule),
+            "the refine prompt must carry the cached rule line:\n{rendered}"
+        );
+    }
+
     /// One theory poller serves every alias that names its repository, so
     /// it stops only when the last of them goes.
     #[test]
