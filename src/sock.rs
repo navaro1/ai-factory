@@ -4349,13 +4349,17 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // The healthy client receives every coalesced push and the final
-        // push, in order.
+        // push, in order. The reader thread may lag under load, so the
+        // drain waits for the final push instead of the first quiet gap.
         let mut healthy = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            match healthy_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(push) => healthy.push(push),
-                Err(_) => break,
+            if let Ok(push) = healthy_rx.recv_timeout(Duration::from_millis(200)) {
+                let done = push == Push::State(final_view.clone());
+                healthy.push(push);
+                if done {
+                    break;
+                }
             }
         }
         assert!(
