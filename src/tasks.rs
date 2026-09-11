@@ -519,12 +519,13 @@ impl TaskTable {
         Ok(())
     }
 
-    /// Cancel a task: the state becomes `Failed("cancelled")`.
+    /// Cancel a task: the state becomes `Failed(reason)`.
     ///
     /// Cancelling follows the transition rules. A queued, running, or
-    /// awaiting task can be cancelled.
-    pub fn cancel(&mut self, id: &str, now_ms: u64) -> Result<()> {
-        self.transition(id, TaskState::Failed("cancelled".to_string()), now_ms)
+    /// awaiting task can be cancelled. The reason names the cause, so a
+    /// cancel with a cause says the cause on the board.
+    pub fn cancel(&mut self, id: &str, reason: &str, now_ms: u64) -> Result<()> {
+        self.transition(id, TaskState::Failed(reason.to_string()), now_ms)
     }
 
     /// The running tasks, in insertion order.
@@ -987,7 +988,7 @@ mod tests {
             TaskState::AwaitingUser,
         ] {
             let (mut table, id) = table_in_state(state);
-            table.cancel(&id, LATER).unwrap();
+            table.cancel(&id, "cancelled", LATER).unwrap();
             assert_eq!(
                 table.by_id[&id].state,
                 TaskState::Failed("cancelled".to_string())
@@ -1006,7 +1007,7 @@ mod tests {
             0
         );
 
-        table.cancel(&id, LATER).unwrap();
+        table.cancel(&id, "cancelled", LATER).unwrap();
 
         assert_eq!(
             table.by_id[&id].state,

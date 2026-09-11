@@ -666,6 +666,16 @@ pub struct Daemon {
     /// instead of running the command once more. An entry lives as long as
     /// its task row: [`Daemon::retire_task`] drops both together.
     fast_results: BTreeMap<String, Record>,
+    /// The fast tree whose finding the record of each pull request
+    /// carries, by `(repository, number)`.
+    ///
+    /// A gate re-fire on the same tree fails the same check, so the
+    /// record needs the finding once. A new tree posts again. The map
+    /// outlives the task rows of a live pull request: the review task of
+    /// a re-fire starts fresh, and only the pull request stays.
+    /// [`Daemon::retire_task`] drops the entry when the pull request
+    /// leaves, so the map cannot grow for ever.
+    fast_finding_posts: BTreeMap<(String, u64), String>,
     /// The head each review task was body-checked at, by review task id.
     ///
     /// A review that waits in the queue re-enters the admission on every
@@ -1046,6 +1056,7 @@ impl Daemon {
             measure_runs: BTreeMap::new(),
             measure_text: BTreeMap::new(),
             fast_results: BTreeMap::new(),
+            fast_finding_posts: BTreeMap::new(),
             body_checks: BTreeMap::new(),
             theory_views: BTreeMap::new(),
             cadences,
@@ -1432,11 +1443,41 @@ impl Daemon {
                 && sched::window_full(&window, task.stage, &task.repo)
             {
                 task.hold = Some(WINDOW_FULL_HOLD.to_string());
+            } else if task.state == TaskState::Queued && task.hold.is_none() {
+                task.hold = self.fast_check_hold(&task.repo, task.number);
             }
         }
         if let Some(pusher) = self.pusher.as_ref() {
             pusher(view);
         }
+    }
+
+    /// The hold a queued implement task inherits from its failed review.
+    ///
+    /// A review whose fast check failed carries the check in its failed
+    /// reason, and the implement task of the same ticket queues again
+    /// while the gate holds. The row names the check, so the operator
+    /// reads the cause on the task that waits and not only on the review
+    /// that died.
+    fn fast_check_hold(&self, repo: &str, number: u64) -> Option<String> {
+        for pr in self.links.get(repo)?.prs_of(number) {
+            let review = format!("{repo}/review-p{pr}");
+            let Some(task) = self.table.by_id.get(&review) else {
+                continue;
+            };
+            let TaskState::Failed(reason) = &task.state else {
+                continue;
+            };
+            let Some(rest) = reason.strip_prefix(FAST_CHECK_FAILED) else {
+                continue;
+            };
+            let rest = rest.trim_start_matches([':', ' ']);
+            let feature = rest
+                .split_once(" exit ")
+                .map_or(rest, |(feature, _)| feature);
+            return Some(format!("{FAST_CHECK_FAILED}: {feature}"));
+        }
+        None
     }
 
     // ------------------------------------------------------------------
@@ -2785,8 +2826,14 @@ impl Daemon {
     /// The daemon removes the tasks of an item that left GitHub instead of
     /// keeping them for ever. A missing id is a no-operation.
     fn retire_task(&mut self, id: &str) {
-        if self.table.remove(id).is_none() {
+        let Some(task) = self.table.remove(id) else {
             return;
+        };
+        if task.stage == Stage::Review && task.kind == ItemKind::Pr {
+            // The pull request left GitHub, so its tree forgets the finding
+            // and a reopen posts the finding again.
+            self.fast_finding_posts
+                .remove(&(task.repo.clone(), task.number));
         }
         self.role_bindings.remove(id);
         self.confirming.remove(id);
@@ -4765,18 +4812,29 @@ impl Daemon {
                 }
             }
             RunEvent::Text { text, .. } => {
-                if self
+                let gated = self
                     .table
                     .by_id
                     .get(&task_id)
-                    .is_some_and(|task| self.wants_final_block(task).is_some())
-                {
+                    .is_some_and(|task| self.wants_final_block(task).is_some());
+                if gated {
+                    // Only a teach, an audit, or a delta reads the whole
+                    // turn back. A proposal turn reads the last block, so
+                    // a ticket chat accumulates no transcript.
+                    let reads_all = self.table.by_id.get(&task_id).is_some_and(|task| {
+                        matches!(
+                            task.purpose,
+                            TaskPurpose::Pipeline | TaskPurpose::Teach(_) | TaskPurpose::Audit(_)
+                        )
+                    });
                     let turn = self.ticket_turn_text.entry(task_id).or_default();
                     if proposal_marker_text(&turn.last) {
                         turn.earlier_marker = true;
                     }
-                    turn.all.push_str(&text);
-                    turn.all.push('\n');
+                    if reads_all {
+                        turn.all.push_str(&text);
+                        turn.all.push('\n');
+                    }
                     turn.last = text;
                 }
                 // The runner also tees this into the task log.
@@ -7299,7 +7357,8 @@ impl Daemon {
         let fast = self.queue_fast(alias, &key, &worktree, &head, &features);
         let held_fast = !fast.is_empty();
         if held_fast {
-            let mut run = FastRun::new(fast.into_iter().map(|slot| slot.id).collect());
+            let mut run =
+                FastRun::new(fast.into_iter().map(|slot| slot.id).collect(), head.clone());
             for id in &run.tasks {
                 if let Some(record) = self.fast_results.get(id) {
                     run.records.insert(id.clone(), record.clone());
@@ -7719,6 +7778,7 @@ impl Daemon {
             return;
         }
         let failure = run.failure().cloned();
+        let tree = run.tree.clone();
         self.fast_runs.remove(review);
         let Some(task) = self.table.by_id.get(review).cloned() else {
             return;
@@ -7739,10 +7799,21 @@ impl Daemon {
         };
         let exit = failure.value.unwrap_or_default().round() as i64;
         let finding = format!("{FAST_CHECK_FAILED}: {} exit {exit}", failure.id);
-        if let Err(error) =
-            self.post_record_comment(&task.repo, &RecordKey::Pr(task.number), &finding)
+        // A re-fire of the same tree fails the same check, so the record
+        // carries the finding once. A new tree posts again.
+        let tree8: String = tree.chars().take(measure::TREE_CHARS).collect();
+        if self
+            .fast_finding_posts
+            .get(&(task.repo.clone(), task.number))
+            != Some(&tree8)
         {
-            eprintln!("the fast check finding of {review}: {error:#}");
+            if let Err(error) =
+                self.post_record_comment(&task.repo, &RecordKey::Pr(task.number), &finding)
+            {
+                eprintln!("the fast check finding of {review}: {error:#}");
+            }
+            self.fast_finding_posts
+                .insert((task.repo.clone(), task.number), tree8);
         }
         // The reason is the finding, so the pipeline row names the check
         // that stopped the review instead of a bare abort.
@@ -9114,10 +9185,7 @@ impl Daemon {
             .get(id)
             .is_some_and(|task| !task.state.is_terminal());
         if active {
-            if let Err(e) =
-                self.table
-                    .transition(id, TaskState::Failed(reason.to_string()), self.now_ms)
-            {
+            if let Err(e) = self.table.cancel(id, reason, self.now_ms) {
                 eprintln!("the abort of {id}: {e:#}");
             }
         }
@@ -20293,6 +20361,12 @@ mod tests {
             )
             .to_string(),
         });
+        assert!(
+            rig.daemon.ticket_turn_text["borsuk/ticket-i7"]
+                .all
+                .is_empty(),
+            "a ticket chat reads only the last block, so it accumulates no transcript"
+        );
         rig.event(turn_ended("borsuk/ticket-i7"));
 
         let proposal = rig.daemon.ticket_conversations[&("borsuk".to_string(), ChatKey::Ticket(7))]
@@ -24466,6 +24540,12 @@ mod tests {
     /// carries them.
     const FAST_TREE: &str = "aabbccdd";
 
+    /// A second tree, for a re-fire that measures different work.
+    const FAST_TREE_SHA_B: &str = "11223344556677889900aabbccddeeffaabbccdd";
+
+    /// The first eight characters of [`FAST_TREE_SHA_B`].
+    const FAST_TREE_B: &str = "11223344";
+
     /// The skills tree of the fast-check tests: one surface, two features.
     const FAST_SKILLS_TREE: &str = concat!(
         ".claude/skills/run-web/SKILL.md\n",
@@ -24689,13 +24769,15 @@ mod tests {
         steps
     }
 
-    /// The git steps of one admission that reuses the head worktree.
+    /// The git steps of one admission that reuses the head worktree and
+    /// measures the tree `tree`.
     fn fast_admission_steps_on_reuse(
         repo: &Path,
         worktree: &Path,
         number: u64,
         gitdir: &Path,
         diff: &str,
+        tree: &str,
     ) -> Vec<Step> {
         let dir = repo.parent().unwrap();
         let mut steps = reuse_pr_steps(repo, worktree, number, gitdir);
@@ -24709,7 +24791,7 @@ mod tests {
             &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
             CmdOut::ok(format!("{diff}\n")),
         ));
-        steps.extend(tree_hash_steps(dir, worktree, FAST_TREE_SHA));
+        steps.extend(tree_hash_steps(dir, worktree, tree));
         steps
     }
 
@@ -28400,7 +28482,7 @@ mod tests {
             .upsert_with_id(spec, PathBuf::new(), T0)
             .map(|task| task.purpose = TaskPurpose::Measure)
             .expect("the fast task must upsert");
-        let mut run = FastRun::new(vec![aborted.clone(), other.clone()]);
+        let mut run = FastRun::new(vec![aborted.clone(), other.clone()], "aaa11111".to_string());
         run.records
             .insert(other.clone(), measure::exit_record("orders", 0));
         rig.daemon
@@ -28453,8 +28535,8 @@ mod tests {
             7,
             &rig_gitdir(&dir),
             "web/pay.ts",
+            FAST_TREE_SHA,
         ));
-        steps.push(record_comment_step("fast check failed: checkout exit 1"));
         let mut rig = Rig::make_in(dir, steps, governed);
         let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
         let orders = format!("borsuk/fast-{FAST_TREE}-orders");
@@ -28488,8 +28570,370 @@ mod tests {
         );
         assert_eq!(
             findings(&rig, "fast check failed: checkout exit 1"),
+            1,
+            "the re-fire reads the finding the record already carries"
+        );
+    }
+
+    /// A new head fires the gate again on the same fast tree. The record
+    /// carries the finding of the tree once, and the new review still
+    /// loses its task while the implement of the linked ticket queues
+    /// again.
+    #[test]
+    fn a_gate_re_fire_on_a_new_head_posts_the_finding_of_the_tree_once() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        // The implement lands and pushes a new head. The theory tree
+        // stays the same, so the records of the tree still hold.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(fast_admission_steps_on_reuse(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+            FAST_TREE_SHA,
+        ));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![issue(142, &[])], vec![linked_draft(7)]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 1".to_string())
+        );
+
+        let mut pushed = linked_draft(7);
+        pushed.head_sha = "sha7b".to_string();
+        rig.set_now(T0 + 1);
+        rig.poll(vec![issue(142, &[])], vec![pushed]);
+
+        assert_eq!(
+            findings(&rig, "fast check failed: checkout exit 1"),
+            1,
+            "the re-fire reads the finding the record already carries"
+        );
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 1".to_string()),
+            "the tree still fails, so the new review loses its task again"
+        );
+    }
+
+    /// A re-fire that measures a different tree posts the finding again.
+    /// The tree of the work is the key of the posted finding, not the
+    /// pull request alone.
+    #[test]
+    fn a_gate_re_fire_on_a_new_tree_posts_the_finding_again() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        // The implement lands and pushes a new head. The diff reads the
+        // same file, but the tree of the head changed, so the gate
+        // measures new task ids and posts the finding again.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(fast_admission_steps_on_reuse(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+            FAST_TREE_SHA_B,
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+        let checkout_b = format!("borsuk/fast-{FAST_TREE_B}-checkout");
+        let orders_b = format!("borsuk/fast-{FAST_TREE_B}-orders");
+
+        rig.poll(vec![issue(142, &[])], vec![linked_draft(7)]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            findings(&rig, "fast check failed: checkout exit 1"),
+            1,
+            "the first tree posts its finding once"
+        );
+
+        let mut pushed = linked_draft(7);
+        pushed.head_sha = "sha7b".to_string();
+        rig.set_now(T0 + 1);
+        rig.poll(vec![issue(142, &[])], vec![pushed]);
+        rig.event(exited(&checkout_b, false, "exit 1"));
+        rig.event(exited(&orders_b, true, "exit 0"));
+
+        assert_eq!(
+            findings(&rig, "fast check failed: checkout exit 1"),
             2,
-            "each admission posts the finding of the tree it measured"
+            "a new tree posts the finding again"
+        );
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 1".to_string())
+        );
+        assert_eq!(
+            rig.daemon
+                .fast_finding_posts
+                .get(&("borsuk".to_string(), 7)),
+            Some(&FAST_TREE_B.to_string()),
+            "the map holds the tree of the last post"
+        );
+    }
+
+    /// A pull request that leaves GitHub takes its posted tree with it, so
+    /// the map of posted findings does not grow for ever. A reopened pull
+    /// request with a new head posts the finding of its tree again.
+    #[test]
+    fn a_retired_pull_request_forgets_its_tree_and_a_reopen_posts_again() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        // The pull request reopens with a new head. The retirement took
+        // the fast tasks of the tree with the pull request, so the gate
+        // measures again, and the dropped posted tree makes it post the
+        // finding again. The close poll and the reopen poll each read the
+        // base of the theory checkout once.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(fast_admission_steps_on_reuse(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+            FAST_TREE_SHA,
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![issue(142, &[])], vec![linked_draft(7)]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(findings(&rig, "fast check failed: checkout exit 1"), 1);
+
+        // The pull request closes. Its review task retires, and the map
+        // of posted findings forgets the pull request.
+        rig.set_now(T0 + 1);
+        rig.poll(vec![issue(142, &[])], vec![]);
+        assert!(
+            !rig.daemon
+                .fast_finding_posts
+                .contains_key(&("borsuk".to_string(), 7)),
+            "the retirement drops the posted tree of the pull request"
+        );
+        assert!(!rig.daemon.table.by_id.contains_key("borsuk/review-p7"));
+
+        let mut pushed = linked_draft(7);
+        pushed.head_sha = "sha7b".to_string();
+        rig.set_now(T0 + 2);
+        rig.poll(vec![issue(142, &[])], vec![pushed]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            findings(&rig, "fast check failed: checkout exit 1"),
+            2,
+            "a reopened pull request posts the finding again"
+        );
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed("fast check failed: checkout exit 1".to_string())
+        );
+    }
+
+    /// The implement task of a ticket whose review died on a fast check
+    /// queues again and carries the check in its hold, so the pipeline
+    /// row names the cause while the gate keeps the ticket.
+    #[test]
+    fn a_queued_implement_of_a_fast_failed_review_carries_the_check_in_its_hold() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = fast_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("checkout", 1));
+        steps.extend(reuse_pr_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(fast_record_step("orders", 0));
+        steps.push(record_comment_step("fast check failed: checkout exit 1"));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_pusher(Box::new(move |view| push_tx.send(view).unwrap()));
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+
+        rig.poll(vec![issue(142, &[])], vec![linked_draft(7)]);
+        rig.event(exited(&checkout, false, "exit 1"));
+        // The operator paused the implement task, so the failure leaves
+        // it queued instead of starting it, and the row carries the hold.
+        rig.daemon
+            .paused
+            .tasks
+            .insert("borsuk/implement-i142".to_string(), true);
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
+        let view = last_view(&push_rx);
+        assert_eq!(
+            pushed_task(&view, "borsuk/implement-i142").hold.as_deref(),
+            Some("fast check failed: checkout"),
+            "the row names the check that holds the ticket"
         );
     }
 
@@ -28640,6 +29084,7 @@ mod tests {
             7,
             &rig_gitdir(&dir),
             "web/pay.ts",
+            FAST_TREE_SHA,
         ));
         steps.extend(reuse_pr_steps(
             &rig_repo(&dir),

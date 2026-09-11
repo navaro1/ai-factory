@@ -188,15 +188,13 @@ pub fn delta_rows(
                     .unwrap_or_default();
                 Decision::theory_event(
                     repo,
-                    TheoryRow {
-                        kind,
-                        number,
-                        slot: slot.clone(),
-                        entry: entry.to_string(),
-                        tag: String::new(),
-                        question: finding,
-                        source: SOURCE_VIOLATION.to_string(),
-                    },
+                    kind,
+                    number,
+                    slot.clone(),
+                    entry.to_string(),
+                    String::new(),
+                    finding,
+                    SOURCE_VIOLATION.to_string(),
                     opened_ms,
                 )
             }
@@ -205,15 +203,13 @@ pub fn delta_rows(
                 let tag = missed.map(super::records::slot_outcome).unwrap_or_default();
                 Decision::theory_event(
                     repo,
-                    TheoryRow {
-                        kind,
-                        number,
-                        slot: slot.clone(),
-                        entry: predicted_entries(predicted, &slot).unwrap_or_else(|| slot.clone()),
-                        tag,
-                        question: delta.question.clone(),
-                        source: SOURCE_MISS.to_string(),
-                    },
+                    kind,
+                    number,
+                    slot.clone(),
+                    predicted_entries(predicted, &slot).unwrap_or_else(|| slot.clone()),
+                    tag,
+                    delta.question.clone(),
+                    SOURCE_MISS.to_string(),
                     opened_ms,
                 )
             }
@@ -243,39 +239,17 @@ pub fn event_rows(
         .map(|(index, event)| {
             Decision::theory_event(
                 repo,
-                TheoryRow {
-                    kind,
-                    number,
-                    slot: event_slot(index),
-                    entry: event.area.clone().unwrap_or_default(),
-                    tag: event.kind.clone(),
-                    question: event.text.clone(),
-                    source: SOURCE_EVENT.to_string(),
-                },
+                kind,
+                number,
+                event_slot(index),
+                event.area.clone().unwrap_or_default(),
+                event.kind.clone(),
+                event.text.clone(),
+                SOURCE_EVENT.to_string(),
                 opened_ms,
             )
         })
         .collect()
-}
-
-/// The parts of one `THEORY` row, as [`Decision::theory_event`] takes them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TheoryRow {
-    /// Whether the record is an issue or a pull request.
-    pub kind: ItemKind,
-    /// The issue or pull request number of the record.
-    pub number: u64,
-    /// The slot key the answer of the row writes.
-    pub slot: String,
-    /// The model entries in scope, empty when the row names none.
-    pub entry: String,
-    /// The short classifier of the row: the slot outcome of a miss, the
-    /// event kind of an event, empty for a violation.
-    pub tag: String,
-    /// The one question the row asks.
-    pub question: String,
-    /// Where the row came from: `miss`, `violation`, or `event`.
-    pub source: String,
 }
 
 #[cfg(test)]

@@ -238,15 +238,19 @@ pub fn fast_feature(task_id: &str) -> Option<&str> {
 pub struct FastRun {
     /// The task id of every fast check, in queue order.
     pub tasks: Vec<String>,
+    /// The tree hash the run measures, so a re-fire of the same tree can
+    /// tell that its finding is the one the record already carries.
+    pub tree: String,
     /// The record of each fast task that ended, by task id.
     pub records: BTreeMap<String, Record>,
 }
 
 impl FastRun {
-    /// One run over the given fast task ids.
-    pub fn new(tasks: Vec<String>) -> Self {
+    /// One run over the given fast task ids, against the given tree.
+    pub fn new(tasks: Vec<String>, tree: String) -> Self {
         FastRun {
             tasks,
+            tree,
             records: BTreeMap::new(),
         }
     }
@@ -1039,7 +1043,10 @@ mod tests {
 
     #[test]
     fn a_run_finishes_only_when_every_record_landed_and_names_the_first_failure() {
-        let mut run = FastRun::new(vec!["a".to_string(), "b".to_string()]);
+        let mut run = FastRun::new(
+            vec!["a".to_string(), "b".to_string()],
+            "aaa11111".to_string(),
+        );
         assert!(!run.finished());
         assert_eq!(run.failure(), None);
 

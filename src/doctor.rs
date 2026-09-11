@@ -1298,13 +1298,15 @@ fn repo_checks(
 ///
 /// One Warn names a repository whose governor is off. One Fail names a
 /// governed theory checkout that is not a git repository, because the
-/// records need Git there. One Info names the shadow repository of each
-/// governed repository that has one, because a shadow repository holds
+/// records need Git there; a `.git` file counts, because a linked
+/// worktree carries one. One Info names each shadow repository and the
+/// governed repositories it serves, because a shadow repository holds
 /// every theory record and the operator sees no theory label at all on
 /// the code repository. A repository with the governor off gets no other
 /// theory line: v0.6 behaviour holds for it.
 fn theory_checks(config: &Config) -> Vec<Check> {
     let mut checks = Vec::new();
+    let mut shadows: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for repo in config.repos.values() {
         if !repo.theory.governor.is_on() {
             checks.push(Check {
@@ -1323,12 +1325,15 @@ fn theory_checks(config: &Config) -> Vec<Check> {
             });
         }
         if let Some(shadow) = repo.theory_repo() {
-            checks.push(Check {
-                label: format!("theory {}", repo.alias),
-                status: Status::Info,
-                detail: format!("shadow {shadow}"),
-            });
+            shadows.entry(shadow).or_default().push(&repo.alias);
         }
+    }
+    for (shadow, aliases) in shadows {
+        checks.push(Check {
+            label: "theory shadow".to_string(),
+            status: Status::Info,
+            detail: format!("shadow {shadow} serves {}", aliases.join(", ")),
+        });
     }
     checks
 }
@@ -4471,7 +4476,8 @@ mod tests {
     );
 
     /// The doctor names the shadow repository of every governed
-    /// repository that has one, once per repository.
+    /// repository that has one, once per shadow repository, and lists
+    /// the repositories the shadow serves.
     #[test]
     fn theory_checks_print_one_shadow_line_per_shadow_repository() {
         let dir = temp_dir("theory-shadow");
@@ -4491,9 +4497,64 @@ mod tests {
         let checks = theory_checks(&config);
 
         assert_eq!(checks.len(), 1, "checks: {checks:?}");
-        assert_eq!(checks[0].label, "theory borsuk");
+        assert_eq!(checks[0].label, "theory shadow");
         assert_eq!(checks[0].status, Status::Info);
-        assert_eq!(checks[0].detail, "shadow navaro1/borsuk-theory");
+        assert_eq!(
+            checks[0].detail,
+            "shadow navaro1/borsuk-theory serves borsuk"
+        );
+
+        let text = config_text(
+            &[],
+            &format!(
+                "[repo.borsuk]\npath = \"{path}\"\n\
+                 theory = {{ repo = \"navaro1/borsuk-theory\", path = \"{path}\" }}\n\
+                 [repo.alfa]\npath = \"{path}\"\n\
+                 theory = {{ repo = \"navaro1/borsuk-theory\", path = \"{path}\" }}\n\
+                 [repo.other]\npath = \"{path}\"\n\
+                 theory = {{ repo = \"navaro1/other-theory\", path = \"{path}\" }}\n",
+                path = checkout.display()
+            ),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = theory_checks(&config);
+
+        assert_eq!(checks.len(), 2, "checks: {checks:?}");
+        assert_eq!(
+            checks[0].detail,
+            "shadow navaro1/borsuk-theory serves alfa, borsuk"
+        );
+        assert_eq!(checks[1].detail, "shadow navaro1/other-theory serves other");
+    }
+
+    /// A `.git` file makes the checkout a repository: a linked worktree
+    /// carries a `gitdir:` file instead of a `.git` directory.
+    #[test]
+    fn theory_checks_accept_a_git_file_as_the_checkout() {
+        let dir = temp_dir("theory-gitfile");
+        let checkout = dir.join("repo");
+        fs::create_dir_all(&checkout).expect("the fake checkout must be creatable");
+        fs::write(
+            checkout.join(".git"),
+            "gitdir: /elsewhere/borsuk/.git/worktrees/repo\n",
+        )
+        .expect("the git file must be writable");
+        let text = config_text(
+            &[],
+            &format!(
+                "[repo.borsuk]\npath = \"{path}\"\n\
+                 theory = {{ repo = \"navaro1/borsuk-theory\", path = \"{path}\" }}\n",
+                path = checkout.display()
+            ),
+        );
+        let config = Config::parse(&text).expect("the config must parse");
+
+        let checks = theory_checks(&config);
+
+        assert_eq!(checks.len(), 1, "checks: {checks:?}");
+        assert_eq!(checks[0].status, Status::Info);
+        assert_eq!(checks[0].label, "theory shadow");
     }
 
     #[test]

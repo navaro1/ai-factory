@@ -2628,7 +2628,6 @@ mod tests {
         AskOption, InputMode, ItemView, MentionStatus, PausedView, RepoView, TaskView, TrainView,
     };
     use crate::tasks::{Task, TaskState};
-    use crate::theory::answers::TheoryRow;
     use crate::theory::model::Entry;
 
     /// The epoch time every test decision opens at.
@@ -2746,15 +2745,13 @@ mod tests {
     fn theory_row() -> Decision {
         Decision::theory_event(
             "borsuk",
-            TheoryRow {
-                kind: ItemKind::Pr,
-                number: 7,
-                slot: "invariants".to_string(),
-                entry: "INV-3".to_string(),
-                tag: "sure-miss".to_string(),
-                question: "Which entry is wrong?".to_string(),
-                source: "miss".to_string(),
-            },
+            ItemKind::Pr,
+            7,
+            "invariants".to_string(),
+            "INV-3".to_string(),
+            "sure-miss".to_string(),
+            "Which entry is wrong?".to_string(),
+            "miss".to_string(),
             OPENED,
         )
     }
@@ -2920,15 +2917,13 @@ mod tests {
     fn card_event_row() -> Decision {
         Decision::theory_event(
             "borsuk",
-            TheoryRow {
-                kind: ItemKind::Pr,
-                number: 7,
-                slot: "event:0".to_string(),
-                entry: "web-checkout".to_string(),
-                tag: "card".to_string(),
-                question: "The answer misses the new retry count.".to_string(),
-                source: "event".to_string(),
-            },
+            ItemKind::Pr,
+            7,
+            "event:0".to_string(),
+            "web-checkout".to_string(),
+            "card".to_string(),
+            "The answer misses the new retry count.".to_string(),
+            "event".to_string(),
             OPENED,
         )
     }

@@ -7,7 +7,7 @@
 //!
 //! Nothing here fails a poll. A file that does not parse becomes one lint
 //! finding that names the file, and every file that did parse stays in the
-//! set. That is why every entry point returns a [`Finding`] instead of an
+//! set. That is why every entry point returns a [`LintFinding`] instead of an
 //! error type the caller must handle.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,7 +82,7 @@ pub struct Feature {
 
 /// One lint finding. The doctor prints it and the AREAS panel marks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finding {
+pub struct LintFinding {
     /// The surface the file belongs to. Empty when the path names none.
     pub surface: String,
     /// The file, relative to the skill directory.
@@ -91,7 +91,7 @@ pub struct Finding {
     pub reason: String,
 }
 
-impl Display for Finding {
+impl Display for LintFinding {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.file, self.reason)
     }
@@ -105,7 +105,7 @@ pub struct SkillSet {
     /// The feature files, in path order.
     pub features: Vec<Feature>,
     /// One finding per file that did not parse.
-    pub lint: Vec<Finding>,
+    pub lint: Vec<LintFinding>,
 }
 
 /// What one file of a skills tree is.
@@ -192,16 +192,16 @@ impl SkillSet {
 /// `path` names the file for the finding. The surface comes from the front
 /// matter, not the directory, because the daemon groups by what the skill
 /// declares.
-pub fn parse_skill(path: &str, text: &str) -> Result<RunSkill, Finding> {
+pub fn parse_skill(path: &str, text: &str) -> Result<RunSkill, LintFinding> {
     let file = inside(path).unwrap_or_else(|| path.to_string());
     let surface = surface_of(path);
-    let fail = |reason: String| Finding {
+    let fail = |reason: String| LintFinding {
         surface: surface.clone(),
         file: file.clone(),
         reason,
     };
     let (keys, body) = front_matter(text).map_err(&fail)?;
-    let required = |key: &str| -> Result<String, Finding> {
+    let required = |key: &str| -> Result<String, LintFinding> {
         match keys.get(key) {
             Some(value) if !value.is_empty() => Ok(value.clone()),
             _ => Err(fail(format!("{key} is required"))),
@@ -231,7 +231,7 @@ pub fn parse_skill(path: &str, text: &str) -> Result<RunSkill, Finding> {
 ///
 /// The id is the file stem and the surface is the `run-<surface>` directory
 /// of the path, because a feature file names neither.
-pub fn parse_feature(path: &str, text: &str) -> Result<Feature, Finding> {
+pub fn parse_feature(path: &str, text: &str) -> Result<Feature, LintFinding> {
     let file = inside(path).unwrap_or_else(|| path.to_string());
     let surface = surface_of(path);
     let id = file
@@ -240,7 +240,7 @@ pub fn parse_feature(path: &str, text: &str) -> Result<Feature, Finding> {
         .unwrap_or(&file)
         .trim_end_matches(".md")
         .to_string();
-    let fail = |reason: String| Finding {
+    let fail = |reason: String| LintFinding {
         surface: surface.clone(),
         file: file.clone(),
         reason,
@@ -262,7 +262,7 @@ pub fn parse_feature(path: &str, text: &str) -> Result<Feature, Finding> {
 /// Every finding of one skill set: the files that did not parse, then
 /// skill sections that hold a placeholder, then index omissions, then
 /// features whose shape or area fails.
-pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
+pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<LintFinding> {
     let known: BTreeSet<&str> = verify.areas.iter().map(|area| area.id.as_str()).collect();
     let mut findings = set.lint.clone();
     for skill in set.surfaces.values() {
@@ -272,7 +272,7 @@ pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
         };
         for id in set.feature_ids(&skill.surface) {
             if !index_lists(index, &id) {
-                findings.push(Finding {
+                findings.push(LintFinding {
                     surface: skill.surface.clone(),
                     file: "features/README.md".to_string(),
                     reason: format!("feature {id} not listed"),
@@ -282,7 +282,7 @@ pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
     }
     for feature in &set.features {
         if !known.contains(feature.area.as_str()) {
-            findings.push(Finding {
+            findings.push(LintFinding {
                 surface: feature.surface.clone(),
                 file: format!("features/{}.md", feature.id),
                 reason: format!("area {} unknown", feature.area),
@@ -290,7 +290,7 @@ pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
         }
         for name in FEATURE_SECTIONS.iter() {
             if !has_heading(&feature.body, name) {
-                findings.push(Finding {
+                findings.push(LintFinding {
                     surface: feature.surface.clone(),
                     file: format!("features/{}.md", feature.id),
                     reason: format!("section {name} missing"),
@@ -307,14 +307,14 @@ pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
 /// ticket. A placeholder is a `<...>` token whose first and last inner
 /// characters are letters, or a literal `TODO` or `TBD`. A comparison
 /// such as `elapsed < 30s and retries > 0` does not match.
-pub fn placeholder_findings(skill: &RunSkill) -> Vec<Finding> {
+pub fn placeholder_findings(skill: &RunSkill) -> Vec<LintFinding> {
     let mut out = Vec::new();
     for name in SECTIONS.iter() {
         let Some(body) = skill.sections.get(*name) else {
             continue;
         };
         if holds_placeholder(body) {
-            out.push(Finding {
+            out.push(LintFinding {
                 surface: skill.surface.clone(),
                 file: "SKILL.md".to_string(),
                 reason: format!("section {name} holds a placeholder"),
