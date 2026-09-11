@@ -176,7 +176,7 @@ The daemon inlines files, not directories. The cap is two surfaces and six featu
 |---|---|---|
 | Refine | Short prediction's areas | The index and the Run and Fast sections of each surface. For a bug ticket, the Drive and Logs sections too. |
 | Implement | Full prediction's areas | The whole skill file of each named surface, and the feature files that bind to those areas. |
-| Review | Implement slice plus areas of `git diff --name-only <base>...<head>` | The same rule over the wider set. |
+| Review | The areas of `git diff --name-only <base>...<head>` | The same rule over the diff areas alone. Spec R9 narrows this row and wins over the table. |
 | Teach | The areas of the PR, delta, or area | The feature files of those areas, index only past the cap. |
 
 This changes design record §5.1 and spec C28, which pass a name. Section 9 lists the edit.
@@ -306,7 +306,7 @@ A `verify-skill` ticket and its PR skip both prediction gates, like `model-pr`. 
 
 ### 6.3 Maintenance
 
-No new cadence. Two existing paths carry it.
+No new cadence. Two existing paths carry it. The v0.7 audit cadence on `sweep.days` also fires the sweep now, and `aif doctor --audit <alias>` fires it on demand.
 
 The reviewer repairs run-skill drift it meets during a re-drive, per 5.6. The weekly audit sweep of C24 gains one paragraph: check each run skill's Run and Fast sections and each feature file's handles against the code, report dead paths and dead handles. When the sweep finds drift, the daemon opens one ticket `Maintain the run skill for <alias>/<surface>` with `to-refine` and `verify-skill` through the `create_issue` path of C32, and skips a surface that already has one open. Its body is the pstack maintain recipe in eight lines: index hygiene, source pass, live pass, triage into doc drift or harness gap or product gap, a `bug` ticket per product gap, re-drive every fix, one PR or one comment, final stop.
 

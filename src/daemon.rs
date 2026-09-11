@@ -7459,10 +7459,12 @@ impl Daemon {
 
     /// The finding of the body check of one pull request, when it has one.
     ///
-    /// The check runs only for a governed repository whose theory parses
-    /// and whose pull request closes a ticket, because that ticket carries
-    /// the criteria and the plan the contract traces to. Every other pull
-    /// request keeps the behaviour it had before the governor.
+    /// The check runs for every pull request of a governed repository whose
+    /// theory parses. A pull request that closes a ticket takes the whole
+    /// contract, because that ticket carries the criteria and the plan the
+    /// contract traces to. A pull request that closes none stands the three
+    /// ticket-bound rules down through `has_ticket`, and every rule that
+    /// reads the body or the verification map still answers.
     ///
     /// The context unions every linked ticket, because one pull request
     /// can close several and each carries its own criteria and plan.
@@ -7478,9 +7480,6 @@ impl Daemon {
             .iter()
             .filter_map(|ticket| snapshot.issues.get(ticket))
             .collect();
-        if tickets.is_empty() {
-            return None;
-        }
         let cache = self.theory_models.get(alias)?;
         let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
             return None;
@@ -7534,10 +7533,12 @@ impl Daemon {
             criteria,
             features,
             areas,
+            measurers: map.measurers.clone(),
             owned_paths,
             changed_paths,
             manifests: &contract::MANIFESTS,
             ticket_names_dependency: names_dependency,
+            has_ticket: !tickets.is_empty(),
         };
         records::check_pr(&pull.body, &pull.head_ref, &ctx).err()
     }
@@ -23992,6 +23993,29 @@ mod tests {
         ]
     }
 
+    /// The git steps the body check of one governed review runs once the
+    /// head worktree exists: the reuse and the diff against the base.
+    fn body_reuse_steps(
+        repo: &Path,
+        worktree: &Path,
+        number: u64,
+        gitdir: &Path,
+        diff: &str,
+    ) -> Vec<Step> {
+        let mut steps = reuse_pr_steps(repo, worktree, number, gitdir);
+        steps.push(git_step(
+            repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok(format!("{diff}\n")),
+        ));
+        steps
+    }
+
     /// The git steps the admission of one governed review runs: the head
     /// worktree, the diff against the default base, and the tree hash.
     fn fast_admission_steps(
@@ -24070,12 +24094,27 @@ mod tests {
 
     /// One unlinked draft pull request, so no implement task holds its
     /// review and the fast checks are the only gate.
+    ///
+    /// The body carries the three sections, because the body check of a
+    /// governed repository reads it even with no ticket behind it.
     fn unlinked_pr(number: u64) -> Pr {
         let mut pull = pr(number, true, &[]);
         pull.head_ref = "feature/landing".to_string();
-        pull.body = String::new();
+        pull.body = UNLINKED_BODY.to_string();
         pull
     }
+
+    /// The body of one unlinked pull request. It names no criterion,
+    /// because no ticket carries one.
+    const UNLINKED_BODY: &str = concat!(
+        "## Why\n",
+        "The landing page hides its price.\n",
+        "\n",
+        "## Before / After\n",
+        "\n",
+        "## Blast radius\n",
+        "The change touches the landing page only.\n",
+    );
 
     /// One draft pull request whose branch and body close ticket 142.
     fn linked_draft(number: u64) -> Pr {
@@ -24181,6 +24220,15 @@ mod tests {
             &rig_gitdir(&dir),
         ));
         steps.push(fast_record_step("orders", 0));
+        // Every check reported 0, so the body check of the head runs
+        // before the review dispatches.
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
         steps.extend(reuse_pr_steps(
             &rig_repo(&dir),
             &worktree,
@@ -24461,6 +24509,9 @@ mod tests {
         "\n",
         "## Before / After\n",
         "- AC-1 \u{b7} checkout \u{b7} http \u{b7} `curl -s :4000/pay` \u{b7} before: 500 \u{b7} after: 422\n",
+        "\n",
+        "## Blast radius\n",
+        "The change touches the checkout form only.\n",
     );
 
     #[test]
@@ -24978,6 +25029,13 @@ mod tests {
                 "docs/notes.md
 ",
             ),
+        ));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "docs/notes.md",
         ));
         steps.extend(reuse_pr_steps(
             &rig_repo(&dir),
@@ -26517,6 +26575,9 @@ mod tests {
         "## Before / After\n",
         "- AC-1 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the submit blocks\n",
         "- AC-2 \u{b7} checkout \u{b7} browser \u{b7} `npx playwright test checkout` \u{b7} before: 500 \u{b7} after: the field shows a message\n",
+        "\n",
+        "## Blast radius\n",
+        "The change touches the checkout form only.\n",
     );
 
     #[test]
@@ -26597,6 +26658,157 @@ mod tests {
                 .any(|job| job.task == "borsuk/review-p7"),
             "a failed body check dispatches no review"
         );
+    }
+
+    /// One refined ticket that carries two criteria. The plan and the
+    /// grounding of [`contract_ticket`] hold for both.
+    fn two_criteria_ticket() -> Issue {
+        let mut ticket = contract_ticket();
+        ticket.body = ticket.body.replace(
+            "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive\n",
+            concat!(
+                "- AC-1 \u{b7} An empty card field blocks submit \u{b7} check: checkout drive\n",
+                "- AC-2 \u{b7} An empty card field shows a message \u{b7} check: checkout drive\n",
+            ),
+        );
+        ticket
+    }
+
+    /// The fourth Given/When/Then example of the v0.8 spec, through the
+    /// daemon path it describes. The ticket asks for two criteria and the
+    /// body answers one, so the trace rule refuses the pull request.
+    #[test]
+    fn a_body_that_answers_one_of_two_criteria_stops_the_review_and_requeues_implement() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let finding = "AC-2 has no Before / After line";
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.push(record_comment_step(&format!("PR: {finding}")));
+        steps.extend(fresh_issue_steps(
+            &rig_repo(&dir),
+            &issue_wt(&dir, 142),
+            142,
+            &rig_gitdir(&dir),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(
+            vec![two_criteria_ticket()],
+            vec![contract_pr(&delta_pr_body())],
+        );
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed(format!("PR: {finding}")),
+            "the trace rule cancels the review"
+        );
+        assert_eq!(findings(&rig, &format!("PR: {finding}")), 1);
+        assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
+        assert!(
+            !rig.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.task == "borsuk/review-p7"),
+            "a failed body check dispatches no review"
+        );
+    }
+
+    /// The body check of C11 reads every governed pull request. One that
+    /// closes no ticket carries no criteria and no plan, so the four
+    /// ticket-bound rules stand down and the heading rules answer.
+    #[test]
+    fn a_governed_pr_without_a_ticket_still_runs_the_heading_rules() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let finding = "section Why missing";
+        let mut steps = body_theory_steps(&rig_repo(&dir));
+        steps.extend(body_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "web/pay.ts",
+        ));
+        steps.push(record_comment_step(&format!("PR: {finding}")));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let mut pull = unlinked_pr(7);
+        pull.body = UNLINKED_BODY.replace("## Why\n", "");
+
+        rig.poll(Vec::new(), vec![pull]);
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Failed(format!("PR: {finding}")),
+            "a pull request with no ticket still answers the heading rules"
+        );
+        assert_eq!(findings(&rig, &format!("PR: {finding}")), 1);
+        assert!(
+            !rig.jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job.task == "borsuk/review-p7"),
+            "a failed body check dispatches no review"
+        );
+    }
+
+    /// One pull request in the shape `push_model_worktree` opens: open,
+    /// not a draft, labelled `model-pr`, on a model branch, with a plain
+    /// body of one sentence.
+    fn daemon_model_pr(number: u64) -> Pr {
+        let mut pull = pr(number, false, &[MODEL_PR_LABEL]);
+        pull.head_ref = "aif/borsuk/model-a1b2c3d4".to_string();
+        pull.body = "The theory model of borsuk.".to_string();
+        pull
+    }
+
+    /// The daemon opens its own pull requests for the model worktree and
+    /// the skills worktree, and neither body carries the three sections.
+    /// Neither passes `--draft` to `gh pr create`, so the review gate
+    /// never admits one and the body check never reads one. This pins that
+    /// invariant, because the body check would refuse the body.
+    #[test]
+    fn a_model_pull_request_of_the_daemon_never_reaches_the_body_check() {
+        let dir = temp_root();
+        let steps = body_theory_steps(&rig_repo(&dir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let pull = daemon_model_pr(7);
+        let ctx = contract::ContractContext {
+            criteria: Vec::new(),
+            features: Vec::new(),
+            areas: Vec::new(),
+            measurers: Vec::new(),
+            owned_paths: Vec::new(),
+            changed_paths: Vec::new(),
+            manifests: &contract::MANIFESTS,
+            ticket_names_dependency: false,
+            has_ticket: false,
+        };
+        let refused = records::check_pr(&pull.body, &pull.head_ref, &ctx)
+            .expect_err("the body carries no Why section");
+        assert_eq!(refused.reason, "section Why missing");
+
+        rig.poll(Vec::new(), vec![pull]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/review-p7"),
+            "a pull request that is no draft is release work, not review work"
+        );
+        assert_eq!(
+            rig.daemon.trains["borsuk"].queue,
+            vec![7],
+            "the pull request joined the merge train instead"
+        );
+        assert_eq!(findings(&rig, "PR: section Why missing"), 0);
+        assert_eq!(rig.job_count(), 0, "the held lane dispatches nothing");
     }
 
     #[test]
@@ -26793,7 +27005,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_without_a_fast_command_runs_no_git_call_at_admission() {
+    fn a_repository_without_a_fast_command_queues_no_fast_check_at_admission() {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
         let mut steps = fast_theory_steps_with(
@@ -26801,9 +27013,25 @@ mod tests {
             &feature_file_without_fast("web-checkout"),
             &feature_file_without_fast("api-orders"),
         );
-        // The only worktree the poll prepares is the one the review runs
-        // in. A git call at admission would meet no scripted step.
+        // The fast path stops before any git call. The body check is what
+        // prepares the head worktree and reads the one diff.
         steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("docs/notes.md\n"),
+        ));
+        steps.extend(reuse_pr_steps(
             &rig_repo(&dir),
             &worktree,
             7,
@@ -26823,8 +27051,8 @@ mod tests {
         );
         assert_eq!(
             git_calls(&rig, "diff"),
-            0,
-            "the admission reads no diff, so it prepares no head worktree"
+            1,
+            "the one diff belongs to the body check, not to the fast path"
         );
         assert_eq!(rig.job_count(), 1);
         assert_eq!(rig.job(0).task, "borsuk/review-p7");
@@ -26851,6 +27079,13 @@ mod tests {
             &worktree,
             &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
             CmdOut::ok("docs/notes.md\n"),
+        ));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            "docs/notes.md",
         ));
         steps.extend(reuse_pr_steps(
             &rig_repo(&dir),
