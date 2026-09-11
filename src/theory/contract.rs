@@ -10,6 +10,7 @@ use std::fmt::{Display, Formatter};
 
 use globset::Glob;
 
+use super::records::SECTION_WHY;
 use super::skills::Feature;
 use super::verify::{Measurer, Tier};
 
@@ -39,11 +40,21 @@ pub const BEFORE_AFTER_HEADING: &str = "## Before / After";
 /// briefing, not a lab notebook.
 pub const SECTIONS_FORBIDDEN: [&str; 2] = ["## Summary", "## Test plan"];
 
+/// The heading that closes a pull request body with its blast radius.
+pub const SECTION_BLAST_RADIUS: &str = "## Blast radius";
+
+/// The only H2 headings a pull request body may carry.
+pub const SECTIONS_ALLOWED: [&str; 3] = [SECTION_WHY, BEFORE_AFTER_HEADING, SECTION_BLAST_RADIUS];
+
 /// The dependency manifests the scope rule guards.
 pub const MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
 
 /// The most prose lines one pull request body may carry.
 pub const MAX_PROSE_LINES: usize = 40;
+
+/// The most lines one fenced transcript of a pull request body may carry.
+/// The full transcript stays in the author's worktree.
+pub const MAX_TRANSCRIPT_LINES: usize = 30;
 
 /// The directory prefix every run skill lives under.
 const SKILL_PREFIX: &str = ".claude/skills/run-";
@@ -442,8 +453,10 @@ pub struct BeforeAfterLine {
 ///
 /// The daemon builds it per pull request: the criteria of the linked
 /// ticket, the features its areas resolve to, the touched areas with their
-/// floor, the owned paths of the plan table, and the changed paths of the
-/// head diff.
+/// floor, the measurers of the map, the owned paths of the plan table, and
+/// the changed paths of the head diff. A pull request that links no ticket
+/// carries an empty criteria list, an empty owned-path list, and
+/// `has_ticket` false, and the three rules that read a ticket stand down.
 #[derive(Debug, Clone)]
 pub struct ContractContext<'a> {
     /// The acceptance criteria of the linked ticket.
@@ -452,6 +465,8 @@ pub struct ContractContext<'a> {
     pub features: Vec<Feature>,
     /// The touched areas, each with the floor it demands.
     pub areas: Vec<(String, Tier)>,
+    /// The measurers of the verification map.
+    pub measurers: Vec<Measurer>,
     /// The paths the plan table of the ticket owns.
     pub owned_paths: Vec<String>,
     /// The paths the head diff changes.
@@ -460,6 +475,10 @@ pub struct ContractContext<'a> {
     pub manifests: &'a [&'a str],
     /// Whether the ticket names a dependency.
     pub ticket_names_dependency: bool,
+    /// Whether one ticket backs this pull request. A pull request that
+    /// links none carries no criteria and no plan, so the trace rule, the
+    /// area half of the coverage rule, and the scope rule do not run.
+    pub has_ticket: bool,
 }
 
 /// Parse the Before / After lines of a pull request body.
@@ -561,38 +580,87 @@ fn parse_before_after(line: &str) -> Result<BeforeAfterLine, String> {
 /// The seven rules run in this order: sections, trace, coverage, tier,
 /// state, scope, and prose. The first broken rule wins, and a broken
 /// floor carries its [`Floor`] so the daemon can open the event.
+///
+/// Three of the seven read the linked ticket: trace, the area half of
+/// coverage, and scope. A body with `has_ticket` false runs without those
+/// three. Every other rule reads the body and the verification map alone,
+/// so it answers with or without a ticket.
 pub fn check_body_lines(body: &str, ctx: &ContractContext<'_>) -> Result<(), Finding> {
     check_sections(body)?;
     let (lines, findings) = parse_lines(body);
     if let Some(finding) = findings.into_iter().next() {
         return Err(finding);
     }
-    check_trace(&lines, ctx)?;
+    if ctx.has_ticket {
+        check_trace(&lines, ctx)?;
+    }
     check_coverage(&lines, ctx)?;
     check_tier(&lines, ctx)?;
     check_state(&lines)?;
-    check_scope(ctx)?;
+    if ctx.has_ticket {
+        check_scope(ctx)?;
+    }
     check_prose(body)
 }
 
-/// The sections rule: the Before / After section is there, and no section
-/// the body forbids.
+/// The sections rule: the body carries the Before / After section and the
+/// Blast radius section, carries no section it forbids, and opens no other
+/// H2 heading.
+///
+/// A transcript may hold a heading of its own, so the rule reads the lines
+/// outside the fenced blocks alone.
 fn check_sections(body: &str) -> Result<(), Finding> {
+    let lines = unfenced_lines(body);
     for heading in SECTIONS_FORBIDDEN {
-        if body.lines().any(|line| line.trim() == heading) {
+        if lines.contains(&heading) {
             return Err(Finding::plain(format!(
                 "section {} is not allowed",
                 heading_name(heading)
             )));
         }
     }
-    if !body.lines().any(|line| line.trim() == BEFORE_AFTER_HEADING) {
-        return Err(Finding::plain(format!(
-            "section {} missing",
-            heading_name(BEFORE_AFTER_HEADING)
-        )));
+    for heading in [BEFORE_AFTER_HEADING, SECTION_BLAST_RADIUS] {
+        if !lines.contains(&heading) {
+            return Err(Finding::plain(format!(
+                "section {} missing",
+                heading_name(heading)
+            )));
+        }
+    }
+    for line in &lines {
+        if line.starts_with("## ") && !SECTIONS_ALLOWED.contains(line) {
+            return Err(Finding::plain(format!(
+                "heading {} is not allowed",
+                heading_name(line)
+            )));
+        }
     }
     Ok(())
+}
+
+/// The backtick width of one line, when the line is a fence.
+///
+/// A fence runs three backticks or more. The block one fence opens closes
+/// at the first fence at least as wide, so a wider fence holds a narrower
+/// one as content.
+fn fence_width(line: &str) -> Option<usize> {
+    let width = line.trim_start().chars().take_while(|c| *c == '`').count();
+    (width >= 3).then_some(width)
+}
+
+/// Every line of one body that sits outside a fenced block, trimmed.
+fn unfenced_lines(body: &str) -> Vec<&str> {
+    let mut open: Option<usize> = None;
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        match (open, fence_width(line)) {
+            (None, Some(width)) => open = Some(width),
+            (Some(width), Some(closing)) if closing >= width => open = None,
+            (None, None) => lines.push(line.trim()),
+            _ => {}
+        }
+    }
+    lines
 }
 
 /// The name of one heading, without its hashes.
@@ -624,8 +692,27 @@ fn check_trace(lines: &[BeforeAfterLine], ctx: &ContractContext<'_>) -> Result<(
 }
 
 /// The coverage rule: every touched area that resolves a feature has at
-/// least one line.
+/// least one line, and every line names a resolved feature or a measurer
+/// of the map.
+///
+/// The area half asks the ticket for a line per area, so a body with no
+/// ticket behind it skips that half. The target half reads the
+/// verification map, so it runs either way.
 fn check_coverage(lines: &[BeforeAfterLine], ctx: &ContractContext<'_>) -> Result<(), Finding> {
+    if ctx.has_ticket {
+        check_areas(lines, ctx)?;
+    }
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(finding) = unknown_target(index, line, ctx) {
+            return Err(finding);
+        }
+    }
+    Ok(())
+}
+
+/// The area half of the coverage rule: every touched area that resolves a
+/// feature has at least one line.
+fn check_areas(lines: &[BeforeAfterLine], ctx: &ContractContext<'_>) -> Result<(), Finding> {
     for (area, _floor) in &ctx.areas {
         let bound: Vec<&Feature> = ctx
             .features
@@ -645,9 +732,41 @@ fn check_coverage(lines: &[BeforeAfterLine], ctx: &ContractContext<'_>) -> Resul
     Ok(())
 }
 
-/// The tier rule: every line reaches the floor of the area it drove.
+/// The finding of one line whose target names nothing the factory can
+/// drive.
+///
+/// A tier line names a resolved feature. A `measure` line names a measurer
+/// of the verification map. Either name resolves, or the line proves
+/// nothing and the body check refuses it.
+fn unknown_target(
+    index: usize,
+    line: &BeforeAfterLine,
+    ctx: &ContractContext<'_>,
+) -> Option<Finding> {
+    let known = match line.tier {
+        TierOrMeasure::Tier(_) => ctx.features.iter().any(|feature| feature.id == line.target),
+        TierOrMeasure::Measure => ctx
+            .measurers
+            .iter()
+            .any(|measurer| measurer.id == line.target),
+    };
+    if known {
+        return None;
+    }
+    Some(Finding::plain(format!(
+        "line {} names {} which is not a feature or a measurer",
+        index + 1,
+        line.target
+    )))
+}
+
+/// The tier rule: every line names a target the factory knows and reaches
+/// the floor of the area it drove.
 fn check_tier(lines: &[BeforeAfterLine], ctx: &ContractContext<'_>) -> Result<(), Finding> {
     for (index, line) in lines.iter().enumerate() {
+        if let Some(finding) = unknown_target(index, line, ctx) {
+            return Err(finding);
+        }
         let TierOrMeasure::Tier(reached) = line.tier else {
             continue;
         };
@@ -760,11 +879,69 @@ fn owns(owned: &str, path: &str) -> bool {
     Glob::new(owned).is_ok_and(|glob| glob.compile_matcher().is_match(path))
 }
 
-/// The prose rule: the three lint rules of pstack, and the line cap.
+/// The prose rule: the three lint rules of pstack, the line cap, and the
+/// transcript cap.
 fn check_prose(body: &str) -> Result<(), Finding> {
     let prose = lint_prose(body)?;
     if prose > MAX_PROSE_LINES {
         return Err(Finding::plain(format!("body has {prose} prose lines")));
+    }
+    check_transcripts(body)
+}
+
+/// One fenced block of a pull request body.
+struct Block {
+    /// The body line the opening fence sits on, counted from one.
+    at: usize,
+    /// How many backticks the opening fence runs.
+    width: usize,
+    /// How many lines sit between the fences.
+    lines: usize,
+}
+
+/// The transcript cap: no fenced block runs past [`MAX_TRANSCRIPT_LINES`].
+///
+/// The finding names the line the block opens on and how many lines it
+/// holds between its fences. A fence narrower than the one that opened the
+/// block is content, not the close. A block the body never closes ends at
+/// the last line.
+fn check_transcripts(body: &str) -> Result<(), Finding> {
+    let mut open: Option<Block> = None;
+    for (index, line) in body.lines().enumerate() {
+        let fence = fence_width(line);
+        match &mut open {
+            None => {
+                if let Some(width) = fence {
+                    open = Some(Block {
+                        at: index + 1,
+                        width,
+                        lines: 0,
+                    });
+                }
+            }
+            Some(block) => {
+                if fence.is_some_and(|closing| closing >= block.width) {
+                    let block = open.take().expect("the walk just read an open block");
+                    cap_block(&block)?;
+                } else {
+                    block.lines += 1;
+                }
+            }
+        }
+    }
+    match open {
+        Some(block) => cap_block(&block),
+        None => Ok(()),
+    }
+}
+
+/// Refuse one fenced block that runs past the transcript cap.
+fn cap_block(block: &Block) -> Result<(), Finding> {
+    if block.lines > MAX_TRANSCRIPT_LINES {
+        return Err(Finding::plain(format!(
+            "fenced block at body line {} has {} lines",
+            block.at, block.lines
+        )));
     }
     Ok(())
 }
@@ -1244,6 +1421,17 @@ mod tests {
         ]
     }
 
+    /// The one measurer of the map the body-check cases read.
+    fn body_measurer() -> Measurer {
+        Measurer {
+            id: "poll_p95".to_string(),
+            area: "api-orders".to_string(),
+            command: "aif measure".to_string(),
+            mode: Mode::Fast,
+            timeout_s: 60,
+        }
+    }
+
     /// A pull request body that passes every rule of the body check.
     ///
     /// Line 3 and line 4 are its two opening prose lines, so a lint case
@@ -1274,11 +1462,35 @@ mod tests {
                 ("web-checkout".to_string(), Tier::Browser),
                 ("api-orders".to_string(), Tier::Http),
             ],
+            measurers: vec![body_measurer()],
             owned_paths: vec!["src/checkout.rs".to_string(), "web/**".to_string()],
             changed_paths: vec!["src/checkout.rs".to_string()],
             manifests: &MANIFESTS,
             ticket_names_dependency: false,
+            has_ticket: true,
         }
+    }
+
+    /// `passing_body()` with one more Before / After line under its two.
+    fn third_line(line: &str) -> String {
+        passing_body().replace("\n## Blast radius", &format!("{line}\n\n## Blast radius"))
+    }
+
+    /// The context of a body whose third line answers a third criterion.
+    fn third_criterion_context(target: CheckTarget) -> ContractContext<'static> {
+        let mut ctx = body_context();
+        ctx.criteria.push(Criterion {
+            id: 3,
+            statement: "The number holds".to_string(),
+            target,
+        });
+        ctx
+    }
+
+    /// One fenced block that holds `lines` lines between its fences.
+    fn fenced_block(lines: usize) -> String {
+        let inner: String = (0..lines).map(|n| format!("out {n}\n")).collect();
+        format!("```\n{inner}```\n")
     }
 
     #[test]
@@ -1384,11 +1596,152 @@ mod tests {
                 "colon at line 3",
             ),
             (long, body_context(), "body has 41 prose lines"),
+            (
+                third_line("- AC-3 \u{b7} nope \u{b7} browser \u{b7} `npx test` \u{b7} before: 500 \u{b7} after: 422"),
+                third_criterion_context(CheckTarget::Drive("nope".to_string())),
+                "line 3 names nope which is not a feature or a measurer",
+            ),
+            (
+                third_line("- AC-3 \u{b7} p99 \u{b7} measure \u{b7} `aif measure` \u{b7} 12 \u{2192} 11 ms"),
+                third_criterion_context(CheckTarget::Measure("p99".to_string())),
+                "line 3 names p99 which is not a feature or a measurer",
+            ),
+            (
+                passing_body().replace("## Blast radius\n", ""),
+                body_context(),
+                "section Blast radius missing",
+            ),
+            (
+                format!("{}\n## Evidence\nThe run log sits here.\n", passing_body()),
+                body_context(),
+                "heading Evidence is not allowed",
+            ),
+            (
+                format!("{}{}", passing_body(), fenced_block(31)),
+                body_context(),
+                "fenced block at body line 12 has 31 lines",
+            ),
         ];
         for (body, ctx, expected) in cases {
             let finding = check_body_lines(&body, &ctx).expect_err(expected);
             assert_eq!(finding.reason, expected, "body:\n{body}");
         }
+    }
+
+    #[test]
+    fn a_measure_line_that_names_a_measurer_of_the_map_passes() {
+        let body = third_line(
+            "- AC-3 \u{b7} poll_p95 \u{b7} measure \u{b7} `aif measure` \u{b7} 12 \u{2192} 11 ms",
+        );
+        let ctx = third_criterion_context(CheckTarget::Measure("poll_p95".to_string()));
+        check_body_lines(&body, &ctx).expect("the map carries poll_p95");
+    }
+
+    /// The coverage rule answers an unknown target first, so the tier rule
+    /// never sees one through [`check_body_lines`]. It must refuse one on
+    /// its own, or a later caller inherits the hole.
+    #[test]
+    fn check_tier_refuses_a_line_that_names_no_feature_of_its_own() {
+        let lines = vec![BeforeAfterLine {
+            id: 1,
+            target: "nope".to_string(),
+            tier: TierOrMeasure::Tier(Tier::Browser),
+            command: "npx test".to_string(),
+            before: "500".to_string(),
+            after: "422".to_string(),
+        }];
+        let finding = check_tier(&lines, &body_context()).expect_err("nope is no feature");
+        assert_eq!(
+            finding.reason,
+            "line 1 names nope which is not a feature or a measurer"
+        );
+    }
+
+    #[test]
+    fn a_fenced_block_at_the_transcript_cap_passes() {
+        let body = format!("{}{}", passing_body(), fenced_block(MAX_TRANSCRIPT_LINES));
+        check_body_lines(&body, &body_context()).expect("thirty lines are the cap, not past it");
+    }
+
+    /// A pull request that closes no ticket carries no criteria and no
+    /// plan. Trace, the area half of coverage, and scope stand down.
+    #[test]
+    fn a_body_without_a_ticket_skips_trace_the_area_half_and_scope() {
+        let ctx = ContractContext {
+            criteria: body_criteria(),
+            changed_paths: vec!["src/other.rs".to_string()],
+            has_ticket: false,
+            ..body_context()
+        };
+        // Dropping line 2 leaves AC-2 without a line and the api-orders
+        // area without one. The changed path sits outside the plan.
+        let body = passing_body().replace(
+            "- AC-2 \u{b7} orders \u{b7} http \u{b7} `curl -s -X POST :4000/orders` \u{b7} before: 500 \u{b7} after: 422\n",
+            "",
+        );
+        check_body_lines(&body, &ctx).expect("trace, the area half, and scope stand down");
+
+        let ctx = ContractContext {
+            has_ticket: false,
+            ..body_context()
+        };
+        let finding = check_body_lines(&passing_body().replace("## Blast radius\n", ""), &ctx)
+            .expect_err("the sections rule still answers");
+        assert_eq!(finding.reason, "section Blast radius missing");
+    }
+
+    /// The target half of coverage and the tier rule read the verification
+    /// map, not the ticket. A pull request with no ticket behind it still
+    /// answers to both.
+    #[test]
+    fn a_body_without_a_ticket_still_refuses_an_unknown_target_and_a_low_tier() {
+        let ctx = ContractContext {
+            criteria: Vec::new(),
+            has_ticket: false,
+            ..body_context()
+        };
+        let unknown = passing_body().replace(
+            "- AC-1 \u{b7} checkout \u{b7} browser",
+            "- AC-1 \u{b7} nope \u{b7} browser",
+        );
+        let finding = check_body_lines(&unknown, &ctx).expect_err("nope is no feature");
+        assert_eq!(
+            finding.reason,
+            "line 1 names nope which is not a feature or a measurer"
+        );
+
+        let low = passing_body().replace(
+            "- AC-1 \u{b7} checkout \u{b7} browser",
+            "- AC-1 \u{b7} checkout \u{b7} http",
+        );
+        let finding = check_body_lines(&low, &ctx).expect_err("http is below the browser floor");
+        assert_eq!(
+            finding.reason,
+            "line 1 tier http is below the floor browser"
+        );
+    }
+
+    /// A transcript may hold a heading and a diff line of its own. Neither
+    /// is a section of the body.
+    #[test]
+    fn a_fenced_transcript_hides_its_headings_from_the_sections_rule() {
+        let body = format!(
+            "{}{}",
+            passing_body(),
+            concat!("```\n", "## Foo\n", " ## bar\n", "## Summary\n", "```\n",)
+        );
+        check_body_lines(&body, &body_context()).expect("a fenced line is not a heading");
+    }
+
+    /// A wider fence holds a narrower one as content, so the block the
+    /// body opens with four backticks ends at the four-backtick fence.
+    #[test]
+    fn a_narrow_fence_inside_a_wider_block_does_not_close_it() {
+        let inner: String = (0..31).map(|n| format!("out {n}\n")).collect();
+        let body = format!("{}````\n```\n{inner}```\n````\n", passing_body());
+        let finding =
+            check_body_lines(&body, &body_context()).expect_err("the wide block runs past the cap");
+        assert_eq!(finding.reason, "fenced block at body line 12 has 33 lines");
     }
 
     #[test]
