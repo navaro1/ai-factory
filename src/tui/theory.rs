@@ -1601,4 +1601,40 @@ mod tests {
         assert_eq!(shipped.lint.len(), 1);
         assert!(render(&state).contains("web-checkout · browser"));
     }
+
+    /// A wide window gauge renders at a narrow width without panic: the
+    /// strip clips inside its width, and the clipped count and the pause
+    /// word stay off the screen until the width fits them.
+    #[test]
+    fn a_wide_window_gauge_clips_at_a_narrow_width_without_panic() {
+        let mut state = view(Vec::new(), 0);
+        state.theory.get_mut("borsuk").unwrap().window = (0, 50);
+
+        let text = render_at(&state, &mut Theory::default(), 70);
+
+        assert!(
+            text.contains("GOVERNOR ON · ENTRIES 0 · AREAS 0 · WINDOW "),
+            "screen was:\n{text}"
+        );
+        assert!(!text.contains("0/50"), "screen was:\n{text}");
+        assert!(!text.contains("PAUSED"), "screen was:\n{text}");
+
+        // A full window of fifty records clips the same way: no count,
+        // no pause word, no panic.
+        state.theory.get_mut("borsuk").unwrap().window = (50, 50);
+        let text = render_at(&state, &mut Theory::default(), 70);
+        assert!(
+            text.contains("GOVERNOR ON · ENTRIES 0 · AREAS 0 · WINDOW "),
+            "screen was:\n{text}"
+        );
+        assert!(!text.contains("50/50"), "screen was:\n{text}");
+        assert!(!text.contains("PAUSED"), "screen was:\n{text}");
+
+        let text = render_at(&state, &mut Theory::default(), 130);
+        let gauge = format!("WINDOW {} 50/50", "\u{25ae}".repeat(50));
+        assert!(
+            text.contains(&format!("{gauge} · IMPLEMENT \u{25b8} PAUSED")),
+            "screen was:\n{text}"
+        );
+    }
 }
