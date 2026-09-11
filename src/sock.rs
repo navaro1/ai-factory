@@ -52,6 +52,7 @@ pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
     Config, ExecutionRole, Harness, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
+    TheoryConfig,
 };
 use crate::decisions::{Decision, Decisions};
 use crate::labels::{LabelKey, LabelNames};
@@ -398,6 +399,11 @@ pub struct SettingsView {
     pub labels: LabelNames,
     /// The effective label names of every repository, by alias.
     pub repository_labels: BTreeMap<String, LabelNames>,
+    /// The theory settings of every repository, by alias.
+    pub repository_theory: BTreeMap<String, TheoryConfig>,
+    /// The skills checkout of every repository that set one, by alias. A
+    /// missing alias falls back to the theory checkout.
+    pub repository_skills: BTreeMap<String, String>,
     /// The label keys the global `[labels]` table sets, in key order.
     pub global_label_overrides: Vec<LabelKey>,
     /// The label keys each `[repo.<alias>.labels]` table sets, by alias.
@@ -442,6 +448,8 @@ struct SettingsViewRef<'a> {
     repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
     labels: &'a LabelNames,
     repository_labels: &'a BTreeMap<String, LabelNames>,
+    repository_theory: &'a BTreeMap<String, TheoryConfig>,
+    repository_skills: &'a BTreeMap<String, String>,
     global_label_overrides: &'a [LabelKey],
     repository_label_overrides: &'a BTreeMap<String, Vec<LabelKey>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -462,6 +470,10 @@ struct SettingsViewWire {
     labels: LabelNames,
     #[serde(default)]
     repository_labels: BTreeMap<String, LabelNames>,
+    #[serde(default)]
+    repository_theory: BTreeMap<String, TheoryConfig>,
+    #[serde(default)]
+    repository_skills: BTreeMap<String, String>,
     #[serde(default)]
     global_label_overrides: Vec<LabelKey>,
     #[serde(default)]
@@ -489,6 +501,8 @@ impl Serialize for SettingsView {
             repository_tag_routes: &self.repository_tag_routes,
             labels: &self.labels,
             repository_labels: &self.repository_labels,
+            repository_theory: &self.repository_theory,
+            repository_skills: &self.repository_skills,
             global_label_overrides: &self.global_label_overrides,
             repository_label_overrides: &self.repository_label_overrides,
             theory_global,
@@ -513,6 +527,8 @@ impl<'de> Deserialize<'de> for SettingsView {
             repository_tag_routes: wire.repository_tag_routes,
             labels: wire.labels,
             repository_labels: wire.repository_labels,
+            repository_theory: wire.repository_theory,
+            repository_skills: wire.repository_skills,
             global_label_overrides: wire.global_label_overrides,
             repository_label_overrides: wire.repository_label_overrides,
             prompts: wire.prompts,
@@ -599,6 +615,20 @@ impl SettingsView {
             .keys()
             .map(|alias| (alias.clone(), config.resolved_labels(Some(alias))))
             .collect();
+        let repository_theory = config
+            .repos
+            .iter()
+            .map(|(alias, repo)| (alias.clone(), repo.theory.clone()))
+            .collect();
+        let repository_skills = config
+            .repos
+            .iter()
+            .filter_map(|(alias, repo)| {
+                repo.skills
+                    .as_ref()
+                    .map(|skills| (alias.clone(), skills.path.to_string_lossy().into_owned()))
+            })
+            .collect();
         let repository_label_overrides = config
             .repos
             .iter()
@@ -621,6 +651,8 @@ impl SettingsView {
             repository_tag_routes,
             labels: config.resolved_labels(None),
             repository_labels,
+            repository_theory,
+            repository_skills,
             global_label_overrides,
             repository_label_overrides,
             prompts: prompts.to_vec(),
@@ -1836,6 +1868,7 @@ pub struct SettingsResult {
 /// One message from the daemon to a UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Push {
     /// The whole current state.
     State(StateView),
@@ -3059,6 +3092,33 @@ mod tests {
             )),
             "a theory role carries no prompt"
         );
+    }
+
+    /// The settings view carries the theory config and the skills checkout
+    /// of every repository, so the panel can warn about the governor and
+    /// edit the checkout. The wire keeps both across a round trip.
+    #[test]
+    fn the_settings_view_ships_the_repository_theory_and_skills() {
+        let text = config_text()
+            .replace("[repo.borsuk]\n", "[repo.borsuk]\ngovernor = \"off\"\n");
+        let text = format!("{}\n[repo.borsuk.skills]\npath = \"/tmp/skills\"\n", text);
+        let config = Config::parse(&text).unwrap();
+        let view = SettingsView::from_config(&config, "content-revision", &[]).unwrap();
+
+        assert_eq!(
+            view.repository_theory["borsuk"].governor,
+            crate::config::Governor::Off
+        );
+        assert_eq!(
+            view.repository_theory["qubitsok"].governor,
+            crate::config::Governor::On
+        );
+        assert_eq!(view.repository_skills["borsuk"], "/tmp/skills");
+        assert!(!view.repository_skills.contains_key("qubitsok"));
+
+        let wire = serde_json::to_string(&view).unwrap();
+        let parsed: SettingsView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed, view, "wire: {wire}");
     }
 
     #[test]

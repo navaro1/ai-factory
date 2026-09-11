@@ -198,6 +198,14 @@ pub enum SettingsEdit {
         /// Each key to write, with its new name or `None` to remove it.
         names: BTreeMap<LabelKey, Option<String>>,
     },
+    /// Write or clear the skills checkout of one repository.
+    Skills {
+        /// The repository alias.
+        repository: String,
+        /// The skills checkout path. `None` removes the `skills` table, so
+        /// the checkout falls back to the theory checkout.
+        path: Option<String>,
+    },
     /// Insert one repository with a single `path` key.
     AddRepository {
         /// The repository alias.
@@ -2018,6 +2026,27 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
                 }
             }
         }
+        SettingsEdit::Skills { repository, path } => {
+            if !valid_alias(repository) {
+                bail!("repo.\"{repository}\": alias must match [a-z0-9._-]+");
+            }
+            let repo = document
+                .get_mut("repo")
+                .and_then(toml_edit::Item::as_table_mut)
+                .and_then(|repos| repos.get_mut(repository))
+                .and_then(toml_edit::Item::as_table_mut)
+                .ok_or_else(|| anyhow!("repo.{repository}: no configured repository"))?;
+            match path.as_deref() {
+                Some(path) => {
+                    nonempty(path, &format!("repo.{repository}.skills.path"))?;
+                    let table = ensure_table(repo, "skills", &format!("repo.{repository}.skills"))?;
+                    set_string(table, "path", Some(path));
+                }
+                None => {
+                    repo.remove("skills");
+                }
+            }
+        }
         SettingsEdit::AddRepository { alias, path } => {
             if !valid_alias(alias) {
                 bail!("repo.\"{alias}\": alias must match [a-z0-9._-]+");
@@ -2929,6 +2958,91 @@ mod repo_edit_tests {
         let same = parse(&config_text());
         assert!(before.topology_delta(&same).is_empty());
         assert!(!before.topology_delta(&after).is_empty());
+    }
+
+    #[test]
+    fn a_skills_edit_writes_the_path_and_keeps_the_neighbouring_tables() {
+        let text = config_text();
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "demo".to_string(),
+                path: Some("/tmp/skills-checkout".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(edited.contains("# keep this factory comment"));
+        assert!(edited.contains("[repo.demo.skills]"), "{edited}");
+        assert!(edited.contains("[repo.demo.theory]"));
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(
+            parsed.repos["demo"].skills,
+            Some(SkillsPath {
+                path: PathBuf::from("/tmp/skills-checkout")
+            }),
+            "edited text:\n{edited}"
+        );
+        assert_eq!(
+            parsed.repos["demo"].skills_checkout(),
+            PathBuf::from("/tmp/skills-checkout")
+        );
+    }
+
+    #[test]
+    fn a_cleared_skills_edit_removes_the_table_and_falls_back_to_the_theory_checkout() {
+        let text = config_text().replace(
+            "[repo.demo.theory]",
+            "[repo.demo.skills]\npath = \"/tmp/skills-checkout\"\n\n[repo.demo.theory]",
+        );
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "demo".to_string(),
+                path: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!edited.contains("skills-checkout"), "{edited}");
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(parsed.repos["demo"].skills, None);
+        assert_eq!(
+            parsed.repos["demo"].skills_checkout(),
+            PathBuf::from("docs/theory")
+        );
+    }
+
+    #[test]
+    fn a_skills_edit_rejects_an_empty_path_and_an_unknown_alias() {
+        let text = config_text();
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "demo".to_string(),
+                path: Some("   ".to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("skills.path must not be empty"),
+            "error was: {error:#}"
+        );
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "ghost".to_string(),
+                path: Some("/tmp/skills".to_string()),
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ghost") && message.contains("no configured repository"),
+            "error was: {message}"
+        );
     }
 }
 
