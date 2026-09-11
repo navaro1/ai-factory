@@ -99,6 +99,7 @@ enum Selection {
 /// Every value is either an input event or a socket event. The main loop
 /// draws one frame per message and never wakes up on its own.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     /// A key press.
     Key(KeyEvent),
@@ -1313,6 +1314,7 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
                 .request
                 .starts_with(crate::sock::SKILL_TICKET_REQUEST)
                 || result.request.starts_with(crate::sock::PREDICTION_REQUEST)
+                || result.request.starts_with(crate::sock::LADDER_REQUEST)
                 || result
                     .request
                     .starts_with(crate::sock::MODEL_COMMIT_REQUEST)
@@ -2251,6 +2253,8 @@ mod tests {
             revision: "rev-one".to_string(),
             labels: crate::labels::LabelNames::default(),
             repository_labels: std::collections::BTreeMap::new(),
+            repository_theory: std::collections::BTreeMap::new(),
+            repository_skills: std::collections::BTreeMap::new(),
             global_label_overrides: Vec::new(),
             repository_label_overrides: std::collections::BTreeMap::new(),
             global: crate::config::ExecutionRole::ALL

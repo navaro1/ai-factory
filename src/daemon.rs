@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -60,7 +61,7 @@ use crate::sock::{
     Action, AreaView, AskView, ChatPurpose, DeltaState, DeltaView, HoldView, InputMode, ModelPath,
     PauseScope, PromptSource, PromptView, Push, RecordView, SettingsOperation, SettingsResult,
     SettingsResultStatus, StateInput, StateView, SurfaceView, TheoryAction, TheoryView,
-    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind,
+    TicketAction, TicketDetails, TicketProposal, TicketResult, TicketResultKind, LADDER_REQUEST,
     MODEL_COMMIT_REQUEST, PREDICTION_REQUEST, SKILL_TICKET_REQUEST,
 };
 use crate::state::{ChatKey, DaemonState, RuntimeState, TaskBinding, TicketConversationState};
@@ -72,7 +73,7 @@ use crate::theory::blocks;
 use crate::theory::cadence::{self, Schedule, ScheduleKind, SweepStats};
 use crate::theory::cards::{self, CardView};
 use crate::theory::contract;
-use crate::theory::measure::{self, FastRun, Record};
+use crate::theory::measure::{self, FastRun, MeasureRun, MeasureSlot, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
     self, delta_block, event_block, no_entries, parse_delta, parse_delta_blocks,
@@ -80,9 +81,10 @@ use crate::theory::records::{
     skips_prediction_gates, slot_outcome, DeltaBlock, DeltaOutcome, Event, FullPrediction,
     Prediction, PredictionTag, RecordKey, ShortPrediction, TheoryRecords, DELTA_BLOCK,
     DELTA_OPEN_COLOR, DELTA_OPEN_LABEL, EVENT_BLOCK, EVENT_OPEN_COLOR, EVENT_OPEN_LABEL,
-    MODEL_FILE, MODEL_PROPOSAL_BLOCK, MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS,
-    THEORY_FULL_COLOR, THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL,
-    VERIFY_SKILL_COLOR, VERIFY_SKILL_LABEL,
+    LADDER_1_LABEL, LADDER_2_LABEL, LADDER_3_LABEL, LADDER_COLOR, MODEL_FILE, MODEL_PROPOSAL_BLOCK,
+    MODEL_PR_COLOR, MODEL_PR_LABEL, PREDICTION_OTHER_AREAS, RULES_FILE, THEORY_FULL_COLOR,
+    THEORY_FULL_LABEL, THEORY_SHORT_COLOR, THEORY_SHORT_LABEL, VERIFY_SKILL_COLOR,
+    VERIFY_SKILL_LABEL,
 };
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
@@ -197,6 +199,63 @@ fn model_repo(repo: &RepoConfig) -> &str {
     repo.theory_repo().unwrap_or(&repo.owner_repo)
 }
 
+/// The body of one ladder ticket: the event text, then the note.
+fn ladder_body(question: &str, note: &str) -> String {
+    if note.is_empty() {
+        question.to_string()
+    } else {
+        format!("{question}\n\n{note}")
+    }
+}
+
+/// The body of one rung 1 ticket.
+///
+/// The ticket leaves its record behind, so the first line names the
+/// record, the slot, and the entry the answer took. The event text and
+/// the note follow.
+fn eliminate_body(key: &RecordKey, question: &str, answer: &AnswerBlock) -> String {
+    format!(
+        "Record {}. Slot {}. Entry {}.\n\n{}",
+        key.key_text(),
+        answer.slot,
+        answer.entry,
+        ladder_body(question, &answer.note)
+    )
+}
+
+/// One rule line of the ladder, dated in UTC.
+fn rule_line(now_ms: u64, answer: &AnswerBlock) -> String {
+    format!(
+        "- {} {}: {}",
+        cadence::ms_date(now_ms),
+        answer.entry,
+        answer.note
+    )
+}
+
+/// Append one line to the rule file, and create the file when it is
+/// absent.
+///
+/// The file is a list, so the line starts on its own row whatever the
+/// last byte of the file is. Only a missing file starts an empty list.
+/// Any other read error fails the rung, so the pull request never drops
+/// the rules the file already holds.
+fn append_rule(file: &Path, line: &str) -> Result<()> {
+    let mut text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!("cannot read {}", file.display())))
+        }
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+    text.push('\n');
+    fs::write(file, text).with_context(|| format!("cannot write {}", file.display()))
+}
+
 /// The pull request number at the end of the URL `gh pr create` prints.
 fn pr_number_from_output(text: &str) -> Option<u64> {
     text.lines()
@@ -255,6 +314,9 @@ pub const FAST_TIMEOUT_S: u64 = 120;
 /// The opening words of the finding one failed fast check posts.
 pub const FAST_CHECK_FAILED: &str = "fast check failed";
 
+/// The reason one aborted measurer reports in the comparison.
+pub const MEASURE_ABORTED: &str = "the operator aborted the run";
+
 /// The hold text of an implement task the theory window refuses.
 pub const WINDOW_FULL_HOLD: &str = "window full";
 
@@ -294,6 +356,9 @@ const CANCELLED_REASON: &str = "cancelled";
 /// The commit message of every model edit.
 const MODEL_COMMIT_MESSAGE: &str = "Update the model";
 
+/// The commit message of every rule one rung 3 answer records.
+const RULE_COMMIT_MESSAGE: &str = "Add a rule";
+
 /// The first `theory/model.toml` of a repository that has no `theory/`.
 ///
 /// The operator edits this file, so it holds one comment line and nothing
@@ -323,6 +388,8 @@ struct ModelCache {
     model: Result<Model, String>,
     /// The parsed verification map. A missing file is an empty map.
     verify: Result<VerifyMap, String>,
+    /// The rule file as the stage prompts render it. Empty when absent.
+    rules: String,
 }
 
 /// What one queued measure task runs.
@@ -331,6 +398,7 @@ struct ModelCache {
 /// dispatch renders it and the exit reads it back. The map is runtime
 /// only: a restart drops every measure task and the next review admission
 /// queues fresh ones.
+#[derive(Clone)]
 struct MeasureJob {
     /// The shell command the script runner runs.
     command: String,
@@ -338,6 +406,13 @@ struct MeasureJob {
     timeout_s: u64,
     /// The record id a failed or timed-out run reports under.
     record: String,
+    /// The worktree the command runs in. A base run and a head run of one
+    /// review share a task shape and read two different trees, so the job
+    /// carries the directory instead of the item.
+    cwd: PathBuf,
+    /// The cache file the records of a clean run land in, when the run
+    /// measures an area. A fast check has none.
+    cache: Option<PathBuf>,
 }
 
 /// One card of the day, the answer the operator gave it, and what its
@@ -569,6 +644,13 @@ pub struct Daemon {
     measure_jobs: BTreeMap<String, MeasureJob>,
     /// The fast checks each admitted review task waits for.
     fast_runs: BTreeMap<String, FastRun>,
+    /// The base and head measure runs each admitted review task waits for.
+    measure_runs: BTreeMap<String, MeasureRun>,
+    /// The comparison text of each review task whose measure run ended.
+    ///
+    /// The review prompt renders it as `{comparison}`. An entry lives as
+    /// long as its task row: [`Daemon::retire_task`] drops both together.
+    measure_text: BTreeMap<String, String>,
     /// The record each finished fast check reported, by fast task id.
     ///
     /// The id names the tree and the feature, so a review the gate admits
@@ -953,6 +1035,8 @@ impl Daemon {
             theory_holds: BTreeMap::new(),
             measure_jobs: BTreeMap::new(),
             fast_runs: BTreeMap::new(),
+            measure_runs: BTreeMap::new(),
+            measure_text: BTreeMap::new(),
             fast_results: BTreeMap::new(),
             body_checks: BTreeMap::new(),
             theory_views: BTreeMap::new(),
@@ -2120,11 +2204,6 @@ impl Daemon {
             eprintln!("the answer of {}: {error:#}", decision.id);
             return;
         }
-        self.theory_blocks
-            .entry((decision.repo.clone(), key.key_text()))
-            .or_default()
-            .answers
-            .push(block);
         if *cause == Cause::Pr && *kind == ItemKind::Pr {
             let finding = format!("{PR_BROKE_THE_MODEL} {entry}: {question}");
             self.return_pr_to_implement(&decision.repo, *number, &finding);
@@ -2132,7 +2211,115 @@ impl Daemon {
         if *cause == Cause::Recall {
             self.recall_card(&decision.repo, &key, question);
         }
+        self.climb_ladder(&decision.repo, &key, question, &block);
+        self.theory_blocks
+            .entry((decision.repo.clone(), key.key_text()))
+            .or_default()
+            .answers
+            .push(block);
         self.changed = true;
+    }
+
+    /// Act on the rung of one answered theory row.
+    ///
+    /// Rung 1 opens a ticket that eliminates the class, rung 2 a ticket
+    /// for a measurer of the area, and rung 3 records one rule on the
+    /// model branch. Rung 2 needs an area and rung 3 needs a note, so an
+    /// answer that carries neither climbs nothing. A repository with the
+    /// governor off climbs nothing either, and a failure reports itself
+    /// and leaves the answer standing: the block is already on the
+    /// record.
+    fn climb_ladder(&self, alias: &str, key: &RecordKey, question: &str, answer: &AnswerBlock) {
+        let Ok(repo) = self.governed_repo(alias) else {
+            return;
+        };
+        let climbed = match answer.rung {
+            1 => self.ladder_ticket(
+                &repo,
+                &format!("Eliminate: {} \u{2014} {}", answer.entry, question),
+                LADDER_1_LABEL,
+                &eliminate_body(key, question, answer),
+            ),
+            2 if answer.area.is_empty() => Err(anyhow!("the answer names no area")),
+            2 => self.ladder_ticket(
+                &repo,
+                &format!("Measure: {} \u{2014} {}", answer.area, answer.entry),
+                LADDER_2_LABEL,
+                &ladder_body(question, &answer.note),
+            ),
+            3 if answer.note.is_empty() => Err(anyhow!("the answer writes no rule")),
+            3 => self.record_rule(&repo, key, answer),
+            _ => return,
+        };
+        if let Err(error) = climbed {
+            let reason = format!(
+                "rung {} of {alias} {}: {error:#}",
+                answer.rung,
+                key.key_text()
+            );
+            eprintln!("{reason}");
+            self.report_ladder(alias, reason);
+        }
+    }
+
+    /// Send one ladder refusal to every interface as a toast.
+    ///
+    /// No ticket row waits for a rung, so the operator reads the reason
+    /// the same way a model commit reports itself.
+    fn report_ladder(&self, alias: &str, message: String) {
+        let Some(pusher) = self.ticket_pusher.as_ref() else {
+            return;
+        };
+        pusher(Push::TicketResult(TicketResult {
+            request: format!("{LADDER_REQUEST}{alias}"),
+            repo: alias.to_string(),
+            number: 0,
+            kind: TicketResultKind::Failure,
+            message,
+            issue: None,
+            conflict: None,
+        }));
+    }
+
+    /// Open one ladder ticket on the code repository.
+    ///
+    /// The ticket carries the configured `to-refine` name, so the v0.6
+    /// refine gate picks it up, and the rung label, so the daily sweep
+    /// counts it. The daemon creates the rung label first, because
+    /// `create_issue` fails on a label the repository does not have.
+    fn ladder_ticket(
+        &self,
+        repo: &RepoConfig,
+        title: &str,
+        rung_label: &str,
+        body: &str,
+    ) -> Result<()> {
+        let gh = GhClient::new(&*self.exec);
+        gh.create_label_if_missing(&repo.owner_repo, rung_label, LADDER_COLOR)?;
+        let names = self.config.resolved_labels(Some(&repo.alias));
+        gh.create_issue(
+            &repo.owner_repo,
+            title,
+            body,
+            &[names.get(LabelKey::ToRefine), rung_label],
+        )?;
+        Ok(())
+    }
+
+    /// Label the record and append one rule to the rule file.
+    ///
+    /// The rule lands on the model branch through the model worktree, so
+    /// the operator approves it in the model pull request like every other
+    /// theory edit. A repository with no rule file yet gets one.
+    fn record_rule(&self, repo: &RepoConfig, key: &RecordKey, answer: &AnswerBlock) -> Result<()> {
+        let (owner_repo, number) = self.theory_record(&repo.alias, key)?;
+        let gh = GhClient::new(&*self.exec);
+        gh.create_label_if_missing(&owner_repo, LADDER_3_LABEL, LADDER_COLOR)?;
+        gh.add_label(&owner_repo, number, LADDER_3_LABEL)?;
+        let worktree = self.prepare_model_worktree(repo)?;
+        append_rule(&worktree.join(RULES_FILE), &rule_line(self.now_ms, answer))?;
+        self.push_model_worktree(repo, RULES_FILE, RULE_COMMIT_MESSAGE)?;
+        Ok(())
     }
 
     /// Post the finding, cancel a live review, and queue implement again.
@@ -2169,6 +2356,7 @@ impl Daemon {
                         commit: String::new(),
                         model: Err(error),
                         verify: Ok(VerifyMap::default()),
+                        rules: String::new(),
                     },
                 );
                 return;
@@ -2194,12 +2382,19 @@ impl Daemon {
             },
             Err(_) => Ok(VerifyMap::default()),
         };
+        // The rule file is prose, so it needs no parser. A repository that
+        // recorded no rule yet carries no file, and `{rules}` stays empty.
+        let rules = self
+            .show_file(path, &commit, RULES_FILE)
+            .map(|text| text.trim_end().to_string())
+            .unwrap_or_default();
         self.theory_models.insert(
             repo.to_string(),
             ModelCache {
                 commit,
                 model,
                 verify,
+                rules,
             },
         );
     }
@@ -2584,6 +2779,8 @@ impl Daemon {
         self.release_batches.remove(id);
         self.measure_jobs.remove(id);
         self.fast_runs.remove(id);
+        self.measure_runs.remove(id);
+        self.measure_text.remove(id);
         self.fast_results.remove(id);
         self.body_checks.remove(id);
         self.pending_chats.remove(id);
@@ -3983,6 +4180,10 @@ impl Daemon {
                             .fast_runs
                             .get(&task.id)
                             .is_some_and(|run| run.tasks.contains(&prior.id))
+                        || self
+                            .measure_runs
+                            .get(&task.id)
+                            .is_some_and(|run| run.holds(&prior.id))
                 }
                 Stage::Release => {
                     prior.repo == task.repo
@@ -4649,6 +4850,9 @@ impl Daemon {
         // the record, so no exit of one fails the task.
         if task.purpose == TaskPurpose::Measure {
             self.finish_measure(&task, detail);
+            return;
+        }
+        if ok && self.hold_skill_implement(&task) {
             return;
         }
         if ok {
@@ -6840,22 +7044,29 @@ impl Daemon {
     // Measure tasks and fast checks
     // ------------------------------------------------------------------
 
-    /// Queue one measure task per measurer of `mode`.
+    /// Queue one measure task per measurer of `mode` at `tree`.
     ///
-    /// The tree hash of `worktree` names each task, so the same tree never
-    /// runs the same command twice: a task the table already holds keeps
-    /// its run and its record. The returned ids name every task of the
-    /// batch, created or already there, in measurer order.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The cache decides first. A tree that already ran a measurer yields
+    /// one slot with its records and no task, so a review whose head moved
+    /// measures the head alone. Every other measurer becomes one task
+    /// named by the tree, so the same tree never runs the same command
+    /// twice: a task the table already holds keeps its run and its record.
+    /// The returned slots name every run of the batch, in measurer order.
     fn queue_measure(
         &mut self,
         alias: &str,
         key: &RecordKey,
         worktree: &Path,
+        tree: &str,
         measurers: &[Measurer],
         mode: Mode,
-    ) -> Vec<String> {
-        self.queue_measure_tasks(alias, key, worktree, measurers, mode, MeasureKind::Measurer)
+    ) -> Vec<MeasureSlot> {
+        let selected: Vec<Measurer> = measurers
+            .iter()
+            .filter(|measurer| measurer.mode == mode)
+            .cloned()
+            .collect();
+        self.queue_measure_tasks(alias, key, worktree, tree, &selected, MeasureKind::Measurer)
     }
 
     /// Queue one fast check per feature that names a fast command.
@@ -6867,8 +7078,9 @@ impl Daemon {
         alias: &str,
         key: &RecordKey,
         worktree: &Path,
+        tree: &str,
         features: &[Feature],
-    ) -> Vec<String> {
+    ) -> Vec<MeasureSlot> {
         let measurers: Vec<Measurer> = features
             .iter()
             .filter_map(|feature| {
@@ -6881,14 +7093,7 @@ impl Daemon {
                 })
             })
             .collect();
-        self.queue_measure_tasks(
-            alias,
-            key,
-            worktree,
-            &measurers,
-            Mode::Pr,
-            MeasureKind::Fast,
-        )
+        self.queue_measure_tasks(alias, key, worktree, tree, &measurers, MeasureKind::Fast)
     }
 
     /// Queue the measure tasks of one batch under the id form of `kind`.
@@ -6897,37 +7102,50 @@ impl Daemon {
         alias: &str,
         key: &RecordKey,
         worktree: &Path,
+        tree: &str,
         measurers: &[Measurer],
-        mode: Mode,
         kind: MeasureKind,
-    ) -> Vec<String> {
-        let Some(tree) = self.tree_hash(worktree) else {
-            eprintln!("the measure tasks of {alias}: cannot read the tree of the worktree");
-            return Vec::new();
-        };
+    ) -> Vec<MeasureSlot> {
+        let tree8: String = tree.chars().take(measure::TREE_CHARS).collect();
         let (item_kind, number, stage) = match key {
             RecordKey::Issue(number) => (ItemKind::Issue, *number, Stage::Implement),
             RecordKey::Pr(number) => (ItemKind::Pr, *number, Stage::Review),
             RecordKey::Repo => return Vec::new(),
         };
-        let mut ids = Vec::new();
-        for measurer in measurers.iter().filter(|entry| entry.mode == mode) {
+        let mut slots = Vec::new();
+        for measurer in measurers {
             let id = match kind {
-                MeasureKind::Fast => measure::fast_id(alias, &tree, &measurer.id),
+                MeasureKind::Fast => measure::fast_id(alias, &tree8, &measurer.id),
                 MeasureKind::Measurer => {
-                    measure::measure_id(alias, &tree, &measurer.area, &measurer.id)
+                    measure::measure_id(alias, &tree8, &measurer.area, &measurer.id)
                 }
             };
+            let pending = MeasureSlot {
+                id: id.clone(),
+                area: measurer.area.clone(),
+                records: None,
+            };
+            let cache = (kind == MeasureKind::Measurer)
+                .then(|| measure::cache_path(&self.state_dir, alias, tree, measurer));
+            // The tree already ran this command, so its records stand and
+            // no task runs for it.
+            if let Some(records) = cache.as_deref().and_then(measure::read_cache) {
+                slots.push(MeasureSlot {
+                    records: Some(records),
+                    ..pending
+                });
+                continue;
+            }
             match self.table.by_id.get(&id) {
                 // A task of the same tree still runs this command and
                 // will report for it.
                 Some(task) if !task.state.is_terminal() => {
-                    ids.push(id);
+                    slots.push(pending);
                     continue;
                 }
                 // The tree ran this command and its record stands.
                 Some(_) if self.fast_results.contains_key(&id) => {
-                    ids.push(id);
+                    slots.push(pending);
                     continue;
                 }
                 // A finished task with no record was cancelled before it
@@ -6955,28 +7173,29 @@ impl Daemon {
                     command: measurer.command.clone(),
                     timeout_s: measurer.timeout_s,
                     record: measurer.id.clone(),
+                    cwd: worktree.to_path_buf(),
+                    cache,
                 },
             );
             self.changed = true;
-            ids.push(id);
+            slots.push(pending);
         }
-        ids
+        slots
     }
 
-    /// The first eight characters of the tree one worktree has checked out.
+    /// The tree one worktree holds, with its uncommitted work included.
+    ///
+    /// A measure run reads the files on disk, so the tree that names its
+    /// task and its cache entry is the tree of the working directory, not
+    /// the tree of `HEAD`.
     fn tree_hash(&self, worktree: &Path) -> Option<String> {
-        let out =
-            worktree::git(self.exec.as_ref(), worktree, &["rev-parse", "HEAD^{tree}"]).ok()?;
-        if out.status != 0 {
-            return None;
+        match measure::tree_hash(self.exec.as_ref(), worktree, &self.state_dir) {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                eprintln!("the tree of {}: {error:#}", worktree.display());
+                None
+            }
         }
-        let tree: String = out
-            .stdout
-            .trim()
-            .chars()
-            .take(measure::TREE_CHARS)
-            .collect();
-        (tree.len() == measure::TREE_CHARS).then_some(tree)
     }
 
     /// The log file of one measure task.
@@ -6986,55 +7205,158 @@ impl Daemon {
             .join(format!("{}.jsonl", id.replace('/', "__")))
     }
 
-    /// Queue one fast check per touched feature of one governed pull
-    /// request, and hold the review until every one of them ends.
+    /// Queue the checks of one governed pull request at review admission,
+    /// and hold the review until every one of them ends.
     ///
-    /// The head worktree is the ground truth of a fast check, so the diff,
-    /// the tree hash, and every command read it. A repository with the
-    /// governor off, an unreadable worktree, and a diff that touches no
-    /// area with a fast command all queue nothing, and the review then runs
-    /// as it ran before the governor.
+    /// Three runs can hold the review. The fast check of every touched
+    /// feature runs on the head. The measurers of every touched area run
+    /// twice, once on the merge base and once on the head, and their
+    /// comparison lands as one comment on the theory record. The head
+    /// worktree is the ground truth, so the diff, the tree hash, and every
+    /// head command read it. A repository with the governor off, an
+    /// unreadable worktree, and a diff that touches no area all queue
+    /// nothing, and the review then runs as it ran before the governor.
     ///
     /// The answer says whether a run now holds the review. A held review
-    /// takes its body check when the last fast check ends; every other
-    /// review takes it at admission.
+    /// takes its body check when the last run ends; every other review
+    /// takes it at admission.
     fn start_fast_checks(&mut self, alias: &str, number: u64, review_task: &str) -> bool {
         let Some(repo_cfg) = self.config.repos.get(alias).cloned() else {
             return false;
         };
-        if !repo_cfg.theory.governor.is_on() || !self.has_fast_feature(alias) {
+        if !repo_cfg.theory.governor.is_on() {
+            return false;
+        }
+        // The comparison belongs to the head that produced it. This
+        // admission decides the next one, so the old text goes now, and a
+        // head that measures nothing renders no comparison at all.
+        self.measure_text.remove(review_task);
+        if !self.has_fast_feature(alias) && !self.has_measurer(alias) {
             return false;
         }
         let worktree = match self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number) {
             Ok(path) => path,
             Err(error) => {
-                eprintln!("the fast checks of {alias} pull request {number}: {error:#}");
+                eprintln!("the checks of {alias} pull request {number}: {error:#}");
                 return false;
             }
         };
-        let features = self.touched_features(alias, &repo_cfg.path, &worktree);
-        if features.is_empty() {
+        let areas = self.touched_areas(alias, &repo_cfg.path, &worktree);
+        let features = self.touched_features(alias, &areas);
+        let measurers = self.touched_measurers(alias, &areas, Mode::Pr);
+        if features.is_empty() && measurers.is_empty() {
             return false;
         }
+        let Some(head) = self.tree_hash(&worktree) else {
+            return false;
+        };
         // A remembered record without its task row can never be checked
         // against the table again, so it goes when the row goes.
         self.fast_results
             .retain(|id, _| self.table.by_id.contains_key(id));
-        let ids = self.queue_fast(alias, &RecordKey::Pr(number), &worktree, &features);
-        if ids.is_empty() {
+        let key = RecordKey::Pr(number);
+        let fast = self.queue_fast(alias, &key, &worktree, &head, &features);
+        let held_fast = !fast.is_empty();
+        if held_fast {
+            let mut run = FastRun::new(fast.into_iter().map(|slot| slot.id).collect());
+            for id in &run.tasks {
+                if let Some(record) = self.fast_results.get(id) {
+                    run.records.insert(id.clone(), record.clone());
+                }
+            }
+            self.fast_runs.insert(review_task.to_string(), run);
+        }
+        let held_measure =
+            self.start_measure_run(&repo_cfg, number, review_task, &worktree, &head, &measurers);
+        if !held_fast && !held_measure {
             return false;
         }
-        let mut run = FastRun::new(ids);
-        for id in &run.tasks {
-            if let Some(record) = self.fast_results.get(id) {
-                run.records.insert(id.clone(), record.clone());
-            }
+        // Every run of these trees may have ended already, and then the
+        // cached and remembered records decide now instead of at the next
+        // exit.
+        if held_fast {
+            self.finish_fast_run(review_task);
         }
-        self.fast_runs.insert(review_task.to_string(), run);
-        // Every check of this tree may have run already, and then the
-        // remembered records decide now instead of at the next exit.
-        self.finish_fast_run(review_task);
+        if held_measure {
+            self.finish_measure_run(review_task);
+        }
         true
+    }
+
+    /// Queue the base and head measure runs of one governed review.
+    ///
+    /// The merge base of the head is the "before" of requirement R25, so
+    /// the daemon cuts one detached worktree at that commit and runs the
+    /// same measurers there. A merge base the daemon cannot read, and a
+    /// base worktree it cannot cut, leave the base side empty, so every
+    /// head record reads `new` and the review still runs.
+    fn start_measure_run(
+        &mut self,
+        repo_cfg: &RepoConfig,
+        number: u64,
+        review_task: &str,
+        worktree: &Path,
+        head_tree: &str,
+        measurers: &[Measurer],
+    ) -> bool {
+        if measurers.is_empty() {
+            return false;
+        }
+        let alias = repo_cfg.alias.clone();
+        let key = RecordKey::Pr(number);
+        let head = self.queue_measure(&alias, &key, worktree, head_tree, measurers, Mode::Pr);
+        let base = self.base_slots(repo_cfg, &key, worktree, measurers);
+        if head.is_empty() && base.is_empty() {
+            return false;
+        }
+        self.measure_runs
+            .insert(review_task.to_string(), MeasureRun { base, head });
+        true
+    }
+
+    /// The measure slots of the merge base of one review.
+    fn base_slots(
+        &mut self,
+        repo_cfg: &RepoConfig,
+        key: &RecordKey,
+        worktree: &Path,
+        measurers: &[Measurer],
+    ) -> Vec<MeasureSlot> {
+        let alias = repo_cfg.alias.clone();
+        let Some(sha) = self.merge_base(&repo_cfg.path, worktree) else {
+            eprintln!("the base measure of {alias}: cannot read the merge base");
+            return Vec::new();
+        };
+        let path = match self.worktrees.ensure_detached(&*self.exec, repo_cfg, &sha) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("the base worktree of {alias} at {sha}: {error:#}");
+                return Vec::new();
+            }
+        };
+        let Some(tree) = self.tree_hash(&path) else {
+            return Vec::new();
+        };
+        self.queue_measure(&alias, key, &path, &tree, measurers, Mode::Pr)
+    }
+
+    /// The commit the head of one worktree branched from.
+    fn merge_base(&self, repo_path: &Path, worktree: &Path) -> Option<String> {
+        let base = self
+            .worktrees
+            .default_base(self.exec.as_ref(), repo_path)
+            .ok()?;
+        let out = worktree::git(
+            self.exec.as_ref(),
+            worktree,
+            &["merge-base", base.as_str(), "HEAD"],
+        )
+        .ok()?;
+        if out.status != 0 {
+            return None;
+        }
+        let sha = out.stdout.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     /// True when one repository has a feature that names a fast command.
@@ -7048,24 +7370,48 @@ impl Daemon {
             .is_some_and(|set| set.features.iter().any(|feature| feature.fast.is_some()))
     }
 
-    /// The features of every area the head diff touches, in area order.
-    ///
-    /// Only a feature with a fast command can become a check, and a
-    /// feature bound to two touched areas becomes one check.
-    fn touched_features(&self, alias: &str, repo_path: &Path, worktree: &Path) -> Vec<Feature> {
+    /// True when the verification map of one repository names a measurer.
+    fn has_measurer(&self, alias: &str) -> bool {
+        self.verify_map(alias)
+            .is_some_and(|map| !map.measurers.is_empty())
+    }
+
+    /// The parsed verification map of one repository, when it parsed.
+    fn verify_map(&self, alias: &str) -> Option<&VerifyMap> {
+        self.theory_models
+            .get(alias)
+            .and_then(|cache| cache.verify.as_ref().ok())
+    }
+
+    /// The areas of the verification map the head diff touches, in map
+    /// order.
+    fn touched_areas(&self, alias: &str, repo_path: &Path, worktree: &Path) -> Vec<String> {
         let Some(cache) = self.theory_models.get(alias) else {
             return Vec::new();
         };
         let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
             return Vec::new();
         };
+        let paths = self.diff_paths(repo_path, worktree);
+        let touched: Vec<&str> = paths.iter().map(String::as_str).collect();
+        map.areas_for_paths(model, &touched)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The features of `areas` that name a fast command, in area order.
+    ///
+    /// A feature bound to two touched areas becomes one check.
+    fn touched_features(&self, alias: &str, areas: &[String]) -> Vec<Feature> {
+        let Some(map) = self.verify_map(alias) else {
+            return Vec::new();
+        };
         let Some(Ok(set)) = self.theory_skills.get(alias).map(|cache| &cache.skills) else {
             return Vec::new();
         };
-        let paths = self.diff_paths(repo_path, worktree);
-        let touched: Vec<&str> = paths.iter().map(String::as_str).collect();
         let mut features: Vec<Feature> = Vec::new();
-        for area in map.areas_for_paths(model, &touched) {
+        for area in areas {
             for feature in skills::resolve(area, map, set) {
                 if feature.fast.is_some() && !features.iter().any(|seen| seen.id == feature.id) {
                     features.push(feature.clone());
@@ -7073,6 +7419,20 @@ impl Daemon {
             }
         }
         features
+    }
+
+    /// The measurers of `areas` that run in `mode`, in map order.
+    fn touched_measurers(&self, alias: &str, areas: &[String], mode: Mode) -> Vec<Measurer> {
+        let Some(map) = self.verify_map(alias) else {
+            return Vec::new();
+        };
+        map.measurers
+            .iter()
+            .filter(|measurer| {
+                measurer.mode == mode && areas.iter().any(|area| area == &measurer.area)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The paths the head of one worktree changes against the default base.
@@ -7105,14 +7465,37 @@ impl Daemon {
     /// `<aif-measure-v1>` comment on the theory record and the task ends
     /// `Done`, so a failing command opens no stuck row and spends no retry.
     fn finish_measure(&mut self, task: &Task, detail: &str) {
-        let job = self.measure_jobs.remove(&task.id);
-        let records = self.measure_records(task, job.as_ref(), script::exit_code(detail));
-        let key = match task.kind {
-            ItemKind::Issue => RecordKey::Issue(task.number),
-            ItemKind::Pr => RecordKey::Pr(task.number),
-        };
-        if let Err(error) = self.post_record_comment(&task.repo, &key, &measure::block(&records)) {
-            eprintln!("the measure records of {}: {error:#}", task.id);
+        let job = self.measure_jobs.get(&task.id).cloned();
+        let code = script::exit_code(detail);
+        let records = self.measure_records(task, job.as_ref(), code);
+        // Only a clean run earns a cache entry. A timeout and a crash are
+        // facts of one run, not of the tree it ran on.
+        if let (Some(path), Some(0)) = (job.and_then(|job| job.cache), code) {
+            if let Err(error) = measure::write_cache(&path, &records) {
+                eprintln!("the measure cache of {}: {error:#}", task.id);
+            }
+        }
+        // A fast check posts its own exit record. A measurer reports
+        // through the comparison of its whole batch, so a measurer whose
+        // batch is gone, a superseded head for example, drops its records
+        // instead of commenting on a head nobody reviews.
+        let fast = measure::fast_feature(&task.id).is_some();
+        let batched = self.measure_runs.values().any(|run| run.holds(&task.id));
+        if fast {
+            let key = match task.kind {
+                ItemKind::Issue => RecordKey::Issue(task.number),
+                ItemKind::Pr => RecordKey::Pr(task.number),
+            };
+            if let Err(error) =
+                self.post_record_comment(&task.repo, &key, &measure::block(&records))
+            {
+                eprintln!("the measure records of {}: {error:#}", task.id);
+            }
+        } else if !batched {
+            eprintln!(
+                "the measure records of {}: no review waits for them, so they are dropped",
+                task.id
+            );
         }
         if let Err(error) = self
             .table
@@ -7120,12 +7503,103 @@ impl Daemon {
         {
             eprintln!("task {}: {error:#}", task.id);
         }
+        self.measure_jobs.remove(&task.id);
         self.changed = true;
-        if measure::fast_feature(&task.id).is_some() {
+        if batched {
+            self.settle_measure_run(&task.id, records.clone());
+        }
+        if fast {
             if let Some(record) = records.first().cloned() {
                 self.settle_fast_run(&task.id, record);
             }
         }
+    }
+
+    /// Release one aborted measure task from the review that waits for it.
+    ///
+    /// An abort produces no exit, so nothing else would settle the run and
+    /// the review would wait for a task that is gone. A measurer settles
+    /// as one incomparable record, because an abort is a reason the
+    /// comparison can print. A fast check leaves the wait list instead,
+    /// because an abort is neither a pass nor a failure of the check.
+    fn release_measure_task(&mut self, task: &Task) {
+        if task.purpose != TaskPurpose::Measure {
+            return;
+        }
+        let job = self.measure_jobs.remove(&task.id);
+        if self.measure_runs.values().any(|run| run.holds(&task.id)) {
+            let id = job.map_or(String::new(), |job| job.record);
+            let record = Record::incomparable(&id, MEASURE_ABORTED);
+            self.settle_measure_run(&task.id, vec![record]);
+            return;
+        }
+        let Some(review) = self
+            .fast_runs
+            .iter_mut()
+            .find(|(_, run)| run.tasks.iter().any(|id| id == &task.id))
+            .map(|(review, run)| {
+                run.drop_task(&task.id);
+                review.clone()
+            })
+        else {
+            return;
+        };
+        self.fast_results.remove(&task.id);
+        self.finish_fast_run(&review);
+    }
+
+    /// Store the records of one finished measure run, and act when the
+    /// last run of a review ends.
+    fn settle_measure_run(&mut self, task: &str, records: Vec<Record>) {
+        let Some(review) = self
+            .measure_runs
+            .iter_mut()
+            .find(|(_, run)| run.holds(task))
+            .map(|(review, run)| {
+                run.settle(task, records);
+                review.clone()
+            })
+        else {
+            return;
+        };
+        self.finish_measure_run(&review);
+    }
+
+    /// Act on one measure run once the base and the head both reported.
+    ///
+    /// The comparison posts as one `<aif-measure-v1>` comment on the
+    /// theory record of the pull request, and its agent text fills
+    /// `{comparison}` of the review prompt. A review that no fast run
+    /// holds any more then takes its body check, the last gate before the
+    /// dispatch.
+    fn finish_measure_run(&mut self, review: &str) {
+        let Some(run) = self.measure_runs.get(review) else {
+            return;
+        };
+        if !run.finished() {
+            return;
+        }
+        let areas = run.report();
+        self.measure_runs.remove(review);
+        let Some(task) = self.table.by_id.get(review).cloned() else {
+            return;
+        };
+        self.measure_text
+            .insert(review.to_string(), measure::agent_text(&areas));
+        if let Err(error) = self.post_record_comment(
+            &task.repo,
+            &RecordKey::Pr(task.number),
+            &measure::comparison_block(&areas),
+        ) {
+            eprintln!("the measure comparison of {review}: {error:#}");
+        }
+        // The operator can abort the review while its runs still work. A
+        // review that already ended takes no body check, and a review a
+        // fast run still holds takes it when that run ends.
+        if task.state.is_terminal() || self.fast_runs.contains_key(review) {
+            return;
+        }
+        self.check_pr_body(&task.repo, task.number, review);
     }
 
     /// The records of one finished measure run.
@@ -7214,9 +7688,12 @@ impl Daemon {
             return;
         }
         let Some(failure) = failure else {
-            // Every check reported 0, so the body check is the last gate
-            // before the review dispatches.
-            self.check_pr_body(&task.repo, task.number, review);
+            // Every check reported 0. A measure run that still holds the
+            // review decides at its own last exit; else the body check is
+            // the last gate before the review dispatches.
+            if !self.measure_runs.contains_key(review) {
+                self.check_pr_body(&task.repo, task.number, review);
+            }
             return;
         };
         let exit = failure.value.unwrap_or_default().round() as i64;
@@ -8065,29 +8542,26 @@ impl Daemon {
 
     /// The directory the agent writes the run skill of `surface` into.
     ///
-    /// In code mode it is relative to the code worktree, so the skill lands
-    /// in the pull request of the ticket. In shadow mode it is the absolute
-    /// path inside the skills worktree of ticket `number`, so the code
-    /// repository never holds a skill file.
+    /// In code mode it is the absolute path inside the issue worktree of
+    /// ticket `number`, so the path is the one the implement task runs in
+    /// and the daemon reads the written files back from it. In shadow mode
+    /// it is the absolute path inside the skills worktree of ticket
+    /// `number`, so the code repository never holds a skill file.
     fn skills_dir(&self, repo: &RepoConfig, surface: &str, number: u64) -> String {
         let leaf = format!(".claude/skills/run-{surface}/");
-        match repo.theory_repo() {
-            None => leaf,
-            Some(_) => format!(
-                "{}/{leaf}",
-                self.worktrees.skills_path(repo, number).display()
-            ),
-        }
+        let root = match repo.theory_repo() {
+            None => self.worktrees.issue_path(repo, number),
+            Some(_) => self.worktrees.skills_path(repo, number),
+        };
+        format!("{}/{leaf}", root.display())
     }
 
-    /// What one shadow-mode run skill implement task writes to the theory
-    /// repository.
+    /// The verify-skill issue one task drives, and its surface.
     ///
     /// The answer is `None` for every other task: another stage, another
-    /// purpose, a repository with the governor off, a repository in code
-    /// mode, a ticket without `verify-skill`, or a title that names no
-    /// surface.
-    fn skill_target(&self, task: &Task, repo: &RepoConfig) -> Option<SkillTarget> {
+    /// kind, another purpose, a repository with the governor off, a ticket
+    /// without `verify-skill`, or a title that names no surface.
+    fn verify_skill_item(&self, task: &Task, repo: &RepoConfig) -> Option<(&Issue, String)> {
         if task.stage != Stage::Implement
             || task.kind != ItemKind::Issue
             || task.purpose != TaskPurpose::Pipeline
@@ -8095,7 +8569,6 @@ impl Daemon {
         {
             return None;
         }
-        let theory_repo = repo.theory_repo()?;
         let issue = self
             .snapshot
             .repos
@@ -8105,11 +8578,65 @@ impl Daemon {
         if !issue.labels.iter().any(|label| label == VERIFY_SKILL_LABEL) {
             return None;
         }
+        Some((issue, skills::ticket_surface(&issue.title)?.to_string()))
+    }
+
+    /// What one shadow-mode run skill implement task writes to the theory
+    /// repository.
+    ///
+    /// The answer is `None` outside shadow mode, because the theory
+    /// repository is where the skill pull request goes.
+    fn skill_target(&self, task: &Task, repo: &RepoConfig) -> Option<SkillTarget> {
+        let theory_repo = repo.theory_repo()?;
+        let (issue, surface) = self.verify_skill_item(task, repo)?;
         Some(SkillTarget {
             theory_repo: theory_repo.to_string(),
-            surface: skills::ticket_surface(&issue.title)?.to_string(),
+            surface,
             title: issue.title.clone(),
         })
+    }
+
+    /// Hold a finished verify-skill implement task whose `SKILL.md` still
+    /// holds a template placeholder.
+    ///
+    /// Design section 4.2: a placeholder left in any section fails the
+    /// setup ticket. The daemon posts the finding on the ticket and
+    /// re-queues the implement task, so the agent gets another attempt
+    /// before any skills pull request opens. A missing or unparseable
+    /// `SKILL.md` holds nothing: its findings reach the operator through
+    /// the doctor and the AREAS panel instead.
+    fn hold_skill_implement(&mut self, task: &Task) -> bool {
+        let Some(repo_cfg) = self.config.repos.get(&task.repo).cloned() else {
+            return false;
+        };
+        let Some((_, surface)) = self.verify_skill_item(task, &repo_cfg) else {
+            return false;
+        };
+        let path = format!(
+            "{}SKILL.md",
+            self.skills_dir(&repo_cfg, &surface, task.number)
+        );
+        let Ok(text) = fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(skill) = skills::parse_skill(
+            &format!("{}run-{surface}/SKILL.md", skills::SKILLS_DIR),
+            &text,
+        ) else {
+            return false;
+        };
+        let Some(finding) = skills::placeholder_findings(&skill).into_iter().next() else {
+            return false;
+        };
+        eprintln!("the run skill of {}: {finding}", task.id);
+        if let Err(error) =
+            self.post_issue_comment(&repo_cfg, task.number, &format!("skill: {finding}"))
+        {
+            eprintln!("the skill finding of {}: {error:#}", task.id);
+        }
+        self.append_task_log(task, &format!("aif: {finding}\n"));
+        self.fail_run(task, &finding.to_string());
+        true
     }
 
     /// Cut the skills worktree of one run skill ticket before its implement
@@ -8348,13 +8875,14 @@ impl Daemon {
                 return;
             }
         };
-        let (kind, message) = match self.push_model_worktree(&repo) {
-            Ok(outcome) => (
-                TicketResultKind::Success,
-                Self::model_push_message(alias, outcome),
-            ),
-            Err(error) => (TicketResultKind::Failure, format!("{error:#}")),
-        };
+        let (kind, message) =
+            match self.push_model_worktree(&repo, MODEL_FILE, MODEL_COMMIT_MESSAGE) {
+                Ok(outcome) => (
+                    TicketResultKind::Success,
+                    Self::model_push_message(alias, outcome),
+                ),
+                Err(error) => (TicketResultKind::Failure, format!("{error:#}")),
+            };
         self.report_model(alias, kind, message);
     }
 
@@ -8382,7 +8910,15 @@ impl Daemon {
     ///
     /// The branch comes from the worktree itself, so the answer matches the
     /// branch the operator just edited, whatever GitHub reports meanwhile.
-    fn push_model_worktree(&self, repo: &RepoConfig) -> Result<PushOutcome> {
+    /// `file` is the one theory file the commit carries, and `message` is
+    /// its commit message. One model pull request carries both the model
+    /// edits of the operator and the rules of the ladder.
+    fn push_model_worktree(
+        &self,
+        repo: &RepoConfig,
+        file: &str,
+        message: &str,
+    ) -> Result<PushOutcome> {
         let worktree = self.worktrees.model_path(repo);
         let branch = self.worktrees.current_branch(&*self.exec, &worktree)?;
         let title = format!("Update the model of {}", repo.alias);
@@ -8390,8 +8926,8 @@ impl Daemon {
         self.push_worktree(&WorktreePush {
             worktree: &worktree,
             branch: &branch,
-            add: &["add", MODEL_FILE],
-            message: MODEL_COMMIT_MESSAGE,
+            add: &["add", file],
+            message,
             owner_repo: model_repo(repo),
             title: &title,
             body: &body,
@@ -8555,6 +9091,7 @@ impl Daemon {
             } else {
                 self.remove_task_session_marker(task);
             }
+            self.release_measure_task(task);
         }
     }
 
@@ -9304,7 +9841,7 @@ impl Daemon {
         model::parse(&merged).map_err(|error| format!("{MODEL_FILE}: {error}"))?;
         fs::write(&file, &merged)
             .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
-        self.push_model_worktree(&repo)
+        self.push_model_worktree(&repo, MODEL_FILE, MODEL_COMMIT_MESSAGE)
             .map(|outcome| Self::model_push_message(alias, outcome))
             .map_err(|error| format!("{error:#}"))
     }
@@ -9432,6 +9969,11 @@ impl Daemon {
 
     /// The working directory of a task's run.
     fn task_cwd(&self, id: &str) -> Option<PathBuf> {
+        // A measure run names its own directory, because the base run of
+        // one review reads a worktree the item does not own.
+        if let Some(job) = self.measure_jobs.get(id) {
+            return Some(job.cwd.clone());
+        }
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
         Some(match self.workspace(task) {
@@ -9898,6 +10440,30 @@ impl Daemon {
         } else {
             (String::new(), String::new(), String::new())
         };
+        // The comparison of the measurers of a governed review, as the
+        // last measure run of that review left it. A review with no
+        // measure run, and every implement run, read the word for an
+        // empty comparison.
+        let comparison = match (repo_cfg.theory.governor.is_on(), task.stage) {
+            (false, _) => String::new(),
+            (true, Stage::Review) => self
+                .measure_text
+                .get(&task.id)
+                .cloned()
+                .unwrap_or_else(|| measure::agent_text(&[])),
+            (true, Stage::Implement) => measure::agent_text(&[]),
+            (true, _) => String::new(),
+        };
+        // The rules of a governed repository come from the cache, so the
+        // prompt costs no git call of its own.
+        let rules = if repo_cfg.theory.governor.is_on() {
+            self.theory_models
+                .get(&task.repo)
+                .map(|cache| cache.rules.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         // Only a shadow-mode repository fills `{why_rule}`, because only
         // there does the code pull request hide the model.
         let why_rule = match repo_cfg.theory_repo() {
@@ -9930,10 +10496,9 @@ impl Daemon {
             ("pr_count", pr_count),
             ("model", model_text),
             ("prediction", prediction_text),
-            // The comparison arrives with the delta of C12.
-            ("comparison", String::new()),
+            ("comparison", comparison),
             ("skills", skills_text),
-            ("rules", String::new()),
+            ("rules", rules),
             ("why_rule", why_rule),
             ("finding", finding),
             ("label_to_refine", names.to_refine.clone()),
@@ -15438,8 +16003,11 @@ mod tests {
     #[test]
     fn the_setup_action_creates_the_run_skill_ticket_with_both_labels() {
         let (tx, rx) = mpsc::channel();
+        // The code-mode body differs between the number 0 provisional
+        // fill and the number 12 fill, so the daemon patches the body.
         let steps = vec![
             verify_skill_label_step(),
+            skill_issue_step("Create the run skill for borsuk/web", 12),
             skill_issue_step("Create the run skill for borsuk/web", 12),
         ];
         let mut rig = Rig::make_with(steps, governed);
@@ -15470,6 +16038,26 @@ mod tests {
             body.contains("6. Prove it once end to end."),
             "step 6 must ask for the proof: {body}"
         );
+
+        // The patched body names the issue worktree the implement task
+        // will run in, not a relative leaf.
+        let patch = rig
+            .exec
+            .calls()
+            .into_iter()
+            .find(|call| call.program == "gh" && call.args.get(3) == Some(&"PATCH".to_string()))
+            .expect("one update_issue call");
+        let root = rig.repo.parent().expect("the repo sits in the rig root");
+        let expected = issue_wt(root, 12)
+            .join(".claude/skills/run-web/")
+            .to_string_lossy()
+            .into_owned();
+        let patched = issue_body(&patch);
+        assert!(
+            patched.contains(&expected),
+            "the patched body must hold the issue worktree path: {patched}"
+        );
+        assert!(!patched.contains("{skills_dir}"), "no placeholder survives");
 
         let Push::TicketResult(result) = rx.try_recv().unwrap() else {
             panic!("the setup action must push one ticket result");
@@ -15868,6 +16456,82 @@ mod tests {
     }
 
     #[test]
+    fn a_setup_implement_exit_with_a_placeholder_requeues_and_opens_no_pull_request() {
+        let dir = temp_root();
+        let comment_url = "repos/acme/borsuk/issues/42/comments";
+        let finding = "skill: SKILL.md: section Run holds a placeholder";
+        let body_field = format!("body={finding}");
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 42), 42, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_skills_steps(&dir, 42))
+                .chain(vec![gh_step(
+                    &["api", "-X", "POST", comment_url, "-f", body_field.as_str()],
+                    CmdOut::ok(""),
+                )])
+                .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, shadow_governed);
+        let mut ticket = issue(42, &["refined", VERIFY_SKILL_LABEL]);
+        ticket.title = SkillTicket::Setup.title("borsuk", "web");
+
+        rig.poll(vec![ticket], vec![]);
+        assert_eq!(rig.job(0).task, "borsuk/implement-i42");
+
+        // The agent wrote a skill whose Run section still holds the
+        // template placeholder.
+        let skill = run_skill("browser").replace("npm run dev", "npm run dev on port <port>");
+        let surface = skills_wt(&dir, 42)
+            .join(".claude")
+            .join("skills")
+            .join("run-web");
+        fs::create_dir_all(&surface).expect("the skill directory must be creatable");
+        fs::write(surface.join("SKILL.md"), skill).expect("the skill file must be writable");
+
+        // The pause keeps the re-queued task parked, so the test sees the
+        // requeue instead of the next attempt's dispatch.
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/implement-i42".to_string(),
+            },
+            paused: true,
+        });
+        rig.event(exited("borsuk/implement-i42", true, ""));
+
+        let task = rig.task("borsuk/implement-i42");
+        assert_eq!(task.state, TaskState::Queued, "the hold requeues the task");
+        assert_eq!(task.attempt, 2, "the hold spends one attempt");
+
+        // The finding lands on the ticket, and no other write reaches
+        // GitHub: no label edit and no skills pull request. The reads of
+        // the shadow theory repository are not writes.
+        let gh_writes: Vec<Call> = rig
+            .exec
+            .calls()
+            .into_iter()
+            .filter(|call| call.program == "gh" && !call.args.contains(&"GET".to_string()))
+            .collect();
+        assert_eq!(gh_writes.len(), 1, "calls were: {:?}", gh_writes);
+        assert_eq!(
+            gh_writes[0].args,
+            vec![
+                "api".to_string(),
+                "-X".to_string(),
+                "POST".to_string(),
+                comment_url.to_string(),
+                "-f".to_string(),
+                body_field,
+            ]
+        );
+
+        // No worktree is committed or pushed.
+        assert!(
+            !rig.exec.calls().iter().any(|call| call.program == "git"
+                && call.args.iter().any(|arg| arg == "commit" || arg == "push")),
+            "the hold must leave every worktree uncommitted"
+        );
+    }
+
+    #[test]
     fn a_skills_worktree_with_nothing_staged_commits_nothing() {
         let dir = temp_root();
         let worktree = skills_wt(&dir, 42);
@@ -15996,6 +16660,24 @@ mod tests {
     /// `open_prs` is the `gh pr list --head` answer, so an open model pull
     /// request stops the create step.
     fn model_commit_steps(dir: &Path, owner_repo: &str, open_prs: &str) -> Vec<Step> {
+        push_model_steps(
+            dir,
+            owner_repo,
+            open_prs,
+            "theory/model.toml",
+            "Update the model",
+        )
+    }
+
+    /// The commit, push, and pull request calls of one model branch edit
+    /// that stages `file` under the commit message `message`.
+    fn push_model_steps(
+        dir: &Path,
+        owner_repo: &str,
+        open_prs: &str,
+        file: &str,
+        message: &str,
+    ) -> Vec<Step> {
         let worktree = model_wt(dir);
         let label_url = format!("repos/{owner_repo}/labels");
         vec![
@@ -16004,13 +16686,9 @@ mod tests {
                 &["rev-parse", "--abbrev-ref", "HEAD"],
                 CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
             ),
-            git_step(&worktree, &["add", "theory/model.toml"], CmdOut::ok("")),
+            git_step(&worktree, &["add", file], CmdOut::ok("")),
             git_step(&worktree, &["diff", "--cached", "--quiet"], refused()),
-            git_step(
-                &worktree,
-                &["commit", "-m", "Update the model"],
-                CmdOut::ok(""),
-            ),
+            git_step(&worktree, &["commit", "-m", message], CmdOut::ok("")),
             git_step(
                 &worktree,
                 &["push", "-u", "origin", RIG_MODEL_BRANCH],
@@ -16189,7 +16867,10 @@ mod tests {
         let rig = Rig::make_in(dir.clone(), steps, governed);
         let repo = rig.daemon.config.repos["borsuk"].clone();
 
-        let outcome = rig.daemon.push_model_worktree(&repo).unwrap();
+        let outcome = rig
+            .daemon
+            .push_model_worktree(&repo, MODEL_FILE, MODEL_COMMIT_MESSAGE)
+            .unwrap();
 
         assert_eq!(outcome, PushOutcome::Pushed(Some(9)));
         let calls = rig.exec.calls();
@@ -23673,6 +24354,12 @@ mod tests {
 
     /// The git steps of one governed theory read with the given features.
     fn fast_theory_steps_with(repo: &Path, checkout: &str, orders: &str) -> Vec<Step> {
+        theory_read_steps(repo, THEORY_VERIFY, checkout, orders)
+    }
+
+    /// The git steps of one governed theory read with the given map and
+    /// features.
+    fn theory_read_steps(repo: &Path, verify: &str, checkout: &str, orders: &str) -> Vec<Step> {
         vec![
             git_step(
                 repo,
@@ -23692,7 +24379,7 @@ mod tests {
             git_step(
                 repo,
                 &["show", "ccc333:theory/verify.toml"],
-                CmdOut::ok(THEORY_VERIFY),
+                CmdOut::ok(verify.to_string()),
             ),
             git_step(
                 repo,
@@ -23782,6 +24469,38 @@ mod tests {
         ]
     }
 
+    /// The three scripted calls one tree hash runs, through the
+    /// temporary index of the state directory.
+    fn tree_hash_steps(dir: &Path, worktree: &Path, tree: &str) -> Vec<Step> {
+        let index = dir
+            .join("state")
+            .join(measure::MEASURE_DIR)
+            .join(format!("tmp-index-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        [
+            (vec!["read-tree", "HEAD"], CmdOut::ok("")),
+            (vec!["add", "-A"], CmdOut::ok("")),
+            (vec!["write-tree"], CmdOut::ok(format!("{tree}\n"))),
+        ]
+        .into_iter()
+        .map(|(args, out)| {
+            let mut full = vec![
+                index.clone(),
+                "git".to_string(),
+                "-C".to_string(),
+                worktree.to_string_lossy().into_owned(),
+            ];
+            full[0] = format!("GIT_INDEX_FILE={index}");
+            full.extend(args.iter().map(|arg| (*arg).to_string()));
+            (
+                Box::new(move |call: &Call| call.program == "env" && call.args == full) as _,
+                out,
+            )
+        })
+        .collect()
+    }
+
     /// The git steps the body check of one governed review runs once the
     /// head worktree exists: the reuse and the diff against the base.
     fn body_reuse_steps(
@@ -23814,6 +24533,7 @@ mod tests {
         gitdir: &Path,
         diff: &str,
     ) -> Vec<Step> {
+        let dir = repo.parent().unwrap();
         let mut steps = fast_pr_worktree_steps(repo, worktree, number, gitdir);
         steps.push(git_step(
             repo,
@@ -23825,11 +24545,7 @@ mod tests {
             &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
             CmdOut::ok(format!("{diff}\n")),
         ));
-        steps.push(git_step(
-            worktree,
-            &["rev-parse", "HEAD^{tree}"],
-            CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-        ));
+        steps.extend(tree_hash_steps(dir, worktree, FAST_TREE_SHA));
         steps
     }
 
@@ -23841,6 +24557,7 @@ mod tests {
         gitdir: &Path,
         diff: &str,
     ) -> Vec<Step> {
+        let dir = repo.parent().unwrap();
         let mut steps = reuse_pr_steps(repo, worktree, number, gitdir);
         steps.push(git_step(
             repo,
@@ -23852,12 +24569,149 @@ mod tests {
             &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
             CmdOut::ok(format!("{diff}\n")),
         ));
-        steps.push(git_step(
-            worktree,
-            &["rev-parse", "HEAD^{tree}"],
-            CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-        ));
+        steps.extend(tree_hash_steps(dir, worktree, FAST_TREE_SHA));
         steps
+    }
+
+    /// The verification map of the measure tests: one measurer on the
+    /// area the `web/**` boundary owns.
+    const MEASURE_VERIFY: &str = concat!(
+        "[[area]]\nid = \"web-checkout\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the cart pays\"\n",
+        "[[area.measurer]]\nid = \"poll_p95\"\ncommand = \"aif bench\"\n",
+        "mode = \"pr\"\ntimeout_s = 30\n",
+        "[[area]]\nid = \"api-orders\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the order lands\"\n",
+    );
+
+    /// The merge base of the measure tests.
+    const BASE_SHA: &str = "bbb22211223344556677889900aabbccddeeff11";
+
+    /// The tree of the merge base worktree.
+    const BASE_TREE_SHA: &str = "99887766554433221100ffeeddccbbaa99887766";
+
+    /// The first eight characters of [`BASE_TREE_SHA`].
+    const BASE_TREE: &str = "99887766";
+
+    /// The tree of a second head of the measure tests.
+    const NEXT_TREE_SHA: &str = "5566778899aabbccddeeff00112233445566778899";
+
+    /// The first eight characters of [`NEXT_TREE_SHA`].
+    const NEXT_TREE: &str = "55667788";
+
+    /// The base worktree path of one merge base inside a rig root.
+    fn base_wt(dir: &Path, sha: &str) -> PathBuf {
+        dir.join("state")
+            .join("worktrees")
+            .join("borsuk")
+            .join(format!("base-{}", &sha[..8]))
+    }
+
+    /// The git steps of one governed theory read whose map carries one
+    /// measurer and whose features name no fast command.
+    fn measure_theory_steps(repo: &Path) -> Vec<Step> {
+        theory_read_steps(
+            repo,
+            MEASURE_VERIFY,
+            &feature_file_without_fast("web-checkout"),
+            &feature_file_without_fast("api-orders"),
+        )
+    }
+
+    /// The git steps the base side of one measure run adds: the merge
+    /// base, a fresh detached worktree at it, and its tree hash.
+    fn fresh_base_steps(dir: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let base = base_wt(dir, BASE_SHA);
+        let base_text = base.to_string_lossy().into_owned();
+        let mut steps = vec![
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                worktree,
+                &["merge-base", "refs/remotes/origin/main", "HEAD"],
+                CmdOut::ok(format!("{BASE_SHA}\n")),
+            ),
+            git_step(&repo, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                &repo,
+                &["worktree", "add", "--detach", base_text.as_str(), BASE_SHA],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(&base, gitdir),
+        ];
+        steps.extend(tree_hash_steps(dir, &base, BASE_TREE_SHA));
+        steps
+    }
+
+    /// The git steps the base side adds once the base worktree stands.
+    fn reuse_base_steps(dir: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let base = base_wt(dir, BASE_SHA);
+        let listed = format!("worktree {}\n", base.display());
+        let mut steps = vec![
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                worktree,
+                &["merge-base", "refs/remotes/origin/main", "HEAD"],
+                CmdOut::ok(format!("{BASE_SHA}\n")),
+            ),
+            git_step(
+                &repo,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(listed),
+            ),
+            common_dir_step(&base, gitdir),
+        ];
+        steps.extend(tree_hash_steps(dir, &base, BASE_TREE_SHA));
+        steps
+    }
+
+    /// One measurer line, as the command prints it.
+    fn measure_line(value: u32) -> String {
+        format!("{{\"id\":\"poll_p95\",\"value\":{value},\"unit\":\"ms\",\"direction\":\"lower\"}}")
+    }
+
+    /// Write the stdout of one measure task into its log file.
+    fn write_measure_log(rig: &Rig, task: &str, value: u32) {
+        let path = rig.task(task).log_path;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{}\n", measure_line(value))).unwrap();
+    }
+
+    /// A measure run that waits for `task` in the area of the fixture,
+    /// and for one slot that never reports, so the batch stays open and
+    /// the settled records stay readable.
+    fn open_run(task: &str) -> MeasureRun {
+        MeasureRun {
+            base: vec![MeasureSlot {
+                id: "borsuk/measure-00000000-web-checkout-poll_p95".to_string(),
+                area: "web-checkout".to_string(),
+                records: None,
+            }],
+            head: vec![MeasureSlot {
+                id: task.to_string(),
+                area: "web-checkout".to_string(),
+                records: None,
+            }],
+        }
+    }
+
+    /// The records one open run settled for `task`.
+    fn settled(rig: &Rig, review: &str, task: &str) -> Vec<Record> {
+        rig.daemon.measure_runs[review]
+            .head
+            .iter()
+            .find(|slot| slot.id == task)
+            .and_then(|slot| slot.records.clone())
+            .expect("the run settled the task")
     }
 
     /// One `gh api` comment step on the theory record of pull request 7.
@@ -24230,6 +25084,7 @@ mod tests {
                 &["show", "ccc333:theory/verify.toml"],
                 CmdOut::ok(FLOOR_VERIFY),
             ),
+            rules_step(repo, "ccc333", refused()),
             git_step(
                 repo,
                 &["ls-tree", "-r", "--name-only", "ccc333", SKILLS_DIR],
@@ -25136,9 +25991,16 @@ mod tests {
         steps.push(answer_comment_step(
             Cause::Recall,
             "T-pay",
-            3,
+            1,
             "behaviours",
             0,
+        ));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step(
+            "Eliminate: T-pay \u{2014} Which entry is wrong?",
+            "Record pr-7. Slot behaviours. Entry T-pay.\n\nWhich entry is wrong?",
+            "ladder-1",
+            81,
         ));
         steps.extend(cached_theory_steps(&repo));
         steps.push(answer_comment_step(
@@ -25147,6 +26009,13 @@ mod tests {
             1,
             "invariants",
             0,
+        ));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step(
+            "Eliminate: INV-3 \u{2014} Which entry is wrong?",
+            "Record pr-7. Slot invariants. Entry INV-3.\n\nWhich entry is wrong?",
+            "ladder-1",
+            82,
         ));
         steps.extend(cached_theory_steps(&repo));
         steps.push(remove_label_step(DELTA_OPEN_LABEL));
@@ -25179,7 +26048,7 @@ mod tests {
             "theory:borsuk:p7:behaviours",
             Cause::Recall,
             "T-pay",
-            3,
+            1,
         ));
         rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
 
@@ -25215,6 +26084,13 @@ mod tests {
         steps.push(answer_comment_step(Cause::Pr, "INV-3", 2, "invariants", 0));
         steps.push(record_comment_step(
             "the pull request broke INV-3: Which entry is wrong?",
+        ));
+        steps.push(ladder_label_step("ladder-2"));
+        steps.push(ladder_issue_step(
+            "Measure: web-checkout \u{2014} INV-3",
+            "Which entry is wrong?",
+            "ladder-2",
+            83,
         ));
         let mut rig = Rig::make_in(dir, steps, |config| {
             governed(config);
@@ -25273,6 +26149,7 @@ mod tests {
             "violation:INV-3",
             T0,
         ));
+        steps.extend(measure_ticket_steps(84));
         steps.extend(cached_theory_steps(&repo));
         steps.extend(model_log_step(&repo, T0, ""));
         steps.extend(cached_theory_steps(&repo));
@@ -25335,6 +26212,7 @@ mod tests {
             "violation:INV-3",
             T0,
         ));
+        steps.extend(measure_ticket_steps(85));
         steps.extend(cached_theory_steps(&repo));
         steps.extend(model_log_step(
             &repo,
@@ -25385,6 +26263,16 @@ mod tests {
         steps.push(shadow_comment_step(
             SHADOW_ROOT,
             &answers::answer_block(&answer),
+        ));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step(
+            "Eliminate: B-checkout \u{2014} INV-9 names a path the code removed",
+            concat!(
+                "Record repo. Slot event:0. Entry B-checkout.\n\n",
+                "INV-9 names a path the code removed"
+            ),
+            "ladder-1",
+            86,
         ));
         steps.extend(cached_theory_steps(&repo));
         steps.push(gh_step(
@@ -25506,6 +26394,13 @@ mod tests {
             "event:0",
             0,
         ));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step(
+            "Eliminate: B-checkout \u{2014} the area asks for a higher tier",
+            "Record pr-7. Slot event:0. Entry B-checkout.\n\nthe area asks for a higher tier",
+            "ladder-1",
+            87,
+        ));
         steps.extend(cached_theory_steps(&repo));
         steps.push(remove_label_step(EVENT_OPEN_LABEL));
         let mut rig = Rig::make_in(dir, steps, governed);
@@ -25541,6 +26436,641 @@ mod tests {
 
         assert_eq!(label_delete_calls(&rig, EVENT_OPEN_LABEL), 1);
         assert!(theory_row_ids(&rig).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // C32: the ladder
+    // ------------------------------------------------------------------
+
+    /// Noon on the day the ladder tests date their rule.
+    const LADDER_NOW: u64 = 1_789_128_000_000;
+
+    /// The `create_label` step of one ladder label.
+    fn ladder_label_step(label: &str) -> Step {
+        let name = format!("name={label}");
+        let body = format!("{{\"name\":\"{label}\",\"color\":\"006b75\"}}");
+        gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/labels",
+                "-f",
+                name.as_str(),
+                "-f",
+                "color=006b75",
+            ],
+            CmdOut::ok(format!("HTTP/2 201\r\n\r\n{body}")),
+        )
+    }
+
+    /// The `create_issue` step of one ladder ticket.
+    ///
+    /// The step pins the title, the body, and both labels, in the order
+    /// `create_issue` sends them.
+    fn ladder_issue_step(title: &str, body: &str, rung_label: &str, number: u64) -> Step {
+        ladder_issue_step_named(title, body, "to-refine", rung_label, number)
+    }
+
+    /// The `create_issue` step of one ladder ticket whose repository
+    /// renamed `to-refine`.
+    fn ladder_issue_step_named(
+        title: &str,
+        body: &str,
+        refine_label: &str,
+        rung_label: &str,
+        number: u64,
+    ) -> Step {
+        let title_field = format!("title={title}");
+        let body_field = format!("body={body}");
+        let refine_field = format!("labels[]={refine_label}");
+        let rung_field = format!("labels[]={rung_label}");
+        let created = json!({
+            "number": number,
+            "node_id": format!("node-{number}"),
+            "title": title,
+            "body": body,
+            "state": "open",
+            "labels": [{"name": refine_label}, {"name": rung_label}],
+            "user": {"login": "piotr"},
+            "assignees": [],
+            "updated_at": "2026-09-11T12:00:00Z",
+            "html_url": format!("https://github.com/acme/borsuk/issues/{number}")
+        })
+        .to_string();
+        gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                title_field.as_str(),
+                "-f",
+                body_field.as_str(),
+                "-f",
+                refine_field.as_str(),
+                "-f",
+                rung_field.as_str(),
+            ],
+            CmdOut::ok(format!("HTTP/2 201\r\n\r\n{created}")),
+        )
+    }
+
+    /// The label and ticket steps of one rung 2 answer of the violation
+    /// row of the delta tests.
+    fn measure_ticket_steps(number: u64) -> Vec<Step> {
+        vec![
+            ladder_label_step("ladder-2"),
+            ladder_issue_step(
+                "Measure: web-checkout \u{2014} INV-3",
+                "the retry crosses the boundary",
+                "ladder-2",
+                number,
+            ),
+        ]
+    }
+
+    /// One answer of the row `slot`, with an area and a note.
+    fn noted_answer(entry: &str, rung: u8, area: &str, note: &str, slot: &str) -> AnswerBlock {
+        AnswerBlock {
+            cause: Cause::Recall,
+            entry: entry.to_string(),
+            rung,
+            area: area.to_string(),
+            note: note.to_string(),
+            slot: slot.to_string(),
+            answered_ms: 0,
+        }
+    }
+
+    /// The action that sends one answer block.
+    fn send_answer(id: &str, answer: &AnswerBlock) -> Action {
+        Action::Answer {
+            decision_id: id.to_string(),
+            response: Response::Theory {
+                cause: answer.cause,
+                entry: answer.entry.clone(),
+                rung: answer.rung,
+                area: answer.area.clone(),
+                note: answer.note.clone(),
+            },
+        }
+    }
+
+    /// Rung 1 eliminates the class, so the daemon opens a ticket titled
+    /// after the entry and the question. The ticket carries the
+    /// configured `to-refine` name and `ladder-1`, and its body holds the
+    /// event text and the note.
+    #[test]
+    fn a_rung_one_answer_opens_the_eliminate_ticket_with_both_labels() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer(
+            "INV-3",
+            1,
+            "web-checkout",
+            "the retry needs a queue",
+            "invariants",
+        );
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step(
+            "Eliminate: INV-3 \u{2014} Which entry is wrong?",
+            concat!(
+                "Record pr-7. Slot invariants. Entry INV-3.\n\n",
+                "Which entry is wrong?\n\nthe retry needs a queue"
+            ),
+            "ladder-1",
+            77,
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:invariants", &answer));
+
+        assert_eq!(
+            issue_call(&rig).argv(),
+            vec![
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Eliminate: INV-3 \u{2014} Which entry is wrong?",
+                "-f",
+                concat!(
+                    "body=Record pr-7. Slot invariants. Entry INV-3.\n\n",
+                    "Which entry is wrong?\n\nthe retry needs a queue"
+                ),
+                "-f",
+                "labels[]=to-refine",
+                "-f",
+                "labels[]=ladder-1",
+            ]
+        );
+    }
+
+    /// Rung 2 asks for a measurer, so the ticket names the area of the
+    /// answer and the entry, and carries `ladder-2`.
+    #[test]
+    fn a_rung_two_answer_opens_the_measure_ticket_of_the_area() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(answer_comment_step(
+            Cause::Recall,
+            "INV-3",
+            2,
+            "invariants",
+            0,
+        ));
+        steps.push(ladder_label_step("ladder-2"));
+        steps.push(ladder_issue_step(
+            "Measure: web-checkout \u{2014} INV-3",
+            "Which entry is wrong?",
+            "ladder-2",
+            78,
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(theory_answer(
+            "theory:borsuk:p7:invariants",
+            Cause::Recall,
+            "INV-3",
+            2,
+        ));
+
+        assert_eq!(
+            issue_call(&rig).argv(),
+            vec![
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Measure: web-checkout \u{2014} INV-3",
+                "-f",
+                "body=Which entry is wrong?",
+                "-f",
+                "labels[]=to-refine",
+                "-f",
+                "labels[]=ladder-2",
+            ]
+        );
+    }
+
+    /// An entry that maps to no area leaves rung 2 no measurer to ask
+    /// for, so the daemon opens no ticket and creates no label.
+    #[test]
+    fn a_rung_two_answer_with_no_area_opens_no_ticket() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("INV-3", 2, "", "", "invariants");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:invariants", &answer));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg.contains("ladder-2"))),
+            "an answer with no area names no rung 2 label"
+        );
+    }
+
+    /// Rung 3 records a rule: the record takes `ladder-3`, the rule line
+    /// lands in the rule file of the model worktree, and the model pull
+    /// request opens with the commit `Add a rule`. The next poll reads
+    /// the file back, so the stage prompts carry the rule.
+    #[test]
+    fn a_rung_three_answer_labels_the_record_and_commits_the_rule() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer(
+            "T-pay",
+            3,
+            "web-checkout",
+            "name the token in the model",
+            "behaviours",
+        );
+        let rule = "- 2026-09-11 T-pay: name the token in the model";
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        steps.push(ladder_label_step("ladder-3"));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=ladder-3",
+            ],
+            gh_ok(),
+        ));
+        steps.push(model_derive_step("acme/borsuk", "[]"));
+        steps.extend(fresh_model_steps(&dir, &repo));
+        steps.extend(push_model_steps(
+            &dir,
+            "acme/borsuk",
+            "[]",
+            "theory/rules.md",
+            "Add a rule",
+        ));
+        // The next poll finds a moved commit, so it reads the theory
+        // files again and the rule reaches the prompt cache.
+        steps.extend(theory_steps_with_rules(
+            &repo,
+            "ddd444",
+            &run_skill("browser"),
+            CmdOut::ok(format!("{rule}\n")),
+        ));
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.set_now(LADDER_NOW);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &answer));
+
+        assert_eq!(
+            fs::read_to_string(model_wt(&dir).join("theory/rules.md")).unwrap(),
+            format!("{rule}\n"),
+            "the rule file carries the dated line"
+        );
+        let verbs: Vec<String> = rig
+            .exec
+            .calls()
+            .iter()
+            .filter_map(|call| match call.program.as_str() {
+                "git" if call.args.iter().any(|arg| arg == "commit") => {
+                    Some(call.argv().last().copied().unwrap_or_default().to_string())
+                }
+                "git" if call.args.iter().any(|arg| arg == "push") => Some("push".to_string()),
+                "gh" if call.args.first().is_some_and(|arg| arg == "pr")
+                    && call.args.get(1).is_some_and(|arg| arg == "create") =>
+                {
+                    Some("pr create".to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(verbs, vec!["Add a rule", "push", "pr create"]);
+        assert!(
+            rig.exec.calls().iter().any(|call| {
+                call.args.iter().any(|arg| arg == "labels[]=ladder-3")
+                    && call
+                        .args
+                        .iter()
+                        .any(|arg| arg == "repos/acme/borsuk/issues/7/labels")
+            }),
+            "the record carries the rung 3 label"
+        );
+        assert!(
+            rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "add")
+                    && call.args.iter().any(|arg| arg == "theory/rules.md")),
+            "the commit stages the rule file alone"
+        );
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+
+        let task = Task::new(
+            "borsuk",
+            Stage::Refine,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let values = rig
+            .daemon
+            .placeholder_values(&task, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(
+            placeholder_of(&values, "rules"),
+            rule,
+            "the next prompt carries the rule"
+        );
+    }
+
+    /// The label and the record label of one rung 3 answer.
+    fn rung_three_label_steps() -> Vec<Step> {
+        vec![
+            ladder_label_step("ladder-3"),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=ladder-3",
+                ],
+                gh_ok(),
+            ),
+        ]
+    }
+
+    /// The git calls of a model worktree that already sits on the model
+    /// branch: the derive, the branch it holds, its registration, and the
+    /// exclude file.
+    fn reused_model_steps(dir: &Path, source: &Path) -> Vec<Step> {
+        let worktree = model_wt(dir);
+        let listing = format!("worktree {}\n", worktree.display());
+        vec![
+            model_derive_step(
+                "acme/borsuk",
+                "[{\"number\":12,\"headRefName\":\"aif/borsuk/model-a1b2c3d4\"}]",
+            ),
+            git_step(
+                &worktree,
+                &["rev-parse", "--abbrev-ref", "HEAD"],
+                CmdOut::ok(format!("{RIG_MODEL_BRANCH}\n")),
+            ),
+            git_step(
+                source,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(listing),
+            ),
+            common_dir_step(&worktree, &rig_gitdir(dir)),
+        ]
+    }
+
+    /// The rule file keeps what it holds, so a second rung 3 answer adds
+    /// its line under the first one.
+    #[test]
+    fn two_rung_three_answers_append_two_lines_to_the_rule_file() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let first = noted_answer(
+            "T-pay",
+            3,
+            "web-checkout",
+            "name the token in the model",
+            "behaviours",
+        );
+        let second = noted_answer(
+            "INV-3",
+            3,
+            "web-checkout",
+            "the retry keeps the boundary",
+            "invariants",
+        );
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&first)));
+        steps.extend(rung_three_label_steps());
+        steps.push(model_derive_step("acme/borsuk", "[]"));
+        steps.extend(fresh_model_steps(&dir, &repo));
+        steps.extend(push_model_steps(
+            &dir,
+            "acme/borsuk",
+            "[]",
+            "theory/rules.md",
+            "Add a rule",
+        ));
+        steps.push(record_comment_step(&answers::answer_block(&second)));
+        steps.extend(rung_three_label_steps());
+        steps.extend(reused_model_steps(&dir, &repo));
+        // The model pull request is open, so the second push opens none
+        // and the label and create steps of the helper stay unused.
+        steps.extend(
+            push_model_steps(
+                &dir,
+                "acme/borsuk",
+                "[{\"number\":12}]",
+                "theory/rules.md",
+                "Add a rule",
+            )
+            .into_iter()
+            .take(6),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.set_now(LADDER_NOW);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &first));
+        rig.act(send_answer("theory:borsuk:p7:invariants", &second));
+
+        assert_eq!(
+            fs::read_to_string(model_wt(&dir).join("theory/rules.md")).unwrap(),
+            concat!(
+                "- 2026-09-11 T-pay: name the token in the model\n",
+                "- 2026-09-11 INV-3: the retry keeps the boundary\n"
+            )
+        );
+        assert_eq!(
+            rig.exec
+                .calls()
+                .iter()
+                .filter(|call| call.args.iter().any(|arg| arg == "Add a rule"))
+                .count(),
+            2,
+            "each answer commits its own rule"
+        );
+    }
+
+    /// A rule needs words, so rung 3 with no note writes nothing and
+    /// tells the operator why.
+    #[test]
+    fn a_rung_three_answer_with_no_note_writes_no_rule() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("T-pay", 3, "web-checkout", "", "behaviours");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &answer));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg.contains("ladder-3"))),
+            "a rung with no rule names no label"
+        );
+        let Push::TicketResult(result) = rx.try_recv().expect("the refusal must toast") else {
+            panic!("the refusal must push a Push::TicketResult");
+        };
+        assert_eq!(result.request, "ladder:borsuk");
+        assert_eq!(result.kind, TicketResultKind::Failure);
+        assert_eq!(
+            result.message,
+            "rung 3 of borsuk pr-7: the answer writes no rule"
+        );
+    }
+
+    /// A rule file the daemon cannot read is not an empty rule file, so
+    /// the rung fails and the pull request never drops the rules the
+    /// file holds.
+    #[test]
+    fn an_unreadable_rule_file_fails_the_rung_and_commits_nothing() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("T-pay", 3, "web-checkout", "name the token", "behaviours");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        steps.extend(rung_three_label_steps());
+        steps.extend(reused_model_steps(&dir, &repo));
+        // A directory answers every read with an error that is not
+        // `NotFound`, which is the case an empty list must not swallow.
+        fs::create_dir_all(model_wt(&dir).join("theory/rules.md")).unwrap();
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        let (tx, rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| tx.send(push).unwrap()));
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:behaviours", &answer));
+
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg == "Add a rule")),
+            "an unreadable file commits nothing"
+        );
+        let Push::TicketResult(result) = rx.try_recv().expect("the failure must toast") else {
+            panic!("the failure must push a Push::TicketResult");
+        };
+        assert!(
+            result.message.contains("cannot read"),
+            "the toast names the read: {}",
+            result.message
+        );
+    }
+
+    /// The ladder belongs to the governor, so a repository with the
+    /// governor off answers its open row and climbs nothing.
+    #[test]
+    fn the_ladder_stays_quiet_with_the_governor_off() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("INV-3", 1, "web-checkout", "", "invariants");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.daemon
+            .config
+            .repos
+            .get_mut("borsuk")
+            .unwrap()
+            .theory
+            .governor = Governor::Off;
+        rig.act(send_answer("theory:borsuk:p7:invariants", &answer));
+
+        assert!(
+            posted_bodies(&rig)
+                .iter()
+                .any(|body| body.contains("\"slot\":\"invariants\"")),
+            "the answer still posts on the record"
+        );
+        assert!(
+            !rig.exec
+                .calls()
+                .iter()
+                .any(|call| call.args.iter().any(|arg| arg.contains("ladder-"))),
+            "the governor is off, so no rung runs"
+        );
+    }
+
+    /// The refine label is configuration, so the ladder ticket carries
+    /// the name the repository chose.
+    #[test]
+    fn a_renamed_to_refine_label_reaches_the_ladder_ticket() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let answer = noted_answer("INV-3", 1, "web-checkout", "", "invariants");
+        let mut steps = first_delta_poll_steps(&repo, &two_miss_delta());
+        steps.push(record_comment_step(&answers::answer_block(&answer)));
+        steps.push(ladder_label_step("ladder-1"));
+        steps.push(ladder_issue_step_named(
+            "Eliminate: INV-3 \u{2014} Which entry is wrong?",
+            "Record pr-7. Slot invariants. Entry INV-3.\n\nWhich entry is wrong?",
+            "needs-refining",
+            "ladder-1",
+            79,
+        ));
+        let mut rig = Rig::make_in(dir, steps, |config| {
+            governed(config);
+            config
+                .repos
+                .get_mut("borsuk")
+                .unwrap()
+                .label_overrides
+                .insert(LabelKey::ToRefine, "needs-refining".to_string());
+        });
+
+        rig.poll(vec![delta_ticket()], vec![closed_pr_with(DELTA_OPEN_LABEL)]);
+        rig.act(send_answer("theory:borsuk:p7:invariants", &answer));
+
+        assert!(
+            issue_call(&rig)
+                .args
+                .contains(&"labels[]=needs-refining".to_string()),
+            "the ticket carries the configured name"
+        );
     }
 
     /// The review gate fires on the edge of readiness, so a queued review
@@ -25951,20 +27481,564 @@ mod tests {
     }
 
     #[test]
+    fn the_comparison_slot_reads_none_until_a_measure_run_fills_it() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let review = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let implement = Task::new(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+        let slot = |rig: &mut Rig, task: &Task, repo: &RepoConfig| {
+            placeholder_of(
+                &rig.daemon
+                    .placeholder_values(task, repo, &worktree)
+                    .expect("the values must render"),
+                "comparison",
+            )
+        };
+
+        assert_eq!(slot(&mut rig, &review, &repo_cfg), "none");
+        assert_eq!(
+            slot(&mut rig, &implement, &repo_cfg),
+            "none",
+            "an implement run has no pull request to measure"
+        );
+
+        let text = "AREA web-checkout\npoll_p95  12 \u{2192} 14  ms  worsened";
+        rig.daemon
+            .measure_text
+            .insert(review.id.clone(), text.to_string());
+
+        assert_eq!(slot(&mut rig, &review, &repo_cfg), text);
+
+        rig.daemon
+            .config
+            .repos
+            .get_mut("borsuk")
+            .unwrap()
+            .theory
+            .governor = Governor::Off;
+        let ungoverned = rig.daemon.config.repos["borsuk"].clone();
+
+        assert_eq!(
+            slot(&mut rig, &review, &ungoverned),
+            "",
+            "with the governor off the v0.6 prompt holds"
+        );
+    }
+
+    #[test]
+    fn a_governed_review_measures_the_merge_base_and_the_head() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = theory_read_steps(
+            &rig_repo(&dir),
+            MEASURE_VERIFY,
+            &feature_file("web-checkout", "cargo test --test cli"),
+            &feature_file("api-orders", "cargo test --test api"),
+        );
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        // Each of the four checks takes the head worktree in turn, and
+        // the body check takes it once more at the end.
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(fast_record_step("checkout", 0));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(fast_record_step("orders", 0));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  12 \u{2192} 14  ms  worsened\n",
+            "</aif-measure-v1>",
+        )));
+        // The body check reads the head worktree and its diff before the
+        // review dispatches.
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let base_path = base_wt(&dir, BASE_SHA);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert_eq!(
+            rig.daemon
+                .table
+                .order
+                .iter()
+                .filter(|id| id.contains("/measure-"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![head.clone(), base.clone()],
+            "one measure task runs on the head and one on the merge base"
+        );
+        assert_eq!(rig.task(&head).purpose, TaskPurpose::Measure);
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the review waits for every check and both measure runs"
+        );
+        write_measure_log(&rig, &head, 14);
+        write_measure_log(&rig, &base, 12);
+
+        rig.event(exited(&checkout, true, "exit 0"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the fast checks alone do not release the review"
+        );
+
+        rig.event(exited(&head, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the head measurement alone does not release the review"
+        );
+
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(rig.task(&base).state, TaskState::Done);
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        let job = rig.job(rig.job_count() - 1);
+        assert_eq!(job.task, "borsuk/review-p7");
+        assert!(
+            job.prompt
+                .contains("AREA web-checkout\npoll_p95  12 \u{2192} 14  ms  worsened"),
+            "the review prompt carries the comparison table:\n{}",
+            job.prompt
+        );
+        // The base run reads the base worktree, not the head worktree.
+        let base_job = rig
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|job| job.task == base)
+            .cloned()
+            .expect("the base measurement ran");
+        assert_eq!(base_job.cwd, base_path);
+        assert_eq!(base_job.prompt, "aif bench");
+    }
+
+    #[test]
+    fn a_measurer_that_times_out_in_a_review_reports_one_incomparable_row() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  incomparable: timeout\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        write_measure_log(&rig, &base, 12);
+
+        rig.event(exited(&head, false, &script::exit_detail(124)));
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(
+            rig.task(&head).state,
+            TaskState::Done,
+            "a timeout ends the measure task, it does not fail it"
+        );
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert!(
+            !measure::cache_path(
+                &rig.daemon.state_dir,
+                "borsuk",
+                FAST_TREE_SHA,
+                &rig.daemon.verify_map("borsuk").unwrap().measurers[0],
+            )
+            .exists(),
+            "a timeout is a fact of one run, so it never caches"
+        );
+    }
+
+    #[test]
+    fn a_new_head_that_touches_no_area_drops_the_old_comparison() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  12 \u{2192} 14  ms  worsened\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        // The second head touches no area at all, so the admission queues
+        // nothing and the comparison of the first head must go.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("docs/readme.md\n"),
+        ));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "docs/readme.md",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        write_measure_log(&rig, &head, 14);
+        write_measure_log(&rig, &base, 12);
+        rig.event(exited(&head, true, "exit 0"));
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert!(
+            rig.daemon.measure_text.contains_key("borsuk/review-p7"),
+            "the first head left its comparison"
+        );
+
+        let mut moved = unlinked_pr(7);
+        moved.head_sha = "deadbee".to_string();
+        rig.poll(vec![], vec![moved]);
+        rig.event(exited(
+            "borsuk/review-p7",
+            false,
+            "the superseded process exited",
+        ));
+
+        assert!(
+            rig.daemon.measure_text.is_empty(),
+            "the new head drops the comparison of the old one"
+        );
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        let job = rig.job(rig.job_count() - 1);
+        assert_eq!(job.task, "borsuk/review-p7");
+        assert!(
+            job.prompt.contains("\nnone\n"),
+            "the comparison slot reads none:\n{}",
+            job.prompt
+        );
+    }
+
+    #[test]
+    fn a_new_head_measures_the_head_again_and_reads_the_base_from_the_cache() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  12 \u{2192} 14  ms  worsened\n",
+            "</aif-measure-v1>",
+        )));
+        // The body check reads the head worktree and its diff before the
+        // review dispatches.
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        // The review prompt slices the model by the areas of the head
+        // diff, so the dispatch reads the diff once more.
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        // The second poll carries a new head sha, so the review starts
+        // again and the head tree moves.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        steps.extend(tree_hash_steps(&dir, &worktree, NEXT_TREE_SHA));
+        steps.extend(reuse_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+        let next = format!("borsuk/measure-{NEXT_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        write_measure_log(&rig, &head, 14);
+        write_measure_log(&rig, &base, 12);
+        rig.event(exited(&head, true, "exit 0"));
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert!(
+            measure::read_cache(&measure::cache_path(
+                &rig.daemon.state_dir,
+                "borsuk",
+                BASE_TREE_SHA,
+                &rig.daemon.verify_map("borsuk").unwrap().measurers[0],
+            ))
+            .is_some(),
+            "the clean base run cached its records"
+        );
+
+        let mut moved = unlinked_pr(7);
+        moved.head_sha = "deadbee".to_string();
+        rig.poll(vec![], vec![moved]);
+        // The new head supersedes the running review. Its replacement
+        // admits once the superseded process reports its exit.
+        rig.event(exited(
+            "borsuk/review-p7",
+            false,
+            "the superseded process exited",
+        ));
+
+        let queued: Vec<String> = rig
+            .daemon
+            .table
+            .order
+            .iter()
+            .filter(|id| id.contains("/measure-"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            queued,
+            vec![head.clone(), base.clone(), next.clone()],
+            "the new head queues one more head measurement and no base"
+        );
+        assert_eq!(rig.task(&next).state, TaskState::Running);
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the new head holds the review on its own measurement"
+        );
+    }
+
+    #[test]
+    fn a_review_whose_diff_touches_no_area_renders_no_comparison() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        // The admission stops at the diff, because no area owns the path
+        // and no check can follow.
+        steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("docs/readme.md\n"),
+        ));
+        // The body check reads the head worktree and its diff before the
+        // review dispatches.
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "docs/readme.md",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert!(
+            !rig.daemon
+                .table
+                .order
+                .iter()
+                .any(|id| id.contains("/measure-")),
+            "a diff that touches no area queues no measure task"
+        );
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Running,
+            "nothing holds the review"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert!(
+            rig.job(0).prompt.contains("\nnone\n"),
+            "the comparison slot reads none:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    #[test]
+    fn one_measure_task_of_a_governed_review_lands_its_records_as_a_comment() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  none \u{2192} 14  ms  new\n",
+            "</aif-measure-v1>",
+        )));
+        // The body check reads the head worktree and its diff before the
+        // review dispatches.
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert_eq!(rig.task(&head).purpose, TaskPurpose::Measure);
+        assert_eq!(rig.job(0).prompt, "aif bench");
+        assert_eq!(rig.job(0).timeout_s, Some(30));
+        write_measure_log(&rig, &head, 14);
+
+        rig.event(exited(&head, true, "exit 0"));
+        // The base command found nothing to print, so its side is empty
+        // and every head record reads new.
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(rig.task(&head).state, TaskState::Done);
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+    }
+
+    #[test]
     fn queue_measure_names_the_area_and_ships_the_records_of_the_run() {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
         let line = "{\"id\":\"poll_p95\",\"value\":12,\"unit\":\"ms\",\"direction\":\"lower\"}";
-        let block = measure::block(&measure::parse_lines(line));
-        let steps = vec![
-            git_step(
-                &worktree,
-                &["rev-parse", "HEAD^{tree}"],
-                CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-            ),
-            record_comment_step(&block),
-        ];
-        let mut rig = Rig::make_in(dir, steps, governed);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
         let measurers = vec![
             Measurer {
                 id: "poll_p95".to_string(),
@@ -25982,9 +28056,19 @@ mod tests {
             },
         ];
 
-        let ids =
-            rig.daemon
-                .queue_measure("borsuk", &RecordKey::Pr(7), &worktree, &measurers, Mode::Pr);
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
 
         assert_eq!(
             ids,
@@ -26000,27 +28084,35 @@ mod tests {
         let task = rig.task(&ids[0]);
         std::fs::create_dir_all(task.log_path.parent().unwrap()).unwrap();
         std::fs::write(&task.log_path, format!("{line}\nstderr noise\n")).unwrap();
+        rig.daemon
+            .measure_runs
+            .insert("borsuk/review-p7".to_string(), open_run(&ids[0]));
 
         rig.daemon.finish_measure(&task, "exit 0");
 
         assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
-        assert_eq!(rig.exec.calls().len(), 2);
+        assert_eq!(
+            settled(&rig, "borsuk/review-p7", &ids[0]),
+            vec![Record::value(
+                "poll_p95",
+                12.0,
+                "ms",
+                measure::Direction::Lower
+            )],
+            "the run of the review takes the records, and the prefixed noise stays out"
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "the tree hash is given and the batch posts the comment later"
+        );
     }
 
     #[test]
-    fn a_measurer_that_fails_ships_one_incomparable_record() {
+    fn a_measure_task_that_belongs_to_no_run_drops_its_records() {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
-        let block = measure::block(&[measure::Record::incomparable("poll_p95", "timeout")]);
-        let steps = vec![
-            git_step(
-                &worktree,
-                &["rev-parse", "HEAD^{tree}"],
-                CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-            ),
-            record_comment_step(&block),
-        ];
-        let mut rig = Rig::make_in(dir, steps, governed);
+        let line = "{\"id\":\"poll_p95\",\"value\":12,\"unit\":\"ms\",\"direction\":\"lower\"}";
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
         let measurers = vec![Measurer {
             id: "poll_p95".to_string(),
             area: "web-checkout".to_string(),
@@ -26028,19 +28120,160 @@ mod tests {
             mode: Mode::Pr,
             timeout_s: 30,
         }];
-        let ids =
-            rig.daemon
-                .queue_measure("borsuk", &RecordKey::Pr(7), &worktree, &measurers, Mode::Pr);
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
         rig.daemon
             .table
             .transition(&ids[0], TaskState::Running, T0)
             .unwrap();
         let task = rig.task(&ids[0]);
+        std::fs::create_dir_all(task.log_path.parent().unwrap()).unwrap();
+        std::fs::write(&task.log_path, format!("{line}\n")).unwrap();
+
+        rig.daemon.finish_measure(&task, "exit 0");
+
+        assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
+        assert!(
+            rig.exec.calls().is_empty(),
+            "a superseded head comments on nobody: {:?}",
+            rig.exec.calls()
+        );
+    }
+
+    #[test]
+    fn a_measurer_that_fails_ships_one_incomparable_record() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let measurers = vec![Measurer {
+            id: "poll_p95".to_string(),
+            area: "web-checkout".to_string(),
+            command: "aif bench".to_string(),
+            mode: Mode::Pr,
+            timeout_s: 30,
+        }];
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
+        rig.daemon
+            .table
+            .transition(&ids[0], TaskState::Running, T0)
+            .unwrap();
+        let task = rig.task(&ids[0]);
+        rig.daemon
+            .measure_runs
+            .insert("borsuk/review-p7".to_string(), open_run(&ids[0]));
 
         rig.daemon.finish_measure(&task, &script::exit_detail(124));
 
         assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
-        assert!(block.contains("incomparable: timeout"), "block: {block}");
+        assert_eq!(
+            settled(&rig, "borsuk/review-p7", &ids[0]),
+            vec![Record::incomparable("poll_p95", "timeout")],
+            "a timeout is one incomparable record that names the reason"
+        );
+    }
+
+    #[test]
+    fn an_aborted_measure_task_releases_the_review_it_holds() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let measurers = vec![Measurer {
+            id: "poll_p95".to_string(),
+            area: "web-checkout".to_string(),
+            command: "aif bench".to_string(),
+            mode: Mode::Pr,
+            timeout_s: 30,
+        }];
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
+        rig.daemon
+            .measure_runs
+            .insert("borsuk/review-p7".to_string(), open_run(&ids[0]));
+
+        rig.daemon
+            .cancel_task_with_reason(&ids[0], false, "the operator aborted it");
+
+        assert_eq!(
+            settled(&rig, "borsuk/review-p7", &ids[0]),
+            vec![Record::incomparable("poll_p95", MEASURE_ABORTED)],
+            "the abort settles the slot with the reason"
+        );
+        assert!(
+            !rig.daemon.measure_runs["borsuk/review-p7"].holds(&ids[0]),
+            "the review no longer waits for the aborted run"
+        );
+        assert!(
+            !rig.daemon.measure_jobs.contains_key(&ids[0]),
+            "the aborted job leaves the map with its task"
+        );
+    }
+
+    #[test]
+    fn an_aborted_fast_check_leaves_the_wait_list_of_its_review() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let aborted = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let other = format!("borsuk/fast-{FAST_TREE}-orders");
+        let spec = tasks::ScopedTask {
+            id: &aborted,
+            repo: "borsuk",
+            stage: Stage::Review,
+            kind: ItemKind::Pr,
+            number: 7,
+        };
+        rig.daemon
+            .table
+            .upsert_with_id(spec, PathBuf::new(), T0)
+            .map(|task| task.purpose = TaskPurpose::Measure)
+            .expect("the fast task must upsert");
+        let mut run = FastRun::new(vec![aborted.clone(), other.clone()]);
+        run.records
+            .insert(other.clone(), measure::exit_record("orders", 0));
+        rig.daemon
+            .fast_runs
+            .insert("borsuk/review-p7".to_string(), run);
+
+        rig.daemon
+            .cancel_task_with_reason(&aborted, false, "the operator aborted it");
+
+        assert!(
+            !rig.daemon.fast_runs.contains_key("borsuk/review-p7"),
+            "the run finished on the check that did report"
+        );
     }
 
     #[test]
@@ -26942,9 +29175,15 @@ mod tests {
     /// The feature index of `run-web`.
     const RUN_INDEX: &str = "# Features of web\n\n- checkout: the cart pays\n";
 
-    /// The one feature file of `run-web`.
-    const RUN_FEATURE: &str =
-        "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n";
+    /// The one feature file of `run-web`, with the four sections of
+    /// design section 4.4.
+    const RUN_FEATURE: &str = concat!(
+        "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n\n",
+        "## Sub-features\na cart and a payment step\n\n",
+        "## How to get to it (user POV)\nthe nav menu\n\n",
+        "## Driving it\nnpx playwright test checkout\n\n",
+        "## Gotchas\nthe cart clears on reload\n",
+    );
 
     /// The tree listing of one skills checkout. The helper script is
     /// listed and never read.
@@ -26955,7 +29194,13 @@ mod tests {
         ".claude/skills/run-web/wait_for.sh\n",
     );
 
-    /// The scripted git steps of one theory read at `commit`.
+    /// The scripted read of the rule file at `commit`.
+    fn rules_step(repo: &Path, commit: &str, out: CmdOut) -> Step {
+        git_step(repo, &["show", &format!("{commit}:theory/rules.md")], out)
+    }
+
+    /// The scripted git steps of one theory read at `commit`, with no
+    /// rule file.
     fn theory_steps(repo: &Path, commit: &str, skill: &str) -> Vec<Step> {
         theory_steps_with_feature(repo, commit, skill, RUN_FEATURE)
     }
@@ -26965,6 +29210,24 @@ mod tests {
         repo: &Path,
         commit: &str,
         skill: &str,
+        feature: &str,
+    ) -> Vec<Step> {
+        theory_steps_with(repo, commit, skill, refused(), feature)
+    }
+
+    /// The scripted git steps of one theory read at `commit` whose rule
+    /// file answers `rules`.
+    fn theory_steps_with_rules(repo: &Path, commit: &str, skill: &str, rules: CmdOut) -> Vec<Step> {
+        theory_steps_with(repo, commit, skill, rules, RUN_FEATURE)
+    }
+
+    /// The scripted git steps of one theory read whose rule file and
+    /// feature file are both chosen.
+    fn theory_steps_with(
+        repo: &Path,
+        commit: &str,
+        skill: &str,
+        rules: CmdOut,
         feature: &str,
     ) -> Vec<Step> {
         vec![
@@ -26988,6 +29251,7 @@ mod tests {
                 &["show", &format!("{commit}:theory/verify.toml")],
                 CmdOut::ok(THEORY_VERIFY),
             ),
+            rules_step(repo, commit, rules),
             git_step(
                 repo,
                 &["ls-tree", "-r", "--name-only", commit, SKILLS_DIR],
@@ -27067,8 +29331,8 @@ mod tests {
         assert_eq!(git_calls(&rig, "ls-tree"), 1);
         assert_eq!(
             git_calls(&rig, "show"),
-            5,
-            "two theory files, the skill, its index, and one feature"
+            6,
+            "three theory files, the skill, its index, and one feature"
         );
         assert_eq!(
             git_calls(&rig, "rev-parse"),
@@ -27104,7 +29368,7 @@ mod tests {
             1,
             "the same commit reads no tree"
         );
-        assert_eq!(git_calls(&rig, "show"), 5, "the same commit reads no file");
+        assert_eq!(git_calls(&rig, "show"), 6, "the same commit reads no file");
         assert_eq!(theory_of(&rig), view);
 
         rig.poll(Vec::new(), Vec::new());
@@ -27116,7 +29380,7 @@ mod tests {
         );
         assert_eq!(
             git_calls(&rig, "show"),
-            10,
+            12,
             "a moved commit reads every file"
         );
     }
@@ -27176,6 +29440,7 @@ mod tests {
                     stderr: "path does not exist\n".to_string(),
                 },
             ),
+            rules_step(&repo, "aaa111", refused()),
             git_step(
                 &repo,
                 &["ls-tree", "-r", "--name-only", "aaa111", SKILLS_DIR],
@@ -27193,8 +29458,8 @@ mod tests {
         assert!(view.skills.is_empty());
         assert_eq!(
             git_calls(&rig, "show"),
-            1,
-            "a missing model leaves no map to read"
+            2,
+            "a missing model leaves no map to read, and the rule file is prose"
         );
         rig.drive();
     }
@@ -28263,6 +30528,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
                 &["show", &show("theory/verify.toml")],
                 CmdOut::ok(SLICE_VERIFY),
             ),
+            rules_step(repo, commit, refused()),
             git_step(
                 repo,
                 &["ls-tree", "-r", "--name-only", commit, SKILLS_DIR],
@@ -28360,7 +30626,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "the review slice reads the head diff once"
         );
         assert_eq!(placeholder_of(&values, "prediction"), "none");
-        assert_eq!(placeholder_of(&values, "comparison"), "");
+        assert_eq!(
+            placeholder_of(&values, "comparison"),
+            "none",
+            "C28 renders the word for an empty comparison on a governed review"
+        );
         assert_eq!(placeholder_of(&values, "rules"), "");
         assert_eq!(placeholder_of(&values, "why_rule"), "");
         let filled = prompts::fill_template(prompts::REVIEW_PROMPT, &values)
@@ -29715,7 +31985,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rig.exec
             .calls()
             .iter()
-            .filter(|call| call.program == "gh" && call.args.iter().any(|arg| arg == TITLE))
+            .filter(|call| {
+                call.program == "gh"
+                    && call.args.iter().any(|arg| arg == TITLE)
+                    && !call.args.contains(&"PATCH".to_string())
+            })
             .cloned()
             .collect()
     }
@@ -29777,6 +32051,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         steps.extend(open_event_steps(&first));
         steps.extend(open_event_steps(&second));
         steps.push(verify_skill_label_step());
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
         steps.push(skill_issue_step(
             "Maintain the run skill for borsuk/web",
             13,
@@ -29845,6 +32123,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "Maintain the run skill for borsuk/web",
             13,
         ));
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
         let mut rig = Rig::make_in(dir, steps, governed);
         let mut closed = issue(41, &[VERIFY_SKILL_LABEL]);
         closed.title = SkillTicket::Maintain.title("borsuk", "web");
@@ -29897,8 +32179,8 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .filter(|call| call.program == "gh" && !is_sweep_list(call))
             .count();
         assert_eq!(
-            gh_calls, 11,
-            "three events, one label, one create, and no api attempt"
+            gh_calls, 12,
+            "three events, one label, one create, one body patch, and no api attempt"
         );
         assert_eq!(rig.task(id).state, TaskState::Done);
     }
@@ -31705,6 +33987,16 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             1,
             "event:0",
             0,
+        ));
+        extra.push(ladder_label_step("ladder-1"));
+        extra.push(ladder_issue_step(
+            "Eliminate: B-checkout \u{2014} The answer misses the new retry count.",
+            concat!(
+                "Record pr-7. Slot event:0. Entry B-checkout.\n\n",
+                "The answer misses the new retry count."
+            ),
+            "ladder-1",
+            88,
         ));
         extra.extend(teach_pr_steps(&repo));
         extra.extend(teach_history_steps(&repo, "web/pay.ts"));
