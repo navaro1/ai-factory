@@ -6,6 +6,7 @@
 
 pub mod ask;
 pub mod catalog;
+pub mod clipboard;
 pub mod config;
 pub mod daemon;
 pub mod decisions;
