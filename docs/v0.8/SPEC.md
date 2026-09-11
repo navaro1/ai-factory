@@ -11,7 +11,7 @@ Date: 2026-09-10 · Status: Ready · Scope: The run skill per surface, the drive
 **What NOT to build (non-goals):**
 1. **No control CLI per surface.** A run skill names a generic driver. The factory ships no driver and installs none. [design §4.3, rule 20]
 2. **No verifier subagent by default.** Fast checks plus the review re-drive give the separation. A verifier route for `very-high` is a follow-up. [design §5.5]
-3. **No new cadence.** Maintenance rides the C24 audit sweep and the reviewer. [design §6.3]
+3. **No new cadence.** Maintenance rides the C24 audit sweep and the reviewer. [design §6.3] The v0.7 audit cadence on `sweep.days` fires that sweep, and `aif doctor --audit <alias>` fires it on demand.
 4. **No principle naming in PR bodies.** Six principles are vocabulary in the stance, each backed by a structural check. [design §8]
 5. **No media evidence.** Text only until `gh --attach` reaches stable. [design §14]
 6. **No browser-profile integration.** Claude in Chrome and the Codex `@Chrome` are never a driver. [design refusal 5]
@@ -94,8 +94,8 @@ Teach:
 - **R23** — WHEN a card is answered with cause `recall`, the inbox row shall offer `t` and start the teach task for the card's PR or entry. [§7]
 
 Non-functional rules. Each has an ID and a tracing chunk.
-- **N1** — Every derivation of this spec rebuilds per poll and persists nothing, like `Links`. The one persisted exception is none.
-- **N2** — The wire revision stays 1: every new `StateView` field carries `#[serde(default)]`, every new `Action`, `TheoryAction`, and `Push` variant joins `every_action()`.
+- **N1** — Every derivation of this spec rebuilds per poll and persists nothing, like `Links`. The one persisted exception is the cadence last-fire list in `StateFile.cadences`.
+- **N2** — The wire revision is 5 and stays 5: every new `StateView` field carries `#[serde(default)]`, every new `Action`, `TheoryAction`, and `Push` variant joins `every_action()`.
 - **N3** — The ticket check, the body check, and the fast checks run no harness and spend no agent tokens.
 - **N4** — A fast task that exceeds its timeout, default 120 s, yields value `124`, so it fails.
 - **N5** — Every stage prompt rewrite lands once, with its docs copy pinned byte for byte under `docs/v0.8/prompts/`.
@@ -148,7 +148,7 @@ docs/v0.8/prompts/       the pinned copies
 - The contract grammar. A criterion line is `- AC-<n> · <text> · check: <target>`, where `<target>` is `<feature> drive`, `<feature> fast`, or `measure <id>`. A Before / After line is `- AC-<n> · <feature | measurer> · <tier | measure> · <command> · before: <text> · after: <text>`. The separator is ` · ` (U+00B7 with spaces). `parse_lines` returns one struct per line and one finding per malformed line.
 - The ticket check runs in `admit_ready` where `implement_ready` admits a governed ticket, after the C9 prediction gate and before the task exists. Its inputs are the issue body from the snapshot and the resolved skills. A failure posts through `post_issue_comment` and adds `to-refine` back, which the poll gate turns into a refine task. That reuses the v0.6 refine path and needs no new task plumbing.
 - The body check. `check_pr(body, paths, branch)` of C11 gains a fourth input, `ctx: &ContractContext { criteria, features, areas, min_tiers, owned_paths, manifests }`, and calls `check_body_lines`. The finding text names the line and the rule. The prose rules are the three of `check-plan.mjs` plus the line cap, applied to text outside fenced blocks.
-- Fast tasks. `queue_fast` reuses `queue_measure` with a synthetic measurer `{ id: <feature>, command: <fast>, mode: pr, timeout_s: 120 }` and the `exit` unit. The task id is `<alias>/fast-<tree8>-<feature>`. The comparison of C27 treats `exit` like any `lower` value. Review admission holds on both the base and head measure tasks of C28 and the fast tasks; the fail rule runs when the last one ends.
+- Fast tasks. `queue_fast` reuses `queue_measure` with a synthetic measurer `{ id: <feature>, command: <fast>, mode: pr, timeout_s: 120 }` and the `exit` unit. The task id is `<alias>/fast-<tree8>-<feature>`. The comparison of C27 treats `exit` like any `lower` value. Review admission holds on both the base and head measure tasks of C28 and the fast tasks; the fail rule runs when the last one ends. C28 is a later chunk and is not built, so the fast tasks alone hold the review today, and no base and head comment exists yet.
 - Refine cwd. `workspace(&task)` returns `Exclusive(Issue(number))` for `Stage::Refine` on an issue, except the ticket-creation task of `is_ticket_creation`, which keeps `Shared`.
 - Setup and maintain tickets. One function `create_skill_ticket(alias, surface, kind)` builds the title, the labels, and the body from two consts `SETUP_BODY` and `MAINTAIN_BODY` with `{alias}`, `{surface}`, `{skills_dir}`, `{app_path}` filled, and calls `create_issue` with labels (C32). The gate skip reads the `verify-skill` label the way C16 reads `model-pr`.
 - Teach. `TaskPurpose::Teach(TeachKey::{Pr(n), Delta(n), Area(id)})` with a `PurposeSpec` under `theory.chat`, `wants_final_block` returning the event tag, and `open_event` per block, all through the C16 and C17 seams.
@@ -244,12 +244,12 @@ Twelve chunks. Every chunk names its v0.7 base on its own line: the C chunk it s
 ### V4 — Fast checks at review admission
 **Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt)
 **v0.7 base:** C26 (`ScriptRunner`, `TaskPurpose::Measure`, `queue_measure`, `Record`, `parse_lines`), C27 (`tree_hash`, the cache, `compare`), and C28 (the base and head measure tasks at review admission, the `prior_stage_active` hold, `WorktreeKind::Base`). The fast task is one more `queue_measure` call with a synthetic measurer. Built: no.
-**Build:** Add `queue_fast(alias, worktree, features)` in `src/daemon.rs` over `queue_measure` with a synthetic measurer per feature (`mode: pr`, `timeout_s: 120`) and the `exit` unit in `src/theory/measure.rs`. In review admission of a governed PR, after the base and head tasks of C28, queue one fast task per touched feature with a `fast` command and hold the review in `prior_stage_active` until every task ends. When the last one ends, read the fast records: on any non-zero value, cancel the review task, post `fast check failed: <feature> exit <n>` on the theory record, and re-queue the implement task of every linked ticket. Show `fast check failed` in the pipeline hint.
+**Build:** Add `queue_fast(alias, worktree, features)` in `src/daemon.rs` over `queue_measure` with a synthetic measurer per feature (`mode: pr`, `timeout_s: 120`) and the `exit` unit in `src/theory/measure.rs`. In review admission of a governed PR, queue one fast task per touched feature with a `fast` command and hold the review in `prior_stage_active` until every task ends. C28 is a later chunk and is not built, so no base and head tasks run and no base and head comment exists yet. When the last one ends, read the fast records: on any non-zero value, cancel the review task, post `fast check failed: <feature> exit <n>` on the theory record, and re-queue the implement task of every linked ticket. Show `fast check failed` in the pipeline hint.
 **AC:**
 - A daemon test with two touched features queues two fast tasks with ids `borsuk/fast-<tree8>-checkout` and `borsuk/fast-<tree8>-orders`, and the review stays held until both end.
 - A fast task whose script exits 1 leaves no review task, posts the finding with `exit 1`, and queues one implement task per linked ticket.
 - A fast task whose script sleeps past 120 s records value `124` and fails the check.
-- Two fast tasks that exit 0 release the review, and the comment of C28 is unchanged.
+- Two fast tasks that exit 0 release the review. C28 is a later chunk and is not built, so no base and head comment exists yet.
 **Depends on:** C26, C27, C28, V1 · **Traces to:** R10, R11, N3, N4
 
 ### V5 — Refine in the issue worktree
