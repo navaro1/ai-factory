@@ -48,6 +48,8 @@ use super::markdown::{tone_color, MentionStatuses};
 use super::theme::THEME;
 use super::transcript;
 use crate::decisions::{Decision, DecisionKind, Response};
+
+pub(super) use crate::decisions::presentation;
 use crate::mentions;
 use crate::model::ItemKind;
 use crate::sock::{
@@ -1617,32 +1619,6 @@ fn ordered_decisions(state: &StateView) -> Vec<&Decision> {
     ordered.into_iter().map(|(_, decision)| decision).collect()
 }
 
-/// How the inbox names and drives one decision kind.
-///
-/// One table answers every per-kind question the feed asks, so a new kind
-/// joins the inbox in one place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Presentation {
-    /// The visible kind name of the feed row.
-    pub label: &'static str,
-    /// The quick actions of the row: the key text and what it does.
-    pub actions: &'static [(&'static str, &'static str)],
-    /// The digit keys the row consumes itself, so the shell keeps them
-    /// from the view switch.
-    pub digits: &'static str,
-}
-
-impl Presentation {
-    /// The quick action line the feed draws under a selected row.
-    pub fn footer(&self) -> String {
-        self.actions
-            .iter()
-            .map(|(key, what)| format!("[{key}] {what}"))
-            .collect::<Vec<_>>()
-            .join(" \u{b7} ")
-    }
-}
-
 /// The areas of one repository whose model slice carries `entry`.
 ///
 /// An area names one boundary of the model, and the slice of that
@@ -1664,80 +1640,6 @@ fn entry_areas(state: &StateView, repo: &str, entry: &str) -> Vec<String> {
         })
         .map(|area| area.id.clone())
         .collect()
-}
-
-/// The presentation of one decision kind.
-pub(super) fn presentation(kind: &DecisionKind) -> Presentation {
-    match kind {
-        DecisionKind::Permission { .. } => Presentation {
-            label: "PERMISSION",
-            actions: &[("y", "allow"), ("n", "deny"), ("enter", "details")],
-            digits: "",
-        },
-        DecisionKind::Question { .. } => Presentation {
-            label: "QUESTION",
-            actions: &[
-                ("1-9", "pick"),
-                ("s", "submit"),
-                ("i", "write"),
-                ("enter", "details"),
-            ],
-            digits: "123456789",
-        },
-        DecisionKind::Stuck { .. } => Presentation {
-            label: "STUCK",
-            actions: &[("r", "retry"), ("c", "cancel task"), ("enter", "details")],
-            digits: "",
-        },
-        DecisionKind::NeedsHuman { .. } => Presentation {
-            label: "NEEDS HUMAN",
-            actions: &[("t", "comment"), ("c", "clear label"), ("enter", "details")],
-            digits: "",
-        },
-        DecisionKind::ReleaseGate { .. } => Presentation {
-            label: "RELEASE",
-            actions: &[
-                ("1-9", "include"),
-                ("space", "all/none"),
-                ("g", "release"),
-                ("enter", "details"),
-            ],
-            digits: "123456789",
-        },
-        DecisionKind::DeltaHit { .. } => Presentation {
-            label: "DELTA",
-            actions: &[("y", "confirm")],
-            digits: "",
-        },
-        DecisionKind::TheoryEvent { .. } => Presentation {
-            label: "THEORY",
-            actions: &[
-                ("m", "model"),
-                ("p", "pr"),
-                ("r", "recall"),
-                ("1-3", "rung"),
-                ("a", "area"),
-                ("n", "note"),
-                ("s", "send"),
-            ],
-            digits: "123",
-        },
-        DecisionKind::Card { recalled, .. } if *recalled => Presentation {
-            label: "CARD",
-            actions: &[("t", "teach")],
-            digits: "",
-        },
-        DecisionKind::Card { .. } => Presentation {
-            label: "CARD",
-            actions: &[("t", "answer")],
-            digits: "",
-        },
-        DecisionKind::FirstRun { .. } => Presentation {
-            label: "FIRST RUN",
-            actions: &[("y", "keep"), ("c", "discard")],
-            digits: "",
-        },
-    }
 }
 
 /// The task id of a task-backed decision.

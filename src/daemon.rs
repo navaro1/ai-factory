@@ -32689,6 +32689,28 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         "\n</aif-event-v1>",
     );
 
+    /// The comment body of the third swept record. The record carries no
+    /// prediction, so the two slots carry their sure tag in the body, and
+    /// the delta adds one sure hit over two sure slots.
+    const SWEEP_LONE_DELTA: &str = concat!(
+        "<aif-delta-v1>\n",
+        "{\"slots\":[",
+        "{\"id\":\"behaviours\",\"outcome\":\"hit\",\"tag\":\"sure\"},",
+        "{\"id\":\"states\",\"outcome\":\"miss\",\"tag\":\"sure\"}]}",
+        "\n</aif-delta-v1>\n",
+        "<aif-event-v1>\n",
+        "{\"kind\":\"violation\",\"text\":\"the cart reset on reload\"}",
+        "\n</aif-event-v1>",
+    );
+
+    /// The comment body of a record whose page holds one event of the
+    /// last day and no delta at all.
+    const SWEEP_EVENT_ONLY: &str = concat!(
+        "<aif-event-v1>\n",
+        "{\"kind\":\"violation\",\"text\":\"the cart reset on reload\"}",
+        "\n</aif-event-v1>",
+    );
+
     /// The theory read of the sweep test at one commit. The model is
     /// [`SWEEP_MODEL`]; the verify map and the skill are the shared ones.
     fn sweep_theory_steps(repo: &Path, commit: &str) -> Vec<Step> {
@@ -32742,9 +32764,16 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         ]
     }
 
-    /// One comment page of one swept record.
+    /// One comment page of one swept record. Records one and two carry
+    /// the full prediction and delta, record three carries the lone
+    /// delta, and the rest carry the event alone. Together the pages
+    /// count seven sure hits over ten sure slots.
     fn sweep_comment_step(number: u64) -> Step {
-        let raw = SWEEP_COMMENT;
+        let raw = match number {
+            1 | 2 => SWEEP_COMMENT,
+            3 => SWEEP_LONE_DELTA,
+            _ => SWEEP_EVENT_ONLY,
+        };
         let url = format!("repos/acme/borsuk/issues/{number}/comments?per_page=100");
         let body = format!(
             "[{{\"user\":{{\"login\":\"agent\"}},\
@@ -32861,9 +32890,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
     }
 
     /// The record list of one sweep: the ten open ladder issues, one
-    /// closed issue with `delta-open`, and one ladder pull request. The
-    /// closed issue and the pull request never enter the open snapshot,
-    /// so only the list brings them to the sweep.
+    /// closed issue with `delta-open`, and one pull request with
+    /// `model-pr`. The closed issue and the pull request never enter
+    /// the open snapshot, so only the list brings them to the sweep.
+    /// The pull request stays out of the ladder counts, so the labels
+    /// read two, five, and three.
     fn sweep_rows() -> String {
         let rung = |index: u64| match index {
             1..=2 => "ladder-1",
@@ -32889,7 +32920,7 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rows.push(
             "{\"number\":12,\"state\":\"open\",\
              \"updated_at\":\"2026-09-06T09:00:00Z\",\
-             \"labels\":[{\"name\":\"ladder-3\"}],\
+             \"labels\":[{\"name\":\"model-pr\"}],\
              \"pull_request\":{\"merged_at\":null}}"
                 .to_string(),
         );
@@ -33511,13 +33542,13 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         let view = theory_of(&rig);
         assert_eq!(
             view.calibration,
-            Some(0.75),
-            "three sure hits over four sure slots"
+            Some(0.7),
+            "seven sure hits over ten sure slots"
         );
         assert_eq!(
             view.rungs,
-            [2, 5, 4],
-            "the ladder labels of the swept records, pull request twelve in"
+            [2, 5, 3],
+            "the ladder labels of the swept issues, pull request twelve out"
         );
         assert_eq!(
             view.events_per_day, 12,
@@ -33533,8 +33564,8 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rig.poll(sweep_issues(), Vec::new());
 
         let view = theory_of(&rig);
-        assert_eq!(view.calibration, Some(0.75), "the cached pages still count");
-        assert_eq!(view.rungs, [2, 5, 4]);
+        assert_eq!(view.calibration, Some(0.7), "the cached pages still count");
+        assert_eq!(view.rungs, [2, 5, 3]);
         assert_eq!(view.events_per_day, 12);
         assert_eq!(view.stale_entries, vec!["INV-9".to_string()]);
 
@@ -34596,6 +34627,49 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .placeholder_values(&implement, &repo_cfg, &dir)
             .expect("the implement values must render");
         assert_eq!(placeholder_of(&values, "finding"), "");
+    }
+
+    /// The rules cache of a governed repository renders into the rules
+    /// section of the refine prompt, so the agent reads the rules of
+    /// `theory/rules.md` without a git call of its own.
+    #[test]
+    fn the_refine_prompt_renders_the_cached_rule_line() {
+        let dir = temp_root();
+        let repo = rig_repo(&dir);
+        let rule = "- 2026-09-11 T-pay: name the token in the model";
+        let steps = theory_steps_with_rules(
+            &repo,
+            "aaa111",
+            &run_skill("browser"),
+            CmdOut::ok(format!("{rule}\n")),
+        );
+        let mut rig = Rig::make_in(dir.clone(), steps, governed);
+        rig.poll(vec![issue(142, &[])], vec![]);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let refine = Task::new(
+            "borsuk",
+            Stage::Refine,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+
+        let values = rig
+            .daemon
+            .placeholder_values(&refine, &repo_cfg, &dir)
+            .expect("the refine values must render");
+        assert_eq!(placeholder_of(&values, "rules"), rule);
+        let rendered =
+            prompts::fill_template(prompts::REFINE_PROMPT, &values).expect("the prompt fills");
+        assert!(
+            rendered.contains("# The rules"),
+            "the refine prompt carries the rules section:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(rule),
+            "the refine prompt must carry the cached rule line:\n{rendered}"
+        );
     }
 
     /// One theory poller serves every alias that names its repository, so

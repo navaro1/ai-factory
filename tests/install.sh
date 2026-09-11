@@ -9,11 +9,10 @@ trap 'rm -rf -- "${test_root}"' EXIT
 fixture="${test_root}/repo"
 fake_bin="${test_root}/fake-bin"
 test_home="${test_root}/home"
-mkdir -p "${fixture}/docs/v0.5" "${fixture}/docs/v0.6" "${fixture}/docs/v0.8" \
+mkdir -p "${fixture}/docs/v0.5" "${fixture}/docs/v0.8" \
     "${fake_bin}" "${test_home}"
 cp "${repo}/install.sh" "${fixture}/install.sh"
 cp "${repo}/docs/v0.5/factory.example.toml" "${fixture}/docs/v0.5/"
-cp -R "${repo}/docs/v0.6/prompts" "${fixture}/docs/v0.6/prompts"
 cp -R "${repo}/docs/v0.8/prompts" "${fixture}/docs/v0.8/prompts"
 
 cat >"${fake_bin}/cargo" <<'FAKE_CARGO'

@@ -36,6 +36,15 @@ the surface on its own.
 
 {finding}
 
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Read the rules before you write
+the sections, and name a rule that shapes a decision of the ticket. An
+empty block means the file holds no rule yet.
+
+{rules}
+
 # The ticket body
 
 Rewrite the body of ticket #{number} with `gh` into the sections below, in

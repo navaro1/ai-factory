@@ -25,6 +25,20 @@ the governor is off.
 
 {skills}
 
+The line below is empty, or it names the one rule of this run. Apply it
+wherever you name a behaviour of the model.
+
+{why_rule}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Follow every rule, and name a
+rule when your change proves or breaks it. An empty block means the file
+holds no rule yet.
+
+{rules}
+
 # The simplest change
 
 Read the conventions of every file you touch, before you edit it. Follow
