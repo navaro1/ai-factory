@@ -3048,6 +3048,29 @@ mod tests {
         assert!(view.repository_tag_routes.is_empty());
     }
 
+    /// A daemon that predates the settings theory and skills fields sends
+    /// a state view without them. The wire defaults must give the empty
+    /// maps, so the settings panel stays usable against an old push.
+    #[test]
+    fn a_settings_view_without_the_theory_and_skills_fields_parses_with_empty_maps() {
+        let mut value = serde_json::to_value(sample_view(1)).unwrap();
+        let settings = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        settings.remove("repository_theory");
+        settings.remove("repository_skills");
+        let text = serde_json::to_string(&value).unwrap();
+
+        let view: StateView = serde_json::from_str(&text).unwrap();
+
+        assert!(view.settings.repository_theory.is_empty(), "{text}");
+        assert!(view.settings.repository_skills.is_empty(), "{text}");
+    }
+
     /// The settings view writes the theory roles into their own wire field
     /// and the prompts into a third. One round trip must return every role
     /// in role order and every prompt, so neither field eats the other.

@@ -3016,6 +3016,29 @@ mod repo_edit_tests {
     }
 
     #[test]
+    fn a_skills_path_with_a_space_or_a_quote_round_trips() {
+        let text = config_text();
+        for path in ["/tmp/my skills", "/tmp/ski\"lls"] {
+            let edited = edit_config_text(
+                &text,
+                &SettingsEdit::Skills {
+                    repository: "demo".to_string(),
+                    path: Some(path.to_string()),
+                },
+            )
+            .unwrap();
+            let parsed = Config::parse(&edited).unwrap();
+            assert_eq!(
+                parsed.repos["demo"].skills,
+                Some(SkillsPath {
+                    path: PathBuf::from(path)
+                }),
+                "path {path:?} gave:\n{edited}"
+            );
+        }
+    }
+
+    #[test]
     fn a_skills_edit_rejects_an_empty_path_and_an_unknown_alias() {
         let text = config_text();
         let error = edit_config_text(
