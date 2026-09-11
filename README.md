@@ -597,6 +597,10 @@ issues inside the active tab.
 |---|---|---|
 | List | `h` / `l` or Left / Right | Switch the repository tab. The switch wraps. |
 | List | `/` | Search the active tab: number, title, and label text. |
+| List | `space` | Mark or unmark the selected row and move down. |
+| List | `a` | Mark every row of the active filter. |
+| List | `esc` | Clear the marks when at least one row is marked. |
+| List | `L` | Open the batch label picker for the marked rows. |
 | List | `n` | Create a ticket in the active repository tab. |
 | List | `enter` | Open the selected issue. |
 | Issue | `j` / `k` or Down / Up | Scroll the issue pane by one line. |
@@ -609,6 +613,8 @@ issues inside the active tab.
 | Editor | `ctrl-s` | Save the content edit. |
 | Label picker | Space | Apply one label change. |
 | Label picker | `n` | Create and attach a repository label. |
+| Batch picker | Space | Add or remove the label on every marked ticket. |
+| Batch picker | `j` / `k` | Move the label selection. |
 | Conflict | `g` | Keep the GitHub version. |
 | Conflict | `p` | Reapply the pending version after another fetch. |
 | Nested view | `esc` | Return one level. |
@@ -620,6 +626,12 @@ It stops at the first issue and at the last issue of the tab.
 It never changes the repository tab.
 Wide terminals put the details and chat beside each other.
 Narrow terminals put the chat below the details.
+
+The list marks rows with `space`, and `a` marks the whole active filter.
+The batch picker shows one coverage count per label over the marked rows.
+One `space` in the picker adds or removes the label on every marked row.
+A tab switch clears the marks, and a search change keeps them.
+The final result toasts one summary over the whole batch.
 
 The example uses Claude with only `Read`, `Glob`, and `Grep`.
 A different ticket chat role can permit repository changes.

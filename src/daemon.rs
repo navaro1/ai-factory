@@ -5520,12 +5520,15 @@ impl Daemon {
                     &self.config,
                     self.now_ms,
                 );
-                if let Some((repo, _, confirmed_ms)) = effects.confirmed.as_mut() {
+                if let Some((repo, _, _)) = effects.confirmed.first() {
+                    let repo = repo.clone();
                     let completed_ms = (self.clock)().max(self.now_ms);
                     self.now_ms = completed_ms;
-                    *confirmed_ms = completed_ms;
+                    for (_, _, confirmed_ms) in &mut effects.confirmed {
+                        *confirmed_ms = completed_ms;
+                    }
                     self.ticket_controller
-                        .record_confirmed_mutation(repo, completed_ms);
+                        .record_confirmed_mutation(&repo, completed_ms);
                 }
                 for push in &mut effects.pushes {
                     if let Push::TicketDetails(details) = push {
@@ -5572,13 +5575,14 @@ impl Daemon {
                         self.changed |= ready || decisions;
                     }
                 }
-                if let Some((repo, issue, _confirmed_ms)) = effects.confirmed {
-                    self.snapshot
-                        .repos
-                        .entry(repo.clone())
-                        .or_default()
-                        .issues
-                        .insert(issue.number, issue);
+                if !effects.confirmed.is_empty() {
+                    let repo = effects.confirmed[0].0.clone();
+                    {
+                        let items = self.snapshot.repos.entry(repo.clone()).or_default();
+                        for (_, issue, _) in &effects.confirmed {
+                            items.issues.insert(issue.number, issue.clone());
+                        }
+                    }
                     self.changed = true;
                     if let Some(fresh) = self.snapshot.repos.get(&repo).cloned() {
                         self.complete_parked_refines(&repo, &fresh);
@@ -29218,6 +29222,85 @@ mod tests {
         assert_eq!(view.tickets.len(), 1);
         assert_eq!(view.tickets[0].repo, "borsuk");
         assert_eq!(view.tickets[0].number, 12);
+    }
+
+    #[test]
+    fn tickets_batch_updates_the_snapshot_and_pushes_one_state_and_summary() {
+        let ok7 = json!([{"name": "ui"}, {"name": "urgent"}]).to_string();
+        let ok9 = ok7.clone();
+        let (mut rig, rx) = pushed_rig(vec![
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/7/labels",
+                    "-f",
+                    "labels[]=urgent",
+                ],
+                CmdOut::ok(format!("HTTP/2 200\r\n\r\n{ok7}")),
+            ),
+            gh_step(
+                &[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/issues/9/labels",
+                    "-f",
+                    "labels[]=urgent",
+                ],
+                CmdOut::ok(format!("HTTP/2 200\r\n\r\n{ok9}")),
+            ),
+        ]);
+        rig.poll(vec![issue(7, &[]), issue(9, &[])], vec![]);
+        let (push_tx, push_rx) = mpsc::channel();
+        rig.daemon
+            .set_ticket_pusher(Box::new(move |push| push_tx.send(push).unwrap()));
+        let _initial = rx.try_recv().expect("the poll must publish one state");
+
+        rig.act(Action::Ticket(TicketAction::BatchToggleLabel {
+            request: "batch-label:one".to_string(),
+            repo: "borsuk".to_string(),
+            numbers: vec![7, 9, 123],
+            label: "urgent".to_string(),
+            on: true,
+        }));
+
+        for number in [7, 9] {
+            let labels = &rig.daemon.snapshot.repos["borsuk"].issues[&number].labels;
+            assert!(
+                labels.iter().any(|label| label == "urgent"),
+                "#{number} must carry the batch label"
+            );
+        }
+        let Push::TicketResult(pending) = push_rx.try_recv().unwrap() else {
+            panic!("the batch must open with one pending result");
+        };
+        assert_eq!(pending.kind, TicketResultKind::Pending);
+        let Push::TicketResult(result) = push_rx.try_recv().unwrap() else {
+            panic!("the batch must close with one final result");
+        };
+        assert_eq!(result.request, "batch-label:one");
+        assert_eq!(result.kind, TicketResultKind::PartialFailure);
+        assert!(result.message.contains("#123"), "{}", result.message);
+        assert!(
+            push_rx.try_recv().is_err(),
+            "the batch must push exactly one final result"
+        );
+        let view = rx
+            .try_recv()
+            .expect("the batch must publish one fresh state");
+        let borsuk: Vec<&crate::sock::TicketSummary> = view
+            .tickets
+            .iter()
+            .filter(|ticket| ticket.repo == "borsuk")
+            .collect();
+        assert_eq!(borsuk.len(), 2);
+        assert!(borsuk
+            .iter()
+            .all(|ticket| ticket.labels.iter().any(|label| label == "urgent")));
     }
 
     #[test]
