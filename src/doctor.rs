@@ -1544,31 +1544,9 @@ fn item_worktrees(dir: &Path) -> Result<Vec<(WorktreeKind, Option<u64>, PathBuf)
     Ok(out)
 }
 
-/// The worktree path of one item, from the manager's directory names.
-///
-/// An unnumbered kind, such as the model worktree, names its directory
-/// with the prefix alone. Only the tests build a path this way; the scan
-/// itself reads the path from the directory entry.
-#[cfg_attr(not(test), allow(dead_code))]
-fn item_path(state_dir: &Path, alias: &str, kind: WorktreeKind, number: Option<u64>) -> PathBuf {
-    state_dir
-        .join("worktrees")
-        .join(alias)
-        .join(dir_name(kind, number))
-}
-
 /// True when one directory suffix is the short sha of a commit.
 fn is_short_sha(text: &str) -> bool {
     text.len() == SHA_CHARS && text.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// The directory name of one worktree: `issue-7`, or `model`.
-#[cfg_attr(not(test), allow(dead_code))]
-fn dir_name(kind: WorktreeKind, number: Option<u64>) -> String {
-    match number {
-        Some(number) => format!("{}{number}", kind.prefix()),
-        None => kind.prefix().to_string(),
-    }
 }
 
 /// The GitHub state that controls one worktree.
@@ -1844,6 +1822,31 @@ mod tests {
     // --- Helpers. ---
 
     static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The worktree path of one item, from the manager's directory names.
+    ///
+    /// An unnumbered kind, such as the model worktree, names its directory
+    /// with the prefix alone. Only a test builds a path this way; the scan
+    /// itself reads the path from the directory entry.
+    fn item_path(
+        state_dir: &Path,
+        alias: &str,
+        kind: WorktreeKind,
+        number: Option<u64>,
+    ) -> PathBuf {
+        state_dir
+            .join("worktrees")
+            .join(alias)
+            .join(dir_name(kind, number))
+    }
+
+    /// The directory name of one worktree: `issue-7`, or `model`.
+    fn dir_name(kind: WorktreeKind, number: Option<u64>) -> String {
+        match number {
+            Some(number) => format!("{}{number}", kind.prefix()),
+            None => kind.prefix().to_string(),
+        }
+    }
 
     /// An executor that returns one operating system error.
     struct IoErrorExec(std::io::ErrorKind);

@@ -256,6 +256,18 @@ impl FastRun {
         self.tasks.iter().all(|id| self.records.contains_key(id))
     }
 
+    /// Stop waiting for one check. The answer says whether the run held it.
+    ///
+    /// An aborted check reports no exit, so nothing will ever record it.
+    /// It leaves the wait list instead, because an abort is neither a
+    /// pass nor a failure of the check.
+    pub fn drop_task(&mut self, task: &str) -> bool {
+        let before = self.tasks.len();
+        self.tasks.retain(|id| id != task);
+        self.records.remove(task);
+        self.tasks.len() != before
+    }
+
     /// The first record that did not report a zero value, in queue order.
     pub fn failure(&self) -> Option<&Record> {
         self.tasks
@@ -633,9 +645,14 @@ impl MeasureRun {
         self.slots().all(|slot| slot.records.is_some())
     }
 
-    /// True when `task` is one of the runs this review waits for.
+    /// True when this review still waits for `task`.
+    ///
+    /// A slot that already holds its records waits for nothing, so an
+    /// aborted or finished run stops holding the review even while the
+    /// other side of the batch still works.
     pub fn holds(&self, task: &str) -> bool {
-        self.slots().any(|slot| slot.id == task)
+        self.slots()
+            .any(|slot| slot.id == task && slot.records.is_none())
     }
 
     /// Store the records of one finished run. The answer says whether the
@@ -937,6 +954,10 @@ mod tests {
         ));
 
         assert!(run.finished());
+        assert!(
+            !run.holds("borsuk/measure-11223344-daemon-poll_p95"),
+            "a settled slot waits for nothing"
+        );
         let report = run.report();
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].0, "daemon");

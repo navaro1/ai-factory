@@ -255,6 +255,9 @@ pub const FAST_TIMEOUT_S: u64 = 120;
 /// The opening words of the finding one failed fast check posts.
 pub const FAST_CHECK_FAILED: &str = "fast check failed";
 
+/// The reason one aborted measurer reports in the comparison.
+pub const MEASURE_ABORTED: &str = "the operator aborted the run";
+
 /// The hold text of an implement task the theory window refuses.
 pub const WINDOW_FULL_HOLD: &str = "window full";
 
@@ -7049,6 +7052,10 @@ impl Daemon {
         if !repo_cfg.theory.governor.is_on() {
             return false;
         }
+        // The comparison belongs to the head that produced it. This
+        // admission decides the next one, so the old text goes now, and a
+        // head that measures nothing renders no comparison at all.
+        self.measure_text.remove(review_task);
         if !self.has_fast_feature(alias) && !self.has_measurer(alias) {
             return false;
         }
@@ -7293,10 +7300,13 @@ impl Daemon {
                 eprintln!("the measure cache of {}: {error:#}", task.id);
             }
         }
-        // A run of a review reports through the comparison of its whole
-        // batch, so only a run outside a batch posts its raw records.
+        // A fast check posts its own exit record. A measurer reports
+        // through the comparison of its whole batch, so a measurer whose
+        // batch is gone, a superseded head for example, drops its records
+        // instead of commenting on a head nobody reviews.
+        let fast = measure::fast_feature(&task.id).is_some();
         let batched = self.measure_runs.values().any(|run| run.holds(&task.id));
-        if !batched {
+        if fast {
             let key = match task.kind {
                 ItemKind::Issue => RecordKey::Issue(task.number),
                 ItemKind::Pr => RecordKey::Pr(task.number),
@@ -7306,6 +7316,11 @@ impl Daemon {
             {
                 eprintln!("the measure records of {}: {error:#}", task.id);
             }
+        } else if !batched {
+            eprintln!(
+                "the measure records of {}: no review waits for them, so they are dropped",
+                task.id
+            );
         }
         if let Err(error) = self
             .table
@@ -7318,11 +7333,44 @@ impl Daemon {
         if batched {
             self.settle_measure_run(&task.id, records.clone());
         }
-        if measure::fast_feature(&task.id).is_some() {
+        if fast {
             if let Some(record) = records.first().cloned() {
                 self.settle_fast_run(&task.id, record);
             }
         }
+    }
+
+    /// Release one aborted measure task from the review that waits for it.
+    ///
+    /// An abort produces no exit, so nothing else would settle the run and
+    /// the review would wait for a task that is gone. A measurer settles
+    /// as one incomparable record, because an abort is a reason the
+    /// comparison can print. A fast check leaves the wait list instead,
+    /// because an abort is neither a pass nor a failure of the check.
+    fn release_measure_task(&mut self, task: &Task) {
+        if task.purpose != TaskPurpose::Measure {
+            return;
+        }
+        let job = self.measure_jobs.remove(&task.id);
+        if self.measure_runs.values().any(|run| run.holds(&task.id)) {
+            let id = job.map_or(String::new(), |job| job.record);
+            let record = Record::incomparable(&id, MEASURE_ABORTED);
+            self.settle_measure_run(&task.id, vec![record]);
+            return;
+        }
+        let Some(review) = self
+            .fast_runs
+            .iter_mut()
+            .find(|(_, run)| run.tasks.iter().any(|id| id == &task.id))
+            .map(|(review, run)| {
+                run.drop_task(&task.id);
+                review.clone()
+            })
+        else {
+            return;
+        };
+        self.fast_results.remove(&task.id);
+        self.finish_fast_run(&review);
     }
 
     /// Store the records of one finished measure run, and act when the
@@ -8859,6 +8907,7 @@ impl Daemon {
             } else {
                 self.remove_task_session_marker(task);
             }
+            self.release_measure_task(task);
         }
     }
 
@@ -24426,6 +24475,34 @@ mod tests {
         std::fs::write(&path, format!("{}\n", measure_line(value))).unwrap();
     }
 
+    /// A measure run that waits for `task` in the area of the fixture,
+    /// and for one slot that never reports, so the batch stays open and
+    /// the settled records stay readable.
+    fn open_run(task: &str) -> MeasureRun {
+        MeasureRun {
+            base: vec![MeasureSlot {
+                id: "borsuk/measure-00000000-web-checkout-poll_p95".to_string(),
+                area: "web-checkout".to_string(),
+                records: None,
+            }],
+            head: vec![MeasureSlot {
+                id: task.to_string(),
+                area: "web-checkout".to_string(),
+                records: None,
+            }],
+        }
+    }
+
+    /// The records one open run settled for `task`.
+    fn settled(rig: &Rig, review: &str, task: &str) -> Vec<Record> {
+        rig.daemon.measure_runs[review]
+            .head
+            .iter()
+            .find(|slot| slot.id == task)
+            .and_then(|slot| slot.records.clone())
+            .expect("the run settled the task")
+    }
+
     /// One `gh api` comment step on the theory record of pull request 7.
     fn record_comment_step(body: &str) -> Step {
         let field = format!("body={body}");
@@ -26672,6 +26749,164 @@ mod tests {
     }
 
     #[test]
+    fn a_measurer_that_times_out_in_a_review_reports_one_incomparable_row() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  incomparable: timeout\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        write_measure_log(&rig, &base, 12);
+
+        rig.event(exited(&head, false, &script::exit_detail(124)));
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(
+            rig.task(&head).state,
+            TaskState::Done,
+            "a timeout ends the measure task, it does not fail it"
+        );
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert!(
+            !measure::cache_path(
+                &rig.daemon.state_dir,
+                "borsuk",
+                FAST_TREE_SHA,
+                &rig.daemon.verify_map("borsuk").unwrap().measurers[0],
+            )
+            .exists(),
+            "a timeout is a fact of one run, so it never caches"
+        );
+    }
+
+    #[test]
+    fn a_new_head_that_touches_no_area_drops_the_old_comparison() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  12 \u{2192} 14  ms  worsened\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        // The second head touches no area at all, so the admission queues
+        // nothing and the comparison of the first head must go.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("docs/readme.md\n"),
+        ));
+        steps.extend(body_reuse_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "docs/readme.md",
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        write_measure_log(&rig, &head, 14);
+        write_measure_log(&rig, &base, 12);
+        rig.event(exited(&head, true, "exit 0"));
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert!(
+            rig.daemon.measure_text.contains_key("borsuk/review-p7"),
+            "the first head left its comparison"
+        );
+
+        let mut moved = unlinked_pr(7);
+        moved.head_sha = "deadbee".to_string();
+        rig.poll(vec![], vec![moved]);
+        rig.event(exited(
+            "borsuk/review-p7",
+            false,
+            "the superseded process exited",
+        ));
+
+        assert!(
+            rig.daemon.measure_text.is_empty(),
+            "the new head drops the comparison of the old one"
+        );
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        let job = rig.job(rig.job_count() - 1);
+        assert_eq!(job.task, "borsuk/review-p7");
+        assert!(
+            job.prompt.contains("\nnone\n"),
+            "the comparison slot reads none:\n{}",
+            job.prompt
+        );
+    }
+
+    #[test]
     fn a_new_head_measures_the_head_again_and_reads_the_base_from_the_cache() {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
@@ -26903,9 +27138,7 @@ mod tests {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
         let line = "{\"id\":\"poll_p95\",\"value\":12,\"unit\":\"ms\",\"direction\":\"lower\"}";
-        let block = measure::block(&measure::parse_lines(line));
-        let steps = vec![record_comment_step(&block)];
-        let mut rig = Rig::make_in(dir, steps, governed);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
         let measurers = vec![
             Measurer {
                 id: "poll_p95".to_string(),
@@ -26951,20 +27184,35 @@ mod tests {
         let task = rig.task(&ids[0]);
         std::fs::create_dir_all(task.log_path.parent().unwrap()).unwrap();
         std::fs::write(&task.log_path, format!("{line}\nstderr noise\n")).unwrap();
+        rig.daemon
+            .measure_runs
+            .insert("borsuk/review-p7".to_string(), open_run(&ids[0]));
 
         rig.daemon.finish_measure(&task, "exit 0");
 
         assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
-        assert_eq!(rig.exec.calls().len(), 1, "the tree hash is given");
+        assert_eq!(
+            settled(&rig, "borsuk/review-p7", &ids[0]),
+            vec![Record::value(
+                "poll_p95",
+                12.0,
+                "ms",
+                measure::Direction::Lower
+            )],
+            "the run of the review takes the records, and the prefixed noise stays out"
+        );
+        assert!(
+            rig.exec.calls().is_empty(),
+            "the tree hash is given and the batch posts the comment later"
+        );
     }
 
     #[test]
-    fn a_measurer_that_fails_ships_one_incomparable_record() {
+    fn a_measure_task_that_belongs_to_no_run_drops_its_records() {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
-        let block = measure::block(&[measure::Record::incomparable("poll_p95", "timeout")]);
-        let steps = vec![record_comment_step(&block)];
-        let mut rig = Rig::make_in(dir, steps, governed);
+        let line = "{\"id\":\"poll_p95\",\"value\":12,\"unit\":\"ms\",\"direction\":\"lower\"}";
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
         let measurers = vec![Measurer {
             id: "poll_p95".to_string(),
             area: "web-checkout".to_string(),
@@ -26990,11 +27238,142 @@ mod tests {
             .transition(&ids[0], TaskState::Running, T0)
             .unwrap();
         let task = rig.task(&ids[0]);
+        std::fs::create_dir_all(task.log_path.parent().unwrap()).unwrap();
+        std::fs::write(&task.log_path, format!("{line}\n")).unwrap();
+
+        rig.daemon.finish_measure(&task, "exit 0");
+
+        assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
+        assert!(
+            rig.exec.calls().is_empty(),
+            "a superseded head comments on nobody: {:?}",
+            rig.exec.calls()
+        );
+    }
+
+    #[test]
+    fn a_measurer_that_fails_ships_one_incomparable_record() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let measurers = vec![Measurer {
+            id: "poll_p95".to_string(),
+            area: "web-checkout".to_string(),
+            command: "aif bench".to_string(),
+            mode: Mode::Pr,
+            timeout_s: 30,
+        }];
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
+        rig.daemon
+            .table
+            .transition(&ids[0], TaskState::Running, T0)
+            .unwrap();
+        let task = rig.task(&ids[0]);
+        rig.daemon
+            .measure_runs
+            .insert("borsuk/review-p7".to_string(), open_run(&ids[0]));
 
         rig.daemon.finish_measure(&task, &script::exit_detail(124));
 
         assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
-        assert!(block.contains("incomparable: timeout"), "block: {block}");
+        assert_eq!(
+            settled(&rig, "borsuk/review-p7", &ids[0]),
+            vec![Record::incomparable("poll_p95", "timeout")],
+            "a timeout is one incomparable record that names the reason"
+        );
+    }
+
+    #[test]
+    fn an_aborted_measure_task_releases_the_review_it_holds() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let measurers = vec![Measurer {
+            id: "poll_p95".to_string(),
+            area: "web-checkout".to_string(),
+            command: "aif bench".to_string(),
+            mode: Mode::Pr,
+            timeout_s: 30,
+        }];
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
+        rig.daemon
+            .measure_runs
+            .insert("borsuk/review-p7".to_string(), open_run(&ids[0]));
+
+        rig.daemon
+            .cancel_task_with_reason(&ids[0], false, "the operator aborted it");
+
+        assert_eq!(
+            settled(&rig, "borsuk/review-p7", &ids[0]),
+            vec![Record::incomparable("poll_p95", MEASURE_ABORTED)],
+            "the abort settles the slot with the reason"
+        );
+        assert!(
+            !rig.daemon.measure_runs["borsuk/review-p7"].holds(&ids[0]),
+            "the review no longer waits for the aborted run"
+        );
+        assert!(
+            !rig.daemon.measure_jobs.contains_key(&ids[0]),
+            "the aborted job leaves the map with its task"
+        );
+    }
+
+    #[test]
+    fn an_aborted_fast_check_leaves_the_wait_list_of_its_review() {
+        let dir = temp_root();
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let aborted = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let other = format!("borsuk/fast-{FAST_TREE}-orders");
+        let spec = tasks::ScopedTask {
+            id: &aborted,
+            repo: "borsuk",
+            stage: Stage::Review,
+            kind: ItemKind::Pr,
+            number: 7,
+        };
+        rig.daemon
+            .table
+            .upsert_with_id(spec, PathBuf::new(), T0)
+            .map(|task| task.purpose = TaskPurpose::Measure)
+            .expect("the fast task must upsert");
+        let mut run = FastRun::new(vec![aborted.clone(), other.clone()]);
+        run.records
+            .insert(other.clone(), measure::exit_record("orders", 0));
+        rig.daemon
+            .fast_runs
+            .insert("borsuk/review-p7".to_string(), run);
+
+        rig.daemon
+            .cancel_task_with_reason(&aborted, false, "the operator aborted it");
+
+        assert!(
+            !rig.daemon.fast_runs.contains_key("borsuk/review-p7"),
+            "the run finished on the check that did report"
+        );
     }
 
     #[test]
