@@ -21,6 +21,15 @@ pub use super::verify::Tier;
 /// lists them. The set is closed: a heading outside it is prose.
 pub const SECTIONS: [&str; 6] = ["Run", "Fast", "Auth or seed", "Drive", "Logs", "Gotchas"];
 
+/// The four H2 headings of a feature file, in the order design section
+/// 4.4 lists them.
+pub const FEATURE_SECTIONS: [&str; 4] = [
+    "Sub-features",
+    "How to get to it (user POV)",
+    "Driving it",
+    "Gotchas",
+];
+
 /// The directory of the run skills inside the skills checkout.
 pub const SKILLS_DIR: &str = ".claude/skills/";
 
@@ -250,11 +259,27 @@ pub fn parse_feature(path: &str, text: &str) -> Result<Feature, Finding> {
     })
 }
 
-/// Every finding of one skill set: the files that did not parse, then the
-/// features that name an area the map does not hold.
+/// Every finding of one skill set: the files that did not parse, then
+/// skill sections that hold a placeholder, then index omissions, then
+/// features whose shape or area fails.
 pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
     let known: BTreeSet<&str> = verify.areas.iter().map(|area| area.id.as_str()).collect();
     let mut findings = set.lint.clone();
+    for skill in set.surfaces.values() {
+        findings.extend(placeholder_findings(skill));
+        let Some(index) = &skill.index else {
+            continue;
+        };
+        for id in set.feature_ids(&skill.surface) {
+            if !index_lists(index, &id) {
+                findings.push(Finding {
+                    surface: skill.surface.clone(),
+                    file: "features/README.md".to_string(),
+                    reason: format!("feature {id} not listed"),
+                });
+            }
+        }
+    }
     for feature in &set.features {
         if !known.contains(feature.area.as_str()) {
             findings.push(Finding {
@@ -263,8 +288,87 @@ pub fn lint(set: &SkillSet, verify: &VerifyMap) -> Vec<Finding> {
                 reason: format!("area {} unknown", feature.area),
             });
         }
+        for name in FEATURE_SECTIONS.iter() {
+            if !has_heading(&feature.body, name) {
+                findings.push(Finding {
+                    surface: feature.surface.clone(),
+                    file: format!("features/{}.md", feature.id),
+                    reason: format!("section {name} missing"),
+                });
+            }
+        }
     }
     findings
+}
+
+/// The sections of `skill` that still hold a template placeholder.
+///
+/// Design section 4.2: a placeholder left in any section fails the setup
+/// ticket. A placeholder is a `<...>` token whose first and last inner
+/// characters are letters, or a literal `TODO` or `TBD`. A comparison
+/// such as `elapsed < 30s and retries > 0` does not match.
+pub fn placeholder_findings(skill: &RunSkill) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for name in SECTIONS.iter() {
+        let Some(body) = skill.sections.get(*name) else {
+            continue;
+        };
+        if holds_placeholder(body) {
+            out.push(Finding {
+                surface: skill.surface.clone(),
+                file: "SKILL.md".to_string(),
+                reason: format!("section {name} holds a placeholder"),
+            });
+        }
+    }
+    out
+}
+
+/// True when `text` holds a template placeholder.
+fn holds_placeholder(text: &str) -> bool {
+    if text.contains("TODO") || text.contains("TBD") {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != b'<' {
+            continue;
+        }
+        let Some(end) = text[start + 1..].find('>') else {
+            continue;
+        };
+        let inner = &text[start + 1..start + 1 + end];
+        let first = inner.chars().next().is_some_and(char::is_alphabetic);
+        let last = inner.chars().last().is_some_and(char::is_alphabetic);
+        if first && last {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `body` carries the heading `## <title>`.
+fn has_heading(body: &str, title: &str) -> bool {
+    let wanted = format!("## {title}");
+    body.lines().any(|line| line.trim() == wanted)
+}
+
+/// True when the index names `id`.
+///
+/// Only a `- ` bullet names a feature. The line names one when the text
+/// after the bullet starts with the id and the id ends there: the next
+/// character is the end of the line, a colon, or whitespace. A
+/// description that merely contains the id as a word does not count.
+fn index_lists(index: &str, id: &str) -> bool {
+    index.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix("- ") else {
+            return false;
+        };
+        let Some(tail) = rest.strip_prefix(id) else {
+            return false;
+        };
+        matches!(tail.chars().next(), None | Some(':')) || tail.starts_with(char::is_whitespace)
+    })
 }
 
 /// The features of one area, in the order of requirement R3.
@@ -673,7 +777,13 @@ blind: pixels below 320 px width, native file dialogs\n---\n\
 
     const FEATURE: &str = "---\narea: web-checkout\n\
 fast: npx playwright test checkout --reporter=line\n---\n\
-# Checkout\n\nThe cart pays.\n";
+# Checkout\n\nThe cart pays.\n\n\
+## Sub-features\na cart and a payment step\n\n\
+## How to get to it (user POV)\nthe nav menu\n\n\
+## Driving it\nnpx playwright test checkout\n\n\
+## Gotchas\nthe cart clears on reload\n";
+
+    const INDEX: &str = "# Features of web\n\n- checkout: the cart pays\n";
 
     fn fixture_model() -> model::Model {
         let text = concat!(
@@ -797,6 +907,75 @@ fast: npx playwright test checkout --reporter=line\n---\n\
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].surface, "web");
         assert_eq!(findings[0].to_string(), "features/x.md: area nope unknown");
+    }
+
+    #[test]
+    fn lint_names_a_section_that_still_holds_a_placeholder() {
+        let text = SKILL.replace("npm run dev on port 4000", "npm run dev on port <port>");
+        let set = SkillSet::from_files([(".claude/skills/run-web/SKILL.md", text.as_str())]);
+
+        let findings = lint(&set, &map(""));
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].surface, "web");
+        assert_eq!(
+            findings[0].to_string(),
+            "SKILL.md: section Run holds a placeholder"
+        );
+
+        let todo = SKILL.replace("npm run dev on port 4000", "TODO fill the port");
+        let set = SkillSet::from_files([(".claude/skills/run-web/SKILL.md", todo.as_str())]);
+        assert_eq!(lint(&set, &map("")).len(), 1);
+
+        let tbd = SKILL.replace("npm run dev on port 4000", "TBD");
+        let set = SkillSet::from_files([(".claude/skills/run-web/SKILL.md", tbd.as_str())]);
+        assert_eq!(lint(&set, &map("")).len(), 1);
+
+        let plain = SKILL.replace("npm run dev on port 4000", "elapsed < 30s and retries > 0");
+        let set = SkillSet::from_files([(".claude/skills/run-web/SKILL.md", plain.as_str())]);
+        assert!(lint(&set, &map("")).is_empty());
+
+        let set = SkillSet::from_files([(".claude/skills/run-web/SKILL.md", SKILL)]);
+        assert!(lint(&set, &map("")).is_empty());
+    }
+
+    #[test]
+    fn lint_names_a_missing_feature_section_and_an_index_that_omits_a_feature() {
+        let indexed = SkillSet::from_files([
+            (".claude/skills/run-web/SKILL.md", SKILL),
+            (".claude/skills/run-web/features/README.md", INDEX),
+            (".claude/skills/run-web/features/checkout.md", FEATURE),
+        ]);
+        assert!(lint(&indexed, &map("")).is_empty());
+
+        let text = FEATURE.replace("## Driving it\n", "");
+        let sparse = SkillSet::from_files([
+            (".claude/skills/run-web/SKILL.md", SKILL),
+            (".claude/skills/run-web/features/checkout.md", text.as_str()),
+        ]);
+
+        let findings = lint(&sparse, &map(""));
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].to_string(),
+            "features/checkout.md: section Driving it missing"
+        );
+
+        let short = "# Features of web\n\n- payments: money moves\n";
+        let listed = SkillSet::from_files([
+            (".claude/skills/run-web/SKILL.md", SKILL),
+            (".claude/skills/run-web/features/README.md", short),
+            (".claude/skills/run-web/features/checkout.md", FEATURE),
+        ]);
+
+        let findings = lint(&listed, &map(""));
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].to_string(),
+            "features/README.md: feature checkout not listed"
+        );
     }
 
     #[test]

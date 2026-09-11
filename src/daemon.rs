@@ -4826,6 +4826,9 @@ impl Daemon {
             self.finish_measure(&task, detail);
             return;
         }
+        if ok && self.hold_skill_implement(&task) {
+            return;
+        }
         if ok {
             self.push_skill_worktree(&task);
         }
@@ -8240,29 +8243,26 @@ impl Daemon {
 
     /// The directory the agent writes the run skill of `surface` into.
     ///
-    /// In code mode it is relative to the code worktree, so the skill lands
-    /// in the pull request of the ticket. In shadow mode it is the absolute
-    /// path inside the skills worktree of ticket `number`, so the code
-    /// repository never holds a skill file.
+    /// In code mode it is the absolute path inside the issue worktree of
+    /// ticket `number`, so the path is the one the implement task runs in
+    /// and the daemon reads the written files back from it. In shadow mode
+    /// it is the absolute path inside the skills worktree of ticket
+    /// `number`, so the code repository never holds a skill file.
     fn skills_dir(&self, repo: &RepoConfig, surface: &str, number: u64) -> String {
         let leaf = format!(".claude/skills/run-{surface}/");
-        match repo.theory_repo() {
-            None => leaf,
-            Some(_) => format!(
-                "{}/{leaf}",
-                self.worktrees.skills_path(repo, number).display()
-            ),
-        }
+        let root = match repo.theory_repo() {
+            None => self.worktrees.issue_path(repo, number),
+            Some(_) => self.worktrees.skills_path(repo, number),
+        };
+        format!("{}/{leaf}", root.display())
     }
 
-    /// What one shadow-mode run skill implement task writes to the theory
-    /// repository.
+    /// The verify-skill issue one task drives, and its surface.
     ///
     /// The answer is `None` for every other task: another stage, another
-    /// purpose, a repository with the governor off, a repository in code
-    /// mode, a ticket without `verify-skill`, or a title that names no
-    /// surface.
-    fn skill_target(&self, task: &Task, repo: &RepoConfig) -> Option<SkillTarget> {
+    /// kind, another purpose, a repository with the governor off, a ticket
+    /// without `verify-skill`, or a title that names no surface.
+    fn verify_skill_item(&self, task: &Task, repo: &RepoConfig) -> Option<(&Issue, String)> {
         if task.stage != Stage::Implement
             || task.kind != ItemKind::Issue
             || task.purpose != TaskPurpose::Pipeline
@@ -8270,7 +8270,6 @@ impl Daemon {
         {
             return None;
         }
-        let theory_repo = repo.theory_repo()?;
         let issue = self
             .snapshot
             .repos
@@ -8280,11 +8279,65 @@ impl Daemon {
         if !issue.labels.iter().any(|label| label == VERIFY_SKILL_LABEL) {
             return None;
         }
+        Some((issue, skills::ticket_surface(&issue.title)?.to_string()))
+    }
+
+    /// What one shadow-mode run skill implement task writes to the theory
+    /// repository.
+    ///
+    /// The answer is `None` outside shadow mode, because the theory
+    /// repository is where the skill pull request goes.
+    fn skill_target(&self, task: &Task, repo: &RepoConfig) -> Option<SkillTarget> {
+        let theory_repo = repo.theory_repo()?;
+        let (issue, surface) = self.verify_skill_item(task, repo)?;
         Some(SkillTarget {
             theory_repo: theory_repo.to_string(),
-            surface: skills::ticket_surface(&issue.title)?.to_string(),
+            surface,
             title: issue.title.clone(),
         })
+    }
+
+    /// Hold a finished verify-skill implement task whose `SKILL.md` still
+    /// holds a template placeholder.
+    ///
+    /// Design section 4.2: a placeholder left in any section fails the
+    /// setup ticket. The daemon posts the finding on the ticket and
+    /// re-queues the implement task, so the agent gets another attempt
+    /// before any skills pull request opens. A missing or unparseable
+    /// `SKILL.md` holds nothing: its findings reach the operator through
+    /// the doctor and the AREAS panel instead.
+    fn hold_skill_implement(&mut self, task: &Task) -> bool {
+        let Some(repo_cfg) = self.config.repos.get(&task.repo).cloned() else {
+            return false;
+        };
+        let Some((_, surface)) = self.verify_skill_item(task, &repo_cfg) else {
+            return false;
+        };
+        let path = format!(
+            "{}SKILL.md",
+            self.skills_dir(&repo_cfg, &surface, task.number)
+        );
+        let Ok(text) = fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(skill) = skills::parse_skill(
+            &format!("{}run-{surface}/SKILL.md", skills::SKILLS_DIR),
+            &text,
+        ) else {
+            return false;
+        };
+        let Some(finding) = skills::placeholder_findings(&skill).into_iter().next() else {
+            return false;
+        };
+        eprintln!("the run skill of {}: {finding}", task.id);
+        if let Err(error) =
+            self.post_issue_comment(&repo_cfg, task.number, &format!("skill: {finding}"))
+        {
+            eprintln!("the skill finding of {}: {error:#}", task.id);
+        }
+        self.append_task_log(task, &format!("aif: {finding}\n"));
+        self.fail_run(task, &finding.to_string());
+        true
     }
 
     /// Cut the skills worktree of one run skill ticket before its implement
@@ -15632,8 +15685,11 @@ mod tests {
     #[test]
     fn the_setup_action_creates_the_run_skill_ticket_with_both_labels() {
         let (tx, rx) = mpsc::channel();
+        // The code-mode body differs between the number 0 provisional
+        // fill and the number 12 fill, so the daemon patches the body.
         let steps = vec![
             verify_skill_label_step(),
+            skill_issue_step("Create the run skill for borsuk/web", 12),
             skill_issue_step("Create the run skill for borsuk/web", 12),
         ];
         let mut rig = Rig::make_with(steps, governed);
@@ -15664,6 +15720,26 @@ mod tests {
             body.contains("6. Prove it once end to end."),
             "step 6 must ask for the proof: {body}"
         );
+
+        // The patched body names the issue worktree the implement task
+        // will run in, not a relative leaf.
+        let patch = rig
+            .exec
+            .calls()
+            .into_iter()
+            .find(|call| call.program == "gh" && call.args.get(3) == Some(&"PATCH".to_string()))
+            .expect("one update_issue call");
+        let root = rig.repo.parent().expect("the repo sits in the rig root");
+        let expected = issue_wt(root, 12)
+            .join(".claude/skills/run-web/")
+            .to_string_lossy()
+            .into_owned();
+        let patched = issue_body(&patch);
+        assert!(
+            patched.contains(&expected),
+            "the patched body must hold the issue worktree path: {patched}"
+        );
+        assert!(!patched.contains("{skills_dir}"), "no placeholder survives");
 
         let Push::TicketResult(result) = rx.try_recv().unwrap() else {
             panic!("the setup action must push one ticket result");
@@ -16058,6 +16134,82 @@ mod tests {
                 && call.args.get(1) == Some(&repo_text)
                 && call.args.iter().any(|arg| arg == "commit" || arg == "push")),
             "no git write lands in the code checkout"
+        );
+    }
+
+    #[test]
+    fn a_setup_implement_exit_with_a_placeholder_requeues_and_opens_no_pull_request() {
+        let dir = temp_root();
+        let comment_url = "repos/acme/borsuk/issues/42/comments";
+        let finding = "skill: SKILL.md: section Run holds a placeholder";
+        let body_field = format!("body={finding}");
+        let steps: Vec<Step> =
+            fresh_issue_steps(&rig_repo(&dir), &issue_wt(&dir, 42), 42, &rig_gitdir(&dir))
+                .into_iter()
+                .chain(fresh_skills_steps(&dir, 42))
+                .chain(vec![gh_step(
+                    &["api", "-X", "POST", comment_url, "-f", body_field.as_str()],
+                    CmdOut::ok(""),
+                )])
+                .collect();
+        let mut rig = Rig::make_in(dir.clone(), steps, shadow_governed);
+        let mut ticket = issue(42, &["refined", VERIFY_SKILL_LABEL]);
+        ticket.title = SkillTicket::Setup.title("borsuk", "web");
+
+        rig.poll(vec![ticket], vec![]);
+        assert_eq!(rig.job(0).task, "borsuk/implement-i42");
+
+        // The agent wrote a skill whose Run section still holds the
+        // template placeholder.
+        let skill = run_skill("browser").replace("npm run dev", "npm run dev on port <port>");
+        let surface = skills_wt(&dir, 42)
+            .join(".claude")
+            .join("skills")
+            .join("run-web");
+        fs::create_dir_all(&surface).expect("the skill directory must be creatable");
+        fs::write(surface.join("SKILL.md"), skill).expect("the skill file must be writable");
+
+        // The pause keeps the re-queued task parked, so the test sees the
+        // requeue instead of the next attempt's dispatch.
+        rig.act(Action::Pause {
+            scope: PauseScope::Task {
+                task: "borsuk/implement-i42".to_string(),
+            },
+            paused: true,
+        });
+        rig.event(exited("borsuk/implement-i42", true, ""));
+
+        let task = rig.task("borsuk/implement-i42");
+        assert_eq!(task.state, TaskState::Queued, "the hold requeues the task");
+        assert_eq!(task.attempt, 2, "the hold spends one attempt");
+
+        // The finding lands on the ticket, and no other write reaches
+        // GitHub: no label edit and no skills pull request. The reads of
+        // the shadow theory repository are not writes.
+        let gh_writes: Vec<Call> = rig
+            .exec
+            .calls()
+            .into_iter()
+            .filter(|call| call.program == "gh" && !call.args.contains(&"GET".to_string()))
+            .collect();
+        assert_eq!(gh_writes.len(), 1, "calls were: {:?}", gh_writes);
+        assert_eq!(
+            gh_writes[0].args,
+            vec![
+                "api".to_string(),
+                "-X".to_string(),
+                "POST".to_string(),
+                comment_url.to_string(),
+                "-f".to_string(),
+                body_field,
+            ]
+        );
+
+        // No worktree is committed or pushed.
+        assert!(
+            !rig.exec.calls().iter().any(|call| call.program == "git"
+                && call.args.iter().any(|arg| arg == "commit" || arg == "push")),
+            "the hold must leave every worktree uncommitted"
         );
     }
 
@@ -27816,9 +27968,15 @@ mod tests {
     /// The feature index of `run-web`.
     const RUN_INDEX: &str = "# Features of web\n\n- checkout: the cart pays\n";
 
-    /// The one feature file of `run-web`.
-    const RUN_FEATURE: &str =
-        "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n";
+    /// The one feature file of `run-web`, with the four sections of
+    /// design section 4.4.
+    const RUN_FEATURE: &str = concat!(
+        "---\narea: web-checkout\nfast: npx playwright test checkout\n---\n# Checkout\n\n",
+        "## Sub-features\na cart and a payment step\n\n",
+        "## How to get to it (user POV)\nthe nav menu\n\n",
+        "## Driving it\nnpx playwright test checkout\n\n",
+        "## Gotchas\nthe cart clears on reload\n",
+    );
 
     /// The tree listing of one skills checkout. The helper script is
     /// listed and never read.
@@ -30594,7 +30752,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         rig.exec
             .calls()
             .iter()
-            .filter(|call| call.program == "gh" && call.args.iter().any(|arg| arg == TITLE))
+            .filter(|call| {
+                call.program == "gh"
+                    && call.args.iter().any(|arg| arg == TITLE)
+                    && !call.args.contains(&"PATCH".to_string())
+            })
             .cloned()
             .collect()
     }
@@ -30656,6 +30818,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
         steps.extend(open_event_steps(&first));
         steps.extend(open_event_steps(&second));
         steps.push(verify_skill_label_step());
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
         steps.push(skill_issue_step(
             "Maintain the run skill for borsuk/web",
             13,
@@ -30724,6 +30890,10 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "Maintain the run skill for borsuk/web",
             13,
         ));
+        steps.push(skill_issue_step(
+            "Maintain the run skill for borsuk/web",
+            13,
+        ));
         let mut rig = Rig::make_in(dir, steps, governed);
         let mut closed = issue(41, &[VERIFY_SKILL_LABEL]);
         closed.title = SkillTicket::Maintain.title("borsuk", "web");
@@ -30776,8 +30946,8 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             .filter(|call| call.program == "gh" && !is_sweep_list(call))
             .count();
         assert_eq!(
-            gh_calls, 11,
-            "three events, one label, one create, and no api attempt"
+            gh_calls, 12,
+            "three events, one label, one create, one body patch, and no api attempt"
         );
         assert_eq!(rig.task(id).state, TaskState::Done);
     }
