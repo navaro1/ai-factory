@@ -502,6 +502,15 @@ entry id the change reached. Add one violation per model rule the change
 broke. Ask the operator one question. A review whose prediction reads `none`
 ends with no block.
 
+# The measurements
+
+The block below compares the measurers of every area this diff touches. The
+left value is the merge base and the right value is the head. It reads `none`
+when no measurer ran. A `worsened` row is a finding. Repair it, or name the
+reason it stands in your record comment.
+
+{comparison}
+
 # The base worktree
 
 Create the base worktree once, and only when the re-drive below asks for it.
