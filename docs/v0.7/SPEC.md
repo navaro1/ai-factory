@@ -245,7 +245,7 @@ All questions are resolved. None waits for clarification.
 ## 7. Chunks and Acceptance Criteria
 
 ### C0 — Configuration fields and the model parser
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented (branch verification-toolbelt, as the v0.8 substrate)
 **Build:** Add `TheoryConfig { governor, window, theory, sweep, cards, interview }` in `src/config.rs` beside `ReleasePolicy` (`src/config.rs:159-199`), the `RawRepo` fields with defaults (`src/config.rs:547-557`), `path` required whenever `theory` is present, zero-value rejection in the style of `validate_release` (`src/config.rs:987-997`), and `TheoryConfig::checkout(&self, repo_path) -> PathBuf`: `theory.path` when set, else `repo_path`. Add `RawTheory { audit, chat }` as an optional top-level table, `ExecutionRole::TheoryAudit` (`theory.audit`) and `ExecutionRole::TheoryChat` (`theory.chat`) to the enum, `ALL`, `table_name`, with `stage() == None` (`src/config.rs:18-55`); `Config::parse` accepts a file without them; `theory.chat` and `theory.audit` reject `limit` like the ticket roles. Add `globset` to `Cargo.toml`. Add `src/theory/model.rs`: `Model`, `Entry` as an internally tagged enum on `kind`, `parse(text) -> Result<Model, ModelError>` with the R5 checks, and `ModelError` that names the entry.
 **AC:**
 - A config test parses `[repo.borsuk] governor = "off"` and `window = 5`, defaults the rest, and rejects `window = 0` and `governor = "maybe"` with messages that name the field.
@@ -255,17 +255,17 @@ All questions are resolved. None waits for clarification.
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
 
 ### C1 — Walking skeleton: the model read, the state view, and the Theory view
-**Status:** `[ ]` pending
+**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; missing: the CRT palette, and `TheoryView.entries` shipped as `model`)
 **Build:** In the daemon, on every `apply_poll` (`src/daemon.rs:601-631`) run `git rev-parse <default_base>` on the theory checkout, `TheoryConfig::checkout`, through the `git` helper (`src/worktree.rs:509-515`, `:437-452`); when the commit moved, read `git show <commit>:theory/model.toml` and cache `(commit, Result<Model, String>)` per alias; a missing file caches `theory/model.toml: missing`. Add `StateView.theory: BTreeMap<String, TheoryView>` with `#[serde(default)]` (`src/sock.rs:84-114`) carrying `governor`, `entries: Vec<EntryView>` with the relation arrays, `error`. Add `src/tui/crt.rs` with the Amber CRT palette (`amber #FFB000`, `dim #9A6A00`, `bright #FFD866`, `frame #C98A00`, `white #FFF7E0`, `background #0B0A06`) locked by a test like `src/tui/theme.rs:76-84`, plus `frame(title)` that returns a `Block` with `BorderType::Double` and an uppercase title. Add `View::Theory` as tab `6` (`src/tui/mod.rs:60-72`, `:370-523`, `:1039-1107`, `:1110-1156`) and `src/tui/theory.rs` that draws the header strip `GOVERNOR ON · ENTRIES n · AREAS n` or the error. Add the help line and the footer digit (`src/tui/mod.rs:1184-1187`, `:1253-1284`).
 **AC:**
 - A daemon test with a `ScriptExec` that answers `rev-parse` and `git show` ships four entries in the state view; a second poll with the same commit runs no `git show`; a moved commit runs one.
 - A `ScriptExec` that fails `git show` with `does not exist` ships `error = "theory/model.toml: missing"` and zero entries; a bad file ships its error; the daemon's next `drive` still runs in both cases.
-- A TUI test renders `6` and asserts the strip `GOVERNOR ON · ENTRIES 4 · AREAS 1` inside a double-line frame; a palette test asserts the six CRT colors.
+- A TUI test renders `6` and asserts the strip `GOVERNOR ON · ENTRIES 4 · AREAS 1` inside a double-line frame; a palette test asserts the six CRT colors. Not yet built: the CRT palette. The v0.8 substrate drew tab `6` with the existing theme and no `src/tui/crt.rs`.
 - `a_state_view_round_trips_through_json` carries the entries and a view without `theory` parses with an empty map.
 **Depends on:** C0 · **Traces to:** R4, R33, N3
 
 ### C2 — The governor switch: settings warning and doctor lines
-**Status:** `[ ]` pending
+**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; missing: the settings warning `the theory governor is off`, which phase 3 adds)
 **Build:** Ship `TheoryConfig` per repository in `SettingsView::from_config` (`src/sock.rs:117-158`). Add the warning `the theory governor is off` to `Settings::warnings` when the selected repository has the governor off (`src/tui/settings.rs:1022-1040`). Add `theory_checks` to the doctor `report` (`src/doctor.rs:167-200`): one `Warn` per repository with the governor off, one `Fail` per theory checkout that is not a git repository.
 **AC:**
 - A settings render test with `governor = "off"` on the selected repository asserts `WARNING: the theory governor is off`; the same view with `"on"` shows no warning.
@@ -274,7 +274,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C1 · **Traces to:** R3
 
 ### C3 — The stance document
-**Status:** `[ ]` pending
+**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; the document carries the v0.8 scope of the stance, so the twelve rules and three refusals of this spec are missing)
 **Build:** Write `docs/STANCE.md` from the design record §1, §2, §3, §6: the thesis, the loops, the governor, the ladder, the twelve rules, the three refusals, and the vocabulary table. Link it from the first section of `README.md`.
 **AC:**
 - A test over `include_str!("../docs/STANCE.md")` asserts that the vocabulary table names each `TheoryConfig` field (`governor`, `window`, `theory`, `sweep`, `cards`, `interview`), each label constant of `src/theory/records.rs` once it exists, and each panel title (`MAP`, `DELTAS`, `LADDER`, `AREAS`); until C4 lands, the label list is the literal set of this spec.
@@ -356,7 +356,7 @@ All questions are resolved. None waits for clarification.
 
 ### C11 — The PR check
 **Status:** `[x]` implemented on 2026-09-10 (branch verification-toolbelt, as the v0.8 dependency closure; the required-config rules of C16 and C17 are not applied)
-**Build:** Add `records::check_pr(body, paths, branch) -> Result<(), Finding>`: require `## Why`; forbid `## How` and any heading that starts with `Implementation`; forbid `theory/model.toml`, `theory/verify.toml`, and `theory/rules.md` in the path list off a model branch. In `dispatch_one` (`src/daemon.rs:1230-1299`), for a governed review after the cwd exists and before the prompt, run the check on the polled body and on `git diff --name-only` in the worktree; a finding posts one comment `PR: <finding>` on the theory record, cancels the review task with the finding, and re-queues implement through `upsert_queued(repo, Implement, Issue, ticket)` for every ticket in `Links::tickets_of(pr)`.
+**Build:** Add `records::check_pr(body, paths, branch) -> Result<(), Finding>`: require `## Why`; forbid `## How` and any heading that starts with `Implementation`; forbid `theory/model.toml`, `theory/verify.toml`, and `theory/rules.md` in the path list off a model branch. For a governed review, the daemon runs the check at review admission, not inside `dispatch_one`, on the polled body and on `git diff --name-only` in the worktree; a finding posts one comment `PR: <finding>` on the theory record, cancels the review task with the finding, and re-queues implement through `upsert_queued(repo, Implement, Issue, ticket)` for every ticket in `Links::tickets_of(pr)`.
 **AC:**
 - A check test accepts a body with `## Why` and `## Evidence`, and rejects a body without `## Why`, a body with `## How`, a body with `## Implementation notes`, and a diff that lists `theory/model.toml` off a model branch, each with the finding text; the same diff on `aif/borsuk/model-1` passes.
 - A dispatch test with a failing body posts the finding, cancels the review task, queues one implement task per linked ticket, and dispatches no review; with the governor off the check does not run.
@@ -486,8 +486,8 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C21 · **Traces to:** R22, N3
 
 ### C25 — The verification map
-**Status:** `[ ]` pending
-**Build:** Add `src/theory/verify.rs`: `VerifyMap`, `Area`, `Property`, `Measurer`, `parse`, and the R23 checks against the model's boundary ids. Read `git show <commit>:theory/verify.toml` next to the model when the commit moves; a missing file is an empty map, not an error. Ship `TheoryView.areas` and draw the AREAS panel: `daemon · 2 props · 1 measurer · ratchet`, where the policy shown is the strictest of the area's properties, `error` over `ratchet` over `observe`.
+**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; missing: properties and policies, so the AREAS row shows the tier mark alone)
+**Build:** Add `src/theory/verify.rs`: `VerifyMap`, `Area`, `Property`, `Measurer`, `parse`, and the R23 checks against the model's boundary ids. Read `git show <commit>:theory/verify.toml` next to the model when the commit moves; a missing file is an empty map, not an error. Ship `TheoryView.areas` and draw the AREAS panel: `daemon · 2 props · 1 measurer · ratchet`, where the policy shown is the strictest of the area's properties, `error` over `ratchet` over `observe`. Not yet built: the property and measurer counts and the policy mark on the row. The v0.8 substrate renders the row as `<area id> · <tier mark>`.
 **AC:**
 - A parse test accepts one area with one property and one measurer, and rejects an area whose boundary is not in the model, a property with an unknown rule, and a measurer with `timeout_s = 0`, each naming the area.
 - A daemon test ships `areas` with the counts; a missing file ships an empty list and no error.
@@ -495,7 +495,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C1 · **Traces to:** R23, R33
 
 ### C26 — One measurer run
-**Status:** `[ ]` pending
+**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; missing: the base and head measurers, and `queue_measure` is unused in production until C27 and C28)
 **Build:** Add `ScriptRunner` in `src/runner/script.rs` that implements `Runner` over `proc::spawn` with a timeout thread that stops the child. Change `RunnerFactory::build(role, purpose)` (`src/runner/mod.rs:48-66`) so `DefaultRunnerFactory` returns `ScriptRunner` for `TaskPurpose::Measure` with a synthetic role; the fake factory in the daemon tests follows. Add `src/theory/measure.rs` with `Record { id, value, unit, direction }` and `parse_lines`: a malformed line, including a missing `direction`, yields one `incomparable` record with the reason, and a run never fails. Add `TaskPurpose::Measure` with its `PurposeSpec` (no stage, limit key `measure`) and the id `<alias>/measure-<tree8>-<area>-<measurer>`, where `<tree8>` is `git rev-parse HEAD^{tree}` of the worktree until C27 replaces it with `tree_hash`; add `[measure] limit` to the config and `Limits`. Add `Daemon::queue_measure(alias, worktree, areas, mode) -> Vec<String>`. On `Exit`, regardless of `ok`, parse the log into records, or one `incomparable` record with the reason on a timeout or a non-zero exit, and post them as an `<aif-measure-v1>` comment on the theory record. On review admission of a governed PR, `queue_measure` one task per area of `areas_for_paths` of the diff at the head in `pr` mode.
 **AC:**
 - A runner test with a script that sleeps past `timeout_s = 1` ends within 3 s, the task ends `Done` at attempt 1, no `Stuck` decision appears, and the comment carries `incomparable: timeout`.

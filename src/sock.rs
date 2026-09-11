@@ -3099,8 +3099,7 @@ mod tests {
     /// edit the checkout. The wire keeps both across a round trip.
     #[test]
     fn the_settings_view_ships_the_repository_theory_and_skills() {
-        let text = config_text()
-            .replace("[repo.borsuk]\n", "[repo.borsuk]\ngovernor = \"off\"\n");
+        let text = config_text().replace("[repo.borsuk]\n", "[repo.borsuk]\ngovernor = \"off\"\n");
         let text = format!("{}\n[repo.borsuk.skills]\npath = \"/tmp/skills\"\n", text);
         let config = Config::parse(&text).unwrap();
         let view = SettingsView::from_config(&config, "content-revision", &[]).unwrap();
