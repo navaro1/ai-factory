@@ -1100,7 +1100,7 @@ impl Inbox {
     ///
     /// A `merged-pr` card teaches its pull request. A `stale-entry` card
     /// teaches the area of its entry; an entry that maps to no area
-    /// teaches nothing and the row shows a hint.
+    /// teaches the entry itself.
     fn send_card_teach(
         &mut self,
         state: &StateView,
@@ -1115,10 +1115,7 @@ impl Inbox {
             (None, Some(entry)) => {
                 match entry_areas(state, &decision.repo, entry).into_iter().next() {
                     Some(area) => TeachKey::Area(area),
-                    None => {
-                        self.hint = Some("the entry maps to no area");
-                        return;
-                    }
+                    None => TeachKey::Entry(entry.clone()),
                 }
             }
             (None, None) => return,
@@ -3023,6 +3020,25 @@ mod tests {
             Some(Action::Theory(TheoryAction::Teach {
                 repo: "borsuk".to_string(),
                 key: TeachKey::Area("web-checkout".to_string()),
+            }))
+        );
+    }
+
+    /// A recalled entry card whose entry maps to no area teaches the
+    /// entry itself, so the card never dead-ends.
+    #[test]
+    fn a_recalled_entry_card_that_maps_to_no_area_teaches_the_entry() {
+        let state = theory_state(vec![entry_card(true)], &[]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('t'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: TeachKey::Entry("INV-3".to_string()),
             }))
         );
     }
