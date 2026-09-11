@@ -1373,9 +1373,9 @@ fn skill_checks(config: &Config) -> Vec<Check> {
             for finding in skills::lint(&set, &verify) {
                 let surface = &finding.surface;
                 checks.push(Check {
-                    label: "run skill".to_string(),
+                    label: format!("run skill {alias}/{surface}", alias = repo.alias),
                     status: Status::Warn,
-                    detail: format!("{alias}/{surface}: lint: {finding}", alias = repo.alias),
+                    detail: format!("lint: {finding}"),
                 });
             }
             for area in &verify.areas {
@@ -4395,12 +4395,13 @@ mod tests {
 
         let findings: Vec<_> = checks
             .iter()
-            .filter(|check| check.label == "run skill" && check.status == Status::Warn)
+            .filter(|check| check.label == "run skill borsuk/web" && check.status == Status::Warn)
             .collect();
         assert_eq!(findings.len(), 1, "checks: {checks:?}");
+        assert_eq!(findings[0].label, "run skill borsuk/web");
         assert_eq!(
             findings[0].detail,
-            "borsuk/web: lint: features/checkout.md: area nope unknown"
+            "lint: features/checkout.md: area nope unknown"
         );
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }

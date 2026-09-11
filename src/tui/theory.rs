@@ -228,12 +228,14 @@ impl Theory {
                 self.move_mark(state, -1);
                 Outcome::None
             }
-            KeyCode::Char('v') => {
-                if self.current(state).is_some() {
+            KeyCode::Char('v') => match self.at(state) {
+                Some(Stop::Repo(_)) => {
                     self.input = Some(String::new());
+                    Outcome::None
                 }
-                Outcome::None
-            }
+                Some(_) => Outcome::Reject("move to the repository row for v".to_string()),
+                None => Outcome::None,
+            },
             KeyCode::Char('t') => self.send_teach(state),
             KeyCode::Char('b') => self.send_bootstrap(state),
             KeyCode::Char('e') => self.send_edit_model(state),
@@ -1349,15 +1351,52 @@ mod tests {
             )
         );
 
-        // The cursor does not wrap, and v still names the repository of
-        // the marked area row.
+        // The cursor does not wrap, and v on an area row asks for the
+        // repository row.
         pane.handle_key(&state, press(KeyCode::Char('j')));
-        pane.handle_key(&state, press(KeyCode::Char('v')));
-        pane.handle_key(&state, press(KeyCode::Char('a')));
-        assert!(matches!(
-            pane.handle_key(&state, press(KeyCode::Enter)),
-            Outcome::Send(_, _)
-        ));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string())
+        );
+        assert!(!pane.typing(), "v on an area row opens no input");
+    }
+
+    #[test]
+    fn v_asks_for_the_repository_row_on_an_area_a_hold_and_a_delta() {
+        let mut state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        );
+        state.theory.get_mut("borsuk").unwrap().holds = vec![HoldView {
+            number: 142,
+            reason: "awaits full prediction".to_string(),
+            stage: crate::model::Stage::Implement,
+        }];
+        state.theory.get_mut("borsuk").unwrap().deltas =
+            vec![delta(142, &[("sure-miss", "INV-3")], 4, 0)];
+        let mut pane = Theory::default();
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string()),
+            "the area row refuses v"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string()),
+            "the hold row refuses v"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string()),
+            "the delta row refuses v"
+        );
+        assert!(!pane.typing(), "v opens the input on no marked row");
     }
 
     /// `t` on a DELTAS row teaches the pull request the delta belongs to.

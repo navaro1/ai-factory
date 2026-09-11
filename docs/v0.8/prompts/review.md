@@ -45,6 +45,15 @@ this diff touches, and they are empty when the governor is off.
 
 {skills}
 
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Check the diff against every
+rule, and name a rule the change proves or breaks. An empty block means
+the file holds no rule yet.
+
+{rules}
+
 # The prediction
 
 The block below holds what the operator predicted this change would touch. It
