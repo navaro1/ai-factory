@@ -200,6 +200,9 @@ pub struct TheoryView {
     /// The run skills, by surface.
     #[serde(default)]
     pub skills: BTreeMap<String, SurfaceView>,
+    /// The merged pull requests the daily sweep saw, newest first.
+    #[serde(default)]
+    pub merged: Vec<u64>,
     /// The predictions the daemon refused, in refusal order. An entry
     /// lives until a prediction of the same item posts.
     #[serde(default)]
@@ -2829,6 +2832,10 @@ mod tests {
                 repo: "borsuk".to_string(),
                 key: crate::tasks::TeachKey::Delta(142),
             }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Entry("INV-3".to_string()),
+            }),
             Action::Theory(TheoryAction::Sweep {
                 repo: "borsuk".to_string(),
             }),
@@ -3299,6 +3306,7 @@ mod tests {
                 rungs: [2, 5, 3],
                 events_per_day: 4,
                 stale_entries: vec!["INV-9".to_string()],
+                merged: vec![9, 7],
                 cards: vec![CardView {
                     source: crate::theory::cards::MERGED_PR_SOURCE.to_string(),
                     prompt: "PR #7 merged. Which entries changed, and how?".to_string(),

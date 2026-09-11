@@ -1377,9 +1377,9 @@ fn skill_checks(config: &Config) -> Vec<Check> {
             for finding in skills::lint(&set, &verify) {
                 let surface = &finding.surface;
                 checks.push(Check {
-                    label: "run skill".to_string(),
+                    label: format!("run skill {alias}/{surface}", alias = repo.alias),
                     status: Status::Warn,
-                    detail: format!("{alias}/{surface}: lint: {finding}", alias = repo.alias),
+                    detail: format!("lint: {finding}"),
                 });
             }
             for area in &verify.areas {
@@ -4689,12 +4689,13 @@ mod tests {
 
         let findings: Vec<_> = checks
             .iter()
-            .filter(|check| check.label == "run skill" && check.status == Status::Warn)
+            .filter(|check| check.label == "run skill borsuk/web" && check.status == Status::Warn)
             .collect();
         assert_eq!(findings.len(), 1, "checks: {checks:?}");
+        assert_eq!(findings[0].label, "run skill borsuk/web");
         assert_eq!(
             findings[0].detail,
-            "borsuk/web: lint: features/checkout.md: area nope unknown"
+            "lint: features/checkout.md: area nope unknown"
         );
         fs::remove_dir_all(&dir).expect("the temp dir must be removable");
     }
@@ -4796,5 +4797,88 @@ mod tests {
             !checks.iter().any(|check| check.label.starts_with("route ")),
             "checks: {checks:?}"
         );
+    }
+
+    /// The worktree of a refine lives until its ticket closes: the report
+    /// names the closed ticket, and the clean removes the worktree.
+    #[test]
+    fn the_refine_worktree_of_a_closed_ticket_is_listed_as_removable() {
+        let fx = fixture();
+        let exec = repo_answers(ScriptExec::new(), &fx.repo_path)
+            .expect(
+                gh_get("repos/acme/borsuk/issues/7"),
+                issue_answer(7, "closed"),
+            )
+            .expect(
+                gh_get("repos/acme/borsuk/issues/8"),
+                issue_answer(8, "open"),
+            );
+        let env = fixture_env(&fx, &exec);
+        let config = read_config(&env).expect("the fixture config must parse");
+        let facts = repo_facts(&exec, &config);
+
+        let checks = worktree_checks(&env, &config, &facts);
+
+        let closed = checks
+            .iter()
+            .find(|check| check.label == "worktree acme issue-7")
+            .expect("the report lists the refine worktree");
+        assert_eq!(closed.status, Status::Info);
+        assert_eq!(closed.detail, "ticket 7 is closed");
+        let open = checks
+            .iter()
+            .find(|check| check.label == "worktree acme issue-8")
+            .expect("the report lists the open ticket worktree");
+        assert_eq!(open.detail, "ticket 8 is open");
+
+        // The clean of the same report removes the removable worktree.
+        let repo_text = fx.repo_path.to_string_lossy().into_owned();
+        let closed_text = item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7))
+            .to_string_lossy()
+            .into_owned();
+        let removal_argv = git_args(&[
+            "-C",
+            &repo_text,
+            "worktree",
+            "remove",
+            "--force",
+            &closed_text,
+        ]);
+        let branch_argv = git_args(&["-C", &repo_text, "branch", "-D", "aif/acme/issue-7"]);
+        let script = repo_answers(ScriptExec::new(), &fx.repo_path)
+            .expect(
+                gh_get("repos/acme/borsuk/issues/7"),
+                issue_answer(7, "closed"),
+            )
+            .expect(
+                gh_get("repos/acme/borsuk/issues/8"),
+                issue_answer(8, "open"),
+            )
+            .expect(
+                move |call| call.program == "git" && call.args == removal_argv,
+                CmdOut::ok(""),
+            )
+            .expect(
+                move |call| call.program == "git" && call.args == branch_argv,
+                CmdOut::ok(""),
+            );
+        let removing = RemovingExec {
+            script,
+            remove_path: item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)),
+        };
+        let env = fixture_env(&fx, &removing);
+
+        let code = clean(&env, true, &mut || Ok(false)).expect("the clean must succeed");
+
+        assert_eq!(code, 0);
+        assert!(
+            !item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(7)).exists(),
+            "the refine worktree of the closed ticket is gone"
+        );
+        assert!(
+            item_path(&fx.state_dir, "acme", WorktreeKind::Issue, Some(8)).exists(),
+            "the worktree of the open ticket survives"
+        );
+        fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 }

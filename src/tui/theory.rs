@@ -228,12 +228,14 @@ impl Theory {
                 self.move_mark(state, -1);
                 Outcome::None
             }
-            KeyCode::Char('v') => {
-                if self.current(state).is_some() {
+            KeyCode::Char('v') => match self.at(state) {
+                Some(Stop::Repo(_)) => {
                     self.input = Some(String::new());
+                    Outcome::None
                 }
-                Outcome::None
-            }
+                Some(_) => Outcome::Reject("move to the repository row for v".to_string()),
+                None => Outcome::None,
+            },
             KeyCode::Char('t') => self.send_teach(state),
             KeyCode::Char('b') => self.send_bootstrap(state),
             KeyCode::Char('e') => self.send_edit_model(state),
@@ -744,6 +746,7 @@ mod tests {
                 rungs: [0; 3],
                 events_per_day: 0,
                 stale_entries: Vec::new(),
+                merged: Vec::new(),
                 deltas: Vec::new(),
                 window: (0, 0),
                 cards: Vec::new(),
@@ -1349,15 +1352,52 @@ mod tests {
             )
         );
 
-        // The cursor does not wrap, and v still names the repository of
-        // the marked area row.
+        // The cursor does not wrap, and v on an area row asks for the
+        // repository row.
         pane.handle_key(&state, press(KeyCode::Char('j')));
-        pane.handle_key(&state, press(KeyCode::Char('v')));
-        pane.handle_key(&state, press(KeyCode::Char('a')));
-        assert!(matches!(
-            pane.handle_key(&state, press(KeyCode::Enter)),
-            Outcome::Send(_, _)
-        ));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string())
+        );
+        assert!(!pane.typing(), "v on an area row opens no input");
+    }
+
+    #[test]
+    fn v_asks_for_the_repository_row_on_an_area_a_hold_and_a_delta() {
+        let mut state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            1,
+        );
+        state.theory.get_mut("borsuk").unwrap().holds = vec![HoldView {
+            number: 142,
+            reason: "awaits full prediction".to_string(),
+            stage: crate::model::Stage::Implement,
+        }];
+        state.theory.get_mut("borsuk").unwrap().deltas =
+            vec![delta(142, &[("sure-miss", "INV-3")], 4, 0)];
+        let mut pane = Theory::default();
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string()),
+            "the area row refuses v"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string()),
+            "the hold row refuses v"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.handle_key(&state, press(KeyCode::Char('v'))),
+            Outcome::Reject("move to the repository row for v".to_string()),
+            "the delta row refuses v"
+        );
+        assert!(!pane.typing(), "v opens the input on no marked row");
     }
 
     /// `t` on a DELTAS row teaches the pull request the delta belongs to.
@@ -1600,5 +1640,41 @@ mod tests {
         assert_eq!(shipped.features, vec!["checkout".to_string()]);
         assert_eq!(shipped.lint.len(), 1);
         assert!(render(&state).contains("web-checkout · browser"));
+    }
+
+    /// A wide window gauge renders at a narrow width without panic: the
+    /// strip clips inside its width, and the clipped count and the pause
+    /// word stay off the screen until the width fits them.
+    #[test]
+    fn a_wide_window_gauge_clips_at_a_narrow_width_without_panic() {
+        let mut state = view(Vec::new(), 0);
+        state.theory.get_mut("borsuk").unwrap().window = (0, 50);
+
+        let text = render_at(&state, &mut Theory::default(), 70);
+
+        assert!(
+            text.contains("GOVERNOR ON · ENTRIES 0 · AREAS 0 · WINDOW "),
+            "screen was:\n{text}"
+        );
+        assert!(!text.contains("0/50"), "screen was:\n{text}");
+        assert!(!text.contains("PAUSED"), "screen was:\n{text}");
+
+        // A full window of fifty records clips the same way: no count,
+        // no pause word, no panic.
+        state.theory.get_mut("borsuk").unwrap().window = (50, 50);
+        let text = render_at(&state, &mut Theory::default(), 70);
+        assert!(
+            text.contains("GOVERNOR ON · ENTRIES 0 · AREAS 0 · WINDOW "),
+            "screen was:\n{text}"
+        );
+        assert!(!text.contains("50/50"), "screen was:\n{text}");
+        assert!(!text.contains("PAUSED"), "screen was:\n{text}");
+
+        let text = render_at(&state, &mut Theory::default(), 130);
+        let gauge = format!("WINDOW {} 50/50", "\u{25ae}".repeat(50));
+        assert!(
+            text.contains(&format!("{gauge} · IMPLEMENT \u{25b8} PAUSED")),
+            "screen was:\n{text}"
+        );
     }
 }

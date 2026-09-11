@@ -4,9 +4,8 @@
 //! changes touch one file. A file `prompts/<name>.md` in the config
 //! directory overrides the built-in default; [`file_name`] gives the name
 //! of each role and [`ROLES`] lists the roles that have one. The docs
-//! directory `docs/v0.8/prompts/` holds a reference copy of each stage
-//! template, and `docs/v0.6/prompts/` holds the two ticket templates,
-//! pinned byte for byte by a test.
+//! directory `docs/v0.8/prompts/` holds a reference copy of every
+//! template, pinned byte for byte by a test.
 //!
 //! The daemon reads the prompt file of a role each time a task of that role
 //! starts. So a saved prompt applies to the next task start, and a running
@@ -78,6 +77,15 @@ the surface on its own.
 {skills}
 
 {finding}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Read the rules before you write
+the sections, and name a rule that shapes a decision of the ticket. An
+empty block means the file holds no rule yet.
+
+{rules}
 
 # The ticket body
 
@@ -278,6 +286,20 @@ the governor is off.
 
 {skills}
 
+The line below is empty, or it names the one rule of this run. Apply it
+wherever you name a behaviour of the model.
+
+{why_rule}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Follow every rule, and name a
+rule when your change proves or breaks it. An empty block means the file
+holds no rule yet.
+
+{rules}
+
 # The simplest change
 
 Read the conventions of every file you touch, before you edit it. Follow
@@ -443,6 +465,15 @@ this diff touches, and they are empty when the governor is off.
 {model}
 
 {skills}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Check the diff against every
+rule, and name a rule the change proves or breaks. An empty block means
+the file holds no rule yet.
+
+{rules}
 
 # The prediction
 
@@ -1626,15 +1657,41 @@ mod tests {
         );
         assert_eq!(
             TICKET_PROMPT,
-            include_str!("../docs/v0.6/prompts/ticket.md")
+            include_str!("../docs/v0.8/prompts/ticket.md")
         );
         assert_eq!(
             TICKET_CHAT_PROMPT,
-            include_str!("../docs/v0.6/prompts/ticket-chat.md")
+            include_str!("../docs/v0.8/prompts/ticket-chat.md")
         );
         assert_eq!(
             REVIEW_PROMPT,
             include_str!("../docs/v0.8/prompts/review.md")
+        );
+    }
+
+    #[test]
+    fn the_stage_prompts_carry_the_rules_section_and_the_why_rule_line() {
+        for prompt in [REFINE_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT] {
+            assert!(
+                prompt.contains("# The rules\n\nThe block below holds the rules"),
+                "a stage prompt must carry the rules section"
+            );
+            assert!(
+                prompt.contains("\n{rules}\n"),
+                "a stage prompt must carry the rules slot on its own line"
+            );
+        }
+        assert!(
+            IMPLEMENT_PROMPT.contains("\n{why_rule}\n"),
+            "the implement prompt must carry the why rule slot on its own line"
+        );
+        assert!(
+            !REFINE_PROMPT.contains("{why_rule}"),
+            "only the implement prompt names the why rule"
+        );
+        assert!(
+            !REVIEW_PROMPT.contains("{why_rule}"),
+            "only the implement prompt names the why rule"
         );
     }
 
@@ -1646,6 +1703,8 @@ mod tests {
             "fails with the change reverted",
             "{model}",
             "{skills}",
+            "{rules}",
+            "{why_rule}",
         ] {
             assert!(
                 IMPLEMENT_PROMPT.contains(required),
@@ -1662,6 +1721,7 @@ mod tests {
             "no criterion needs",
             "{model}",
             "{skills}",
+            "{rules}",
             "{prediction}",
             "Compare the prediction",
             "<aif-delta-v1>",

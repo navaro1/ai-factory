@@ -70,6 +70,13 @@ pub(super) enum Row {
         /// The pull request number.
         pr: u64,
     },
+    /// One merged pull request the daily sweeps saw.
+    Merged {
+        /// The repository alias.
+        repo: String,
+        /// The pull request number.
+        pr: u64,
+    },
 }
 
 /// The stable identity of one selectable pipeline item.
@@ -85,6 +92,8 @@ pub(super) enum RowKey {
     Train(String),
     /// One pull request in a release train.
     ReleasePr(String, u64),
+    /// One merged pull request.
+    Merged(String, u64),
 }
 
 /// The selectable items of the pipeline board, in stage order.
@@ -106,7 +115,16 @@ pub(super) fn rows(state: &StateView) -> Vec<Row> {
                 .then(|| state.trains.iter().find(|t| t.repo == repo.alias))
                 .flatten()
                 .map(|t| t.repo.clone());
-            if tickets.is_empty() && train.is_none() {
+            let merged: &[u64] = if stage == Stage::Release {
+                state
+                    .theory
+                    .get(&repo.alias)
+                    .map(|theory| theory.merged.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                &[]
+            };
+            if tickets.is_empty() && train.is_none() && merged.is_empty() {
                 continue;
             }
             rows.push(Row::Repo {
@@ -119,6 +137,7 @@ pub(super) fn rows(state: &StateView) -> Vec<Row> {
             }
             let Some(train_repo) = train else {
                 rows.extend(tickets.into_iter().map(|index| Row::Ticket { index }));
+                append_merged(&mut rows, &repo.alias, merged);
                 continue;
             };
             let Some(train) = state.trains.iter().find(|train| train.repo == train_repo) else {
@@ -159,9 +178,18 @@ pub(super) fn rows(state: &StateView) -> Vec<Row> {
                     .filter(|index| Some(*index) != batch_task)
                     .map(|index| Row::Ticket { index }),
             );
+            append_merged(&mut rows, &repo.alias, merged);
         }
     }
     rows
+}
+
+/// The merged rows of one repository, in view order, newest first.
+fn append_merged(rows: &mut Vec<Row>, repo: &str, merged: &[u64]) {
+    rows.extend(merged.iter().copied().map(|pr| Row::Merged {
+        repo: repo.to_string(),
+        pr,
+    }));
 }
 
 /// The stable key of the selected item in one state view.
@@ -192,6 +220,7 @@ fn row_key(state: &StateView, row: &Row) -> Option<RowKey> {
             .map(|task| RowKey::Ticket(task.id.clone())),
         Row::Train { repo } => Some(RowKey::Train(repo.clone())),
         Row::ReleasePr { repo, pr } => Some(RowKey::ReleasePr(repo.clone(), *pr)),
+        Row::Merged { repo, pr } => Some(RowKey::Merged(repo.clone(), *pr)),
     }
 }
 
@@ -226,7 +255,12 @@ fn stage_is_empty(state: &StateView, stage: Stage) -> bool {
         .iter()
         .any(|task| task.stage == stage && !superseded(state, task));
     let any_train = stage == Stage::Release && !state.trains.is_empty();
-    !any_task && !any_train
+    let any_merged = stage == Stage::Release
+        && state
+            .theory
+            .values()
+            .any(|theory| !theory.merged.is_empty());
+    !any_task && !any_train && !any_merged
 }
 
 /// True when the pause hierarchy blocks this stage.
@@ -491,7 +525,9 @@ fn open_selected_task(app: &mut App) {
                 OpenTarget::Ticket(task.id.clone())
             }
             Row::ReleasePr { repo, pr } => OpenTarget::Release { repo, pr },
-            Row::Stage { .. } | Row::Repo { .. } | Row::Train { .. } => return,
+            Row::Stage { .. } | Row::Repo { .. } | Row::Train { .. } | Row::Merged { .. } => {
+                return;
+            }
         }
     };
     match target {
@@ -570,7 +606,9 @@ fn change_amount(app: &mut App, sink: &mut impl ActionSink, change: AmountChange
                 let slots = change.apply(slots, 0);
                 Target::Lane { stage, repo, slots }
             }
-            Row::Ticket { .. } | Row::Train { .. } | Row::ReleasePr { .. } => return,
+            Row::Ticket { .. } | Row::Train { .. } | Row::ReleasePr { .. } | Row::Merged { .. } => {
+                return;
+            }
         }
     };
     match target {
@@ -655,7 +693,7 @@ fn pause_selected(app: &mut App, sink: &mut impl ActionSink) {
                     label,
                 )
             }
-            Row::ReleasePr { repo, .. } => {
+            Row::ReleasePr { repo, .. } | Row::Merged { repo, .. } => {
                 let label = format!("release/{repo}");
                 (
                     PauseScope::Lane {
@@ -1099,12 +1137,17 @@ fn retry_failed(app: &mut App, sink: &mut impl ActionSink) {
 }
 
 /// Stack or unstack the selected pull request in a waiting release queue.
-/// Send one teach request for the selected release pull request.
+/// Send one teach request for the selected pull request row.
 ///
-/// The board holds no merged pull request of its own, so the train rows
-/// are the pull requests a release merges. Every other row sends nothing.
+/// A train row teaches a pull request the release merges, and a merged
+/// row teaches one pull request the sweeps merged. Every other row
+/// sends nothing.
 fn teach_selected_pr(app: &mut App, sink: &mut impl ActionSink) {
-    let Some(Row::ReleasePr { repo, pr }) = selected_row(app) else {
+    let found = match selected_row(app) {
+        Some(Row::ReleasePr { repo, pr }) | Some(Row::Merged { repo, pr }) => Some((repo, pr)),
+        _ => None,
+    };
+    let Some((repo, pr)) = found else {
         return;
     };
     emit(
@@ -1221,6 +1264,7 @@ fn selected_release_repo(state: &StateView, row: &Row) -> Option<String> {
             .filter(|task| task.stage == Stage::Release)
             .map(|task| task.repo.clone()),
         Row::Stage { .. } | Row::Repo { .. } => None,
+        Row::Merged { .. } => None,
     }
 }
 
@@ -1323,6 +1367,7 @@ pub(super) fn footer_hints(app: &App) -> String {
                 "t teach · enter details · p pause · ? help".to_string()
             }
         }
+        Row::Merged { .. } => "t teach · p pause · ? help".to_string(),
     }
 }
 
@@ -1656,6 +1701,7 @@ fn release_lane_lines(
                 let row = Row::Ticket { index };
                 push_row_line(state, all, selected, &row, now_ms, &mut lines);
             }
+            push_merged_lines(state, all, selected, &repo.alias, now_ms, &mut lines);
             continue;
         };
         if let Some(fire) = train.next_fire_ms {
@@ -1778,8 +1824,36 @@ fn release_lane_lines(
             let row = Row::Ticket { index };
             push_row_line(state, all, selected, &row, now_ms, &mut lines);
         }
+        push_merged_lines(state, all, selected, &repo.alias, now_ms, &mut lines);
     }
     lines
+}
+
+/// The merged rows of one repository, below a small header line.
+fn push_merged_lines(
+    state: &StateView,
+    all: &[Row],
+    selected: Option<usize>,
+    repo: &str,
+    now_ms: u64,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let merged = state
+        .theory
+        .get(repo)
+        .map(|theory| theory.merged.as_slice())
+        .unwrap_or(&[]);
+    if merged.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled("  merged", THEME.dim())));
+    for pr in merged {
+        let row = Row::Merged {
+            repo: repo.to_string(),
+            pr: *pr,
+        };
+        push_row_line(state, all, selected, &row, now_ms, lines);
+    }
 }
 
 /// The inherited or explicit pause status below one stage row.
@@ -1912,7 +1986,7 @@ fn row_stage(state: &StateView, row: &Row) -> Option<Stage> {
     match row {
         Row::Stage { stage } | Row::Repo { stage, .. } => Some(*stage),
         Row::Ticket { index } => state.tasks.get(*index).map(|task| task.stage),
-        Row::Train { .. } | Row::ReleasePr { .. } => Some(Stage::Release),
+        Row::Train { .. } | Row::ReleasePr { .. } | Row::Merged { .. } => Some(Stage::Release),
     }
 }
 
@@ -1927,6 +2001,10 @@ fn row_spans(state: &StateView, row: &Row, now_ms: u64) -> Vec<Span<'static>> {
         },
         Row::Train { repo } => train_spans(state, repo, now_ms),
         Row::ReleasePr { pr, .. } => vec![Span::styled(
+            format!("#{pr}"),
+            Style::default().fg(THEME.text),
+        )],
+        Row::Merged { pr, .. } => vec![Span::styled(
             format!("#{pr}"),
             Style::default().fg(THEME.text),
         )],
@@ -4212,6 +4290,55 @@ mod tests {
             .position(|entry| entry == &row)
             .expect("the state must contain the selected row");
         app.selection = Selection::Row(index);
+    }
+
+    /// The `t` key teaches the selected pull request row: a merged row
+    /// of the sweep board and a release row of the train.
+    #[test]
+    fn t_teaches_the_selected_merged_and_release_rows() {
+        let mut state = sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                merged: vec![12, 7],
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        let mut app = app_with_state_and_row(
+            state,
+            Row::Merged {
+                repo: "borsuk".to_string(),
+                pr: 12,
+            },
+        );
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('t'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Theory(crate::sock::TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Pr(12),
+            })]
+        );
+
+        select_row(
+            &mut app,
+            Row::ReleasePr {
+                repo: "borsuk".to_string(),
+                pr: 5,
+            },
+        );
+        let mut sink = FakeSink::default();
+        handle_key(&mut app, pressed('t'), &mut sink);
+        assert_eq!(
+            sink.0,
+            vec![Action::Theory(crate::sock::TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Pr(5),
+            })]
+        );
     }
 
     #[test]

@@ -67,16 +67,19 @@ pub enum TeachKey {
     Area(String),
     /// The delta of one pull request.
     Delta(u64),
+    /// One model entry, named by its id.
+    Entry(String),
 }
 
 impl TeachKey {
-    /// The id fragment of one key: `pr-7`, `area-web-checkout`, or
-    /// `delta-142`.
+    /// The id fragment of one key: `pr-7`, `area-web-checkout`,
+    /// `delta-142`, or `entry-INV-3`.
     pub fn slug(&self) -> String {
         match self {
             TeachKey::Pr(number) => format!("pr-{number}"),
             TeachKey::Area(id) => format!("area-{id}"),
             TeachKey::Delta(number) => format!("delta-{number}"),
+            TeachKey::Entry(id) => format!("entry-{id}"),
         }
     }
 }
@@ -690,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn a_teach_id_names_the_pull_request_the_area_or_the_delta() {
+    fn a_teach_id_names_the_key_of_every_arm() {
         assert_eq!(teach_id("borsuk", &TeachKey::Pr(7)), "borsuk/teach-pr-7");
         assert_eq!(
             teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
@@ -699,6 +702,10 @@ mod tests {
         assert_eq!(
             teach_id("borsuk", &TeachKey::Delta(142)),
             "borsuk/teach-delta-142"
+        );
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Entry("INV-3".to_string())),
+            "borsuk/teach-entry-INV-3"
         );
     }
 
