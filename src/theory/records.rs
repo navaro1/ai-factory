@@ -1183,15 +1183,17 @@ mod tests {
             criteria: Vec::new(),
             features: Vec::new(),
             areas: Vec::new(),
+            measurers: Vec::new(),
             owned_paths: vec!["theory/**".to_string()],
             changed_paths: paths.iter().map(|path| path.to_string()).collect(),
             manifests: &contract::MANIFESTS,
             ticket_names_dependency: false,
+            has_ticket: true,
         }
     }
 
     /// The smallest body the Before / After contract accepts.
-    const EMPTY_CONTRACT: &str = "## Why\n\n## Before / After\n";
+    const EMPTY_CONTRACT: &str = "## Why\n\n## Before / After\n\n## Blast radius\n";
 
     #[test]
     fn check_pr_refuses_a_model_file_off_a_model_branch() {
@@ -1214,8 +1216,7 @@ mod tests {
     #[test]
     fn check_pr_reads_the_headings_of_one_body_by_the_table() {
         let ctx = model_context(&[]);
-        check_pr("## Why\n\n## Evidence\n\n## Before / After\n", "main", &ctx)
-            .expect("Why and Evidence are the accepted pair");
+        check_pr(EMPTY_CONTRACT, "main", &ctx).expect("the three sections are the whole body");
 
         let cases = [
             ("## Evidence\n\n## Before / After\n", "section Why missing"),
@@ -1236,6 +1237,17 @@ mod tests {
             let finding = check_pr(body, "main", &ctx).expect_err(expected);
             assert_eq!(finding.reason, expected, "body:\n{body}");
         }
+    }
+
+    /// Design 5.1 gives the body three sections and nothing else. A fourth
+    /// H2 heading passes every heading rule of this module, so the
+    /// sections rule of the contract is the one that answers it.
+    #[test]
+    fn check_pr_refuses_a_fourth_section_of_one_body() {
+        let ctx = model_context(&[]);
+        let body = format!("{EMPTY_CONTRACT}\n## Evidence\nThe run log.\n");
+        let finding = check_pr(&body, "main", &ctx).expect_err("the body holds three sections");
+        assert_eq!(finding.reason, "heading Evidence is not allowed");
     }
 
     #[test]
