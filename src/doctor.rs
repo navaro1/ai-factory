@@ -4382,7 +4382,11 @@ mod tests {
         .expect("the skill file must be writable");
         fs::write(
             skills.join("features").join("checkout.md"),
-            "---\narea: nope\n---\n",
+            "---\narea: nope\n---\n# Checkout\n\n\
+             ## Sub-features\na cart and a payment step\n\n\
+             ## How to get to it (user POV)\nthe nav menu\n\n\
+             ## Driving it\nnpx playwright test checkout\n\n\
+             ## Gotchas\nthe cart clears on reload\n",
         )
         .expect("the feature file must be writable");
         let text = config_text(
