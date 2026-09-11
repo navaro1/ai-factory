@@ -72,7 +72,7 @@ use crate::theory::blocks;
 use crate::theory::cadence::{self, Schedule, ScheduleKind, SweepStats};
 use crate::theory::cards::{self, CardView};
 use crate::theory::contract;
-use crate::theory::measure::{self, FastRun, Record};
+use crate::theory::measure::{self, FastRun, MeasureRun, MeasureSlot, Record};
 use crate::theory::model::{self, Entry, Model};
 use crate::theory::records::{
     self, delta_block, event_block, no_entries, parse_delta, parse_delta_blocks,
@@ -331,6 +331,7 @@ struct ModelCache {
 /// dispatch renders it and the exit reads it back. The map is runtime
 /// only: a restart drops every measure task and the next review admission
 /// queues fresh ones.
+#[derive(Clone)]
 struct MeasureJob {
     /// The shell command the script runner runs.
     command: String,
@@ -338,6 +339,13 @@ struct MeasureJob {
     timeout_s: u64,
     /// The record id a failed or timed-out run reports under.
     record: String,
+    /// The worktree the command runs in. A base run and a head run of one
+    /// review share a task shape and read two different trees, so the job
+    /// carries the directory instead of the item.
+    cwd: PathBuf,
+    /// The cache file the records of a clean run land in, when the run
+    /// measures an area. A fast check has none.
+    cache: Option<PathBuf>,
 }
 
 /// One card of the day, the answer the operator gave it, and what its
@@ -569,6 +577,13 @@ pub struct Daemon {
     measure_jobs: BTreeMap<String, MeasureJob>,
     /// The fast checks each admitted review task waits for.
     fast_runs: BTreeMap<String, FastRun>,
+    /// The base and head measure runs each admitted review task waits for.
+    measure_runs: BTreeMap<String, MeasureRun>,
+    /// The comparison text of each review task whose measure run ended.
+    ///
+    /// The review prompt renders it as `{comparison}`. An entry lives as
+    /// long as its task row: [`Daemon::retire_task`] drops both together.
+    measure_text: BTreeMap<String, String>,
     /// The record each finished fast check reported, by fast task id.
     ///
     /// The id names the tree and the feature, so a review the gate admits
@@ -953,6 +968,8 @@ impl Daemon {
             theory_holds: BTreeMap::new(),
             measure_jobs: BTreeMap::new(),
             fast_runs: BTreeMap::new(),
+            measure_runs: BTreeMap::new(),
+            measure_text: BTreeMap::new(),
             fast_results: BTreeMap::new(),
             body_checks: BTreeMap::new(),
             theory_views: BTreeMap::new(),
@@ -2584,6 +2601,8 @@ impl Daemon {
         self.release_batches.remove(id);
         self.measure_jobs.remove(id);
         self.fast_runs.remove(id);
+        self.measure_runs.remove(id);
+        self.measure_text.remove(id);
         self.fast_results.remove(id);
         self.body_checks.remove(id);
         self.pending_chats.remove(id);
@@ -3983,6 +4002,10 @@ impl Daemon {
                             .fast_runs
                             .get(&task.id)
                             .is_some_and(|run| run.tasks.contains(&prior.id))
+                        || self
+                            .measure_runs
+                            .get(&task.id)
+                            .is_some_and(|run| run.holds(&prior.id))
                 }
                 Stage::Release => {
                     prior.repo == task.repo
@@ -6840,22 +6863,29 @@ impl Daemon {
     // Measure tasks and fast checks
     // ------------------------------------------------------------------
 
-    /// Queue one measure task per measurer of `mode`.
+    /// Queue one measure task per measurer of `mode` at `tree`.
     ///
-    /// The tree hash of `worktree` names each task, so the same tree never
-    /// runs the same command twice: a task the table already holds keeps
-    /// its run and its record. The returned ids name every task of the
-    /// batch, created or already there, in measurer order.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The cache decides first. A tree that already ran a measurer yields
+    /// one slot with its records and no task, so a review whose head moved
+    /// measures the head alone. Every other measurer becomes one task
+    /// named by the tree, so the same tree never runs the same command
+    /// twice: a task the table already holds keeps its run and its record.
+    /// The returned slots name every run of the batch, in measurer order.
     fn queue_measure(
         &mut self,
         alias: &str,
         key: &RecordKey,
         worktree: &Path,
+        tree: &str,
         measurers: &[Measurer],
         mode: Mode,
-    ) -> Vec<String> {
-        self.queue_measure_tasks(alias, key, worktree, measurers, mode, MeasureKind::Measurer)
+    ) -> Vec<MeasureSlot> {
+        let selected: Vec<Measurer> = measurers
+            .iter()
+            .filter(|measurer| measurer.mode == mode)
+            .cloned()
+            .collect();
+        self.queue_measure_tasks(alias, key, worktree, tree, &selected, MeasureKind::Measurer)
     }
 
     /// Queue one fast check per feature that names a fast command.
@@ -6867,8 +6897,9 @@ impl Daemon {
         alias: &str,
         key: &RecordKey,
         worktree: &Path,
+        tree: &str,
         features: &[Feature],
-    ) -> Vec<String> {
+    ) -> Vec<MeasureSlot> {
         let measurers: Vec<Measurer> = features
             .iter()
             .filter_map(|feature| {
@@ -6881,14 +6912,7 @@ impl Daemon {
                 })
             })
             .collect();
-        self.queue_measure_tasks(
-            alias,
-            key,
-            worktree,
-            &measurers,
-            Mode::Pr,
-            MeasureKind::Fast,
-        )
+        self.queue_measure_tasks(alias, key, worktree, tree, &measurers, MeasureKind::Fast)
     }
 
     /// Queue the measure tasks of one batch under the id form of `kind`.
@@ -6897,37 +6921,50 @@ impl Daemon {
         alias: &str,
         key: &RecordKey,
         worktree: &Path,
+        tree: &str,
         measurers: &[Measurer],
-        mode: Mode,
         kind: MeasureKind,
-    ) -> Vec<String> {
-        let Some(tree) = self.tree_hash(worktree) else {
-            eprintln!("the measure tasks of {alias}: cannot read the tree of the worktree");
-            return Vec::new();
-        };
+    ) -> Vec<MeasureSlot> {
+        let tree8: String = tree.chars().take(measure::TREE_CHARS).collect();
         let (item_kind, number, stage) = match key {
             RecordKey::Issue(number) => (ItemKind::Issue, *number, Stage::Implement),
             RecordKey::Pr(number) => (ItemKind::Pr, *number, Stage::Review),
             RecordKey::Repo => return Vec::new(),
         };
-        let mut ids = Vec::new();
-        for measurer in measurers.iter().filter(|entry| entry.mode == mode) {
+        let mut slots = Vec::new();
+        for measurer in measurers {
             let id = match kind {
-                MeasureKind::Fast => measure::fast_id(alias, &tree, &measurer.id),
+                MeasureKind::Fast => measure::fast_id(alias, &tree8, &measurer.id),
                 MeasureKind::Measurer => {
-                    measure::measure_id(alias, &tree, &measurer.area, &measurer.id)
+                    measure::measure_id(alias, &tree8, &measurer.area, &measurer.id)
                 }
             };
+            let pending = MeasureSlot {
+                id: id.clone(),
+                area: measurer.area.clone(),
+                records: None,
+            };
+            let cache = (kind == MeasureKind::Measurer)
+                .then(|| measure::cache_path(&self.state_dir, alias, tree, measurer));
+            // The tree already ran this command, so its records stand and
+            // no task runs for it.
+            if let Some(records) = cache.as_deref().and_then(measure::read_cache) {
+                slots.push(MeasureSlot {
+                    records: Some(records),
+                    ..pending
+                });
+                continue;
+            }
             match self.table.by_id.get(&id) {
                 // A task of the same tree still runs this command and
                 // will report for it.
                 Some(task) if !task.state.is_terminal() => {
-                    ids.push(id);
+                    slots.push(pending);
                     continue;
                 }
                 // The tree ran this command and its record stands.
                 Some(_) if self.fast_results.contains_key(&id) => {
-                    ids.push(id);
+                    slots.push(pending);
                     continue;
                 }
                 // A finished task with no record was cancelled before it
@@ -6955,28 +6992,29 @@ impl Daemon {
                     command: measurer.command.clone(),
                     timeout_s: measurer.timeout_s,
                     record: measurer.id.clone(),
+                    cwd: worktree.to_path_buf(),
+                    cache,
                 },
             );
             self.changed = true;
-            ids.push(id);
+            slots.push(pending);
         }
-        ids
+        slots
     }
 
-    /// The first eight characters of the tree one worktree has checked out.
+    /// The tree one worktree holds, with its uncommitted work included.
+    ///
+    /// A measure run reads the files on disk, so the tree that names its
+    /// task and its cache entry is the tree of the working directory, not
+    /// the tree of `HEAD`.
     fn tree_hash(&self, worktree: &Path) -> Option<String> {
-        let out =
-            worktree::git(self.exec.as_ref(), worktree, &["rev-parse", "HEAD^{tree}"]).ok()?;
-        if out.status != 0 {
-            return None;
+        match measure::tree_hash(self.exec.as_ref(), worktree, &self.state_dir) {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                eprintln!("the tree of {}: {error:#}", worktree.display());
+                None
+            }
         }
-        let tree: String = out
-            .stdout
-            .trim()
-            .chars()
-            .take(measure::TREE_CHARS)
-            .collect();
-        (tree.len() == measure::TREE_CHARS).then_some(tree)
     }
 
     /// The log file of one measure task.
@@ -6986,55 +7024,154 @@ impl Daemon {
             .join(format!("{}.jsonl", id.replace('/', "__")))
     }
 
-    /// Queue one fast check per touched feature of one governed pull
-    /// request, and hold the review until every one of them ends.
+    /// Queue the checks of one governed pull request at review admission,
+    /// and hold the review until every one of them ends.
     ///
-    /// The head worktree is the ground truth of a fast check, so the diff,
-    /// the tree hash, and every command read it. A repository with the
-    /// governor off, an unreadable worktree, and a diff that touches no
-    /// area with a fast command all queue nothing, and the review then runs
-    /// as it ran before the governor.
+    /// Three runs can hold the review. The fast check of every touched
+    /// feature runs on the head. The measurers of every touched area run
+    /// twice, once on the merge base and once on the head, and their
+    /// comparison lands as one comment on the theory record. The head
+    /// worktree is the ground truth, so the diff, the tree hash, and every
+    /// head command read it. A repository with the governor off, an
+    /// unreadable worktree, and a diff that touches no area all queue
+    /// nothing, and the review then runs as it ran before the governor.
     ///
     /// The answer says whether a run now holds the review. A held review
-    /// takes its body check when the last fast check ends; every other
-    /// review takes it at admission.
+    /// takes its body check when the last run ends; every other review
+    /// takes it at admission.
     fn start_fast_checks(&mut self, alias: &str, number: u64, review_task: &str) -> bool {
         let Some(repo_cfg) = self.config.repos.get(alias).cloned() else {
             return false;
         };
-        if !repo_cfg.theory.governor.is_on() || !self.has_fast_feature(alias) {
+        if !repo_cfg.theory.governor.is_on() {
+            return false;
+        }
+        if !self.has_fast_feature(alias) && !self.has_measurer(alias) {
             return false;
         }
         let worktree = match self.worktrees.ensure_pr(&*self.exec, &repo_cfg, number) {
             Ok(path) => path,
             Err(error) => {
-                eprintln!("the fast checks of {alias} pull request {number}: {error:#}");
+                eprintln!("the checks of {alias} pull request {number}: {error:#}");
                 return false;
             }
         };
-        let features = self.touched_features(alias, &repo_cfg.path, &worktree);
-        if features.is_empty() {
+        let areas = self.touched_areas(alias, &repo_cfg.path, &worktree);
+        let features = self.touched_features(alias, &areas);
+        let measurers = self.touched_measurers(alias, &areas, Mode::Pr);
+        if features.is_empty() && measurers.is_empty() {
             return false;
         }
+        let Some(head) = self.tree_hash(&worktree) else {
+            return false;
+        };
         // A remembered record without its task row can never be checked
         // against the table again, so it goes when the row goes.
         self.fast_results
             .retain(|id, _| self.table.by_id.contains_key(id));
-        let ids = self.queue_fast(alias, &RecordKey::Pr(number), &worktree, &features);
-        if ids.is_empty() {
+        let key = RecordKey::Pr(number);
+        let fast = self.queue_fast(alias, &key, &worktree, &head, &features);
+        let held_fast = !fast.is_empty();
+        if held_fast {
+            let mut run = FastRun::new(fast.into_iter().map(|slot| slot.id).collect());
+            for id in &run.tasks {
+                if let Some(record) = self.fast_results.get(id) {
+                    run.records.insert(id.clone(), record.clone());
+                }
+            }
+            self.fast_runs.insert(review_task.to_string(), run);
+        }
+        let held_measure =
+            self.start_measure_run(&repo_cfg, number, review_task, &worktree, &head, &measurers);
+        if !held_fast && !held_measure {
             return false;
         }
-        let mut run = FastRun::new(ids);
-        for id in &run.tasks {
-            if let Some(record) = self.fast_results.get(id) {
-                run.records.insert(id.clone(), record.clone());
-            }
+        // Every run of these trees may have ended already, and then the
+        // cached and remembered records decide now instead of at the next
+        // exit.
+        if held_fast {
+            self.finish_fast_run(review_task);
         }
-        self.fast_runs.insert(review_task.to_string(), run);
-        // Every check of this tree may have run already, and then the
-        // remembered records decide now instead of at the next exit.
-        self.finish_fast_run(review_task);
+        if held_measure {
+            self.finish_measure_run(review_task);
+        }
         true
+    }
+
+    /// Queue the base and head measure runs of one governed review.
+    ///
+    /// The merge base of the head is the "before" of requirement R25, so
+    /// the daemon cuts one detached worktree at that commit and runs the
+    /// same measurers there. A merge base the daemon cannot read, and a
+    /// base worktree it cannot cut, leave the base side empty, so every
+    /// head record reads `new` and the review still runs.
+    fn start_measure_run(
+        &mut self,
+        repo_cfg: &RepoConfig,
+        number: u64,
+        review_task: &str,
+        worktree: &Path,
+        head_tree: &str,
+        measurers: &[Measurer],
+    ) -> bool {
+        if measurers.is_empty() {
+            return false;
+        }
+        let alias = repo_cfg.alias.clone();
+        let key = RecordKey::Pr(number);
+        let head = self.queue_measure(&alias, &key, worktree, head_tree, measurers, Mode::Pr);
+        let base = self.base_slots(repo_cfg, &key, worktree, measurers);
+        if head.is_empty() && base.is_empty() {
+            return false;
+        }
+        self.measure_runs
+            .insert(review_task.to_string(), MeasureRun { base, head });
+        true
+    }
+
+    /// The measure slots of the merge base of one review.
+    fn base_slots(
+        &mut self,
+        repo_cfg: &RepoConfig,
+        key: &RecordKey,
+        worktree: &Path,
+        measurers: &[Measurer],
+    ) -> Vec<MeasureSlot> {
+        let alias = repo_cfg.alias.clone();
+        let Some(sha) = self.merge_base(&repo_cfg.path, worktree) else {
+            eprintln!("the base measure of {alias}: cannot read the merge base");
+            return Vec::new();
+        };
+        let path = match self.worktrees.ensure_detached(&*self.exec, repo_cfg, &sha) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("the base worktree of {alias} at {sha}: {error:#}");
+                return Vec::new();
+            }
+        };
+        let Some(tree) = self.tree_hash(&path) else {
+            return Vec::new();
+        };
+        self.queue_measure(&alias, key, &path, &tree, measurers, Mode::Pr)
+    }
+
+    /// The commit the head of one worktree branched from.
+    fn merge_base(&self, repo_path: &Path, worktree: &Path) -> Option<String> {
+        let base = self
+            .worktrees
+            .default_base(self.exec.as_ref(), repo_path)
+            .ok()?;
+        let out = worktree::git(
+            self.exec.as_ref(),
+            worktree,
+            &["merge-base", base.as_str(), "HEAD"],
+        )
+        .ok()?;
+        if out.status != 0 {
+            return None;
+        }
+        let sha = out.stdout.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     /// True when one repository has a feature that names a fast command.
@@ -7048,24 +7185,48 @@ impl Daemon {
             .is_some_and(|set| set.features.iter().any(|feature| feature.fast.is_some()))
     }
 
-    /// The features of every area the head diff touches, in area order.
-    ///
-    /// Only a feature with a fast command can become a check, and a
-    /// feature bound to two touched areas becomes one check.
-    fn touched_features(&self, alias: &str, repo_path: &Path, worktree: &Path) -> Vec<Feature> {
+    /// True when the verification map of one repository names a measurer.
+    fn has_measurer(&self, alias: &str) -> bool {
+        self.verify_map(alias)
+            .is_some_and(|map| !map.measurers.is_empty())
+    }
+
+    /// The parsed verification map of one repository, when it parsed.
+    fn verify_map(&self, alias: &str) -> Option<&VerifyMap> {
+        self.theory_models
+            .get(alias)
+            .and_then(|cache| cache.verify.as_ref().ok())
+    }
+
+    /// The areas of the verification map the head diff touches, in map
+    /// order.
+    fn touched_areas(&self, alias: &str, repo_path: &Path, worktree: &Path) -> Vec<String> {
         let Some(cache) = self.theory_models.get(alias) else {
             return Vec::new();
         };
         let (Ok(model), Ok(map)) = (&cache.model, &cache.verify) else {
             return Vec::new();
         };
+        let paths = self.diff_paths(repo_path, worktree);
+        let touched: Vec<&str> = paths.iter().map(String::as_str).collect();
+        map.areas_for_paths(model, &touched)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The features of `areas` that name a fast command, in area order.
+    ///
+    /// A feature bound to two touched areas becomes one check.
+    fn touched_features(&self, alias: &str, areas: &[String]) -> Vec<Feature> {
+        let Some(map) = self.verify_map(alias) else {
+            return Vec::new();
+        };
         let Some(Ok(set)) = self.theory_skills.get(alias).map(|cache| &cache.skills) else {
             return Vec::new();
         };
-        let paths = self.diff_paths(repo_path, worktree);
-        let touched: Vec<&str> = paths.iter().map(String::as_str).collect();
         let mut features: Vec<Feature> = Vec::new();
-        for area in map.areas_for_paths(model, &touched) {
+        for area in areas {
             for feature in skills::resolve(area, map, set) {
                 if feature.fast.is_some() && !features.iter().any(|seen| seen.id == feature.id) {
                     features.push(feature.clone());
@@ -7073,6 +7234,20 @@ impl Daemon {
             }
         }
         features
+    }
+
+    /// The measurers of `areas` that run in `mode`, in map order.
+    fn touched_measurers(&self, alias: &str, areas: &[String], mode: Mode) -> Vec<Measurer> {
+        let Some(map) = self.verify_map(alias) else {
+            return Vec::new();
+        };
+        map.measurers
+            .iter()
+            .filter(|measurer| {
+                measurer.mode == mode && areas.iter().any(|area| area == &measurer.area)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The paths the head of one worktree changes against the default base.
@@ -7105,14 +7280,29 @@ impl Daemon {
     /// `<aif-measure-v1>` comment on the theory record and the task ends
     /// `Done`, so a failing command opens no stuck row and spends no retry.
     fn finish_measure(&mut self, task: &Task, detail: &str) {
-        let job = self.measure_jobs.remove(&task.id);
-        let records = self.measure_records(task, job.as_ref(), script::exit_code(detail));
-        let key = match task.kind {
-            ItemKind::Issue => RecordKey::Issue(task.number),
-            ItemKind::Pr => RecordKey::Pr(task.number),
-        };
-        if let Err(error) = self.post_record_comment(&task.repo, &key, &measure::block(&records)) {
-            eprintln!("the measure records of {}: {error:#}", task.id);
+        let job = self.measure_jobs.get(&task.id).cloned();
+        let code = script::exit_code(detail);
+        let records = self.measure_records(task, job.as_ref(), code);
+        // Only a clean run earns a cache entry. A timeout and a crash are
+        // facts of one run, not of the tree it ran on.
+        if let (Some(path), Some(0)) = (job.and_then(|job| job.cache), code) {
+            if let Err(error) = measure::write_cache(&path, &records) {
+                eprintln!("the measure cache of {}: {error:#}", task.id);
+            }
+        }
+        // A run of a review reports through the comparison of its whole
+        // batch, so only a run outside a batch posts its raw records.
+        let batched = self.measure_runs.values().any(|run| run.holds(&task.id));
+        if !batched {
+            let key = match task.kind {
+                ItemKind::Issue => RecordKey::Issue(task.number),
+                ItemKind::Pr => RecordKey::Pr(task.number),
+            };
+            if let Err(error) =
+                self.post_record_comment(&task.repo, &key, &measure::block(&records))
+            {
+                eprintln!("the measure records of {}: {error:#}", task.id);
+            }
         }
         if let Err(error) = self
             .table
@@ -7120,12 +7310,70 @@ impl Daemon {
         {
             eprintln!("task {}: {error:#}", task.id);
         }
+        self.measure_jobs.remove(&task.id);
         self.changed = true;
+        if batched {
+            self.settle_measure_run(&task.id, records.clone());
+        }
         if measure::fast_feature(&task.id).is_some() {
             if let Some(record) = records.first().cloned() {
                 self.settle_fast_run(&task.id, record);
             }
         }
+    }
+
+    /// Store the records of one finished measure run, and act when the
+    /// last run of a review ends.
+    fn settle_measure_run(&mut self, task: &str, records: Vec<Record>) {
+        let Some(review) = self
+            .measure_runs
+            .iter_mut()
+            .find(|(_, run)| run.holds(task))
+            .map(|(review, run)| {
+                run.settle(task, records);
+                review.clone()
+            })
+        else {
+            return;
+        };
+        self.finish_measure_run(&review);
+    }
+
+    /// Act on one measure run once the base and the head both reported.
+    ///
+    /// The comparison posts as one `<aif-measure-v1>` comment on the
+    /// theory record of the pull request, and its agent text fills
+    /// `{comparison}` of the review prompt. A review that no fast run
+    /// holds any more then takes its body check, the last gate before the
+    /// dispatch.
+    fn finish_measure_run(&mut self, review: &str) {
+        let Some(run) = self.measure_runs.get(review) else {
+            return;
+        };
+        if !run.finished() {
+            return;
+        }
+        let areas = run.report();
+        self.measure_runs.remove(review);
+        let Some(task) = self.table.by_id.get(review).cloned() else {
+            return;
+        };
+        self.measure_text
+            .insert(review.to_string(), measure::agent_text(&areas));
+        if let Err(error) = self.post_record_comment(
+            &task.repo,
+            &RecordKey::Pr(task.number),
+            &measure::comparison_block(&areas),
+        ) {
+            eprintln!("the measure comparison of {review}: {error:#}");
+        }
+        // The operator can abort the review while its runs still work. A
+        // review that already ended takes no body check, and a review a
+        // fast run still holds takes it when that run ends.
+        if task.state.is_terminal() || self.fast_runs.contains_key(review) {
+            return;
+        }
+        self.check_pr_body(&task.repo, task.number, review);
     }
 
     /// The records of one finished measure run.
@@ -7214,9 +7462,12 @@ impl Daemon {
             return;
         }
         let Some(failure) = failure else {
-            // Every check reported 0, so the body check is the last gate
-            // before the review dispatches.
-            self.check_pr_body(&task.repo, task.number, review);
+            // Every check reported 0. A measure run that still holds the
+            // review decides at its own last exit; else the body check is
+            // the last gate before the review dispatches.
+            if !self.measure_runs.contains_key(review) {
+                self.check_pr_body(&task.repo, task.number, review);
+            }
             return;
         };
         let exit = failure.value.unwrap_or_default().round() as i64;
@@ -9431,6 +9682,11 @@ impl Daemon {
 
     /// The working directory of a task's run.
     fn task_cwd(&self, id: &str) -> Option<PathBuf> {
+        // A measure run names its own directory, because the base run of
+        // one review reads a worktree the item does not own.
+        if let Some(job) = self.measure_jobs.get(id) {
+            return Some(job.cwd.clone());
+        }
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
         Some(match self.workspace(task) {
@@ -9897,6 +10153,20 @@ impl Daemon {
         } else {
             (String::new(), String::new(), String::new())
         };
+        // The comparison of the measurers of a governed review, as the
+        // last measure run of that review left it. A review with no
+        // measure run, and every implement run, read the word for an
+        // empty comparison.
+        let comparison = match (repo_cfg.theory.governor.is_on(), task.stage) {
+            (false, _) => String::new(),
+            (true, Stage::Review) => self
+                .measure_text
+                .get(&task.id)
+                .cloned()
+                .unwrap_or_else(|| measure::agent_text(&[])),
+            (true, Stage::Implement) => measure::agent_text(&[]),
+            (true, _) => String::new(),
+        };
         // Only a shadow-mode repository fills `{why_rule}`, because only
         // there does the code pull request hide the model.
         let why_rule = match repo_cfg.theory_repo() {
@@ -9929,8 +10199,7 @@ impl Daemon {
             ("pr_count", pr_count),
             ("model", model_text),
             ("prediction", prediction_text),
-            // The comparison arrives with the delta of C12.
-            ("comparison", String::new()),
+            ("comparison", comparison),
             ("skills", skills_text),
             ("rules", String::new()),
             ("why_rule", why_rule),
@@ -23672,6 +23941,12 @@ mod tests {
 
     /// The git steps of one governed theory read with the given features.
     fn fast_theory_steps_with(repo: &Path, checkout: &str, orders: &str) -> Vec<Step> {
+        theory_read_steps(repo, THEORY_VERIFY, checkout, orders)
+    }
+
+    /// The git steps of one governed theory read with the given map and
+    /// features.
+    fn theory_read_steps(repo: &Path, verify: &str, checkout: &str, orders: &str) -> Vec<Step> {
         vec![
             git_step(
                 repo,
@@ -23691,7 +23966,7 @@ mod tests {
             git_step(
                 repo,
                 &["show", "ccc333:theory/verify.toml"],
-                CmdOut::ok(THEORY_VERIFY),
+                CmdOut::ok(verify.to_string()),
             ),
             git_step(
                 repo,
@@ -23781,6 +24056,38 @@ mod tests {
         ]
     }
 
+    /// The three scripted calls one tree hash runs, through the
+    /// temporary index of the state directory.
+    fn tree_hash_steps(dir: &Path, worktree: &Path, tree: &str) -> Vec<Step> {
+        let index = dir
+            .join("state")
+            .join(measure::MEASURE_DIR)
+            .join(format!("tmp-index-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        [
+            (vec!["read-tree", "HEAD"], CmdOut::ok("")),
+            (vec!["add", "-A"], CmdOut::ok("")),
+            (vec!["write-tree"], CmdOut::ok(format!("{tree}\n"))),
+        ]
+        .into_iter()
+        .map(|(args, out)| {
+            let mut full = vec![
+                index.clone(),
+                "git".to_string(),
+                "-C".to_string(),
+                worktree.to_string_lossy().into_owned(),
+            ];
+            full[0] = format!("GIT_INDEX_FILE={index}");
+            full.extend(args.iter().map(|arg| (*arg).to_string()));
+            (
+                Box::new(move |call: &Call| call.program == "env" && call.args == full) as _,
+                out,
+            )
+        })
+        .collect()
+    }
+
     /// The git steps the admission of one governed review runs: the head
     /// worktree, the diff against the default base, and the tree hash.
     fn fast_admission_steps(
@@ -23790,6 +24097,7 @@ mod tests {
         gitdir: &Path,
         diff: &str,
     ) -> Vec<Step> {
+        let dir = repo.parent().unwrap();
         let mut steps = fast_pr_worktree_steps(repo, worktree, number, gitdir);
         steps.push(git_step(
             repo,
@@ -23801,11 +24109,7 @@ mod tests {
             &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
             CmdOut::ok(format!("{diff}\n")),
         ));
-        steps.push(git_step(
-            worktree,
-            &["rev-parse", "HEAD^{tree}"],
-            CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-        ));
+        steps.extend(tree_hash_steps(dir, worktree, FAST_TREE_SHA));
         steps
     }
 
@@ -23817,6 +24121,7 @@ mod tests {
         gitdir: &Path,
         diff: &str,
     ) -> Vec<Step> {
+        let dir = repo.parent().unwrap();
         let mut steps = reuse_pr_steps(repo, worktree, number, gitdir);
         steps.push(git_step(
             repo,
@@ -23828,12 +24133,121 @@ mod tests {
             &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
             CmdOut::ok(format!("{diff}\n")),
         ));
-        steps.push(git_step(
-            worktree,
-            &["rev-parse", "HEAD^{tree}"],
-            CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-        ));
+        steps.extend(tree_hash_steps(dir, worktree, FAST_TREE_SHA));
         steps
+    }
+
+    /// The verification map of the measure tests: one measurer on the
+    /// area the `web/**` boundary owns.
+    const MEASURE_VERIFY: &str = concat!(
+        "[[area]]\nid = \"web-checkout\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the cart pays\"\n",
+        "[[area.measurer]]\nid = \"poll_p95\"\ncommand = \"aif bench\"\n",
+        "mode = \"pr\"\ntimeout_s = 30\n",
+        "[[area]]\nid = \"api-orders\"\nboundary = \"B-checkout\"\n",
+        "statement = \"the order lands\"\n",
+    );
+
+    /// The merge base of the measure tests.
+    const BASE_SHA: &str = "bbb22211223344556677889900aabbccddeeff11";
+
+    /// The tree of the merge base worktree.
+    const BASE_TREE_SHA: &str = "99887766554433221100ffeeddccbbaa99887766";
+
+    /// The first eight characters of [`BASE_TREE_SHA`].
+    const BASE_TREE: &str = "99887766";
+
+    /// The tree of a second head of the measure tests.
+    const NEXT_TREE_SHA: &str = "5566778899aabbccddeeff00112233445566778899";
+
+    /// The first eight characters of [`NEXT_TREE_SHA`].
+    const NEXT_TREE: &str = "55667788";
+
+    /// The base worktree path of one merge base inside a rig root.
+    fn base_wt(dir: &Path, sha: &str) -> PathBuf {
+        dir.join("state")
+            .join("worktrees")
+            .join("borsuk")
+            .join(format!("base-{}", &sha[..8]))
+    }
+
+    /// The git steps of one governed theory read whose map carries one
+    /// measurer and whose features name no fast command.
+    fn measure_theory_steps(repo: &Path) -> Vec<Step> {
+        theory_read_steps(
+            repo,
+            MEASURE_VERIFY,
+            &feature_file_without_fast("web-checkout"),
+            &feature_file_without_fast("api-orders"),
+        )
+    }
+
+    /// The git steps the base side of one measure run adds: the merge
+    /// base, a fresh detached worktree at it, and its tree hash.
+    fn fresh_base_steps(dir: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let base = base_wt(dir, BASE_SHA);
+        let base_text = base.to_string_lossy().into_owned();
+        let mut steps = vec![
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                worktree,
+                &["merge-base", "refs/remotes/origin/main", "HEAD"],
+                CmdOut::ok(format!("{BASE_SHA}\n")),
+            ),
+            git_step(&repo, &["worktree", "prune"], CmdOut::ok("")),
+            git_step(
+                &repo,
+                &["worktree", "add", "--detach", base_text.as_str(), BASE_SHA],
+                CmdOut::ok(""),
+            ),
+            common_dir_step(&base, gitdir),
+        ];
+        steps.extend(tree_hash_steps(dir, &base, BASE_TREE_SHA));
+        steps
+    }
+
+    /// The git steps the base side adds once the base worktree stands.
+    fn reuse_base_steps(dir: &Path, worktree: &Path, gitdir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let base = base_wt(dir, BASE_SHA);
+        let listed = format!("worktree {}\n", base.display());
+        let mut steps = vec![
+            git_step(
+                &repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                worktree,
+                &["merge-base", "refs/remotes/origin/main", "HEAD"],
+                CmdOut::ok(format!("{BASE_SHA}\n")),
+            ),
+            git_step(
+                &repo,
+                &["worktree", "list", "--porcelain"],
+                CmdOut::ok(listed),
+            ),
+            common_dir_step(&base, gitdir),
+        ];
+        steps.extend(tree_hash_steps(dir, &base, BASE_TREE_SHA));
+        steps
+    }
+
+    /// One measurer line, as the command prints it.
+    fn measure_line(value: u32) -> String {
+        format!("{{\"id\":\"poll_p95\",\"value\":{value},\"unit\":\"ms\",\"direction\":\"lower\"}}")
+    }
+
+    /// Write the stdout of one measure task into its log file.
+    fn write_measure_log(rig: &Rig, task: &str, value: u32) {
+        let path = rig.task(task).log_path;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{}\n", measure_line(value))).unwrap();
     }
 
     /// One `gh api` comment step on the theory record of pull request 7.
@@ -25726,19 +26140,371 @@ mod tests {
     }
 
     #[test]
+    fn the_comparison_slot_reads_none_until_a_measure_run_fills_it() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let mut rig = Rig::make_in(dir, Vec::new(), governed);
+        let repo_cfg = rig.daemon.config.repos["borsuk"].clone();
+        let review = Task::new("borsuk", Stage::Review, ItemKind::Pr, 7, PathBuf::new(), T0);
+        let implement = Task::new(
+            "borsuk",
+            Stage::Implement,
+            ItemKind::Issue,
+            142,
+            PathBuf::new(),
+            T0,
+        );
+        let slot = |rig: &mut Rig, task: &Task, repo: &RepoConfig| {
+            placeholder_of(
+                &rig.daemon
+                    .placeholder_values(task, repo, &worktree)
+                    .expect("the values must render"),
+                "comparison",
+            )
+        };
+
+        assert_eq!(slot(&mut rig, &review, &repo_cfg), "none");
+        assert_eq!(
+            slot(&mut rig, &implement, &repo_cfg),
+            "none",
+            "an implement run has no pull request to measure"
+        );
+
+        let text = "AREA web-checkout\npoll_p95  12 \u{2192} 14  ms  worsened";
+        rig.daemon
+            .measure_text
+            .insert(review.id.clone(), text.to_string());
+
+        assert_eq!(slot(&mut rig, &review, &repo_cfg), text);
+
+        rig.daemon
+            .config
+            .repos
+            .get_mut("borsuk")
+            .unwrap()
+            .theory
+            .governor = Governor::Off;
+        let ungoverned = rig.daemon.config.repos["borsuk"].clone();
+
+        assert_eq!(
+            slot(&mut rig, &review, &ungoverned),
+            "",
+            "with the governor off the v0.6 prompt holds"
+        );
+    }
+
+    #[test]
+    fn a_governed_review_measures_the_merge_base_and_the_head() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = theory_read_steps(
+            &rig_repo(&dir),
+            MEASURE_VERIFY,
+            &feature_file("web-checkout", "cargo test --test cli"),
+            &feature_file("api-orders", "cargo test --test api"),
+        );
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        // Each of the four checks takes the head worktree in turn, and
+        // the body check takes it once more at the end.
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(fast_record_step("checkout", 0));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(fast_record_step("orders", 0));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  12 \u{2192} 14  ms  worsened\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let base_path = base_wt(&dir, BASE_SHA);
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let checkout = format!("borsuk/fast-{FAST_TREE}-checkout");
+        let orders = format!("borsuk/fast-{FAST_TREE}-orders");
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert_eq!(
+            rig.daemon
+                .table
+                .order
+                .iter()
+                .filter(|id| id.contains("/measure-"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![head.clone(), base.clone()],
+            "one measure task runs on the head and one on the merge base"
+        );
+        assert_eq!(rig.task(&head).purpose, TaskPurpose::Measure);
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the review waits for every check and both measure runs"
+        );
+        write_measure_log(&rig, &head, 14);
+        write_measure_log(&rig, &base, 12);
+
+        rig.event(exited(&checkout, true, "exit 0"));
+        rig.event(exited(&orders, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the fast checks alone do not release the review"
+        );
+
+        rig.event(exited(&head, true, "exit 0"));
+
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the head measurement alone does not release the review"
+        );
+
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(rig.task(&base).state, TaskState::Done);
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        let job = rig.job(rig.job_count() - 1);
+        assert_eq!(job.task, "borsuk/review-p7");
+        assert!(
+            job.prompt
+                .contains("AREA web-checkout\npoll_p95  12 \u{2192} 14  ms  worsened"),
+            "the review prompt carries the comparison table:\n{}",
+            job.prompt
+        );
+        // The base run reads the base worktree, not the head worktree.
+        let base_job = rig
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|job| job.task == base)
+            .cloned()
+            .expect("the base measurement ran");
+        assert_eq!(base_job.cwd, base_path);
+        assert_eq!(base_job.prompt, "aif bench");
+    }
+
+    #[test]
+    fn a_new_head_measures_the_head_again_and_reads_the_base_from_the_cache() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  12 \u{2192} 14  ms  worsened\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        // The review prompt slices the model by the areas of the head
+        // diff, so the dispatch reads the diff once more.
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        // The second poll carries a new head sha, so the review starts
+        // again and the head tree moves.
+        steps.extend(commit_steps(&rig_repo(&dir), "ccc333"));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("web/pay.ts\n"),
+        ));
+        steps.extend(tree_hash_steps(&dir, &worktree, NEXT_TREE_SHA));
+        steps.extend(reuse_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+        let next = format!("borsuk/measure-{NEXT_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+        write_measure_log(&rig, &head, 14);
+        write_measure_log(&rig, &base, 12);
+        rig.event(exited(&head, true, "exit 0"));
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+        assert!(
+            measure::read_cache(&measure::cache_path(
+                &rig.daemon.state_dir,
+                "borsuk",
+                BASE_TREE_SHA,
+                &rig.daemon.verify_map("borsuk").unwrap().measurers[0],
+            ))
+            .is_some(),
+            "the clean base run cached its records"
+        );
+
+        let mut moved = unlinked_pr(7);
+        moved.head_sha = "deadbee".to_string();
+        rig.poll(vec![], vec![moved]);
+        // The new head supersedes the running review. Its replacement
+        // admits once the superseded process reports its exit.
+        rig.event(exited(
+            "borsuk/review-p7",
+            false,
+            "the superseded process exited",
+        ));
+
+        let queued: Vec<String> = rig
+            .daemon
+            .table
+            .order
+            .iter()
+            .filter(|id| id.contains("/measure-"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            queued,
+            vec![head.clone(), base.clone(), next.clone()],
+            "the new head queues one more head measurement and no base"
+        );
+        assert_eq!(rig.task(&next).state, TaskState::Running);
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Queued,
+            "the new head holds the review on its own measurement"
+        );
+    }
+
+    #[test]
+    fn a_review_whose_diff_touches_no_area_renders_no_comparison() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        // The admission stops at the diff, because no area owns the path
+        // and no check can follow.
+        steps.extend(fast_pr_worktree_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+        ));
+        steps.push(git_step(
+            &rig_repo(&dir),
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &worktree,
+            &["diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+            CmdOut::ok("docs/readme.md\n"),
+        ));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert!(
+            !rig.daemon
+                .table
+                .order
+                .iter()
+                .any(|id| id.contains("/measure-")),
+            "a diff that touches no area queues no measure task"
+        );
+        assert_eq!(
+            rig.task("borsuk/review-p7").state,
+            TaskState::Running,
+            "nothing holds the review"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/review-p7");
+        assert!(
+            rig.job(0).prompt.contains("\nnone\n"),
+            "the comparison slot reads none:\n{}",
+            rig.job(0).prompt
+        );
+    }
+
+    #[test]
+    fn one_measure_task_of_a_governed_review_lands_its_records_as_a_comment() {
+        let dir = temp_root();
+        let worktree = pr_wt(&dir, 7);
+        let gitdir = rig_gitdir(&dir);
+        let mut steps = measure_theory_steps(&rig_repo(&dir));
+        steps.extend(fast_admission_steps(
+            &rig_repo(&dir),
+            &worktree,
+            7,
+            &gitdir,
+            "web/pay.ts",
+        ));
+        steps.extend(fresh_base_steps(&dir, &worktree, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        steps.push(record_comment_step(concat!(
+            "<aif-measure-v1>\n",
+            "AREA web-checkout\n",
+            "poll_p95  none \u{2192} 14  ms  new\n",
+            "</aif-measure-v1>",
+        )));
+        steps.extend(reuse_pr_steps(&rig_repo(&dir), &worktree, 7, &gitdir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let head = format!("borsuk/measure-{FAST_TREE}-web-checkout-poll_p95");
+        let base = format!("borsuk/measure-{BASE_TREE}-web-checkout-poll_p95");
+
+        rig.poll(vec![], vec![unlinked_pr(7)]);
+
+        assert_eq!(rig.task(&head).purpose, TaskPurpose::Measure);
+        assert_eq!(rig.job(0).prompt, "aif bench");
+        assert_eq!(rig.job(0).timeout_s, Some(30));
+        write_measure_log(&rig, &head, 14);
+
+        rig.event(exited(&head, true, "exit 0"));
+        // The base command found nothing to print, so its side is empty
+        // and every head record reads new.
+        rig.event(exited(&base, true, "exit 0"));
+
+        assert_eq!(rig.task(&head).state, TaskState::Done);
+        assert_eq!(rig.task("borsuk/review-p7").state, TaskState::Running);
+    }
+
+    #[test]
     fn queue_measure_names_the_area_and_ships_the_records_of_the_run() {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
         let line = "{\"id\":\"poll_p95\",\"value\":12,\"unit\":\"ms\",\"direction\":\"lower\"}";
         let block = measure::block(&measure::parse_lines(line));
-        let steps = vec![
-            git_step(
-                &worktree,
-                &["rev-parse", "HEAD^{tree}"],
-                CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-            ),
-            record_comment_step(&block),
-        ];
+        let steps = vec![record_comment_step(&block)];
         let mut rig = Rig::make_in(dir, steps, governed);
         let measurers = vec![
             Measurer {
@@ -25757,9 +26523,19 @@ mod tests {
             },
         ];
 
-        let ids =
-            rig.daemon
-                .queue_measure("borsuk", &RecordKey::Pr(7), &worktree, &measurers, Mode::Pr);
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
 
         assert_eq!(
             ids,
@@ -25779,7 +26555,7 @@ mod tests {
         rig.daemon.finish_measure(&task, "exit 0");
 
         assert_eq!(rig.task(&ids[0]).state, TaskState::Done);
-        assert_eq!(rig.exec.calls().len(), 2);
+        assert_eq!(rig.exec.calls().len(), 1, "the tree hash is given");
     }
 
     #[test]
@@ -25787,14 +26563,7 @@ mod tests {
         let dir = temp_root();
         let worktree = pr_wt(&dir, 7);
         let block = measure::block(&[measure::Record::incomparable("poll_p95", "timeout")]);
-        let steps = vec![
-            git_step(
-                &worktree,
-                &["rev-parse", "HEAD^{tree}"],
-                CmdOut::ok(format!("{FAST_TREE_SHA}\n")),
-            ),
-            record_comment_step(&block),
-        ];
+        let steps = vec![record_comment_step(&block)];
         let mut rig = Rig::make_in(dir, steps, governed);
         let measurers = vec![Measurer {
             id: "poll_p95".to_string(),
@@ -25803,9 +26572,19 @@ mod tests {
             mode: Mode::Pr,
             timeout_s: 30,
         }];
-        let ids =
-            rig.daemon
-                .queue_measure("borsuk", &RecordKey::Pr(7), &worktree, &measurers, Mode::Pr);
+        let ids: Vec<String> = rig
+            .daemon
+            .queue_measure(
+                "borsuk",
+                &RecordKey::Pr(7),
+                &worktree,
+                FAST_TREE_SHA,
+                &measurers,
+                Mode::Pr,
+            )
+            .into_iter()
+            .map(|slot| slot.id)
+            .collect();
         rig.daemon
             .table
             .transition(&ids[0], TaskState::Running, T0)
@@ -28102,7 +28881,11 @@ surface: api\ndriver: curl\ntier: http\n---\n\
             "the review slice reads the head diff once"
         );
         assert_eq!(placeholder_of(&values, "prediction"), "none");
-        assert_eq!(placeholder_of(&values, "comparison"), "");
+        assert_eq!(
+            placeholder_of(&values, "comparison"),
+            "none",
+            "C28 renders the word for an empty comparison on a governed review"
+        );
         assert_eq!(placeholder_of(&values, "rules"), "");
         assert_eq!(placeholder_of(&values, "why_rule"), "");
         let filled = prompts::fill_template(prompts::REVIEW_PROMPT, &values)

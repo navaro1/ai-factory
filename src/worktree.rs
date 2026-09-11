@@ -55,37 +55,57 @@ pub enum WorktreeKind {
     /// repository owns exactly one, so the directory carries no number.
     /// It is cut from the theory checkout.
     Model,
+    /// The measure worktree of one merge base: the `base-<sha8>`
+    /// directory. It is detached at that commit, so the measurers of a
+    /// review read the base of the change without a branch of their own.
+    Base,
 }
 
 impl WorktreeKind {
-    /// The directory prefix: `issue-`, `pr-`, or `skills-`. An unnumbered
-    /// kind returns the whole directory name.
+    /// The directory prefix: `issue-`, `pr-`, `skills-`, or `base-`. A
+    /// bare kind returns the whole directory name.
     pub fn prefix(self) -> &'static str {
         match self {
             WorktreeKind::Issue => "issue-",
             WorktreeKind::Pr => "pr-",
             WorktreeKind::Skills => "skills-",
             WorktreeKind::Model => MODEL_DIR,
+            WorktreeKind::Base => "base-",
         }
     }
 
-    /// Whether one repository owns many worktrees of this kind, each named
-    /// by its item number.
-    ///
-    /// A numbered kind names its directory `<prefix><number>`. An
-    /// unnumbered kind names it [`WorktreeKind::prefix`] alone.
-    pub fn numbered(self) -> bool {
-        !matches!(self, WorktreeKind::Model)
+    /// What follows the prefix in the directory name of this kind.
+    pub fn naming(self) -> DirName {
+        match self {
+            WorktreeKind::Issue | WorktreeKind::Pr | WorktreeKind::Skills => DirName::Number,
+            WorktreeKind::Model => DirName::Bare,
+            WorktreeKind::Base => DirName::Sha,
+        }
     }
 }
 
+/// How the directory of one worktree kind is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirName {
+    /// The prefix alone, because one repository owns exactly one.
+    Bare,
+    /// The prefix and the item number.
+    Number,
+    /// The prefix and the first [`SHA_CHARS`] characters of a commit.
+    Sha,
+}
+
+/// How many characters of a commit sha a directory name carries.
+pub const SHA_CHARS: usize = 8;
+
 /// The worktree kinds the manager owns. The doctor asks for this list, so
 /// the manager is the single source of the directory names.
-pub const WORKTREE_KINDS: [WorktreeKind; 4] = [
+pub const WORKTREE_KINDS: [WorktreeKind; 5] = [
     WorktreeKind::Issue,
     WorktreeKind::Pr,
     WorktreeKind::Skills,
     WorktreeKind::Model,
+    WorktreeKind::Base,
 ];
 
 /// The directory name of the train worktree. The manager owns this name,
@@ -154,6 +174,19 @@ impl WorktreeManager {
             .join("worktrees")
             .join(&repo.alias)
             .join(MODEL_DIR)
+    }
+
+    /// The measure worktree path of one merge base:
+    /// `<state_dir>/worktrees/<alias>/base-<sha8>`.
+    ///
+    /// The sha names the directory, so two reviews that share a merge base
+    /// share one worktree and one measurement of it.
+    pub fn base_path(&self, repo: &RepoConfig, sha: &str) -> PathBuf {
+        let sha8: String = sha.chars().take(SHA_CHARS).collect();
+        self.state_dir
+            .join("worktrees")
+            .join(&repo.alias)
+            .join(format!("{}{sha8}", WorktreeKind::Base.prefix()))
     }
 
     /// The issue branch name: `aif/<alias>/issue-<n>`.
@@ -301,6 +334,37 @@ impl WorktreeManager {
             &self.model_path(repo),
             branch,
         )
+    }
+
+    /// Return the measure worktree of one merge base, and create it when
+    /// missing.
+    ///
+    /// The worktree sits at `<state_dir>/worktrees/<alias>/base-<sha8>`
+    /// with no branch, detached at `sha`. A merge base never moves, so an
+    /// existing worktree returns as it stands and its measurements stay
+    /// valid. The create path first recovers a broken previous worktree,
+    /// the way [`WorktreeManager::ensure_from`] does.
+    pub fn ensure_detached(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        sha: &str,
+    ) -> Result<PathBuf> {
+        let path = self.base_path(repo, sha);
+        if path.exists() && self.registered(exec, &repo.path, &path)? {
+            self.prepare(exec, &path)?;
+            return Ok(path);
+        }
+        self.recover(exec, &repo.path, &path)?;
+        let path_text = path.to_string_lossy().into_owned();
+        let out = git(
+            exec,
+            &repo.path,
+            &["worktree", "add", "--detach", path_text.as_str(), sha],
+        )?;
+        require_zero(out, "git worktree add --detach")?;
+        self.prepare(exec, &path)?;
+        Ok(path)
     }
 
     /// The branch the worktree at `path` has checked out.
@@ -537,6 +601,30 @@ impl WorktreeManager {
             &self.model_path(repo),
             branch,
         )
+    }
+
+    /// Remove one measure worktree of a merge base.
+    ///
+    /// The proof contract matches [`WorktreeManager::remove_issue`]. The
+    /// worktree is detached, so there is no branch to delete.
+    pub fn remove_base(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        path: &Path,
+        proof: Cleanable,
+    ) -> Result<()> {
+        match proof {
+            Cleanable::MergedOrClosed => {}
+        }
+        let path_text = path.to_string_lossy().into_owned();
+        let out = git(
+            exec,
+            &repo.path,
+            &["worktree", "remove", "--force", path_text.as_str()],
+        )?;
+        require_zero(out, "git worktree remove")?;
+        Ok(())
     }
 
     /// Remove the worktree at `path` and delete `branch` in `source`.
