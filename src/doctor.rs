@@ -44,6 +44,10 @@ pub const CLAUDE_FLOOR: Version = Version {
 /// The tools that every factory installation needs.
 const CORE_TOOLS: [&str; 2] = ["gh", "git"];
 
+/// The clipboard readers that image paste reads, as `(program, version
+/// flag)` pairs.
+const CLIPBOARD_TOOLS: [(&str, &str); 2] = [("xclip", "-version"), ("wl-paste", "--version")];
+
 /// A semantic version triple parsed out of a tool version line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
@@ -216,6 +220,7 @@ pub fn report(env: &DoctorEnv) -> Vec<Check> {
             checks.extend(daemon_checks(env.socket));
         }
     }
+    checks.extend(clipboard_check(env.exec));
     checks
 }
 
@@ -917,6 +922,30 @@ fn usage_curl_check(exec: &dyn Exec, config: &Config) -> Option<Check> {
             status: Status::Warn,
             detail: format!("cannot run curl: {error:#}; {empty}"),
         },
+    })
+}
+
+/// Check that one clipboard reader is installed.
+///
+/// Image paste reads the clipboard through `wl-paste` on Wayland and
+/// `xclip` on X11. When neither program answers, every paste fails with a
+/// named error, so the doctor warns once and names both. One present
+/// reader silences the check. The warning changes no exit code.
+fn clipboard_check(exec: &dyn Exec) -> Option<Check> {
+    let mut missing = Vec::new();
+    for (tool, flag) in CLIPBOARD_TOOLS {
+        if exec.run(tool, &[flag], None).is_ok() {
+            return None;
+        }
+        missing.push(tool);
+    }
+    Some(Check {
+        label: "clipboard".to_string(),
+        status: Status::Warn,
+        detail: format!(
+            "neither {} is on the PATH; image paste is unavailable",
+            missing.join(" nor ")
+        ),
     })
 }
 
@@ -2404,6 +2433,41 @@ mod tests {
         );
     }
 
+    // --- The image paste readers. ---
+
+    #[test]
+    fn the_image_paste_check_warns_when_both_clipboard_readers_are_missing() {
+        let exec = ScriptExec::new();
+
+        let check = clipboard_check(&exec).expect("both missing readers must warn");
+
+        assert_eq!(check.label, "clipboard");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .detail
+                .contains("neither xclip nor wl-paste is on the PATH"),
+            "detail: {}",
+            check.detail
+        );
+        assert!(!has_failures(&[check]));
+        let programs: Vec<_> = exec.calls().into_iter().map(|call| call.program).collect();
+        assert_eq!(programs, ["xclip", "wl-paste"]);
+    }
+
+    #[test]
+    fn the_image_paste_check_prints_nothing_when_one_reader_is_present() {
+        // `xclip` answers, so the check stays silent and never probes
+        // `wl-paste`.
+        let exec = ScriptExec::new().expect(
+            |call| call.program == "xclip" && call.args == ["-version"],
+            CmdOut::ok("xclip version 0.13\n"),
+        );
+
+        assert!(clipboard_check(&exec).is_none());
+        assert_eq!(exec.calls().len(), 1);
+    }
+
     #[test]
     fn the_report_carries_the_usage_curl_check_for_a_parsed_config() {
         let dir = temp_dir("usage-curl-report");
@@ -2851,9 +2915,15 @@ mod tests {
             summary.detail
         );
         assert!(!has_failures(&checks));
-        // The ten tool, auth, and repository answers plus the usage curl
-        // version check of the enabled [usage] table.
-        assert_eq!(exec.calls().len(), 11, "calls: {:?}", exec.calls());
+        let clipboard = checks
+            .iter()
+            .find(|check| check.label == "clipboard")
+            .expect("the clipboard check must exist");
+        assert_eq!(clipboard.status, Status::Warn);
+        // The ten tool, auth, and repository answers, the usage curl
+        // version check of the enabled [usage] table, and the two
+        // clipboard reader probes.
+        assert_eq!(exec.calls().len(), 13, "calls: {:?}", exec.calls());
         fs::remove_dir_all(&fx.dir).expect("the temp dir must be removable");
     }
 
