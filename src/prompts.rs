@@ -4,8 +4,8 @@
 //! changes touch one file. A file `prompts/<name>.md` in the config
 //! directory overrides the built-in default; [`file_name`] gives the name
 //! of each role and [`ROLES`] lists the roles that have one. The docs
-//! directory `docs/v0.6/prompts/` holds a reference copy of each template,
-//! pinned byte for byte by a test.
+//! directory `docs/v0.8/prompts/` holds a reference copy of every
+//! template, pinned byte for byte by a test.
 //!
 //! The daemon reads the prompt file of a role each time a task of that role
 //! starts. So a saved prompt applies to the next task start, and a running
@@ -39,10 +39,10 @@ repeat work that is already done.";
 
 /// The built-in prompt of a refine run.
 ///
-/// It runs in the repository checkout and never creates a worktree.
+/// It runs in the issue worktree of its ticket.
 pub const REFINE_PROMPT: &str = r#"You refine ticket #{number} of {repo}
-({owner_repo}). You work in {worktree}, the repository checkout. Never create
-a git worktree; stay in this checkout.
+({owner_repo}). You work in {worktree}, your own git worktree. Never create
+another git worktree; work only in this one.
 
 Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a
@@ -54,7 +54,8 @@ operator answer to a question from an earlier run arrives there. Such an
 answer settles the question. Act on it, and never ask that question again.
 
 Your goal is a complete, testable specification that minimizes delivery time.
-Do not implement the change.
+Do not implement the change. The refine stage commits nothing and leaves no
+file behind in the worktree. The implement stage inherits the branch.
 
 Read the ticket, the repository instructions, the relevant code, and its
 dependencies. Confirm that the ticket is still valid. Keep the requested scope.
@@ -62,17 +63,94 @@ Use parallel tool calls for independent reads. Use subagents only for sizeable,
 independent research. Use at most three subagents. Do not use a subagent for
 routine reads or for a second review.
 
-The ticket body must contain these sections:
+# The theory slices
+
+The factory fills the two blocks below from the theory governor of the
+repository. The model entries carry the theory model of the repository. The
+run skills carry the drive recipes, the fast commands, and the feature index
+of the areas the ticket touches. Read both blocks before you write the
+sections. Empty blocks mean the governor is off, and the ticket then defines
+the surface on its own.
+
+{model}
+
+{skills}
+
+{finding}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Read the rules before you write
+the sections, and name a rule that shapes a decision of the ticket. An
+empty block means the file holds no rule yet.
+
+{rules}
+
+# The ticket body
+
+Rewrite the body of ticket #{number} with `gh` into the sections below, in
+this order. Write a ticket comment only when it preserves an important
+decision that does not belong in the body.
 
 - Problem
-- Agreed approach
+- Grounding
+- Decisions
+- Repro, for a ticket with the `bug` label
 - Acceptance criteria
 - Implementation plan
 
+`## Problem` opens with the request restated in your own words, one
+paragraph. Write the restatement before you read code.
+
+`## Grounding` states the mechanism, the history, and the paths of the
+change. Cite the code you read and the `git log` and `gh pr list` output of
+the paths the ticket touches.
+
+`## Decisions` holds one line per open question, its answer, and the command
+that answered it. A question an experiment can answer is not the operator's.
+Run the experiment in a scratch directory under the worktree, never
+committed, and record the result.
+Remove the scratch directory before you finish. Only a product or preference
+call earns `{label_needs_human}`.
+
+`## Repro` belongs to a ticket with the `bug` label only. Drive the surface
+on the base until the defect reproduces twice. Write the exact command, the
+two observed outputs, and the exit code. A third miss goes to
+`{label_needs_human}` with the attempts.
+
+`## Acceptance criteria` holds one falsifiable line per criterion, in this
+grammar.
+
+- AC-<n> · <falsifiable statement> · check: <target>
+
+The target is `<feature> drive`, `<feature> fast`, or `measure <id>`. The
+drive target asks for a full drive of the feature. The fast target runs the
+fast command of the feature file. The measure target runs a measurer of
+`theory/verify.toml`. When the `{skills}` block is empty, no run skill
+exists yet. Use `measure <id>` when the theory map has a measurer.
+Otherwise name the target `<feature> fast`, and write `new: <feature>` in
+the Fast column of the chunk that adds the feature file. These lines show
+the shape.
+
+- AC-1 · An empty card field blocks submit and shows "Card is required" · check: checkout-submit drive
+- AC-2 · POST /orders with no card returns 422 and `{"error":"card_required"}` · check: api-orders fast
+- AC-3 · poll_p95 does not worsen · check: measure poll_p95
+
+A criterion names the condition, the observable result, and the check. A
+criterion that no command can falsify is not a criterion. Rewrite it, or
+take it to a human decision when no experiment can settle it. A criterion
+that the ticket text does not ask for is scope creep. Drop it.
+
+# The implementation plan
+
 The implementation plan must use this table:
 
-| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |
-|---|---|---|---|---|---|
+| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |
+|---|---|---|---|---|---|---|
+
+The Fast column names the fast command that proves the chunk, or
+`new: <feature>` when the chunk must add a feature file.
 
 Create separate chunks only when the split reduces delivery time. Make each
 chunk large enough to justify coordination. Put independent chunks in the same
@@ -83,9 +161,6 @@ the last wave. Put a shared interface or data contract before chunks that
 depend on it. State the final integration order and final validation. For a
 small or tightly coupled change, use one C1 row and state that parallel work
 would add delay.
-
-Edit the ticket body with `gh`. Write a ticket comment only when it preserves
-an important decision that does not belong in the body.
 
 # Labels
 
@@ -118,15 +193,17 @@ the shared specification. No agent implements the parent.
 Create the sub-tickets in wave order. Then you know the number of every
 earlier chunk when you write a dependency.
 
-The body of a sub-ticket must hold these sections:
+The body of a sub-ticket must hold these sections as `##` headings:
 
-- Parent: #{number}
-- Problem
-- Agreed approach
-- Acceptance criteria
-- Implementation plan, as the table above, with one C1 row for this chunk
-- Owned files or paths
-- Validation
+- A `Parent: #{number}` line before the headings
+- `## Problem`
+- `## Grounding`
+- `## Decisions`
+- `## Repro`, when the parent carries the `bug` label
+- `## Acceptance criteria`
+- `## Implementation plan`, as the table above, with one C1 row for this chunk
+- The `Owned files or paths` column of the plan table
+- `## Validation`
 
 A sub-ticket must stand alone. Copy every fact the chunk needs from the
 parent. The agent that implements the chunk reads the sub-ticket only.
@@ -176,7 +253,7 @@ block in this form. Keep the JSON on one line:
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Ticket #{number}: {title}
+Ticket #{number}, {title}
 
 {body}
 "#;
@@ -198,6 +275,41 @@ answer settles the question. Act on it, and never ask that question again.
 Your goal is a complete change that meets every acceptance criterion with the
 shortest safe delivery time. Follow the repository instructions and keep the
 requested scope. Implement the ticket on the current branch.
+
+# The theory slices
+
+Read the two blocks below before your first edit. They carry the theory model
+and the run skills of the areas the ticket touches, and they are empty when
+the governor is off.
+
+{model}
+
+{skills}
+
+The line below is empty, or it names the one rule of this run. Apply it
+wherever you name a behaviour of the model.
+
+{why_rule}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Follow every rule, and name a
+rule when your change proves or breaks it. An empty block means the file
+holds no rule yet.
+
+{rules}
+
+# The simplest change
+
+Read the conventions of every file you touch, before you edit it. Follow
+them. Make the smallest change that meets every acceptance criterion. Add no
+abstraction, layer, flag, or dependency that no criterion needs. Delete the
+dead weight you meet, in its own commit. Before each commit, strip your
+narrating comments, every guard no criterion asks for, and every edit outside
+the plan.
+
+# The execution plan
 
 Use the ticket implementation plan as the execution schedule. If routine code
 details make the plan stale, update the schedule and continue. If the ticket
@@ -226,6 +338,64 @@ Run focused validation after each chunk. Run the required full validation once
 after integration. Do not run several full test suites concurrently. Make the
 test suite pass. Commit the integrated work in small, complete commits.
 
+# The proof
+
+Drive every feature you touched once through its run skill, before you open
+the PR. Write one Before / After line per acceptance criterion, from what you
+observed. Write no line you did not observe. Run every fast command of those
+features and paste its exit code under the line.
+
+# The lever rule
+
+When you check the same fact by hand twice, or write a throwaway script to
+check it, add that script to the run skill in the same PR. Give it one
+invocation line in `SKILL.md`, or name it as the `fast` command of a feature
+file. Commit the lever on its own. A reviewer must be able to rerun it. A
+one-off `grep`, a line of shell history, and a test that passes when every
+dependency returns nothing are not levers.
+
+# Tests
+
+Every test you add asserts a literal result through the public path of the
+change. Every test you add fails with the change reverted. A test that still
+passes with the change reverted proves nothing. Delete it, or rewrite it.
+
+# The PR body
+
+The body holds `## Why`, `## Before / After`, and `## Blast radius`, and
+nothing else.
+
+`## Why` holds one or two short paragraphs. Name the behaviour that changes,
+and for whom. `## Blast radius` holds one to three sentences. Name what else
+the change touches, and why it is safe.
+
+`## Before / After` holds one line per acceptance criterion. Two surfaces
+prove one criterion with two lines. The grammar is this line.
+
+- AC-<n> · <feature or measurer> · <tier or measure> · <command> · before: <observed> · after: <observed>
+
+The separator is one middle dot with one space on each side. The tier is
+`browser`, `dom`, `http`, `terminal`, `none`, or `measure` for a measurer
+line, and it names how far your drive reached. These two lines show the
+shape.
+
+- AC-1 · checkout-submit · browser · `npx playwright test checkout` · before: an empty card is accepted and the API returns 500 · after: the field shows "Card is required" and the page sends no request
+- AC-2 · api-orders · http · `curl -s -X POST :4000/orders -d @empty.json` · before: 500 and the log line `NullPointer at Orders.create` · after: 422 and the body `{"error":"card_required"}`
+
+Write short declarative sentences, one thought per sentence, in the active
+voice. Narrate no work. The body carries no `## Summary` section and no
+`## Test plan` section. It carries at most 40 lines of prose outside the
+fenced blocks. It carries no long dash, no curly quote, and no colon inside a
+sentence. A transcript goes in a fenced block under its own line, cut to 30
+lines, and the full file stays in `.aif/evidence/` in this worktree.
+
+Every path your commits change belongs to an owned path of the plan table, to
+a run skill directory, or to a test file. A dependency manifest changes only
+when the ticket names the dependency. The factory reads this body, refuses a
+body that breaks one of these rules, and sends the ticket back to you.
+
+# The PR
+
 Open a draft PR with `gh pr create --draft` when the work is done. Put
 `Closes #{number}` in the body. When the ticket body names a parent ticket and
 marks this ticket as the final chunk, add a second `Closes` line for the parent
@@ -241,17 +411,18 @@ on one line:
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Report one line at the end: what you did, and the PR number.
+Report one line at the end. Name what you did, and the PR number.
 
-Ticket #{number}: {title}
+Ticket #{number}, {title}
 
 {body}
 "#;
 
 /// The built-in prompt of a review run.
 pub const REVIEW_PROMPT: &str = r#"You review PR #{number} of {repo}
-({owner_repo}). You work in {worktree}, your own git worktree. Never create
-another git worktree; work only in this one.
+({owner_repo}). You work in {worktree}, your own git worktree. Except for
+the base worktree this prompt names, never create another git worktree; work
+only in this one.
 
 Run without the operator. No person reads your text during the run. Do not
 ask for approval of a plan, a design, or a change. Do not stop to report a
@@ -262,11 +433,11 @@ Before any other step, read the newest comments of the PR with `gh`. An
 operator answer to a question from an earlier run arrives there. Such an
 answer settles the question. Act on it, and never ask that question again.
 
-PR #{number}: {title}
+PR #{number}, {title}
 
 {body}
 
-Tickets this PR closes: {tickets}
+The tickets this PR closes are {tickets}
 
 You are the last agent on this change. You repair every finding yourself. You
 never hand a finding back to the author. The PR must leave your run ready for
@@ -286,6 +457,96 @@ Before your first edit, prove that this worktree holds the PR head. Compare
 `git rev-parse HEAD`. When the two differ, run
 `git fetch origin pull/{number}/head` and then `git reset --hard FETCH_HEAD`.
 
+# The theory slices
+
+The two blocks below carry the theory model and the run skills of the areas
+this diff touches, and they are empty when the governor is off.
+
+{model}
+
+{skills}
+
+# The rules
+
+The block below holds the rules of `theory/rules.md`. A rule names a
+behaviour the repository treats as fixed. Check the diff against every
+rule, and name a rule the change proves or breaks. An empty block means
+the file holds no rule yet.
+
+{rules}
+
+# The prediction
+
+The block below holds what the operator predicted this change would touch. It
+reads `none` when the ticket carries no prediction. Compare the prediction
+with what the diff did. Name every area the diff touched that the prediction
+left out. Name every predicted area the diff never reached. Put both in your
+record comment.
+
+{prediction}
+
+End your report with one `<aif-delta-v1>` block when the prediction above is
+not `none`. Put the block last, on its own lines, and never inside a code
+fence. Its body is one JSON object.
+
+<aif-delta-v1>
+{"slots":[{"id":"behaviours","outcome":"hit"},{"id":"states","outcome":"hit"},{"id":"invariants","outcome":"miss"},{"id":"failure-modes","outcome":"hit"},{"id":"other-areas","outcome":"hit"}],"touched":["INV-3"],"violations":[{"entry":"INV-3","finding":"the retry crosses the boundary"}],"question":"Does the cart keep the token?"}
+</aif-delta-v1>
+
+Write one slot per prediction slot. The five slot ids are `behaviours`,
+`states`, `invariants`, `failure-modes`, and `other-areas`. The outcome is
+`hit` when the change stayed inside the entries the slot named, and `miss`
+when the change reached past them. A path that maps to an area the
+prediction left out is a miss on `other-areas`. List in `touched` every model
+entry id the change reached. Add one violation per model rule the change
+broke. Ask the operator one question. A review whose prediction reads `none`
+ends with no block.
+
+# The measurements
+
+The block below compares the measurers of every area this diff touches. The
+left value is the merge base and the right value is the head. It reads `none`
+when no measurer ran. A `worsened` row is a finding. Repair it, or name the
+reason it stands in your record comment.
+
+{comparison}
+
+# The base worktree
+
+Create the base worktree once, and only when the re-drive below asks for it.
+Run `git worktree add --detach .aif/base $(git merge-base origin/main HEAD)`
+inside this worktree. Read the default branch of the repository first, and
+use its name in place of `main`. The path `.aif/` never reaches a commit.
+Remove the base worktree with `git worktree remove --force .aif/base` before
+you push.
+
+# The re-drive
+
+Trust no Before / After line until you drive it yourself.
+
+1. Run the command of every Before / After line on the head. Compare what you
+   observe with the after text of the line.
+2. For a ticket with the `bug` label, run the command of the `## Repro`
+   section in the base worktree, and expect the before text. Then run it on
+   the head, and expect the after text. Red on base, green on head.
+3. Run every lever the PR adds, and expect the exit code the PR states.
+4. Run every test the PR adds against the base worktree, with
+   only the test files applied. Each one must fail there. A test that passes
+   on base tests nothing. Delete it, or rewrite it, and say so.
+5. Read the diff once for what it does not need. An abstraction, a layer, a
+   flag, a guard, or a dependency that no criterion needs is a finding.
+   Remove it. A deviation from the conventions of the surrounding files is a
+   finding. Align it.
+6. Repair every run skill drift you meet during a drive. A dead path or a
+   dead handle in a `SKILL.md` or a feature file is a finding of this run.
+
+A mismatch is a finding. Repair the code, or repair the check when the check
+was the defect, then drive the full list again. A bug that does not fail in
+the base worktree is a wrong root cause. Take the human path with both
+outputs.
+
+# The repairs
+
 Fix every finding in this worktree. Add the missing tests. Keep the scope of
 the linked tickets. Run the full validation of the repository and make it
 pass. Commit the repairs in small, complete commits.
@@ -298,24 +559,28 @@ gate in one command line:
 
 Never pass `--force`. Never merge the PR.
 
-Record the outcome with `gh pr comment {number}`. Name the findings, the
-repairs, and the validation result. GitHub refuses a formal review of your own
-PR, so this comment is the record.
+# The record
+
+Record the outcome with `gh pr comment {number}`. Write your own Before /
+After lines, in the shape the PR body uses, from what you observed on your
+own run. Name the findings, the repairs, and the validation result. GitHub
+refuses a formal review of your own PR, so this comment is the record.
 
 When the PR needs no repair, post the record and run `gh pr ready {number}`.
 
 Take the human path when the PR comes from a fork, when a finding needs a human
-decision, when the repair leaves the scope of the linked tickets, or when the
-push fails. On that path, add the `{label_needs_human}` label to the PR with `gh`, write
-the question into a comment, leave the draft, and stop. Do not guess. When the
-decision is a choice between named answers, end the comment with one strict
-block in this form. Keep the JSON on one line:
+decision, when the repair leaves the scope of the linked tickets, when a bug
+does not reproduce in the base worktree, or when the push fails. On that path,
+add the `{label_needs_human}` label to the PR with `gh`, write the question into
+a comment, leave the draft, and stop. Do not guess. When the decision is a
+choice between named answers, end the comment with one strict block in this
+form. Keep the JSON on one line:
 <aif-ask-v1>
 {"question":"Which workload mode ships first?","options":[{"label":"Fast","description":"deterministic only"},{"label":"Full"}]}
 </aif-ask-v1>
 
-Report one line at the end: the review verdict, and the number of commits you
-pushed.
+Report one line at the end. Name the review verdict, and the number of commits
+you pushed.
 "#;
 
 /// The built-in prompt of a release run.
@@ -382,6 +647,245 @@ Put valid JSON between the markers. Do not quote the block. Do not put the
 block in a code fence. Include no text after the closing marker.
 "#;
 
+/// The built-in prompt of one teach task.
+///
+/// The theory roles carry no prompt file, so a teach task fills this
+/// template directly. The placeholders are `{repo}`, `{worktree}`,
+/// `{subject}`, `{history}`, `{model}`, and `{skills}`.
+pub const TEACH_PROMPT: &str = r#"You explain one subject of the repository {repo}
+to the operator. You work in {worktree}, the repository checkout. Read the
+files you need. Change no file.
+
+The subject
+
+{subject}
+
+The history
+
+{history}
+
+The model
+
+{model}
+
+The skills
+
+{skills}
+
+Explain how the subject works and why it works that way. Use the model, the
+skills, and the history. Give the smallest complete answer first. Then add
+one layer at a time. Build the picture in steps, one part per step.
+
+Keep the confidence of what you found. Name the history when the history
+shows a fact. Say that you infer a step when you reason it out. Print no
+framing label. Ask the operator no question. Set no quiz.
+
+End the turn with one block per contradiction you find between the code and
+the model. A subject that matches the model ends with no block. Each block
+takes this form.
+
+<aif-event-v1>
+{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The body of one run skill ticket, before the daemon fills it.
+///
+/// The eight steps are section 6.2 of the verification toolbelt design
+/// record. The daemon fills `{alias}`, `{surface}`, `{skills_dir}`, and
+/// `{app_path}` when it creates the ticket, so the refine agent and the
+/// implement agent read one complete recipe.
+pub const SETUP_BODY: &str = r#"Write the run skill of the {surface} surface of {alias}.
+
+The application lives at {app_path}. Write every skill file under
+{skills_dir}. Never edit `theory/verify.toml`.
+
+1. Interview the repository, not the operator. Find the surface, the run
+command, the drivers that are already installed, the evidence a run leaves
+behind, and how a run isolates its state.
+2. Probe the driver ladder. Pick the highest tier that is already present.
+Install nothing.
+3. Fix a checkout that does not start. Report the failure precisely when you
+cannot fix it. Do this before you write any skill file.
+4. Write `SKILL.md` with the front matter keys `name`, `description`,
+`surface`, `driver`, `tier`, and `blind`, and with the sections Run, Fast,
+Auth or seed, Drive, Logs, and Gotchas. Measure the Fast path and record how
+long it takes. Under Claude Code the bundled `run-skill-generator` skill
+writes the first draft.
+5. Seed the `features/` directory from `theory/verify.toml`. Write the index
+first. Then write one file per area that maps to this surface and needs a
+drive recipe. Write the top three to five areas only.
+6. Prove it once end to end. Run the application, run the fast command, drive
+one feature, read the logs, and stop the application. Confirm that the
+evidence file still exists.
+7. Write the PR body to the contract of the implement prompt. The Before and
+After line of a setup PR states `before: no run skill`. Its after text is
+what step 6 proved.
+8. Propose the `skills` entry of `theory/verify.toml` as text in the PR body.
+Never edit `theory/verify.toml`.
+"#;
+
+/// The built-in prompt of one audit sweep task.
+///
+/// The theory roles carry no prompt file, so a sweep task fills this
+/// template directly. The placeholders are `{repo}`, `{worktree}`,
+/// `{model}`, and `{skills}`.
+pub const AUDIT_SWEEP_PROMPT: &str = r#"You audit the repository {repo}
+against the model. You work in {worktree}, the repository checkout. Read
+the files you need. Change no file.
+
+The model
+
+{model}
+
+The skills
+
+{skills}
+
+Check every entry of the model against the code. An entry that no code
+supports is dead. End the turn with one event block per dead entry.
+
+Then check each run skill against the code. Read the Run and Fast sections
+of every SKILL.md file. Read the handles of every feature file. A command
+that names a path that the code no longer holds is a dead path. A handle
+that no code answers is a dead handle. End the turn with one skill-drift
+block per surface with drift. Name the dead paths and the dead handles in
+the text of the block.
+
+A model event block takes this form.
+
+<aif-event-v1>
+{"kind":"sweep","text":"One sentence on the dead entry.","area":"area id"}
+</aif-event-v1>
+
+A drift block names its surface and takes this form.
+
+<aif-event-v1>
+{"kind":"skill-drift","text":"The dead paths and the dead handles.","surface":"surface id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a
+block in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The built-in prompt of one card grading.
+///
+/// The audit role reads the card, the answer of the operator, and the
+/// subject the card names: the diff of the merged pull request, or the
+/// model entry. It grades the answer against the subject and ends the
+/// turn with one event block per gap. A correct answer ends with no
+/// block, so a pass opens no theory event.
+pub const AUDIT_CARD_PROMPT: &str = r#"You grade one card answer of the operator
+of the repository {repo}. You work in {worktree}, the repository checkout.
+Read the files you need. Change no file.
+
+The card
+
+{card}
+
+The answer of the operator
+
+{answer}
+
+The subject
+
+{subject}
+
+Compare the answer against the subject. A claim the subject contradicts is a
+gap. A part of the subject the answer misses is a gap. A claim the subject
+supports is a hit.
+
+End the turn with one block per gap. An answer with no gap ends with no
+block. Each block takes this form.
+
+<aif-event-v1>
+{"kind":"card","text":"One sentence on the gap.","area":"area id"}
+</aif-event-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The built-in prompt of one bootstrap chat.
+///
+/// The operator dictates a stream of memory about one area, and the agent
+/// turns it into model entries. The agent adds no claim the operator did
+/// not state, because a model the operator did not write is not the
+/// operator's theory. The placeholders are `{repo}`, `{worktree}`,
+/// `{area}`, and `{model}`.
+pub const BOOTSTRAP_PROMPT: &str = r#"You write the model of the area {area}
+in the repository {repo} with the operator. You work in {worktree}, the
+theory checkout. Read the files you need. Change no file.
+
+The model so far
+
+{model}
+
+The operator dictates a stream of memory about the area. The operator is the
+only source. Add no claim the operator did not state. Take no claim from the
+code. Read the code only to name a path or a file the operator points at.
+
+Ask short questions. Ask one question per turn. Ask only what an entry needs.
+An entry needs an id, a kind, a title, and a statement. Say back what you
+understood in one short sentence.
+
+An entry takes one of five kinds. Each kind takes its own keys.
+
+- state names one region of the system. It takes no other key.
+- boundary names the two regions it separates in sides, and the path globs
+  that cross it in paths.
+- transition names the state it leaves in from, and the state it reaches
+  in to.
+- invariant names a claim that always holds, and the states or the
+  boundaries it holds over in constrains.
+- failure names one way the system breaks, and the boundary it breaks
+  through in crosses.
+
+Give each entry a short id the operator recognises. Reuse no id the model so
+far already holds.
+
+The operator ends the interview with the word done. End that turn with one
+block that carries every entry you collected. Write no text after it. A turn
+the operator did not end takes no block.
+
+<aif-model-proposal-v1>
+{"entries":[{"kind":"state","id":"checkout","title":"Checkout","statement":"The buyer pays."}]}
+</aif-model-proposal-v1>
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
+/// The body of one run skill maintain ticket, before the daemon fills it.
+///
+/// The eight steps are section 6.3 of the verification toolbelt design
+/// record. The daemon fills `{alias}`, `{surface}`, `{skills_dir}`, and
+/// `{app_path}` when it creates the ticket, so the refine agent and the
+/// implement agent read one complete recipe.
+pub const MAINTAIN_BODY: &str = r#"Maintain the run skill of the {surface} surface of {alias}.
+
+The audit sweep found drift between the skill and the code. The application
+lives at {app_path}. Every skill file lives under {skills_dir}. Never edit
+`theory/verify.toml`.
+
+1. Clean the feature index. Remove an entry that no file or area supports.
+2. Read every source path that the Run and Fast sections name. Fix a path
+that the code moved.
+3. Run the Run section and the Fast section once each. Fix a command that
+fails against the live application.
+4. Triage every finding. A finding is doc drift, or a harness gap, or a
+product gap.
+5. Open one `bug` ticket per product gap. Fix no product code in this
+ticket.
+6. Re-drive every fix against the live application.
+7. Ship the repair as one PR. Post a comment instead when the skill needs
+no change.
+8. Stop when the skill matches the code again.
+"#;
+
 /// The placeholders the daemon fills in a stage prompt.
 const STAGE_PLACEHOLDERS: &[&str] = &[
     "repo",
@@ -394,6 +898,17 @@ const STAGE_PLACEHOLDERS: &[&str] = &[
     "pr_list",
     "pr_numbers",
     "pr_count",
+    // The theory placeholders. `prediction`, `comparison`, and `rules`
+    // render empty until their chunks land; `why_rule` fills for a
+    // shadow-mode repository only.
+    "model",
+    "prediction",
+    "comparison",
+    "skills",
+    "rules",
+    "why_rule",
+    // The last ticket check finding, for a refine that follows one.
+    "finding",
     // The configured label names of this repository. A prompt names a
     // label through one of these, never as literal text, so a repository
     // that renamed a label gets an agent that writes the right name.
@@ -506,14 +1021,12 @@ pub struct Template {
     pub from_file: bool,
 }
 
-/// Read the template of one role.
+/// Read the template file `name` in the prompts directory.
 ///
-/// The prompt file wins when it exists. An absent file yields the built-in.
-/// An unreadable file is an error that names the path. A role with no
-/// template is an error that names the role.
-pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
-    let path = path(prompts_dir, role)?;
-    let builtin = builtin(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
+/// The file wins when it exists. An absent file yields the `builtin` text.
+/// An unreadable file is an error that names the path.
+pub fn load_named(prompts_dir: &Path, name: &str, builtin: &str) -> Result<Template> {
+    let path = prompts_dir.join(name);
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Template {
             text,
@@ -525,6 +1038,16 @@ pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
         }),
         Err(error) => Err(anyhow!("cannot read {}: {error}", path.display())),
     }
+}
+
+/// Read the template of one role.
+///
+/// The prompt file wins when it exists. An absent file yields the built-in.
+/// An unreadable file is an error that names the path. A role with no
+/// template is an error that names the role.
+pub fn load(prompts_dir: &Path, role: ExecutionRole) -> Result<Template> {
+    let builtin = builtin(role).ok_or_else(|| anyhow!("the {role} role has no prompt template"))?;
+    load_named(prompts_dir, name_of(role)?, builtin)
 }
 
 /// Check one template against the placeholder set of its role.
@@ -735,6 +1258,141 @@ mod tests {
                     "the built-in {role} prompt hides {{{literal}}} from the scan"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_teach_prompt_names_exactly_its_six_placeholders() {
+        assert_eq!(
+            scan_placeholders(TEACH_PROMPT),
+            vec!["repo", "worktree", "subject", "history", "model", "skills"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(TEACH_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(TEACH_PROMPT, &values).expect("the teach prompt fills");
+        assert!(filled.contains("<subject>"));
+        assert!(filled.contains("<history>"));
+        assert!(
+            filled.contains(
+                r#"{"kind":"teach","text":"One sentence on the contradiction.","area":"area id"}"#
+            ),
+            "the event block stays literal:\n{filled}"
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_prompt_names_exactly_its_four_placeholders() {
+        assert_eq!(
+            scan_placeholders(BOOTSTRAP_PROMPT),
+            vec!["area", "repo", "worktree", "model"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(BOOTSTRAP_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(BOOTSTRAP_PROMPT, &values).expect("the bootstrap prompt fills");
+        assert!(filled.contains("<area>"));
+        assert!(filled.contains("<model>"));
+        assert!(
+            filled.contains(
+                r#"{"entries":[{"kind":"state","id":"checkout","title":"Checkout","statement":"The buyer pays."}]}"#
+            ),
+            "the proposal block stays literal:\n{filled}"
+        );
+        assert!(
+            filled.contains(crate::theory::records::MODEL_PROPOSAL_BLOCK),
+            "the prompt names the block tag the daemon parses:\n{filled}"
+        );
+        for key in ["sides", "paths", "constrains", "from", "to", "crosses"] {
+            assert!(
+                filled.contains(&format!(" in {key}")),
+                "the prompt names the required key {key}:\n{filled}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_audit_sweep_prompt_names_exactly_its_four_placeholders() {
+        assert_eq!(
+            scan_placeholders(AUDIT_SWEEP_PROMPT),
+            vec!["repo", "worktree", "model", "skills"]
+        );
+        assert!(
+            AUDIT_SWEEP_PROMPT.contains("dead handles"),
+            "the drift paragraph names the dead handles"
+        );
+        assert!(
+            AUDIT_SWEEP_PROMPT.contains("skill-drift"),
+            "the drift block carries the skill-drift kind"
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(AUDIT_SWEEP_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(AUDIT_SWEEP_PROMPT, &values).expect("the sweep prompt fills");
+        assert!(filled.contains("<model>"));
+        assert!(filled.contains(
+            r#"{"kind":"skill-drift","text":"The dead paths and the dead handles.","surface":"surface id"}"#
+        ), "the drift block stays literal:\n{filled}");
+    }
+
+    #[test]
+    fn the_audit_card_prompt_names_exactly_its_five_placeholders() {
+        assert_eq!(
+            scan_placeholders(AUDIT_CARD_PROMPT),
+            vec!["repo", "worktree", "card", "answer", "subject"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(AUDIT_CARD_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(AUDIT_CARD_PROMPT, &values).expect("the card prompt fills");
+        assert!(filled.contains("<card>"));
+        assert!(filled.contains("<answer>"));
+        assert!(filled.contains("<subject>"));
+        assert!(
+            filled
+                .contains(r#"{"kind":"card","text":"One sentence on the gap.","area":"area id"}"#),
+            "the card block stays literal:\n{filled}"
+        );
+        assert!(
+            filled.contains("An answer with no gap ends with no\nblock."),
+            "the prompt says a pass opens no event:\n{filled}"
+        );
+    }
+
+    #[test]
+    fn the_maintain_body_fills_like_the_setup_body() {
+        assert_eq!(
+            scan_placeholders(MAINTAIN_BODY),
+            vec!["surface", "alias", "app_path", "skills_dir"]
+        );
+        let filled = fill_template(
+            MAINTAIN_BODY,
+            &[
+                ("alias", "borsuk".to_string()),
+                ("surface", "web".to_string()),
+                ("skills_dir", "/tmp/skills/run-web/".to_string()),
+                ("app_path", "/srv/app".to_string()),
+            ],
+        )
+        .expect("the maintain body fills");
+        assert!(filled.contains("Maintain the run skill of the web surface of borsuk."));
+        assert!(filled.contains("/tmp/skills/run-web/"));
+        assert!(filled.contains("/srv/app"));
+        for step in [
+            "1. Clean the feature index",
+            "2. Read every source path",
+            "3. Run the Run section",
+            "4. Triage every finding",
+            "5. Open one `bug` ticket",
+            "6. Re-drive every fix",
+            "7. Ship the repair as one PR",
+            "8. Stop when the skill matches",
+        ] {
+            assert!(filled.contains(step), "the eight steps stay:\n{filled}");
         }
     }
 
@@ -987,28 +1645,103 @@ mod tests {
     fn the_docs_copies_match_the_consts_byte_for_byte() {
         assert_eq!(
             REFINE_PROMPT,
-            include_str!("../docs/v0.6/prompts/refine.md")
+            include_str!("../docs/v0.8/prompts/refine.md")
         );
         assert_eq!(
             IMPLEMENT_PROMPT,
-            include_str!("../docs/v0.6/prompts/implement.md")
+            include_str!("../docs/v0.8/prompts/implement.md")
         );
         assert_eq!(
             RELEASE_PROMPT,
-            include_str!("../docs/v0.6/prompts/release.md")
+            include_str!("../docs/v0.8/prompts/release.md")
         );
         assert_eq!(
             TICKET_PROMPT,
-            include_str!("../docs/v0.6/prompts/ticket.md")
+            include_str!("../docs/v0.8/prompts/ticket.md")
         );
         assert_eq!(
             TICKET_CHAT_PROMPT,
-            include_str!("../docs/v0.6/prompts/ticket-chat.md")
+            include_str!("../docs/v0.8/prompts/ticket-chat.md")
         );
         assert_eq!(
             REVIEW_PROMPT,
-            include_str!("../docs/v0.6/prompts/review.md")
+            include_str!("../docs/v0.8/prompts/review.md")
         );
+    }
+
+    #[test]
+    fn the_stage_prompts_carry_the_rules_section_and_the_why_rule_line() {
+        for prompt in [REFINE_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT] {
+            assert!(
+                prompt.contains("# The rules\n\nThe block below holds the rules"),
+                "a stage prompt must carry the rules section"
+            );
+            assert!(
+                prompt.contains("\n{rules}\n"),
+                "a stage prompt must carry the rules slot on its own line"
+            );
+        }
+        assert!(
+            IMPLEMENT_PROMPT.contains("\n{why_rule}\n"),
+            "the implement prompt must carry the why rule slot on its own line"
+        );
+        assert!(
+            !REFINE_PROMPT.contains("{why_rule}"),
+            "only the implement prompt names the why rule"
+        );
+        assert!(
+            !REVIEW_PROMPT.contains("{why_rule}"),
+            "only the implement prompt names the why rule"
+        );
+    }
+
+    #[test]
+    fn the_implement_prompt_carries_the_contract_and_the_simplest_change() {
+        for required in [
+            "## Before / After",
+            "smallest change",
+            "fails with the change reverted",
+            "{model}",
+            "{skills}",
+            "{rules}",
+            "{why_rule}",
+        ] {
+            assert!(
+                IMPLEMENT_PROMPT.contains(required),
+                "the implement prompt must carry {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_carries_the_re_drive() {
+        for required in [
+            "base worktree",
+            "only the test files",
+            "no criterion needs",
+            "{model}",
+            "{skills}",
+            "{rules}",
+            "{prediction}",
+            "Compare the prediction",
+            "<aif-delta-v1>",
+            "The five slot ids are",
+            "ends with no block",
+        ] {
+            assert!(
+                REVIEW_PROMPT.contains(required),
+                "the review prompt must carry {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rewritten_prompts_pass_the_prose_rules_they_ask_for() {
+        for (name, prompt) in [("implement", IMPLEMENT_PROMPT), ("review", REVIEW_PROMPT)] {
+            crate::theory::contract::lint_prose(prompt).unwrap_or_else(|finding| {
+                panic!("the {name} prompt breaks a prose rule: {finding}")
+            });
+        }
     }
 
     #[test]
@@ -1028,7 +1761,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         for required in [
-            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Wave |",
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |",
             "Put independent chunks in the same",
             "do not edit the same files",
             "Assign shared files and final integration to one coordinator chunk",
@@ -1037,6 +1770,32 @@ mod tests {
         ] {
             assert!(prompt.contains(required), "missing: {required}");
         }
+    }
+
+    /// Requirement R13. The refined ticket carries the R13 sections before
+    /// the plan table, one falsifiable line per criterion, and no wording
+    /// the v0.7 acceptance section used.
+    #[test]
+    fn the_refine_prompt_defines_the_criteria_contract() {
+        for required in [
+            "## Problem",
+            "## Grounding",
+            "## Decisions",
+            "## Repro",
+            "## Acceptance criteria",
+            "- AC-<n> · <falsifiable statement> · check: <target>",
+            "`<feature> drive`",
+            "`<feature> fast`",
+            "`measure <id>`",
+            "| Chunk | Goal | Owned files or paths | Depends on | Validation | Fast | Wave |",
+            "`new: <feature>`",
+        ] {
+            assert!(REFINE_PROMPT.contains(required), "missing: {required}");
+        }
+        assert!(
+            !REFINE_PROMPT.contains("Agreed approach"),
+            "the v0.7 acceptance wording must not return"
+        );
     }
 
     #[test]
@@ -1139,7 +1898,7 @@ stop to report a plan, and do not end a turn with a question. Decide with \
 the facts you have and act. Stop early only through the escape this prompt \
 names.";
         for (prompt, opening_end) in [
-            (REFINE_PROMPT, "stay in this checkout."),
+            (REFINE_PROMPT, "work only in this one."),
             (IMPLEMENT_PROMPT, "work only in this one."),
             (REVIEW_PROMPT, "work only in this one."),
             (RELEASE_PROMPT, "work only in this one."),

@@ -10,6 +10,7 @@
 pub mod claude;
 pub mod codex;
 pub mod opencode;
+pub mod script;
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -19,6 +20,7 @@ use anyhow::anyhow;
 
 use crate::config::{Harness, ResolvedRoleSettings};
 use crate::model::Stage;
+use crate::tasks::TaskPurpose;
 
 /// Runtime actions that one harness supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,15 +52,22 @@ pub const fn capabilities(harness: Harness) -> Capabilities {
 }
 
 /// Build one configured runner for one resolved execution role.
+///
+/// The purpose decides before the harness does. A measure task runs a
+/// shell command under a synthetic role, so no configured harness applies
+/// to it.
 pub trait RunnerFactory: Send + Sync {
-    fn build(&self, role: &ResolvedRoleSettings) -> Box<dyn Runner>;
+    fn build(&self, role: &ResolvedRoleSettings, purpose: &TaskPurpose) -> Box<dyn Runner>;
 }
 
 /// The factory that selects the installed harness adapter.
 pub struct DefaultRunnerFactory;
 
 impl RunnerFactory for DefaultRunnerFactory {
-    fn build(&self, role: &ResolvedRoleSettings) -> Box<dyn Runner> {
+    fn build(&self, role: &ResolvedRoleSettings, purpose: &TaskPurpose) -> Box<dyn Runner> {
+        if *purpose == TaskPurpose::Measure {
+            return Box::new(script::ScriptRunner::new());
+        }
         match role.settings.harness {
             Harness::Claude => {
                 let sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
@@ -111,6 +120,9 @@ pub struct Job {
     /// The permission rules the run grants, when the harness takes them
     /// from the environment. Empty for a harness that answers live asks.
     pub allowed_permissions: Vec<AllowedPermission>,
+    /// The seconds the run may take, when the job carries a deadline.
+    /// Only the script runner reads it.
+    pub timeout_s: Option<u64>,
 }
 
 /// One asynchronous report from a running agent.

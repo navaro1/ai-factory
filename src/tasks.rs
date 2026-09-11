@@ -57,8 +57,65 @@ impl fmt::Display for TaskState {
     }
 }
 
+/// What one teach task explains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeachKey {
+    /// One merged pull request.
+    Pr(u64),
+    /// One area of the verification map.
+    Area(String),
+    /// The delta of one pull request.
+    Delta(u64),
+    /// One model entry, named by its id.
+    Entry(String),
+}
+
+impl TeachKey {
+    /// The id fragment of one key: `pr-7`, `area-web-checkout`,
+    /// `delta-142`, or `entry-INV-3`.
+    pub fn slug(&self) -> String {
+        match self {
+            TeachKey::Pr(number) => format!("pr-{number}"),
+            TeachKey::Area(id) => format!("area-{id}"),
+            TeachKey::Delta(number) => format!("delta-{number}"),
+            TeachKey::Entry(id) => format!("entry-{id}"),
+        }
+    }
+}
+
+/// What one card asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardKey {
+    /// One merged pull request.
+    Pr(u64),
+    /// One model entry.
+    Entry(String),
+}
+
+impl CardKey {
+    /// The id fragment of one key: `7` or `INV-9`.
+    pub fn slug(&self) -> String {
+        match self {
+            CardKey::Pr(number) => number.to_string(),
+            CardKey::Entry(id) => id.clone(),
+        }
+    }
+}
+
+/// Which audit one audit task runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditJob {
+    /// The drift sweep over every model entry and every run skill.
+    Sweep,
+    /// The grading of one answered card.
+    Card(CardKey),
+}
+
 /// The workflow purpose of one task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPurpose {
     /// A normal pipeline task.
@@ -68,6 +125,17 @@ pub enum TaskPurpose {
     TicketCreate,
     /// A read-only conversation about one open issue.
     TicketChat,
+    /// One measurer or fast check: a shell command, not an agent.
+    Measure,
+    /// A one-shot explanation of one subject against the model.
+    Teach(TeachKey),
+    /// One audit sweep over the model and the run skills.
+    Audit(AuditJob),
+    /// An interactive conversation that writes the model of one area.
+    Bootstrap {
+        /// The area the conversation covers.
+        area: String,
+    },
 }
 
 /// One stage of one item in one repository.
@@ -146,6 +214,19 @@ impl Task {
         task.purpose = TaskPurpose::TicketChat;
         task
     }
+
+    /// Create one queued bootstrap conversation for an area.
+    ///
+    /// The item is the ticket-session item, so no worktree and no pipeline
+    /// sweep claims the task, and the area alone names the subject.
+    fn bootstrap_chat(repo: &str, area: &str, log_path: PathBuf, now_ms: u64) -> Self {
+        let mut task = Self::new(repo, Stage::Refine, ItemKind::Issue, 0, log_path, now_ms);
+        task.id = bootstrap_id(repo, area);
+        task.purpose = TaskPurpose::Bootstrap {
+            area: area.to_string(),
+        };
+        task
+    }
 }
 
 /// The identity of one queued task under an explicit id.
@@ -179,6 +260,25 @@ pub fn scoped_id(repo: &str, scope: &str) -> String {
 /// The task id for one issue conversation.
 pub fn ticket_chat_id(repo: &str, number: u64) -> String {
     format!("{repo}/ticket-i{number}")
+}
+
+/// The task id for one teach task: `<repo>/teach-<key>`.
+pub fn teach_id(repo: &str, key: &TeachKey) -> String {
+    format!("{repo}/teach-{}", key.slug())
+}
+
+/// The task id for one bootstrap chat: `<repo>/bootstrap-<area>`.
+pub fn bootstrap_id(repo: &str, area: &str) -> String {
+    format!("{repo}/bootstrap-{area}")
+}
+
+/// The task id for one audit task: `<repo>/audit-sweep` or
+/// `<repo>/audit-card-<key>`.
+pub fn audit_id(repo: &str, job: &AuditJob) -> String {
+    match job {
+        AuditJob::Sweep => format!("{repo}/audit-sweep"),
+        AuditJob::Card(key) => format!("{repo}/audit-card-{}", key.slug()),
+    }
 }
 
 /// All tasks of the daemon, in insertion order.
@@ -286,6 +386,29 @@ impl TaskTable {
         now_ms: u64,
     ) -> Result<&mut Task> {
         let id = ticket_chat_id(repo, number);
+        self.upsert_chat(id, || Task::ticket_chat(repo, number, log_path, now_ms))
+    }
+
+    /// Queue one bootstrap conversation or reuse its active task.
+    pub fn upsert_bootstrap_chat(
+        &mut self,
+        repo: &str,
+        area: &str,
+        log_path: PathBuf,
+        now_ms: u64,
+    ) -> Result<&mut Task> {
+        let id = bootstrap_id(repo, area);
+        self.upsert_chat(id, || Task::bootstrap_chat(repo, area, log_path, now_ms))
+    }
+
+    /// Return the live conversation under `id`, or insert what `build`
+    /// makes.
+    ///
+    /// A conversation outlives one turn, so a task that is still open
+    /// returns as it stands. Only a terminal task is replaced, which is
+    /// how a closed chat starts again under the same id. `build` runs
+    /// only for that second case.
+    fn upsert_chat(&mut self, id: String, build: impl FnOnce() -> Task) -> Result<&mut Task> {
         if self
             .by_id
             .get(&id)
@@ -296,8 +419,7 @@ impl TaskTable {
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("task \"{id}\" vanished before reuse"));
         }
-        let task = Task::ticket_chat(repo, number, log_path, now_ms);
-        self.insert_task(id.clone(), task)
+        self.insert_task(id, build())
     }
 
     /// Move one task to the back of the insertion order.
@@ -397,12 +519,13 @@ impl TaskTable {
         Ok(())
     }
 
-    /// Cancel a task: the state becomes `Failed("cancelled")`.
+    /// Cancel a task: the state becomes `Failed(reason)`.
     ///
     /// Cancelling follows the transition rules. A queued, running, or
-    /// awaiting task can be cancelled.
-    pub fn cancel(&mut self, id: &str, now_ms: u64) -> Result<()> {
-        self.transition(id, TaskState::Failed("cancelled".to_string()), now_ms)
+    /// awaiting task can be cancelled. The reason names the cause, so a
+    /// cancel with a cause says the cause on the board.
+    pub fn cancel(&mut self, id: &str, reason: &str, now_ms: u64) -> Result<()> {
+        self.transition(id, TaskState::Failed(reason.to_string()), now_ms)
     }
 
     /// The running tasks, in insertion order.
@@ -423,16 +546,26 @@ impl TaskTable {
     /// The number of running tasks of each stage.
     ///
     /// Queued, awaiting, and terminal tasks do not use a scheduler slot.
-    /// Every stage appears, with 0 when nothing runs.
+    /// Every stage appears, with 0 when nothing runs. A measure task
+    /// carries a stage for its worktree only and answers to the `measure`
+    /// limit, so it counts nowhere here.
     pub fn counts_by_stage(&self) -> BTreeMap<Stage, usize> {
         let mut counts: BTreeMap<Stage, usize> =
             Stage::ALL.iter().map(|stage| (*stage, 0)).collect();
         for task in self.by_id.values() {
-            if task.state == TaskState::Running {
+            if task.state == TaskState::Running && task.purpose != TaskPurpose::Measure {
                 *counts.entry(task.stage).or_insert(0) += 1;
             }
         }
         counts
+    }
+
+    /// The number of running measure tasks.
+    pub fn running_measure(&self) -> usize {
+        self.by_id
+            .values()
+            .filter(|task| task.state == TaskState::Running && task.purpose == TaskPurpose::Measure)
+            .count()
     }
 
     /// The number of running tasks per repository and stage.
@@ -449,7 +582,7 @@ impl TaskTable {
             }
         }
         for task in self.by_id.values() {
-            if task.state == TaskState::Running {
+            if task.state == TaskState::Running && task.purpose != TaskPurpose::Measure {
                 *counts.entry((task.repo.clone(), task.stage)).or_default() += 1;
             }
         }
@@ -556,6 +689,44 @@ mod tests {
         assert_eq!(
             table.by_id["borsuk/ticket-i42"].purpose,
             TaskPurpose::TicketChat
+        );
+    }
+
+    #[test]
+    fn a_teach_id_names_the_key_of_every_arm() {
+        assert_eq!(teach_id("borsuk", &TeachKey::Pr(7)), "borsuk/teach-pr-7");
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Area("web-checkout".to_string())),
+            "borsuk/teach-area-web-checkout"
+        );
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Delta(142)),
+            "borsuk/teach-delta-142"
+        );
+        assert_eq!(
+            teach_id("borsuk", &TeachKey::Entry("INV-3".to_string())),
+            "borsuk/teach-entry-INV-3"
+        );
+    }
+
+    #[test]
+    fn a_bootstrap_id_names_the_area() {
+        assert_eq!(bootstrap_id("borsuk", "gh"), "borsuk/bootstrap-gh");
+    }
+
+    #[test]
+    fn an_audit_id_names_the_sweep() {
+        assert_eq!(audit_id("borsuk", &AuditJob::Sweep), "borsuk/audit-sweep");
+        assert_eq!(
+            audit_id("borsuk", &AuditJob::Card(CardKey::Pr(7))),
+            "borsuk/audit-card-7"
+        );
+        assert_eq!(
+            audit_id(
+                "borsuk",
+                &AuditJob::Card(CardKey::Entry("INV-9".to_string()))
+            ),
+            "borsuk/audit-card-INV-9"
         );
     }
 
@@ -817,7 +988,7 @@ mod tests {
             TaskState::AwaitingUser,
         ] {
             let (mut table, id) = table_in_state(state);
-            table.cancel(&id, LATER).unwrap();
+            table.cancel(&id, "cancelled", LATER).unwrap();
             assert_eq!(
                 table.by_id[&id].state,
                 TaskState::Failed("cancelled".to_string())
@@ -836,7 +1007,7 @@ mod tests {
             0
         );
 
-        table.cancel(&id, LATER).unwrap();
+        table.cancel(&id, "cancelled", LATER).unwrap();
 
         assert_eq!(
             table.by_id[&id].state,

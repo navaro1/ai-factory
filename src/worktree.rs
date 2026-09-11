@@ -47,25 +47,73 @@ pub enum WorktreeKind {
     Issue,
     /// The worktree of one PR: the `pr-<n>` directory.
     Pr,
+    /// The skills worktree of one run skill ticket: the `skills-<n>`
+    /// directory. It is cut from the skills checkout, not from the code
+    /// repository.
+    Skills,
+    /// The model worktree of one repository: the `model` directory. One
+    /// repository owns exactly one, so the directory carries no number.
+    /// It is cut from the theory checkout.
+    Model,
+    /// The measure worktree of one merge base: the `base-<sha8>`
+    /// directory. It is detached at that commit, so the measurers of a
+    /// review read the base of the change without a branch of their own.
+    Base,
 }
 
 impl WorktreeKind {
-    /// The directory prefix: `issue-` or `pr-`.
+    /// The directory prefix: `issue-`, `pr-`, `skills-`, or `base-`. A
+    /// bare kind returns the whole directory name.
     pub fn prefix(self) -> &'static str {
         match self {
             WorktreeKind::Issue => "issue-",
             WorktreeKind::Pr => "pr-",
+            WorktreeKind::Skills => "skills-",
+            WorktreeKind::Model => MODEL_DIR,
+            WorktreeKind::Base => "base-",
+        }
+    }
+
+    /// What follows the prefix in the directory name of this kind.
+    pub fn naming(self) -> DirName {
+        match self {
+            WorktreeKind::Issue | WorktreeKind::Pr | WorktreeKind::Skills => DirName::Number,
+            WorktreeKind::Model => DirName::Bare,
+            WorktreeKind::Base => DirName::Sha,
         }
     }
 }
 
+/// How the directory of one worktree kind is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirName {
+    /// The prefix alone, because one repository owns exactly one.
+    Bare,
+    /// The prefix and the item number.
+    Number,
+    /// The prefix and the first [`SHA_CHARS`] characters of a commit.
+    Sha,
+}
+
+/// How many characters of a commit sha a directory name carries.
+pub const SHA_CHARS: usize = 8;
+
 /// The worktree kinds the manager owns. The doctor asks for this list, so
 /// the manager is the single source of the directory names.
-pub const WORKTREE_KINDS: [WorktreeKind; 2] = [WorktreeKind::Issue, WorktreeKind::Pr];
+pub const WORKTREE_KINDS: [WorktreeKind; 5] = [
+    WorktreeKind::Issue,
+    WorktreeKind::Pr,
+    WorktreeKind::Skills,
+    WorktreeKind::Model,
+    WorktreeKind::Base,
+];
 
 /// The directory name of the train worktree. The manager owns this name,
 /// so every caller that prints it reads this const.
 pub const TRAIN_DIR: &str = "train";
+
+/// The directory name of the model worktree.
+pub const MODEL_DIR: &str = "model";
 
 /// Creates, reuses, and removes one git worktree per issue, plus the train
 /// worktree of a repository.
@@ -98,7 +146,13 @@ impl WorktreeManager {
         self.path(repo, WorktreeKind::Pr, number)
     }
 
-    /// The worktree path of one kind: `issue-<n>` or `pr-<n>`.
+    /// The skills worktree path: `<state_dir>/worktrees/<alias>/skills-<n>`.
+    pub fn skills_path(&self, repo: &RepoConfig, number: u64) -> PathBuf {
+        self.path(repo, WorktreeKind::Skills, number)
+    }
+
+    /// The worktree path of one kind: `issue-<n>`, `pr-<n>`, or
+    /// `skills-<n>`.
     pub fn path(&self, repo: &RepoConfig, kind: WorktreeKind, number: u64) -> PathBuf {
         self.state_dir
             .join("worktrees")
@@ -114,6 +168,27 @@ impl WorktreeManager {
             .join(TRAIN_DIR)
     }
 
+    /// The model worktree path: `<state_dir>/worktrees/<alias>/model`.
+    pub fn model_path(&self, repo: &RepoConfig) -> PathBuf {
+        self.state_dir
+            .join("worktrees")
+            .join(&repo.alias)
+            .join(MODEL_DIR)
+    }
+
+    /// The measure worktree path of one merge base:
+    /// `<state_dir>/worktrees/<alias>/base-<sha8>`.
+    ///
+    /// The sha names the directory, so two reviews that share a merge base
+    /// share one worktree and one measurement of it.
+    pub fn base_path(&self, repo: &RepoConfig, sha: &str) -> PathBuf {
+        let sha8: String = sha.chars().take(SHA_CHARS).collect();
+        self.state_dir
+            .join("worktrees")
+            .join(&repo.alias)
+            .join(format!("{}{sha8}", WorktreeKind::Base.prefix()))
+    }
+
     /// The issue branch name: `aif/<alias>/issue-<n>`.
     pub fn issue_branch(repo: &RepoConfig, number: u64) -> String {
         format!("aif/{}/issue-{number}", repo.alias)
@@ -124,9 +199,29 @@ impl WorktreeManager {
         format!("aif/{}/pr-{number}", repo.alias)
     }
 
+    /// The skills branch name: `aif/<alias>/skills-<n>`.
+    pub fn skills_branch(repo: &RepoConfig, number: u64) -> String {
+        format!("aif/{}/skills-{number}", repo.alias)
+    }
+
     /// The train branch name: `aif/<alias>/train`.
     pub fn train_branch(repo: &RepoConfig) -> String {
         format!("aif/{}/train", repo.alias)
+    }
+
+    /// The prefix every model branch of one repository carries:
+    /// `aif/<alias>/model-`.
+    pub fn model_branch_prefix(repo: &RepoConfig) -> String {
+        format!("aif/{}/model-", repo.alias)
+    }
+
+    /// A fresh model branch name: `aif/<alias>/model-<uuid8>`.
+    ///
+    /// The daemon mints one only when no model pull request is open, so a
+    /// branch name never has to survive a restart.
+    pub fn new_model_branch(repo: &RepoConfig) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        format!("{}{}", Self::model_branch_prefix(repo), &id[..8])
     }
 
     /// Create the marker directory and hide it in one repository checkout.
@@ -170,9 +265,9 @@ impl WorktreeManager {
     /// branch without `-b`, so the old work survives the loss of the
     /// directory.
     pub fn ensure_issue(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
-        self.ensure_on(
+        self.ensure_from(
             exec,
-            repo,
+            &repo.path,
             &self.issue_path(repo, number),
             &Self::issue_branch(repo, number),
         )
@@ -189,7 +284,7 @@ impl WorktreeManager {
     /// reset never reads.
     pub fn ensure_pr(&self, exec: &dyn Exec, repo: &RepoConfig, number: u64) -> Result<PathBuf> {
         let path = self.pr_path(repo, number);
-        let worktree = self.ensure_on(exec, repo, &path, &Self::pr_branch(repo, number))?;
+        let worktree = self.ensure_from(exec, &repo.path, &path, &Self::pr_branch(repo, number))?;
         let reference = format!("pull/{number}/head");
         let out = git(exec, &worktree, &["fetch", "origin", reference.as_str()])?;
         require_zero(out, "git fetch")?;
@@ -198,42 +293,129 @@ impl WorktreeManager {
         Ok(worktree)
     }
 
-    /// Return the worktree at `path` on `branch`, and create it when missing.
+    /// Return the skills worktree of one run skill ticket, and create it
+    /// when missing.
     ///
-    /// When the path exists and git registers it, the worktree returns as it
-    /// stands, so work resumes in place. Otherwise the create path first
-    /// recovers a broken previous worktree (see [`WorktreeManager::recover`]),
-    /// and then cuts the branch from the default branch: `origin/HEAD`
-    /// resolved through `git symbolic-ref`, else the repository's own
-    /// `HEAD`. When the branch already exists, the worktree is added on that
-    /// branch without `-b`, so the old work survives the loss of the
-    /// directory.
-    fn ensure_on(
+    /// The worktree sits at `<state_dir>/worktrees/<alias>/skills-<n>` on
+    /// the branch `aif/<alias>/skills-<n>`, cut from the default branch of
+    /// the skills checkout. In shadow mode that checkout is the theory
+    /// repository, so the code repository never holds a skill file.
+    pub fn ensure_skills(
         &self,
         exec: &dyn Exec,
         repo: &RepoConfig,
+        number: u64,
+    ) -> Result<PathBuf> {
+        self.ensure_from(
+            exec,
+            &repo.skills_checkout(),
+            &self.skills_path(repo, number),
+            &Self::skills_branch(repo, number),
+        )
+    }
+
+    /// Return the model worktree of one repository, and create it when
+    /// missing.
+    ///
+    /// The worktree sits at `<state_dir>/worktrees/<alias>/model` on
+    /// `branch`, cut from the theory checkout. `branch` reaches the git
+    /// call only on the create path: an existing worktree keeps the branch
+    /// it already holds, and the doctor removes it once no model pull
+    /// request is open.
+    pub fn ensure_model(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        branch: &str,
+    ) -> Result<PathBuf> {
+        self.ensure_from(
+            exec,
+            &repo.theory.checkout(&repo.path),
+            &self.model_path(repo),
+            branch,
+        )
+    }
+
+    /// Return the measure worktree of one merge base, and create it when
+    /// missing.
+    ///
+    /// The worktree sits at `<state_dir>/worktrees/<alias>/base-<sha8>`
+    /// with no branch, detached at `sha`. A merge base never moves, so an
+    /// existing worktree returns as it stands and its measurements stay
+    /// valid. The create path first recovers a broken previous worktree,
+    /// the way [`WorktreeManager::ensure_from`] does.
+    pub fn ensure_detached(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        sha: &str,
+    ) -> Result<PathBuf> {
+        let path = self.base_path(repo, sha);
+        if path.exists() && self.registered(exec, &repo.path, &path)? {
+            self.prepare(exec, &path)?;
+            return Ok(path);
+        }
+        self.recover(exec, &repo.path, &path)?;
+        let path_text = path.to_string_lossy().into_owned();
+        let out = git(
+            exec,
+            &repo.path,
+            &["worktree", "add", "--detach", path_text.as_str(), sha],
+        )?;
+        require_zero(out, "git worktree add --detach")?;
+        self.prepare(exec, &path)?;
+        Ok(path)
+    }
+
+    /// The branch the worktree at `path` has checked out.
+    pub fn current_branch(&self, exec: &dyn Exec, path: &Path) -> Result<String> {
+        let out = git(exec, path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let out = require_zero(out, "git rev-parse --abbrev-ref HEAD")?;
+        let branch = out.stdout.trim();
+        if branch.is_empty() {
+            bail!("the worktree {} has no branch", path.display());
+        }
+        Ok(branch.to_string())
+    }
+
+    /// Return the worktree at `path` on `branch`, and create it when missing.
+    ///
+    /// `source` is the checkout the worktree is cut from: the code
+    /// repository for a ticket or a PR, the skills checkout for a run
+    /// skill. When the path exists and git registers it, the worktree
+    /// returns as it stands, so work resumes in place. Otherwise the create
+    /// path first recovers a broken previous worktree (see
+    /// [`WorktreeManager::recover`]), and then cuts the branch from the
+    /// default branch: `origin/HEAD` resolved through `git symbolic-ref`,
+    /// else the source checkout's own `HEAD`. When the branch already
+    /// exists, the worktree is added on that branch without `-b`, so the
+    /// old work survives the loss of the directory.
+    fn ensure_from(
+        &self,
+        exec: &dyn Exec,
+        source: &Path,
         path: &Path,
         branch: &str,
     ) -> Result<PathBuf> {
-        if path.exists() && self.registered(exec, &repo.path, path)? {
+        if path.exists() && self.registered(exec, source, path)? {
             self.prepare(exec, path)?;
             return Ok(path.to_path_buf());
         }
 
-        self.recover(exec, &repo.path, path)?;
+        self.recover(exec, source, path)?;
         let path_text = path.to_string_lossy().into_owned();
-        if self.branch_exists(exec, &repo.path, branch)? {
+        if self.branch_exists(exec, source, branch)? {
             let out = git(
                 exec,
-                &repo.path,
+                source,
                 &["worktree", "add", path_text.as_str(), branch],
             )?;
             require_zero(out, "git worktree add")?;
         } else {
-            let base = self.default_base(exec, &repo.path)?;
+            let base = self.default_base(exec, source)?;
             let out = git(
                 exec,
-                &repo.path,
+                source,
                 &[
                     "worktree",
                     "add",
@@ -346,9 +528,9 @@ impl WorktreeManager {
             Cleanable::MergedOrClosed => {}
         }
 
-        self.remove_on(
+        self.remove_from(
             exec,
-            repo,
+            &repo.path,
             &self.issue_path(repo, number),
             &Self::issue_branch(repo, number),
         )
@@ -367,22 +549,74 @@ impl WorktreeManager {
         match proof {
             Cleanable::MergedOrClosed => {}
         }
-        self.remove_on(
+        self.remove_from(
             exec,
-            repo,
+            &repo.path,
             &self.pr_path(repo, number),
             &Self::pr_branch(repo, number),
         )
     }
 
-    /// Remove the worktree at `path` and delete `branch`.
-    fn remove_on(
+    /// Remove the skills worktree of one run skill ticket and delete its
+    /// branch.
+    ///
+    /// The proof contract matches [`WorktreeManager::remove_issue`]. The
+    /// removal runs in the skills checkout, which owns the worktree.
+    pub fn remove_skills(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        number: u64,
+        proof: Cleanable,
+    ) -> Result<()> {
+        match proof {
+            Cleanable::MergedOrClosed => {}
+        }
+        self.remove_from(
+            exec,
+            &repo.skills_checkout(),
+            &self.skills_path(repo, number),
+            &Self::skills_branch(repo, number),
+        )
+    }
+
+    /// Remove the model worktree of one repository and delete `branch`.
+    ///
+    /// The proof contract matches [`WorktreeManager::remove_issue`]. The
+    /// model branch is derived and never stored, so the caller reads it
+    /// with [`WorktreeManager::current_branch`] first.
+    pub fn remove_model(
+        &self,
+        exec: &dyn Exec,
+        repo: &RepoConfig,
+        branch: &str,
+        proof: Cleanable,
+    ) -> Result<()> {
+        match proof {
+            Cleanable::MergedOrClosed => {}
+        }
+        self.remove_from(
+            exec,
+            &repo.theory.checkout(&repo.path),
+            &self.model_path(repo),
+            branch,
+        )
+    }
+
+    /// Remove one measure worktree of a merge base.
+    ///
+    /// The proof contract matches [`WorktreeManager::remove_issue`]. The
+    /// worktree is detached, so there is no branch to delete.
+    pub fn remove_base(
         &self,
         exec: &dyn Exec,
         repo: &RepoConfig,
         path: &Path,
-        branch: &str,
+        proof: Cleanable,
     ) -> Result<()> {
+        match proof {
+            Cleanable::MergedOrClosed => {}
+        }
         let path_text = path.to_string_lossy().into_owned();
         let out = git(
             exec,
@@ -390,7 +624,19 @@ impl WorktreeManager {
             &["worktree", "remove", "--force", path_text.as_str()],
         )?;
         require_zero(out, "git worktree remove")?;
-        let out = git(exec, &repo.path, &["branch", "-D", branch])?;
+        Ok(())
+    }
+
+    /// Remove the worktree at `path` and delete `branch` in `source`.
+    fn remove_from(&self, exec: &dyn Exec, source: &Path, path: &Path, branch: &str) -> Result<()> {
+        let path_text = path.to_string_lossy().into_owned();
+        let out = git(
+            exec,
+            source,
+            &["worktree", "remove", "--force", path_text.as_str()],
+        )?;
+        require_zero(out, "git worktree remove")?;
+        let out = git(exec, source, &["branch", "-D", branch])?;
         require_zero(out, "git branch -D")?;
         Ok(())
     }
@@ -490,7 +736,7 @@ impl WorktreeManager {
     /// Resolve the base commitish: `origin/HEAD` when git knows it, else the
     /// repository's own `HEAD`. Status 1 means that the reference is absent.
     /// Other failures propagate.
-    fn default_base(&self, exec: &dyn Exec, repo_path: &Path) -> Result<String> {
+    pub(crate) fn default_base(&self, exec: &dyn Exec, repo_path: &Path) -> Result<String> {
         let out = git(
             exec,
             repo_path,
@@ -563,7 +809,7 @@ impl WorktreeManager {
 }
 
 /// Run `git -C <dir> <args>` and return the raw output.
-fn git(exec: &dyn Exec, dir: &Path, args: &[&str]) -> Result<CmdOut> {
+pub(crate) fn git(exec: &dyn Exec, dir: &Path, args: &[&str]) -> Result<CmdOut> {
     let dir_text = dir.to_string_lossy().into_owned();
     let mut argv: Vec<&str> = vec!["-C", dir_text.as_str()];
     argv.extend_from_slice(args);
@@ -700,6 +946,7 @@ mod tests {
             lanes: BTreeMap::new(),
             release: ReleasePolicy::Manual,
             theory: crate::config::TheoryConfig::default(),
+            skills: None,
             role_overrides: BTreeMap::new(),
             tag_route_overrides: BTreeMap::new(),
             label_overrides: BTreeMap::new(),

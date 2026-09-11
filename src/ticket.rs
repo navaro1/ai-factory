@@ -692,64 +692,29 @@ impl TicketController {
             };
         };
         let gh = GhClient::new(&*self.exec);
-        let mut created_new = false;
-        let label = match gh.create_label(&repo_config.owner_repo, &name, &color) {
-            Ok(label) => {
-                created_new = true;
-                label
-            }
-            Err(error) if error.to_string().contains("HTTP 422") => {
-                let labels = match gh.fetch_labels(&repo_config.owner_repo) {
-                    Ok(labels) => labels,
-                    Err(refresh_error) => {
-                        pushes.push(Push::TicketResult(result(
-                            request,
-                            repo,
-                            number,
-                            TicketResultKind::Failure,
-                            &format!(
-                                "GitHub reported an existing label, but the catalog refresh failed: {refresh_error:#}"
-                            ),
-                        )));
-                        return TicketEffects {
-                            pushes,
-                            confirmed: None,
-                        };
-                    }
-                };
-                self.label_catalogs.insert(repo.clone(), labels.clone());
-                let Some(label) = labels
-                    .into_iter()
-                    .find(|label| label.name.eq_ignore_ascii_case(&name))
-                else {
+        let (label, refreshed) =
+            match gh.create_label_if_missing(&repo_config.owner_repo, &name, &color) {
+                Ok(found) => found,
+                Err(error) => {
+                    // The error text is the full operator message; the
+                    // three v0.6 texts live in `create_label_if_missing`.
                     pushes.push(Push::TicketResult(result(
                         request,
                         repo,
                         number,
                         TicketResultKind::Failure,
-                        "GitHub rejected label creation, and the refreshed catalog has no matching label.",
+                        &format!("{error:#}"),
                     )));
                     return TicketEffects {
                         pushes,
                         confirmed: None,
                     };
-                };
-                label
-            }
-            Err(error) => {
-                pushes.push(Push::TicketResult(result(
-                    request,
-                    repo,
-                    number,
-                    TicketResultKind::Failure,
-                    &format!("GitHub rejected label creation: {error:#}"),
-                )));
-                return TicketEffects {
-                    pushes,
-                    confirmed: None,
-                };
-            }
-        };
+                }
+            };
+        let created_new = refreshed.is_none();
+        if let Some(labels) = refreshed {
+            self.label_catalogs.insert(repo.clone(), labels);
+        }
         let catalog = self.label_catalogs.entry(repo.clone()).or_default();
         if !catalog
             .iter()
@@ -848,7 +813,7 @@ impl TicketController {
             };
         };
         let gh = GhClient::new(&*self.exec);
-        let issue = match gh.create_issue(&repo_config.owner_repo, &title, &body) {
+        let issue = match gh.create_issue(&repo_config.owner_repo, &title, &body, &[]) {
             Ok(issue) => issue,
             Err(error) => {
                 pushes.push(Push::TicketResult(result(
@@ -891,27 +856,12 @@ pub fn normalize_label_color(color: &str) -> Result<String, String> {
     Ok(color.to_ascii_lowercase())
 }
 
+/// The opening tag of one ticket proposal block.
+pub const TICKET_PROPOSAL_BLOCK: &str = "<aif-ticket-proposal-v1>";
+
 /// Parse the final strict proposal block from one assistant text event.
 pub fn parse_ticket_proposal(text: &str) -> Option<TicketContent> {
-    const OPEN: &str = "<aif-ticket-proposal-v1>";
-    const CLOSE: &str = "</aif-ticket-proposal-v1>";
-
-    let text = text.trim_end();
-    if text.contains("```")
-        || text.match_indices(OPEN).count() != 1
-        || text.match_indices(CLOSE).count() != 1
-        || !text.ends_with(CLOSE)
-    {
-        return None;
-    }
-    let open = text.find(OPEN)?;
-    if open > 0 && text.as_bytes().get(open - 1) != Some(&b'\n') {
-        return None;
-    }
-    let block = &text[open..];
-    let json = block
-        .strip_prefix(&format!("{OPEN}\n"))?
-        .strip_suffix(&format!("\n{CLOSE}"))?;
+    let json = crate::theory::blocks::parse_block(TICKET_PROPOSAL_BLOCK, text).ok()?;
     if json.contains('\n') {
         return None;
     }
@@ -923,7 +873,7 @@ pub fn parse_ticket_proposal(text: &str) -> Option<TicketContent> {
         body: String,
     }
 
-    let proposal: ProposalWire = serde_json::from_str(json).ok()?;
+    let proposal: ProposalWire = serde_json::from_str(&json).ok()?;
     if proposal.title.trim().is_empty() {
         return None;
     }

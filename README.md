@@ -5,6 +5,7 @@ repositories. A daemon (a background program that runs without a terminal)
 does the work. A terminal user interface (UI) shows the work and takes your
 decisions.
 GitHub is the source of truth. AI Factory keeps no journal and no database.
+The stance of the factory lives in [docs/STANCE.md](docs/STANCE.md).
 
 ## The four stages
 
@@ -16,7 +17,7 @@ refine ──▶ implement ──▶ review ──▶ release
 
 | Stage | Default harness and model | Result |
 |---|---|---|
-| refine | Claude, Opus | You shape the ticket. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
+| refine | Claude, Opus | You shape the ticket in its own issue worktree. The issue gets the label `refined`. A plan with two or more chunks becomes one sub-issue per chunk, and the parent gets the label `epic`. |
 | implement | OpenCode, GLM-5.3-Flash | The agent writes the change and opens a draft pull request. |
 | review | OpenCode, GPT-5.6 | The agent repairs every finding, pushes the repair, and marks the pull request ready. |
 | release | Claude, Opus | Release trains merge the ready pull requests. |
@@ -58,8 +59,8 @@ of each repository. The poll is conditional: an unchanged repository costs
 almost nothing.
 
 Each implementation issue gets one git worktree (a second repository
-checkout). The implementation and review agents use this worktree. The
-factory creates the worktree. The agents never create it.
+checkout). The refine, implementation, and review agents use this worktree.
+The factory creates the worktree. The agents never create it.
 
 ### Ticket dependencies
 
@@ -141,8 +142,8 @@ do not exist:
 
 The installer never overwrites a file that exists. The installer keeps an
 installed prompt file. After an upgrade, copy the new prompt files from
-`docs/v0.6/prompts/` by hand, or edit each prompt in the Settings view.
-Edit `~/.config/aif/factory.toml` and set the path of every repository.
+`docs/v0.8/prompts/` by hand, or edit each prompt in the Settings view. Edit `~/.config/aif/factory.toml` and set the path of
+every repository.
 
 ## Configure
 
@@ -220,6 +221,18 @@ minutes = 10
 - `minutes` is the cadence between two probes of one identity, from 1 to
   1440. The default is `10`. A failed probe doubles the wait of its identity
   up to 60 minutes.
+
+The optional `[measure]` table caps the measure tasks:
+
+```toml
+[measure]
+limit = 2
+```
+
+- `limit` is how many measure tasks may run at once, over every repository.
+  The default is `2`. A measure task runs one shell command, not an agent,
+  so it holds no stage slot. A fast check of a governed pull request is one
+  measure task.
 
 The daemon derives one billed identity per plan: `claude`, `codex`, and one
 identity per OpenCode provider segment of a model, such as
@@ -359,7 +372,7 @@ rows, and the tasks that ran at the stop come back.
 repository checkout:
 
 ```sh
-cp docs/v0.6/prompts/*.md ~/.config/aif/prompts/
+cp docs/v0.8/prompts/*.md ~/.config/aif/prompts/
 ```
 
 The copy replaces your edits to the installed prompt files.

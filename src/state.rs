@@ -19,15 +19,44 @@ use crate::model::Stage;
 use crate::runner::AllowedPermission;
 use crate::sock::TicketProposal;
 use crate::tasks::{Task, MAX_ATTEMPTS};
+use crate::theory::cadence::Schedule;
 use crate::usage::{SpendTotals, UsageRecord};
+
+/// What one live conversation is about.
+///
+/// A ticket chat names its issue number. A theory chat names its subject,
+/// which is the area a bootstrap chat writes. The value is untagged, so a
+/// `state.json` written before the theory chats loads its bare issue
+/// numbers as [`ChatKey::Ticket`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatKey {
+    /// One open issue of the repository.
+    Ticket(u64),
+    /// One theory subject of the repository.
+    Theory(String),
+}
+
+impl ChatKey {
+    /// The issue number of a ticket chat, else `None`.
+    pub fn ticket(&self) -> Option<u64> {
+        match self {
+            ChatKey::Ticket(number) => Some(*number),
+            ChatKey::Theory(_) => None,
+        }
+    }
+}
 
 /// One issue conversation that survives a daemon restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketConversationState {
     /// The repository alias.
     pub repo: String,
-    /// The issue number.
-    pub number: u64,
+    /// The subject of the conversation.
+    ///
+    /// The alias reads the issue number an older file wrote.
+    #[serde(alias = "number")]
+    pub key: ChatKey,
     /// The Claude session identity, when the first run started.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -48,6 +77,54 @@ struct LaneEntry {
     repo: String,
     /// The reserved slots. 0 keeps a former reservation disabled.
     slots: usize,
+}
+
+/// The immutable binding of one task: the role it started with and, from
+/// C10 on, the model commit it is pinned to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TaskBindingFile")]
+pub struct TaskBinding {
+    /// The resolved role settings of the first run.
+    pub role: ResolvedRoleSettings,
+    /// The model commit the task pins to. `None` until a prediction names
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_commit: Option<String>,
+}
+
+impl From<TaskBindingFile> for TaskBinding {
+    fn from(file: TaskBindingFile) -> Self {
+        match file {
+            TaskBindingFile::Bound { role, model_commit } => TaskBinding { role, model_commit },
+            TaskBindingFile::Bare(role) => TaskBinding {
+                role,
+                model_commit: None,
+            },
+        }
+    }
+}
+
+/// The read shape of one role binding in `state.json`.
+///
+/// A file written before C5 holds the resolved settings bare. A file
+/// written after wraps them and adds the model commit. `TaskBinding`
+/// always writes the wrapped shape; `TaskBindingFile` exists for the read
+/// only. The untagged order tries the wrapped shape first. A bare value
+/// fails it, because its `role` field holds a role name, not an object.
+/// The bare value then loads as `Bare`, with `model_commit = None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TaskBindingFile {
+    /// The wrapped shape, with the optional model commit.
+    Bound {
+        /// The resolved role settings of the first run.
+        role: ResolvedRoleSettings,
+        /// The model commit the task pins to.
+        #[serde(default)]
+        model_commit: Option<String>,
+    },
+    /// The bare shape of the older file, without the model commit.
+    Bare(ResolvedRoleSettings),
 }
 
 /// One persisted lane pause mark.
@@ -140,12 +217,15 @@ struct StateFile {
     /// The last fire stamp of each train, by repository alias.
     #[serde(default)]
     last_fire_ms: BTreeMap<String, u64>,
+    /// The theory cadences of the governed repositories.
+    #[serde(default)]
+    cadences: Vec<Schedule>,
     /// Active issue conversations.
     #[serde(default)]
     ticket_conversations: Vec<TicketConversationState>,
     /// Immutable role bindings, by stable task identity.
     #[serde(default)]
-    role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    role_bindings: BTreeMap<String, TaskBinding>,
     /// The runtime work state of the last drive.
     #[serde(default)]
     runtime: RuntimeState,
@@ -165,10 +245,12 @@ pub struct DaemonState {
     pub policies: BTreeMap<String, ReleasePolicy>,
     /// The last fire stamp of each train, by repository alias.
     pub last_fire_ms: BTreeMap<String, u64>,
+    /// The theory cadences of the governed repositories.
+    pub cadences: Vec<Schedule>,
     /// Active issue conversations.
     pub ticket_conversations: Vec<TicketConversationState>,
     /// Immutable role bindings, by stable task identity.
-    pub role_bindings: BTreeMap<String, ResolvedRoleSettings>,
+    pub role_bindings: BTreeMap<String, TaskBinding>,
     /// The runtime work state: pause marks, tasks, queued chats, review
     /// ticket sets, release batches, and stuck rows.
     pub runtime: RuntimeState,
@@ -217,6 +299,7 @@ impl DaemonState {
                         .collect(),
                     policies: file.policies,
                     last_fire_ms: file.last_fire_ms,
+                    cadences: file.cadences,
                     ticket_conversations: file.ticket_conversations,
                     role_bindings: file.role_bindings,
                     runtime: file.runtime,
@@ -251,6 +334,7 @@ impl DaemonState {
                 .collect(),
             policies: self.policies.clone(),
             last_fire_ms: self.last_fire_ms.clone(),
+            cadences: self.cadences.clone(),
             ticket_conversations: self.ticket_conversations.clone(),
             role_bindings: self.role_bindings.clone(),
             runtime: self.runtime.clone(),
@@ -295,7 +379,7 @@ fn invalid_state(file: &StateFile) -> Option<String> {
     }
     for (task, binding) in &file.role_bindings {
         if let Err(error) = crate::config::validate_persisted_settings(
-            &binding.settings,
+            &binding.role.settings,
             &format!("role binding {task}"),
         ) {
             return Some(error.to_string());
@@ -667,13 +751,23 @@ mod tests {
                 ReleasePolicy::Interval { minutes: 5 },
             )]),
             last_fire_ms: BTreeMap::from([("borsuk".to_string(), 1_000)]),
-            ticket_conversations: vec![TicketConversationState {
-                repo: "borsuk".to_string(),
-                number: 42,
-                session_id: Some("session-42".to_string()),
-                handoff_active: true,
-                proposal: None,
-            }],
+            cadences: Vec::new(),
+            ticket_conversations: vec![
+                TicketConversationState {
+                    repo: "borsuk".to_string(),
+                    key: ChatKey::Ticket(42),
+                    session_id: Some("session-42".to_string()),
+                    handoff_active: true,
+                    proposal: None,
+                },
+                TicketConversationState {
+                    repo: "borsuk".to_string(),
+                    key: ChatKey::Theory("gh".to_string()),
+                    session_id: Some("session-gh".to_string()),
+                    handoff_active: false,
+                    proposal: None,
+                },
+            ],
             role_bindings: BTreeMap::new(),
             runtime: RuntimeState {
                 paused: PausedState {
@@ -702,6 +796,58 @@ mod tests {
         state.save(&path).unwrap();
         let loaded = DaemonState::load(&path);
         assert_eq!(loaded, state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A file written before the theory chats keys each conversation by a
+    /// bare issue number, and that number still names the ticket.
+    #[test]
+    fn an_old_conversation_key_loads_as_a_ticket_chat() {
+        let dir = temp_dir("old-conversation-key");
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"stage_limits":{},"lanes":[],"policies":{},"last_fire_ms":{},
+                "ticket_conversations":[{"repo":"borsuk","number":7,
+                "session_id":"session-7","handoff_active":true}],
+                "runtime":{"paused":{"global":false},"tasks":[],"pending_chats":{},
+                "review_tickets":{},"release_batches":{},"stuck":[]}}"#,
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert_eq!(loaded.ticket_conversations.len(), 1);
+        assert_eq!(loaded.ticket_conversations[0].key, ChatKey::Ticket(7));
+        assert_eq!(loaded.ticket_conversations[0].key.ticket(), Some(7));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_cadence_last_fire_times_survive_a_restart() {
+        use crate::theory::cadence::ScheduleKind;
+        let dir = temp_dir("cadence-round-trip");
+        let path = dir.join("state.json");
+        let state = DaemonState {
+            cadences: vec![
+                Schedule {
+                    kind: ScheduleKind::Daily,
+                    repo: "borsuk".to_string(),
+                    last_ms: Some(1_788_091_200_000),
+                },
+                Schedule {
+                    kind: ScheduleKind::Audit,
+                    repo: "borsuk".to_string(),
+                    last_ms: None,
+                },
+            ],
+            ..DaemonState::default()
+        };
+
+        state.save(&path).unwrap();
+        let loaded = DaemonState::load(&path);
+        assert_eq!(loaded.cadences, state.cadences);
+        assert_eq!(loaded.cadences[0].last_ms, Some(1_788_091_200_000));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -799,36 +945,39 @@ mod tests {
     fn a_full_role_binding_survives_a_restart() {
         let dir = temp_dir("role-binding");
         let path = dir.join("state.json");
-        let binding = ResolvedRoleSettings {
-            role: ExecutionRole::Implement,
-            source: SettingsSource::Repository {
-                alias: "borsuk".to_string(),
+        let binding = TaskBinding {
+            role: ResolvedRoleSettings {
+                role: ExecutionRole::Implement,
+                source: SettingsSource::Repository {
+                    alias: "borsuk".to_string(),
+                },
+                tag_route: Some(TagRouteBinding {
+                    key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
+                    matches: vec![TagRouteMatch {
+                        kind: ItemKind::Issue,
+                        number: 142,
+                        label: "complexity:high".to_string(),
+                    }],
+                }),
+                settings: RoleSettings {
+                    harness: Harness::Codex,
+                    program: "codex-custom".to_string(),
+                    model: "gpt-test".to_string(),
+                    effort: Some("high".to_string()),
+                    extra_args: vec!["--color=never".to_string()],
+                    agent: None,
+                    profile: Some("factory".to_string()),
+                    permission_mode: None,
+                    permission_handler: None,
+                    tools: Vec::new(),
+                    disallowed_tools: Vec::new(),
+                    strict_mcp: None,
+                    auto_approve: None,
+                    approval_policy: Some("never".to_string()),
+                    sandbox: Some("workspace-write".to_string()),
+                },
             },
-            tag_route: Some(TagRouteBinding {
-                key: TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High),
-                matches: vec![TagRouteMatch {
-                    kind: ItemKind::Issue,
-                    number: 142,
-                    label: "complexity:high".to_string(),
-                }],
-            }),
-            settings: RoleSettings {
-                harness: Harness::Codex,
-                program: "codex-custom".to_string(),
-                model: "gpt-test".to_string(),
-                effort: Some("high".to_string()),
-                extra_args: vec!["--color=never".to_string()],
-                agent: None,
-                profile: Some("factory".to_string()),
-                permission_mode: None,
-                permission_handler: None,
-                tools: Vec::new(),
-                disallowed_tools: Vec::new(),
-                strict_mcp: None,
-                auto_approve: None,
-                approval_policy: Some("never".to_string()),
-                sandbox: Some("workspace-write".to_string()),
-            },
+            model_commit: Some("c0ffee00".to_string()),
         };
         let mut state = DaemonState::default();
         state
@@ -850,7 +999,10 @@ mod tests {
     fn an_old_role_binding_without_tag_route_evidence_still_loads() {
         let dir = temp_dir("old-role-binding");
         let path = dir.join("state.json");
-        let binding = valid_binding();
+        let binding = TaskBinding {
+            role: valid_binding(),
+            model_commit: None,
+        };
         let mut state = DaemonState::default();
         state
             .role_bindings
@@ -863,6 +1015,28 @@ mod tests {
             DaemonState::load(&path).role_bindings["borsuk/review-p5"],
             binding
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_state_file_with_a_bare_role_value_still_loads() {
+        let dir = temp_dir("bare-role-binding");
+        let path = dir.join("state.json");
+        // The shape a daemon wrote before C5: the resolved settings sit
+        // bare in the map, with no wrapper and no model commit.
+        let bare = serde_json::to_value(valid_binding()).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "role_bindings": { "borsuk/review-p5": bare }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let binding = &DaemonState::load(&path).role_bindings["borsuk/review-p5"];
+        assert_eq!(binding.model_commit, None);
+        assert_eq!(binding.role, valid_binding());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -885,9 +1059,15 @@ mod tests {
         let dir = temp_dir("corrupt-role-binding");
         let path = dir.join("state.json");
         let mut state = DaemonState::default();
-        let mut binding = valid_binding();
-        binding.settings.model.clear();
-        state.role_bindings.insert("task".to_string(), binding);
+        let mut role = valid_binding();
+        role.settings.model.clear();
+        state.role_bindings.insert(
+            "task".to_string(),
+            TaskBinding {
+                role,
+                model_commit: None,
+            },
+        );
         state.stage_limits.insert(Stage::Review, 9);
         state.save(&path).unwrap();
         assert_eq!(DaemonState::load(&path), DaemonState::default());
@@ -899,9 +1079,15 @@ mod tests {
         let dir = temp_dir("unsafe-role-binding");
         let path = dir.join("state.json");
         let mut state = DaemonState::default();
-        let mut binding = valid_binding();
-        binding.settings.extra_args = vec!["--yolo".to_string()];
-        state.role_bindings.insert("task".to_string(), binding);
+        let mut role = valid_binding();
+        role.settings.extra_args = vec!["--yolo".to_string()];
+        state.role_bindings.insert(
+            "task".to_string(),
+            TaskBinding {
+                role,
+                model_commit: None,
+            },
+        );
         state.save(&path).unwrap();
         assert_eq!(DaemonState::load(&path), DaemonState::default());
         let _ = fs::remove_dir_all(dir);

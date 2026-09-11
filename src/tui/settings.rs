@@ -49,6 +49,9 @@ enum Field {
     Prompt,
     /// One configurable label name. Only the labels target shows these.
     Label(LabelKey),
+    /// The skills checkout of the selected repository. Only the skills
+    /// target shows it.
+    SkillsPath,
 }
 
 impl Field {
@@ -72,6 +75,7 @@ impl Field {
             Self::Sandbox => "sandbox",
             Self::Limit => "limit",
             Self::Prompt => "prompt",
+            Self::SkillsPath => "skills path",
         }
     }
 
@@ -109,6 +113,8 @@ enum DraftValue {
         names: LabelNames,
         fallback: LabelNames,
     },
+    /// The edited skills checkout of one repository. `None` clears it.
+    Skills { path: Option<String> },
     Global {
         settings: RoleSettings,
         limit: Option<usize>,
@@ -126,6 +132,8 @@ enum SettingsTarget {
     TagRoute(TagRouteKey),
     /// The label name set. It carries no execution role and no harness.
     Labels,
+    /// The skills checkout. It exists per repository only.
+    Skills,
 }
 
 impl SettingsTarget {
@@ -143,9 +151,10 @@ impl SettingsTarget {
                 TagRouteStage::Implement => ExecutionRole::Implement,
                 TagRouteStage::Review => ExecutionRole::Review,
             },
-            // The labels target has no role. Callers that branch on the
-            // target check `is_labels` first; this keeps the type total.
-            Self::Labels => ExecutionRole::Refine,
+            // The labels and skills targets have no role. Callers that
+            // branch on the target check `is_labels` first; this keeps the
+            // type total.
+            Self::Labels | Self::Skills => ExecutionRole::Refine,
         }
     }
 }
@@ -160,14 +169,14 @@ struct Draft {
 }
 
 impl Draft {
-    /// The harness settings of this draft. `None` on the labels target,
-    /// which edits names instead.
+    /// The harness settings of this draft. `None` on the labels and skills
+    /// targets, which edit names and one path instead.
     fn settings_opt(&self) -> Option<&RoleSettings> {
         match &self.value {
             DraftValue::Global { settings, .. } | DraftValue::Repository { settings, .. } => {
                 Some(settings)
             }
-            DraftValue::Labels { .. } => None,
+            DraftValue::Labels { .. } | DraftValue::Skills { .. } => None,
         }
     }
 
@@ -181,9 +190,17 @@ impl Draft {
             DraftValue::Global { settings, .. } | DraftValue::Repository { settings, .. } => {
                 settings
             }
-            DraftValue::Labels { .. } => {
+            DraftValue::Labels { .. } | DraftValue::Skills { .. } => {
                 unreachable!("the labels draft carries no harness settings")
             }
+        }
+    }
+
+    /// The edited skills path of this draft, when it is a skills draft.
+    fn skills_path(&self) -> Option<&Option<String>> {
+        match &self.value {
+            DraftValue::Skills { path } => Some(path),
+            _ => None,
         }
     }
 
@@ -217,7 +234,8 @@ impl Draft {
                 override_settings: None,
                 ..
             }
-            | DraftValue::Labels { .. } => None,
+            | DraftValue::Labels { .. }
+            | DraftValue::Skills { .. } => None,
         }
     }
 
@@ -234,7 +252,8 @@ impl Draft {
                 override_settings: None,
                 ..
             }
-            | DraftValue::Labels { .. } => None,
+            | DraftValue::Labels { .. }
+            | DraftValue::Skills { .. } => None,
         }
     }
 }
@@ -1429,6 +1448,10 @@ impl Settings {
                     names: changed,
                 }
             }
+            (SettingsTarget::Skills, DraftValue::Skills { path }) => SettingsEdit::Skills {
+                repository: self.repositories(state)[draft.scope - 1].clone(),
+                path,
+            },
             _ => unreachable!("each settings target has one draft shape"),
         };
         Some(Action::SaveSettings {
@@ -1470,6 +1493,12 @@ impl Settings {
             SettingsTarget::Labels => SettingsEdit::Labels {
                 repository: Some(repository),
                 names: LabelKey::ALL.into_iter().map(|key| (key, None)).collect(),
+            },
+            // Clearing the skills path returns the checkout to the theory
+            // checkout.
+            SettingsTarget::Skills => SettingsEdit::Skills {
+                repository,
+                path: None,
             },
         };
         Some(Action::SaveSettings {
@@ -1659,6 +1688,19 @@ impl Settings {
             self.discard_confirm = false;
             return;
         }
+        if field == Field::SkillsPath {
+            // An empty path clears the field, so the checkout falls back
+            // to the theory checkout.
+            let trimmed = value.trim().to_string();
+            let DraftValue::Skills { path } = &mut draft.value else {
+                return;
+            };
+            *path = (!trimmed.is_empty()).then_some(trimmed);
+            draft.changed.insert(field);
+            self.errors.remove(&field);
+            self.discard_confirm = false;
+            return;
+        }
         let settings = draft.settings_mut();
         match field {
             Field::Program => settings.program = value,
@@ -1726,6 +1768,19 @@ impl Settings {
                     (names.clone(), state.settings.labels.clone())
                 };
                 DraftValue::Labels { names, fallback }
+            }
+            (_, SettingsTarget::Skills) => {
+                // The skills checkout is a repository table. The global
+                // scope has none, so no draft opens there.
+                let Some(alias) = (scope > 0)
+                    .then(|| self.repositories(state).get(scope - 1).cloned())
+                    .flatten()
+                else {
+                    return;
+                };
+                DraftValue::Skills {
+                    path: state.settings.repository_skills.get(&alias).cloned(),
+                }
             }
             (0, SettingsTarget::Role(role)) => {
                 let Some(source) = state
@@ -1832,6 +1887,8 @@ impl Settings {
         match (self.scope, target) {
             // The labels target edits names, not harness settings.
             (_, SettingsTarget::Labels) => None,
+            // The skills target edits one path, not harness settings.
+            (_, SettingsTarget::Skills) => None,
             (0, SettingsTarget::Role(role)) => state
                 .settings
                 .global
@@ -1870,6 +1927,14 @@ impl Settings {
     fn visible_fields(&self, state: &StateView) -> Vec<Field> {
         if self.selected_target().is_labels() {
             return LabelKey::ALL.into_iter().map(Field::Label).collect();
+        }
+        if matches!(self.selected_target(), SettingsTarget::Skills) {
+            // The skills checkout is a repository table; the global scope
+            // has no skills row to edit.
+            if self.scope == 0 {
+                return Vec::new();
+            }
+            return vec![Field::SkillsPath];
         }
         let Some(settings) = self.current_settings_ref(state) else {
             return Vec::new();
@@ -2018,11 +2083,30 @@ impl Settings {
         if let Field::Label(key) = field {
             return self.label_value(state, key);
         }
+        if field == Field::SkillsPath {
+            if let Some(path) = self
+                .draft
+                .as_ref()
+                .filter(|draft| draft.scope == self.scope && draft.target == self.selected_target())
+                .and_then(Draft::skills_path)
+            {
+                return path.clone().unwrap_or_default();
+            }
+            let repositories = self.repositories(state);
+            return self
+                .scope
+                .checked_sub(1)
+                .and_then(|index| repositories.get(index))
+                .and_then(|alias| state.settings.repository_skills.get(alias))
+                .cloned()
+                .unwrap_or_default();
+        }
         let Some(settings) = self.current_settings_ref(state) else {
             return String::new();
         };
         match field {
             Field::Label(_) => unreachable!("the labels field returns above"),
+            Field::SkillsPath => unreachable!("the skills path returns above"),
             Field::Harness => settings.harness.program().to_string(),
             Field::Program => settings.program.clone(),
             Field::Model => settings.model.clone(),
@@ -2056,7 +2140,9 @@ impl Settings {
                         DraftValue::Global { limit, .. } => {
                             limit.map(|value| value.to_string()).unwrap_or_default()
                         }
-                        DraftValue::Repository { .. } | DraftValue::Labels { .. } => String::new(),
+                        DraftValue::Repository { .. }
+                        | DraftValue::Labels { .. }
+                        | DraftValue::Skills { .. } => String::new(),
                     }
                 } else {
                     state
@@ -2171,6 +2257,21 @@ impl Settings {
             lines.push(Line::from(vec![
                 Span::styled("labels  ", THEME.dim()),
                 Span::raw(format!("{scope} · the names this scope matches on GitHub")),
+            ]));
+            lines.push(Line::from(""));
+        }
+        if matches!(self.selected_target(), SettingsTarget::Skills) {
+            let scope = if self.scope == 0 {
+                "global".to_string()
+            } else {
+                self.repositories(state)
+                    .get(self.scope - 1)
+                    .cloned()
+                    .unwrap_or_else(|| "global".to_string())
+            };
+            lines.push(Line::from(vec![
+                Span::styled("skills  ", THEME.dim()),
+                Span::raw(format!("{scope} · the checkout that holds .claude/skills/")),
             ]));
             lines.push(Line::from(""));
         }
@@ -2547,6 +2648,19 @@ impl Settings {
             (_, SettingsTarget::Labels) => {
                 return Some(self.label_source(state, field));
             }
+            // A skills path is set by the repository or falls back to the
+            // theory checkout.
+            (_, SettingsTarget::Skills) => {
+                let repositories = self.repositories(state);
+                let alias = repositories.get(self.scope.checked_sub(1)?)?;
+                return Some(if state.settings.repository_skills.contains_key(alias) {
+                    SettingsSource::Repository {
+                        alias: alias.clone(),
+                    }
+                } else {
+                    SettingsSource::BuiltIn
+                });
+            }
             (0, SettingsTarget::Role(_)) => return Some(SettingsSource::Global),
             (0, SettingsTarget::TagRoute(key)) => {
                 &state
@@ -2581,25 +2695,39 @@ impl Settings {
     }
 
     fn warnings(&self, state: &StateView) -> Vec<&'static str> {
-        let Some(settings) = self.current_settings_ref(state) else {
-            return Vec::new();
-        };
         let mut warnings = Vec::new();
-        if settings.permission_mode.as_deref() == Some("bypassPermissions") {
-            warnings.push("Claude permission checks are disabled");
+        if let Some(settings) = self.current_settings_ref(state) {
+            if settings.permission_mode.as_deref() == Some("bypassPermissions") {
+                warnings.push("Claude permission checks are disabled");
+            }
+            if settings.auto_approve == Some(true) {
+                warnings.push(if settings.harness == Harness::Codex {
+                    "Codex approval checks are disabled"
+                } else {
+                    "OpenCode approval checks are disabled"
+                });
+            }
+            if settings.approval_policy.as_deref() == Some("never") {
+                warnings.push("Codex approval checks are disabled");
+            }
+            if settings.sandbox.as_deref() == Some("danger-full-access") {
+                warnings.push("Codex sandbox protection is disabled");
+            }
         }
-        if settings.auto_approve == Some(true) {
-            warnings.push(if settings.harness == Harness::Codex {
-                "Codex approval checks are disabled"
-            } else {
-                "OpenCode approval checks are disabled"
-            });
-        }
-        if settings.approval_policy.as_deref() == Some("never") {
-            warnings.push("Codex approval checks are disabled");
-        }
-        if settings.sandbox.as_deref() == Some("danger-full-access") {
-            warnings.push("Codex sandbox protection is disabled");
+        let Some(alias) = self
+            .scope
+            .checked_sub(1)
+            .and_then(|index| self.repositories(state).get(index).cloned())
+        else {
+            return warnings;
+        };
+        if state
+            .settings
+            .repository_theory
+            .get(&alias)
+            .is_some_and(|theory| !theory.governor.is_on())
+        {
+            warnings.push("the theory governor is off");
         }
         warnings
     }
@@ -2660,6 +2788,15 @@ impl Settings {
     }
 
     #[cfg(test)]
+    fn set_skills_target(&mut self) {
+        self.role = settings_targets()
+            .iter()
+            .position(|value| *value == SettingsTarget::Skills)
+            .unwrap();
+        self.field = 0;
+    }
+
+    #[cfg(test)]
     fn set_field(&mut self, field: Field) {
         self.field = match field {
             Field::Harness => 0,
@@ -2679,6 +2816,7 @@ impl Settings {
                 .into_iter()
                 .position(|candidate| candidate == key)
                 .unwrap_or(0),
+            Field::SkillsPath => 0,
         };
     }
 
@@ -2810,6 +2948,7 @@ fn settings_targets() -> Vec<SettingsTarget> {
         }
     }
     targets.push(SettingsTarget::Labels);
+    targets.push(SettingsTarget::Skills);
     targets
 }
 
@@ -2818,6 +2957,7 @@ fn target_label(target: SettingsTarget) -> String {
         SettingsTarget::Role(role) => role_label(role).to_string(),
         SettingsTarget::TagRoute(key) => format!("{} · {}", key.stage, key.level),
         SettingsTarget::Labels => "labels".to_string(),
+        SettingsTarget::Skills => "skills".to_string(),
     }
 }
 
@@ -2924,6 +3064,7 @@ fn sync_override(draft: &mut Draft, field: Field) {
     }
     match field {
         Field::Label(_) => {}
+        Field::SkillsPath => {}
         Field::Program => override_settings.program = Some(settings.program.clone()),
         Field::Model => override_settings.model = Some(settings.model.clone()),
         Field::Effort => override_settings.effort = settings.effort.clone(),
@@ -2971,6 +3112,12 @@ fn validate_draft(draft: &Draft) -> BTreeMap<Field, String> {
                 );
             }
         }
+        return errors;
+    }
+    // A skills draft carries one optional path. An empty path clears the
+    // checkout, and the daemon re-parses the file on save, so a bad path
+    // fails the save with the parse reason.
+    if matches!(draft.value, DraftValue::Skills { .. }) {
         return errors;
     }
     let settings = draft.settings();
@@ -3091,6 +3238,7 @@ fn source_for_field(sources: &RoleFieldSources, field: Field) -> &SettingsSource
         // A label name has no role field source; `label_source` answers
         // for the labels target before this function is reached.
         Field::Label(_) => &SettingsSource::BuiltIn,
+        Field::SkillsPath => &SettingsSource::BuiltIn,
         Field::Harness => &sources.harness,
         Field::Program => &sources.program,
         Field::Model => &sources.model,
@@ -3268,6 +3416,11 @@ mod tests {
             revision: "rev-one".to_string(),
             labels: crate::labels::LabelNames::default(),
             repository_labels: std::collections::BTreeMap::new(),
+            repository_theory: std::collections::BTreeMap::from([(
+                "borsuk".to_string(),
+                crate::config::TheoryConfig::default(),
+            )]),
+            repository_skills: std::collections::BTreeMap::new(),
             global_label_overrides: Vec::new(),
             repository_label_overrides: std::collections::BTreeMap::new(),
             global: ExecutionRole::ALL
@@ -4210,6 +4363,110 @@ mod tests {
             "chunk",
             "the old name stays"
         );
+    }
+
+    #[test]
+    fn an_off_governor_warns_and_an_on_governor_does_not() {
+        let mut state = state();
+        state
+            .settings
+            .repository_theory
+            .get_mut("borsuk")
+            .unwrap()
+            .governor = crate::config::Governor::Off;
+        let mut settings = Settings::default();
+
+        let global = text(&settings, &state, 100, 28);
+        assert!(
+            !global.contains("governor"),
+            "the global scope has no repository to warn about: {global}"
+        );
+
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        let repository = text(&settings, &state, 100, 28);
+        assert!(
+            repository.contains("WARNING: the theory governor is off"),
+            "{repository}"
+        );
+    }
+
+    #[test]
+    fn an_on_governor_shows_no_warning() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+
+        let output = text(&settings, &state, 100, 28);
+        assert!(
+            !output.contains("WARNING"),
+            "the governor is on, so nothing warns: {output}"
+        );
+    }
+
+    #[test]
+    fn the_skills_field_shows_the_configured_checkout() {
+        let mut state = state();
+        state
+            .settings
+            .repository_skills
+            .insert("borsuk".to_string(), "/tmp/skills-checkout".to_string());
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_skills_target();
+
+        let output = text(&settings, &state, 100, 28);
+        assert!(output.contains("the checkout that holds"), "{output}");
+        assert!(output.contains("/tmp/skills-checkout"), "{output}");
+    }
+
+    #[test]
+    fn the_skills_target_saves_the_edited_path_for_its_repository() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_skills_target();
+        settings.set_field(Field::SkillsPath);
+        settings.replace_selected_text(&state, "/tmp/new-skills");
+
+        let save = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("save action");
+        let Action::SaveSettings {
+            edit: SettingsEdit::Skills { repository, path },
+            ..
+        } = save
+        else {
+            panic!("the skills target must send a skills edit");
+        };
+        assert_eq!(repository, "borsuk");
+        assert_eq!(path.as_deref(), Some("/tmp/new-skills"));
+    }
+
+    #[test]
+    fn an_emptied_skills_path_sends_a_cleared_edit() {
+        let mut state = state();
+        state
+            .settings
+            .repository_skills
+            .insert("borsuk".to_string(), "/tmp/skills-checkout".to_string());
+        let mut settings = Settings::default();
+        settings.handle_key(&state, key(KeyCode::Char('l')));
+        settings.set_skills_target();
+        settings.set_field(Field::SkillsPath);
+        settings.replace_selected_text(&state, "   ");
+
+        let save = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("save action");
+        let Action::SaveSettings {
+            edit: SettingsEdit::Skills { repository, path },
+            ..
+        } = save
+        else {
+            panic!("the skills target must send a skills edit");
+        };
+        assert_eq!(repository, "borsuk");
+        assert_eq!(path, None);
     }
 
     #[test]

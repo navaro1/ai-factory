@@ -198,6 +198,14 @@ pub enum SettingsEdit {
         /// Each key to write, with its new name or `None` to remove it.
         names: BTreeMap<LabelKey, Option<String>>,
     },
+    /// Write or clear the skills checkout of one repository.
+    Skills {
+        /// The repository alias.
+        repository: String,
+        /// The skills checkout path. `None` removes the `skills` table, so
+        /// the checkout falls back to the theory checkout.
+        path: Option<String>,
+    },
     /// Insert one repository with a single `path` key.
     AddRepository {
         /// The repository alias.
@@ -249,6 +257,30 @@ impl Default for UsageConfig {
         Self {
             enabled: true,
             minutes: 10,
+        }
+    }
+}
+
+/// The `[measure]` table of `factory.toml`.
+///
+/// A measure task runs one shell command, not an agent, so it answers to
+/// its own limit instead of a stage limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureConfig {
+    /// How many measure tasks may run at once, over every repository.
+    #[serde(default = "default_measure_limit")]
+    pub limit: usize,
+}
+
+fn default_measure_limit() -> usize {
+    2
+}
+
+impl Default for MeasureConfig {
+    fn default() -> Self {
+        Self {
+            limit: default_measure_limit(),
         }
     }
 }
@@ -369,6 +401,15 @@ impl TheoryConfig {
     }
 }
 
+/// The per-repository skills checkout of `factory.toml`.
+///
+/// It points at the checkout that holds `.claude/skills/`. The operator
+/// sets it to experiment against a repository that many people share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsPath {
+    pub path: PathBuf,
+}
+
 /// Temporary stage data for callers that still use the old runner interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageConfig {
@@ -396,10 +437,33 @@ pub struct RepoConfig {
     pub lanes: BTreeMap<Stage, usize>,
     pub release: ReleasePolicy,
     pub theory: TheoryConfig,
+    /// The checkout that holds the run skills. Absent means the theory
+    /// checkout.
+    pub skills: Option<SkillsPath>,
     pub role_overrides: BTreeMap<ExecutionRole, RoleOverride>,
     pub tag_route_overrides: BTreeMap<TagRouteKey, RoleOverride>,
     /// The `[repo.<alias>.labels]` values, over the global set.
     pub label_overrides: BTreeMap<LabelKey, String>,
+}
+
+impl RepoConfig {
+    /// The `owner/name` of the theory repository, when the operator named
+    /// one. Absent means code mode: the code repository holds the theory.
+    pub fn theory_repo(&self) -> Option<&str> {
+        self.theory
+            .theory
+            .as_ref()
+            .and_then(|theory| theory.repo.as_deref())
+    }
+
+    /// The checkout that holds `.claude/skills/`: the skills path when the
+    /// operator set one, else the theory checkout.
+    pub fn skills_checkout(&self) -> PathBuf {
+        self.skills.as_ref().map_or_else(
+            || self.theory.checkout(&self.path),
+            |skills| skills.path.clone(),
+        )
+    }
 }
 
 /// Temporary chat data for callers that still use the old ticket interface.
@@ -419,6 +483,7 @@ pub struct Config {
     pub labels: LabelNames,
     pub ticket_chat: TicketChatConfig,
     pub usage: UsageConfig,
+    pub measure: MeasureConfig,
 }
 
 impl Config {
@@ -660,6 +725,7 @@ impl Config {
             }
             validate_release(&raw_repo.release, &alias)?;
             let theory = theory_config(&raw_repo, &alias)?;
+            let skills = skills_config(&raw_repo, &alias)?;
             let raw_overrides = raw_repo.overrides();
             let raw_tag_route_overrides = raw_repo.tag_routes.entries();
             let label_overrides = raw_repo.labels.overrides(&format!("repo.{alias}.labels"))?;
@@ -709,6 +775,7 @@ impl Config {
                     lanes,
                     release: raw_repo.release,
                     theory,
+                    skills,
                     role_overrides,
                     tag_route_overrides: repository_tag_route_overrides,
                     label_overrides,
@@ -727,6 +794,7 @@ impl Config {
             },
             roles,
             usage: raw.usage,
+            measure: raw.measure,
         })
     }
 
@@ -833,6 +901,8 @@ struct RawConfig {
     repo: BTreeMap<String, RawRepo>,
     #[serde(default)]
     usage: UsageConfig,
+    #[serde(default)]
+    measure: MeasureConfig,
 }
 
 /// One optional `[labels]` or `[repo.<alias>.labels]` table.
@@ -1109,6 +1179,7 @@ struct RawRepo {
     governor: Option<String>,
     window: Option<usize>,
     theory: Option<RawTheoryRepo>,
+    skills: Option<RawSkills>,
     sweep: Option<RawSweep>,
     cards: Option<RawCards>,
     interview: Option<RawInterview>,
@@ -1125,6 +1196,11 @@ struct RawRepo {
 #[serde(deny_unknown_fields)]
 struct RawTheoryRepo {
     repo: Option<String>,
+    path: Option<String>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSkills {
     path: Option<String>,
 }
 #[derive(Debug, Default, Deserialize)]
@@ -1602,6 +1678,23 @@ fn validate_usage(value: &UsageConfig) -> Result<()> {
     }
     Ok(())
 }
+/// Build the skills checkout override of one repository.
+fn skills_config(raw: &RawRepo, alias: &str) -> Result<Option<SkillsPath>> {
+    let Some(raw) = &raw.skills else {
+        return Ok(None);
+    };
+    let path = raw
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow!("repo.{alias}.skills.path is required"))?;
+    if path.trim().is_empty() {
+        bail!("repo.{alias}.skills.path must not be empty");
+    }
+    Ok(Some(SkillsPath {
+        path: PathBuf::from(path),
+    }))
+}
+
 fn theory_config(raw: &RawRepo, alias: &str) -> Result<TheoryConfig> {
     let governor = match raw.governor.as_deref() {
         None | Some("on") => Governor::On,
@@ -1930,6 +2023,27 @@ pub fn edit_config_text(text: &str, edit: &SettingsEdit) -> Result<String> {
                             repo.remove("labels");
                         }
                     }
+                }
+            }
+        }
+        SettingsEdit::Skills { repository, path } => {
+            if !valid_alias(repository) {
+                bail!("repo.\"{repository}\": alias must match [a-z0-9._-]+");
+            }
+            let repo = document
+                .get_mut("repo")
+                .and_then(toml_edit::Item::as_table_mut)
+                .and_then(|repos| repos.get_mut(repository))
+                .and_then(toml_edit::Item::as_table_mut)
+                .ok_or_else(|| anyhow!("repo.{repository}: no configured repository"))?;
+            match path.as_deref() {
+                Some(path) => {
+                    nonempty(path, &format!("repo.{repository}.skills.path"))?;
+                    let table = ensure_table(repo, "skills", &format!("repo.{repository}.skills"))?;
+                    set_string(table, "path", Some(path));
+                }
+                None => {
+                    repo.remove("skills");
                 }
             }
         }
@@ -2844,6 +2958,114 @@ mod repo_edit_tests {
         let same = parse(&config_text());
         assert!(before.topology_delta(&same).is_empty());
         assert!(!before.topology_delta(&after).is_empty());
+    }
+
+    #[test]
+    fn a_skills_edit_writes_the_path_and_keeps_the_neighbouring_tables() {
+        let text = config_text();
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "demo".to_string(),
+                path: Some("/tmp/skills-checkout".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert!(edited.contains("# keep this factory comment"));
+        assert!(edited.contains("[repo.demo.skills]"), "{edited}");
+        assert!(edited.contains("[repo.demo.theory]"));
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(
+            parsed.repos["demo"].skills,
+            Some(SkillsPath {
+                path: PathBuf::from("/tmp/skills-checkout")
+            }),
+            "edited text:\n{edited}"
+        );
+        assert_eq!(
+            parsed.repos["demo"].skills_checkout(),
+            PathBuf::from("/tmp/skills-checkout")
+        );
+    }
+
+    #[test]
+    fn a_cleared_skills_edit_removes_the_table_and_falls_back_to_the_theory_checkout() {
+        let text = config_text().replace(
+            "[repo.demo.theory]",
+            "[repo.demo.skills]\npath = \"/tmp/skills-checkout\"\n\n[repo.demo.theory]",
+        );
+
+        let edited = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "demo".to_string(),
+                path: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!edited.contains("skills-checkout"), "{edited}");
+        let parsed = Config::parse(&edited).unwrap();
+        assert_eq!(parsed.repos["demo"].skills, None);
+        assert_eq!(
+            parsed.repos["demo"].skills_checkout(),
+            PathBuf::from("docs/theory")
+        );
+    }
+
+    #[test]
+    fn a_skills_path_with_a_space_or_a_quote_round_trips() {
+        let text = config_text();
+        for path in ["/tmp/my skills", "/tmp/ski\"lls"] {
+            let edited = edit_config_text(
+                &text,
+                &SettingsEdit::Skills {
+                    repository: "demo".to_string(),
+                    path: Some(path.to_string()),
+                },
+            )
+            .unwrap();
+            let parsed = Config::parse(&edited).unwrap();
+            assert_eq!(
+                parsed.repos["demo"].skills,
+                Some(SkillsPath {
+                    path: PathBuf::from(path)
+                }),
+                "path {path:?} gave:\n{edited}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skills_edit_rejects_an_empty_path_and_an_unknown_alias() {
+        let text = config_text();
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "demo".to_string(),
+                path: Some("   ".to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("skills.path must not be empty"),
+            "error was: {error:#}"
+        );
+        let error = edit_config_text(
+            &text,
+            &SettingsEdit::Skills {
+                repository: "ghost".to_string(),
+                path: Some("/tmp/skills".to_string()),
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ghost") && message.contains("no configured repository"),
+            "error was: {message}"
+        );
     }
 }
 

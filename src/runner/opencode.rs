@@ -164,6 +164,7 @@ impl Runner for OpenCodeRunner {
             .map(|value| vec![(PERMISSION_ENV.to_string(), value)])
             .unwrap_or_default();
         let spec = RunSpec {
+            own_group: false,
             task: job.task.clone(),
             cwd: job.cwd.clone(),
             program: self.settings.program.clone(),
@@ -684,6 +685,7 @@ not json at all
             yolo: true,
             allowed_tools: None,
             allowed_permissions: Vec::new(),
+            timeout_s: None,
         }
     }
 
@@ -1227,28 +1229,35 @@ not json at all
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Start the run, retrying the transient `Text file busy` race.
+    /// Start the run, retrying the transient start races.
     ///
     /// The test writes its fake child and executes it at once. On this
     /// kernel, that exec can lose against the write-count release of the
     /// just-closed file and fail with `Text file busy` for a few
-    /// microseconds. Production never executes a file it just wrote, so the
-    /// retry lives in this helper and not in the runner.
+    /// microseconds, and a machine near a load average of 100 fails the
+    /// spawn for seconds. Production never executes a file it just wrote,
+    /// so the retry lives in this helper and not in the runner. The loop
+    /// retries every error and keeps the last one, so a broken fixture
+    /// still fails, with its cause, after the budget of five seconds.
     fn start_with_retry(
         runner: &mut OpenCodeRunner,
         job: &Job,
     ) -> (Box<dyn Session>, Receiver<RunEvent>) {
         let (tx, rx) = channel();
-        for _ in 0..100 {
+        let mut last = None;
+        for _ in 0..200 {
             match runner.start(job, tx.clone()) {
                 Ok(session) => return (session, rx),
-                Err(error) if error.to_string().contains("Text file busy") => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                Err(error) => {
+                    last = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                Err(error) => panic!("the fake child did not start: {error}"),
             }
         }
-        panic!("the fake child did not start after 100 attempts");
+        panic!(
+            "the fake child did not start after 200 attempts: {}",
+            last.expect("the loop ran at least once")
+        );
     }
 
     #[test]

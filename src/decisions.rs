@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ItemKind, Stage};
 use crate::tasks::Task;
+use crate::theory::answers::Cause;
+use crate::theory::cards::CardView;
 
 /// One condition that waits for a human answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +66,59 @@ pub enum DecisionKind {
         /// The pull request numbers stacked at the gate.
         prs: Vec<u64>,
     },
+    /// A delta hit every slot and waits for one confirmation.
+    DeltaHit {
+        /// Whether the record is an issue or a pull request.
+        kind: ItemKind,
+        /// The issue or pull request number of the record.
+        number: u64,
+        /// How many slots the delta hit.
+        hits: usize,
+    },
+    /// One theory event waits for a cause and a rung.
+    TheoryEvent {
+        /// Whether the record is an issue or a pull request.
+        kind: ItemKind,
+        /// The issue or pull request number of the record.
+        number: u64,
+        /// The slot key the answer of the row writes.
+        slot: String,
+        /// The model entries in scope, empty when the row names none.
+        entry: String,
+        /// The short classifier of the row: the slot outcome of a miss,
+        /// the event kind of an event, empty for a violation.
+        tag: String,
+        /// The one question the row asks.
+        question: String,
+        /// Where the row came from: `miss`, `violation`, or `event`.
+        source: String,
+    },
+    /// One card waits for a typed answer.
+    Card {
+        /// Where the card came from.
+        source: String,
+        /// The question the card asks.
+        prompt: String,
+        /// The merged pull request the card names, when it names one.
+        #[serde(default)]
+        number: Option<u64>,
+        /// The model entry the card names, when it names one.
+        #[serde(default)]
+        entry: Option<String>,
+        /// Whether the operator gave the cause `recall` to an event the
+        /// grading of this card opened.
+        #[serde(default)]
+        recalled: bool,
+    },
+    /// The first run of one measurer waits for a confirmation.
+    FirstRun {
+        /// The area the measurer belongs to.
+        area: String,
+        /// The measurer id.
+        measurer: String,
+        /// The first sample the measurer reported.
+        sample: String,
+    },
 }
 
 impl DecisionKind {
@@ -75,6 +130,10 @@ impl DecisionKind {
             DecisionKind::Stuck { .. } => "stuck",
             DecisionKind::NeedsHuman { .. } => "needs_human",
             DecisionKind::ReleaseGate { .. } => "release_gate",
+            DecisionKind::DeltaHit { .. } => "delta_hit",
+            DecisionKind::TheoryEvent { .. } => "theory_event",
+            DecisionKind::Card { .. } => "card",
+            DecisionKind::FirstRun { .. } => "first_run",
         }
     }
 
@@ -86,6 +145,10 @@ impl DecisionKind {
             DecisionKind::Stuck { .. } => "retry or cancel",
             DecisionKind::NeedsHuman { .. } => "text or cancel",
             DecisionKind::ReleaseGate { .. } => "go",
+            DecisionKind::DeltaHit { .. } => "confirm",
+            DecisionKind::TheoryEvent { .. } => "theory",
+            DecisionKind::Card { .. } => "text",
+            DecisionKind::FirstRun { .. } => "confirm or cancel",
         }
     }
 }
@@ -210,6 +273,68 @@ impl Decision {
         )
     }
 
+    /// Build the confirmation row of one hit-only delta.
+    pub fn delta_hit(repo: &str, kind: ItemKind, number: u64, hits: usize, opened_ms: u64) -> Self {
+        Self::from_parts(
+            format!("delta:{repo}:{}{number}", kind.as_str()),
+            repo.to_string(),
+            None,
+            DecisionKind::DeltaHit { kind, number, hits },
+            opened_ms,
+        )
+    }
+
+    /// Build one theory row from the parts its record derived.
+    #[allow(clippy::too_many_arguments)]
+    pub fn theory_event(
+        repo: &str,
+        kind: ItemKind,
+        number: u64,
+        slot: String,
+        entry: String,
+        tag: String,
+        question: String,
+        source: String,
+        opened_ms: u64,
+    ) -> Self {
+        Self::from_parts(
+            format!("theory:{repo}:{}{number}:{slot}", kind.as_str()),
+            repo.to_string(),
+            None,
+            DecisionKind::TheoryEvent {
+                kind,
+                number,
+                slot,
+                entry,
+                tag,
+                question,
+                source,
+            },
+            opened_ms,
+        )
+    }
+
+    /// Build one card row from the card of the day.
+    ///
+    /// `recalled` is true once the operator gave the cause `recall` to
+    /// an event the grading of this card opened, and the row then
+    /// offers the teach key instead of the answer key.
+    pub fn card(repo: &str, card: &CardView, recalled: bool, opened_ms: u64) -> Self {
+        Self::from_parts(
+            format!("card:{repo}:{}", card.slug()),
+            repo.to_string(),
+            None,
+            DecisionKind::Card {
+                source: card.source.clone(),
+                prompt: card.prompt.clone(),
+                number: card.number,
+                entry: card.entry.clone(),
+                recalled,
+            },
+            opened_ms,
+        )
+    }
+
     /// Build a manual release decision for one repository.
     pub fn release_gate(repo: &str, prs: Vec<u64>, opened_ms: u64) -> Self {
         Self::from_parts(
@@ -255,6 +380,21 @@ pub enum Response {
         /// The pull request numbers the human released.
         prs: Vec<u64>,
     },
+    /// Confirm the row as it stands.
+    Confirm,
+    /// Answer one theory row with a cause and a rung.
+    Theory {
+        /// Why the miss or the violation happened.
+        cause: Cause,
+        /// The model entry the human named.
+        entry: String,
+        /// The rung of the ladder, 1, 2, or 3.
+        rung: u8,
+        /// The area the entry belongs to, empty when it maps to none.
+        area: String,
+        /// What the human added, empty when nothing.
+        note: String,
+    },
 }
 
 impl Response {
@@ -268,6 +408,8 @@ impl Response {
             Response::Retry => "retry",
             Response::Cancel => "cancel",
             Response::Go { .. } => "go",
+            Response::Confirm => "confirm",
+            Response::Theory { .. } => "theory",
         }
     }
 }
@@ -283,6 +425,10 @@ impl Response {
 /// | `Stuck` | `Retry`, `Cancel` |
 /// | `NeedsHuman` | `Text`, `Cancel` |
 /// | `ReleaseGate` | `Go` |
+/// | `DeltaHit` | `Confirm` |
+/// | `TheoryEvent` | `Theory` |
+/// | `Card` | `Text` |
+/// | `FirstRun` | `Confirm`, `Cancel` |
 ///
 /// Every other combination is an error.
 ///
@@ -296,14 +442,23 @@ pub fn validate(decision: &Decision, response: &Response) -> Result<()> {
         Response::Answers { .. } => matches!(decision.kind, DecisionKind::Question { .. }),
         Response::Text { .. } => matches!(
             decision.kind,
-            DecisionKind::Question { .. } | DecisionKind::NeedsHuman { .. }
+            DecisionKind::Question { .. }
+                | DecisionKind::NeedsHuman { .. }
+                | DecisionKind::Card { .. }
         ),
         Response::Retry => matches!(decision.kind, DecisionKind::Stuck { .. }),
         Response::Cancel => matches!(
             decision.kind,
-            DecisionKind::Stuck { .. } | DecisionKind::NeedsHuman { .. }
+            DecisionKind::Stuck { .. }
+                | DecisionKind::NeedsHuman { .. }
+                | DecisionKind::FirstRun { .. }
         ),
         Response::Go { .. } => matches!(decision.kind, DecisionKind::ReleaseGate { .. }),
+        Response::Confirm => matches!(
+            decision.kind,
+            DecisionKind::DeltaHit { .. } | DecisionKind::FirstRun { .. }
+        ),
+        Response::Theory { .. } => matches!(decision.kind, DecisionKind::TheoryEvent { .. }),
     };
     if legal {
         Ok(())
@@ -382,7 +537,12 @@ impl Decisions {
                 DecisionKind::Permission { task: row_task, .. }
                 | DecisionKind::Question { task: row_task, .. } => row_task == task && !keep_asks,
                 DecisionKind::Stuck { task: row_task, .. } => row_task == task,
-                DecisionKind::NeedsHuman { .. } | DecisionKind::ReleaseGate { .. } => false,
+                DecisionKind::NeedsHuman { .. }
+                | DecisionKind::ReleaseGate { .. }
+                | DecisionKind::DeltaHit { .. }
+                | DecisionKind::TheoryEvent { .. }
+                | DecisionKind::Card { .. }
+                | DecisionKind::FirstRun { .. } => false,
             };
             if belongs {
                 dropped.push(row);
@@ -392,6 +552,106 @@ impl Decisions {
         }
         self.open = kept;
         dropped
+    }
+}
+
+/// How the inbox names and drives one decision kind.
+///
+/// One table answers every per-kind question the feed asks, so a new kind
+/// joins the inbox in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Presentation {
+    /// The visible kind name of the feed row.
+    pub label: &'static str,
+    /// The quick actions of the row: the key text and what it does.
+    pub actions: &'static [(&'static str, &'static str)],
+    /// The digit keys the row consumes itself, so the shell keeps them
+    /// from the view switch.
+    pub digits: &'static str,
+}
+
+impl Presentation {
+    /// The quick action line the feed draws under a selected row.
+    pub fn footer(&self) -> String {
+        self.actions
+            .iter()
+            .map(|(key, what)| format!("[{key}] {what}"))
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+    }
+}
+
+/// The presentation of one decision kind.
+pub fn presentation(kind: &DecisionKind) -> Presentation {
+    match kind {
+        DecisionKind::Permission { .. } => Presentation {
+            label: "PERMISSION",
+            actions: &[("y", "allow"), ("n", "deny"), ("enter", "details")],
+            digits: "",
+        },
+        DecisionKind::Question { .. } => Presentation {
+            label: "QUESTION",
+            actions: &[
+                ("1-9", "pick"),
+                ("s", "submit"),
+                ("i", "write"),
+                ("enter", "details"),
+            ],
+            digits: "123456789",
+        },
+        DecisionKind::Stuck { .. } => Presentation {
+            label: "STUCK",
+            actions: &[("r", "retry"), ("c", "cancel task"), ("enter", "details")],
+            digits: "",
+        },
+        DecisionKind::NeedsHuman { .. } => Presentation {
+            label: "NEEDS HUMAN",
+            actions: &[("t", "comment"), ("c", "clear label"), ("enter", "details")],
+            digits: "",
+        },
+        DecisionKind::ReleaseGate { .. } => Presentation {
+            label: "RELEASE",
+            actions: &[
+                ("1-9", "include"),
+                ("space", "all/none"),
+                ("g", "release"),
+                ("enter", "details"),
+            ],
+            digits: "123456789",
+        },
+        DecisionKind::DeltaHit { .. } => Presentation {
+            label: "DELTA",
+            actions: &[("y", "confirm")],
+            digits: "",
+        },
+        DecisionKind::TheoryEvent { .. } => Presentation {
+            label: "THEORY",
+            actions: &[
+                ("m", "model"),
+                ("p", "pr"),
+                ("r", "recall"),
+                ("1-3", "rung"),
+                ("a", "area"),
+                ("n", "note"),
+                ("s", "send"),
+            ],
+            digits: "123",
+        },
+        DecisionKind::Card { recalled, .. } if *recalled => Presentation {
+            label: "CARD",
+            actions: &[("t", "teach")],
+            digits: "",
+        },
+        DecisionKind::Card { .. } => Presentation {
+            label: "CARD",
+            actions: &[("t", "answer")],
+            digits: "",
+        },
+        DecisionKind::FirstRun { .. } => Presentation {
+            label: "FIRST RUN",
+            actions: &[("y", "keep"), ("c", "discard")],
+            digits: "",
+        },
     }
 }
 
@@ -433,6 +693,40 @@ mod tests {
             Decision::stuck(&worker, "3 failures", NOW),
             Decision::needs_human("borsuk", ItemKind::Issue, 142, "Fix the flake", NOW),
             Decision::release_gate("borsuk", vec![7, 9], NOW),
+            Decision::delta_hit("borsuk", ItemKind::Pr, 7, 4, NOW),
+            Decision::theory_event(
+                "borsuk",
+                ItemKind::Pr,
+                7,
+                "invariants".to_string(),
+                "INV-3".to_string(),
+                "sure-miss".to_string(),
+                "which entry is wrong?".to_string(),
+                "miss".to_string(),
+                NOW,
+            ),
+            Decision::card(
+                "borsuk",
+                &CardView {
+                    source: "stale-entry".to_string(),
+                    prompt: "State INV-3. What would violate it?".to_string(),
+                    number: None,
+                    entry: Some("INV-3".to_string()),
+                },
+                false,
+                NOW,
+            ),
+            Decision::from_parts(
+                "first:borsuk:web-checkout".to_string(),
+                "borsuk".to_string(),
+                None,
+                DecisionKind::FirstRun {
+                    area: "web-checkout".to_string(),
+                    measurer: "pay-latency".to_string(),
+                    sample: "180ms".to_string(),
+                },
+                NOW,
+            ),
         ]
     }
 
@@ -452,6 +746,14 @@ mod tests {
             Response::Retry,
             Response::Cancel,
             Response::Go { prs: vec![7] },
+            Response::Confirm,
+            Response::Theory {
+                cause: Cause::Model,
+                entry: "INV-3".to_string(),
+                rung: 2,
+                area: "web-checkout".to_string(),
+                note: String::new(),
+            },
         ]
     }
 
@@ -584,6 +886,10 @@ mod tests {
         const STUCK: usize = 2;
         const NEEDS_HUMAN: usize = 3;
         const GATE: usize = 4;
+        const DELTA_HIT: usize = 5;
+        const THEORY_EVENT: usize = 6;
+        const CARD: usize = 7;
+        const FIRST_RUN: usize = 8;
         const ALLOW: usize = 0;
         const DENY: usize = 1;
         const ANSWERS: usize = 2;
@@ -591,6 +897,8 @@ mod tests {
         const RETRY: usize = 4;
         const CANCEL: usize = 5;
         const GO: usize = 6;
+        const CONFIRM: usize = 7;
+        const THEORY: usize = 8;
 
         let legal = [
             (PERMISSION, ALLOW),
@@ -602,6 +910,11 @@ mod tests {
             (NEEDS_HUMAN, TEXT),
             (NEEDS_HUMAN, CANCEL),
             (GATE, GO),
+            (DELTA_HIT, CONFIRM),
+            (THEORY_EVENT, THEORY),
+            (CARD, TEXT),
+            (FIRST_RUN, CONFIRM),
+            (FIRST_RUN, CANCEL),
         ];
 
         let kinds = every_decision();
@@ -627,6 +940,30 @@ mod tests {
             }
         }
         assert_eq!(accepted, legal.len());
+    }
+
+    #[test]
+    fn a_theory_event_refuses_a_bare_confirmation() {
+        let row = every_decision()[6].clone();
+        assert!(matches!(row.kind, DecisionKind::TheoryEvent { .. }));
+
+        let error = validate(&row, &Response::Confirm).unwrap_err().to_string();
+
+        assert_eq!(
+            error,
+            "a theory_event decision does not accept the response confirm; it accepts theory"
+        );
+        validate(
+            &row,
+            &Response::Theory {
+                cause: Cause::Recall,
+                entry: "INV-3".to_string(),
+                rung: 3,
+                area: String::new(),
+                note: String::new(),
+            },
+        )
+        .expect("a theory event takes a theory answer");
     }
 
     /// One needs-human decision.

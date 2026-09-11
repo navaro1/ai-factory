@@ -48,9 +48,16 @@ use super::markdown::{tone_color, MentionStatuses};
 use super::theme::THEME;
 use super::transcript;
 use crate::decisions::{Decision, DecisionKind, Response};
+
+pub(super) use crate::decisions::presentation;
 use crate::mentions;
 use crate::model::ItemKind;
-use crate::sock::{Action, AskView, Client, ItemView, StateView, TicketAction, TicketMentions};
+use crate::sock::{
+    Action, AskView, Client, ItemView, StateView, TheoryAction, TicketAction, TicketMentions,
+};
+use crate::tasks::TeachKey;
+use crate::theory::answers::Cause;
+use crate::theory::cadence::rfc3339_ms;
 
 /// The maximum task log section that one detail draw reads.
 const CONTEXT_LOG_BYTES: u64 = 128 * 1024;
@@ -96,6 +103,23 @@ pub struct Inbox {
     requested_asks: BTreeSet<String>,
     /// The picked option index of each `NeedsHuman` row, keyed by decision id.
     ask_picks: BTreeMap<String, usize>,
+    /// The answer of each `TheoryEvent` row so far, keyed by decision id.
+    theory_picks: BTreeMap<String, TheoryPicks>,
+}
+
+/// The answer of one `THEORY` row, as the human builds it step by step.
+#[derive(Debug, Default)]
+struct TheoryPicks {
+    /// The cause the human picked, or none yet.
+    cause: Option<Cause>,
+    /// The entry id the human typed, empty until then.
+    entry: String,
+    /// The rung the human picked, or none yet.
+    rung: Option<u8>,
+    /// The area of the entry, pre-filled when the entry maps to one.
+    area: String,
+    /// The note the human typed, empty until then.
+    note: String,
 }
 
 /// Local navigation state for one focused decision screen.
@@ -187,8 +211,14 @@ struct TextInput {
 enum InputKind {
     /// The reason of a `Deny` for a `Permission` row.
     DenyReason,
-    /// A free `Text` answer for a `Question` or `NeedsHuman` row.
+    /// A free `Text` answer for a `Question`, `NeedsHuman`, or `Card` row.
     FreeText,
+    /// The entry id of a `TheoryEvent` row.
+    TheoryEntry,
+    /// The area of a `TheoryEvent` row.
+    TheoryArea,
+    /// The note of a `TheoryEvent` row.
+    TheoryNote,
 }
 
 impl InputKind {
@@ -199,7 +229,13 @@ impl InputKind {
             (InputKind::DenyReason, DecisionKind::Permission { .. })
                 | (
                     InputKind::FreeText,
-                    DecisionKind::Question { .. } | DecisionKind::NeedsHuman { .. }
+                    DecisionKind::Question { .. }
+                        | DecisionKind::NeedsHuman { .. }
+                        | DecisionKind::Card { .. }
+                )
+                | (
+                    InputKind::TheoryEntry | InputKind::TheoryArea | InputKind::TheoryNote,
+                    DecisionKind::TheoryEvent { .. }
                 )
         )
     }
@@ -370,6 +406,8 @@ impl Inbox {
             .retain(|id, _| state.decisions.iter().any(|decision| decision.id == *id));
         self.requested_asks
             .retain(|id| state.decisions.iter().any(|decision| decision.id == *id));
+        self.theory_picks
+            .retain(|id, _| state.decisions.iter().any(|row| row.id == *id));
         self.ask_picks
             .retain(|id, _| state.decisions.iter().any(|decision| decision.id == *id));
         if self.input.as_ref().is_some_and(|input| {
@@ -618,6 +656,49 @@ impl Inbox {
                 self.open_detail(&decision);
                 InboxOutcome::None
             }
+            (DecisionKind::DeltaHit { .. }, KeyCode::Char('y')) => {
+                self.answer(&decision.id, Response::Confirm, sink);
+                InboxOutcome::None
+            }
+            (DecisionKind::TheoryEvent { .. }, KeyCode::Char(letter @ ('m' | 'p' | 'r'))) => {
+                self.pick_cause(&decision, letter);
+                InboxOutcome::None
+            }
+            (DecisionKind::TheoryEvent { .. }, KeyCode::Char(digit @ '1'..='3')) => {
+                self.theory_picks
+                    .entry(decision.id.clone())
+                    .or_default()
+                    .rung = digit.to_digit(10).map(|rung| rung as u8);
+                InboxOutcome::None
+            }
+            (DecisionKind::TheoryEvent { .. }, KeyCode::Char('a')) => {
+                self.open_input(&decision, "area", InputKind::TheoryArea);
+                InboxOutcome::None
+            }
+            (DecisionKind::TheoryEvent { .. }, KeyCode::Char('n')) => {
+                self.open_input(&decision, "note", InputKind::TheoryNote);
+                InboxOutcome::None
+            }
+            (DecisionKind::TheoryEvent { .. }, KeyCode::Char('s')) => {
+                self.submit_theory(state, &decision, sink);
+                InboxOutcome::None
+            }
+            (DecisionKind::Card { recalled: true, .. }, KeyCode::Char('t')) => {
+                self.send_card_teach(state, &decision, sink);
+                InboxOutcome::None
+            }
+            (DecisionKind::Card { .. }, KeyCode::Char('t')) => {
+                self.open_input(&decision, "answer", InputKind::FreeText);
+                InboxOutcome::None
+            }
+            (DecisionKind::FirstRun { .. }, KeyCode::Char('y')) => {
+                self.answer(&decision.id, Response::Confirm, sink);
+                InboxOutcome::None
+            }
+            (DecisionKind::FirstRun { .. }, KeyCode::Char('c')) => {
+                self.answer(&decision.id, Response::Cancel, sink);
+                InboxOutcome::None
+            }
             _ => InboxOutcome::None,
         }
     }
@@ -863,7 +944,7 @@ impl Inbox {
                 }
                 InboxOutcome::None
             }
-            KeyCode::Enter => self.submit_text(&decision, sink),
+            KeyCode::Enter => self.submit_text(state, &decision, sink),
             KeyCode::Char(character) => {
                 if let Some(input) = self.input.as_mut() {
                     input.buffer.push(character);
@@ -893,7 +974,15 @@ impl Inbox {
     }
 
     /// Finish the text input and send its response.
-    fn submit_text(&mut self, decision: &Decision, sink: &mut impl ActionSink) -> InboxOutcome {
+    ///
+    /// A theory input fills one step of the answer of its row instead of
+    /// sending it. The row sends on `s`.
+    fn submit_text(
+        &mut self,
+        state: &StateView,
+        decision: &Decision,
+        sink: &mut impl ActionSink,
+    ) -> InboxOutcome {
         let Some(input) = self.input.as_ref() else {
             return InboxOutcome::None;
         };
@@ -902,13 +991,139 @@ impl Inbox {
             self.hint = Some("type the text first, or press esc");
             return InboxOutcome::None;
         }
-        let response = match input.kind {
+        let kind = input.kind;
+        self.input = None;
+        let response = match kind {
             InputKind::DenyReason => Response::Deny { message: text },
             InputKind::FreeText => Response::Text { text },
+            InputKind::TheoryEntry => return self.take_entry(state, decision, text),
+            InputKind::TheoryArea => {
+                self.theory_picks
+                    .entry(decision.id.clone())
+                    .or_default()
+                    .area = text;
+                return InboxOutcome::None;
+            }
+            InputKind::TheoryNote => {
+                self.theory_picks
+                    .entry(decision.id.clone())
+                    .or_default()
+                    .note = text;
+                return InboxOutcome::None;
+            }
         };
-        self.input = None;
         self.answer(&decision.id, response, sink);
         InboxOutcome::None
+    }
+
+    /// Pick the cause of a theory row and ask for the entry id.
+    fn pick_cause(&mut self, decision: &Decision, letter: char) {
+        let cause = match letter {
+            'm' => Cause::Model,
+            'p' => Cause::Pr,
+            _ => Cause::Recall,
+        };
+        self.theory_picks
+            .entry(decision.id.clone())
+            .or_default()
+            .cause = Some(cause);
+        self.open_input(decision, "entry", InputKind::TheoryEntry);
+    }
+
+    /// Store one typed entry id, once the model of the repository knows it.
+    ///
+    /// An entry that maps to exactly one area fills the area in. An entry
+    /// the model does not carry is refused with a hint. A repository whose
+    /// model the daemon did not ship takes any id.
+    fn take_entry(&mut self, state: &StateView, decision: &Decision, text: String) -> InboxOutcome {
+        let entries = state
+            .theory
+            .get(&decision.repo)
+            .map(|theory| theory.model.entries.as_slice())
+            .unwrap_or_default();
+        if !entries.is_empty() && !entries.iter().any(|entry| entry.id() == text) {
+            self.hint = Some("the model carries no such entry");
+            return InboxOutcome::None;
+        }
+        let areas = entry_areas(state, &decision.repo, &text);
+        let picks = self.theory_picks.entry(decision.id.clone()).or_default();
+        picks.entry = text;
+        if areas.len() == 1 {
+            picks.area.clone_from(&areas[0]);
+        }
+        InboxOutcome::None
+    }
+
+    /// Send the answer of one theory row, or hint at the missing step.
+    fn submit_theory(
+        &mut self,
+        state: &StateView,
+        decision: &Decision,
+        sink: &mut impl ActionSink,
+    ) {
+        let picks = self.theory_picks.entry(decision.id.clone()).or_default();
+        let Some(cause) = picks.cause else {
+            self.hint = Some("pick a cause");
+            return;
+        };
+        if picks.entry.is_empty() {
+            self.hint = Some("type an entry id");
+            return;
+        }
+        let Some(rung) = picks.rung else {
+            self.hint = Some("pick a rung");
+            return;
+        };
+        let entry = picks.entry.clone();
+        let area = picks.area.clone();
+        let note = picks.note.clone();
+        if area.is_empty() && entry_areas(state, &decision.repo, &entry).len() > 1 {
+            self.hint = Some("pick an area");
+            return;
+        }
+        self.theory_picks.remove(&decision.id);
+        self.answer(
+            &decision.id,
+            Response::Theory {
+                cause,
+                entry,
+                rung,
+                area,
+                note,
+            },
+            sink,
+        );
+    }
+
+    /// Start the teach task of one card whose event the operator
+    /// answered with the cause `recall`.
+    ///
+    /// A `merged-pr` card teaches its pull request. A `stale-entry` card
+    /// teaches the area of its entry; an entry that maps to no area
+    /// teaches the entry itself.
+    fn send_card_teach(
+        &mut self,
+        state: &StateView,
+        decision: &Decision,
+        sink: &mut impl ActionSink,
+    ) {
+        let DecisionKind::Card { number, entry, .. } = &decision.kind else {
+            return;
+        };
+        let key = match (number, entry) {
+            (Some(number), _) => TeachKey::Pr(*number),
+            (None, Some(entry)) => {
+                match entry_areas(state, &decision.repo, entry).into_iter().next() {
+                    Some(area) => TeachKey::Area(area),
+                    None => TeachKey::Entry(entry.clone()),
+                }
+            }
+            (None, None) => return,
+        };
+        sink.send_action(Action::Theory(TheoryAction::Teach {
+            repo: decision.repo.clone(),
+            key,
+        }));
     }
 
     /// Apply one digit key to the options of a question row.
@@ -1303,6 +1518,34 @@ fn feed_message(decision: &Decision) -> String {
         DecisionKind::ReleaseGate { prs } => {
             format!("Release {} PRs: {}?", prs.len(), pr_list(prs))
         }
+        DecisionKind::DeltaHit { kind, number, hits } => format!(
+            "{} #{number}: all {hits} slots hit. Confirm it?",
+            kind.title_noun()
+        ),
+        DecisionKind::TheoryEvent {
+            source,
+            entry,
+            question,
+            ..
+        } if entry.is_empty() => format!("{source}: {question}"),
+        DecisionKind::TheoryEvent {
+            source,
+            entry,
+            question,
+            ..
+        } => format!("{source} on {entry}: {question}"),
+        DecisionKind::Card {
+            source,
+            prompt,
+            recalled,
+            ..
+        } if *recalled => format!("{source}: {prompt} The event of this card is a recall."),
+        DecisionKind::Card { source, prompt, .. } => format!("{source}: {prompt}"),
+        DecisionKind::FirstRun {
+            area,
+            measurer,
+            sample,
+        } => format!("The measurer {measurer} of the area {area} first read {sample}."),
     };
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1376,15 +1619,27 @@ fn ordered_decisions(state: &StateView) -> Vec<&Decision> {
     ordered.into_iter().map(|(_, decision)| decision).collect()
 }
 
-/// The visible name of one decision kind.
-fn kind_label(decision: &Decision) -> &'static str {
-    match decision.kind {
-        DecisionKind::Permission { .. } => "PERMISSION",
-        DecisionKind::Question { .. } => "QUESTION",
-        DecisionKind::Stuck { .. } => "STUCK",
-        DecisionKind::NeedsHuman { .. } => "NEEDS HUMAN",
-        DecisionKind::ReleaseGate { .. } => "RELEASE",
-    }
+/// The areas of one repository whose model slice carries `entry`.
+///
+/// An area names one boundary of the model, and the slice of that
+/// boundary holds every entry the area covers.
+fn entry_areas(state: &StateView, repo: &str, entry: &str) -> Vec<String> {
+    let Some(theory) = state.theory.get(repo) else {
+        return Vec::new();
+    };
+    theory
+        .areas
+        .iter()
+        .filter(|area| {
+            theory
+                .model
+                .slice(&[area.boundary.as_str()])
+                .entries
+                .iter()
+                .any(|one| one.id() == entry)
+        })
+        .map(|area| area.id.clone())
+        .collect()
 }
 
 /// The task id of a task-backed decision.
@@ -1393,7 +1648,12 @@ fn task_id(decision: &Decision) -> Option<&str> {
         DecisionKind::Permission { task, .. }
         | DecisionKind::Question { task, .. }
         | DecisionKind::Stuck { task, .. } => Some(task),
-        DecisionKind::NeedsHuman { .. } | DecisionKind::ReleaseGate { .. } => None,
+        DecisionKind::NeedsHuman { .. }
+        | DecisionKind::ReleaseGate { .. }
+        | DecisionKind::DeltaHit { .. }
+        | DecisionKind::TheoryEvent { .. }
+        | DecisionKind::Card { .. }
+        | DecisionKind::FirstRun { .. } => None,
     }
 }
 
@@ -1556,7 +1816,7 @@ fn feed_lines(
     let marker = if selected { "> " } else { "  " };
     let mut metadata = format!(
         "{marker}{} · {} · {}",
-        kind_label(decision),
+        presentation(&decision.kind).label,
         age_text(decision.opened_ms, now_ms),
         decision.repo
     );
@@ -1567,7 +1827,12 @@ fn feed_lines(
     lines.extend(wrapped_lines(&feed_message(decision), width, "  ", style));
     if selected {
         lines.extend(choice_lines(state, decision, inbox, width, style));
-        lines.extend(wrapped_lines(&feed_actions(decision), width, "  ", style));
+        lines.extend(wrapped_lines(
+            &presentation(&decision.kind).footer(),
+            width,
+            "  ",
+            style,
+        ));
     }
     lines
 }
@@ -1637,26 +1902,36 @@ fn choice_lines(
             }
             lines
         }
+        DecisionKind::TheoryEvent { .. } => {
+            let picks = inbox.theory_picks.get(&decision.id);
+            let field = |value: Option<String>| value.filter(|one| !one.is_empty());
+            let cause = field(
+                picks
+                    .and_then(|one| one.cause)
+                    .map(|one| one.word().to_string()),
+            );
+            let entry = field(picks.map(|one| one.entry.clone()));
+            let rung = field(picks.and_then(|one| one.rung).map(|one| one.to_string()));
+            let area = field(picks.map(|one| one.area.clone()));
+            [
+                ("cause", cause),
+                ("entry", entry),
+                ("rung", rung),
+                ("area", area),
+            ]
+            .into_iter()
+            .flat_map(|(name, value)| {
+                let text = format!("{name} {}", value.unwrap_or_else(|| "-".to_string()));
+                wrapped_lines(&text, width, "  ", style)
+            })
+            .collect()
+        }
         DecisionKind::Permission { .. }
         | DecisionKind::Stuck { .. }
-        | DecisionKind::NeedsHuman { .. } => Vec::new(),
-    }
-}
-
-/// The visible quick actions of one feed item.
-fn feed_actions(decision: &Decision) -> String {
-    match decision.kind {
-        DecisionKind::Permission { .. } => "[y] allow · [n] deny · [enter] details".to_string(),
-        DecisionKind::Question { .. } => {
-            "[1-9] pick · [s] submit · [i] write · [enter] details".to_string()
-        }
-        DecisionKind::Stuck { .. } => "[r] retry · [c] cancel task · [enter] details".to_string(),
-        DecisionKind::NeedsHuman { .. } => {
-            "[t] comment · [c] clear label · [enter] details".to_string()
-        }
-        DecisionKind::ReleaseGate { .. } => {
-            "[1-9] include · [space] all/none · [g] release · [enter] details".to_string()
-        }
+        | DecisionKind::NeedsHuman { .. }
+        | DecisionKind::DeltaHit { .. }
+        | DecisionKind::Card { .. }
+        | DecisionKind::FirstRun { .. } => Vec::new(),
     }
 }
 
@@ -1881,7 +2156,7 @@ fn agent_detail_lines(
 ) -> (String, Vec<Line<'static>>) {
     let title = format!(
         "{} · {} · {}",
-        kind_label(decision),
+        presentation(&decision.kind).label,
         decision.repo,
         age_text(decision.opened_ms, now_ms)
     );
@@ -1947,7 +2222,11 @@ fn decision_request_id(decision: &Decision) -> Option<&str> {
         }
         DecisionKind::Stuck { .. }
         | DecisionKind::NeedsHuman { .. }
-        | DecisionKind::ReleaseGate { .. } => None,
+        | DecisionKind::ReleaseGate { .. }
+        | DecisionKind::DeltaHit { .. }
+        | DecisionKind::TheoryEvent { .. }
+        | DecisionKind::Card { .. }
+        | DecisionKind::FirstRun { .. } => None,
     }
 }
 
@@ -2013,7 +2292,11 @@ fn detail_item_key(decision: &Decision, item_number: Option<u64>) -> Option<(Ite
         DecisionKind::NeedsHuman { kind, number, .. } => (*kind, *number),
         DecisionKind::Permission { .. }
         | DecisionKind::Question { .. }
-        | DecisionKind::Stuck { .. } => return None,
+        | DecisionKind::Stuck { .. }
+        | DecisionKind::DeltaHit { .. }
+        | DecisionKind::TheoryEvent { .. }
+        | DecisionKind::Card { .. }
+        | DecisionKind::FirstRun { .. } => return None,
     }
     .into()
 }
@@ -2043,59 +2326,6 @@ fn github_link(state: &StateView, repo: &str, number: u64) -> Option<String> {
         .map(|view| view.owner_repo.as_str())
         .filter(|owner_repo| !owner_repo.is_empty())?;
     Some(format!("https://github.com/{owner_repo}/issues/{number}"))
-}
-
-/// Convert one GitHub RFC 3339 timestamp to milliseconds since the epoch.
-///
-/// The parser accepts the exact `YYYY-MM-DDTHH:MM:SSZ` form that GitHub
-/// reports. Any other form gives `None`.
-fn rfc3339_ms(text: &str) -> Option<u64> {
-    let bytes = text.as_bytes();
-    let shaped = bytes.len() == 20
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[10] == b'T'
-        && bytes[13] == b':'
-        && bytes[16] == b':'
-        && bytes[19] == b'Z';
-    if !shaped {
-        return None;
-    }
-    let year: i64 = text.get(0..4)?.parse().ok()?;
-    let month: i64 = text.get(5..7)?.parse().ok()?;
-    let day: i64 = text.get(8..10)?.parse().ok()?;
-    let hour: i64 = text.get(11..13)?.parse().ok()?;
-    let minute: i64 = text.get(14..16)?.parse().ok()?;
-    let second: i64 = text.get(17..19)?.parse().ok()?;
-    let in_range = (1..=12).contains(&month)
-        && (1..=31).contains(&day)
-        && (0..=23).contains(&hour)
-        && (0..=59).contains(&minute)
-        && (0..=59).contains(&second);
-    if !in_range {
-        return None;
-    }
-    let days = days_from_civil(year, month, day)?;
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    u64::try_from(seconds)
-        .ok()
-        .map(|seconds| seconds.saturating_mul(1_000))
-}
-
-/// Count the days from 1970-01-01 to one civil date.
-///
-/// The formula is the proleptic Gregorian day count of Howard
-/// Hinnant's date algorithm. An extreme date gives `None`.
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era.checked_mul(146_097)?
-        .checked_add(day_of_era)?
-        .checked_sub(719_468)
 }
 
 /// The bordered title and body lines of one repository item detail.
@@ -2314,6 +2544,10 @@ pub(super) fn footer_text(state: &StateView, inbox: &Inbox) -> String {
                     DecisionKind::Stuck { .. } => {
                         "esc back · j k scroll · r retry · c cancel · o session".to_string()
                     }
+                    DecisionKind::DeltaHit { .. }
+                    | DecisionKind::TheoryEvent { .. }
+                    | DecisionKind::Card { .. }
+                    | DecisionKind::FirstRun { .. } => "esc back · j k scroll".to_string(),
                     DecisionKind::NeedsHuman { kind, .. } => {
                         // The bottom row holds 64 characters. A fetched
                         // option list takes the two answer keys and gives
@@ -2361,6 +2595,13 @@ pub(super) fn footer_text(state: &StateView, inbox: &Inbox) -> String {
         DecisionKind::NeedsHuman { .. } => {
             "PgUp PgDn · j k move · t comment · c clear label · enter details".to_string()
         }
+        DecisionKind::DeltaHit { .. } => "PgUp PgDn · j k move · y confirm".to_string(),
+        DecisionKind::TheoryEvent { .. } => {
+            "j k move · m p r cause · 1-3 rung · a area · s send".to_string()
+        }
+        DecisionKind::Card { recalled: true, .. } => "PgUp PgDn · j k move · t teach".to_string(),
+        DecisionKind::Card { .. } => "PgUp PgDn · j k move · t answer".to_string(),
+        DecisionKind::FirstRun { .. } => "PgUp PgDn · j k move · y keep · c discard".to_string(),
         DecisionKind::ReleaseGate { .. } => {
             "j k move · 1-9 include · space all · g release · enter details".to_string()
         }
@@ -2387,6 +2628,7 @@ mod tests {
         AskOption, InputMode, ItemView, MentionStatus, PausedView, RepoView, TaskView, TrainView,
     };
     use crate::tasks::{Task, TaskState};
+    use crate::theory::model::Entry;
 
     /// The epoch time every test decision opens at.
     const OPENED: u64 = 10_000_000;
@@ -2456,6 +2698,7 @@ mod tests {
             },
             settings: crate::sock::SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         }
     }
 
@@ -2492,6 +2735,424 @@ mod tests {
     /// A fake sender and its receiver.
     fn fake_sink() -> (mpsc::Sender<Action>, mpsc::Receiver<Action>) {
         mpsc::channel()
+    }
+
+    // ------------------------------------------------------------------
+    // The presentation table and the theory rows
+    // ------------------------------------------------------------------
+
+    /// One theory row over the record of pull request 7.
+    fn theory_row() -> Decision {
+        Decision::theory_event(
+            "borsuk",
+            ItemKind::Pr,
+            7,
+            "invariants".to_string(),
+            "INV-3".to_string(),
+            "sure-miss".to_string(),
+            "Which entry is wrong?".to_string(),
+            "miss".to_string(),
+            OPENED,
+        )
+    }
+
+    /// A state whose Theory view carries the model and `areas` areas, each
+    /// over the one boundary the invariant constrains.
+    fn theory_state(decisions: Vec<Decision>, areas: &[&str]) -> StateView {
+        let mut state = state_with(decisions);
+        let mut theory = crate::sock::TheoryView {
+            governor: true,
+            ..crate::sock::TheoryView::default()
+        };
+        theory.model.entries = vec![
+            Entry::Boundary {
+                id: "B-checkout".to_string(),
+                title: "checkout".to_string(),
+                statement: "the cart pays".to_string(),
+                sides: vec!["web".to_string(), "api".to_string()],
+                paths: vec!["web/**".to_string()],
+            },
+            Entry::Invariant {
+                id: "INV-3".to_string(),
+                title: "the token".to_string(),
+                statement: "the cart keeps the token".to_string(),
+                constrains: vec!["B-checkout".to_string()],
+            },
+        ];
+        theory.areas = areas
+            .iter()
+            .map(|id| crate::sock::AreaView {
+                id: (*id).to_string(),
+                boundary: "B-checkout".to_string(),
+                ..crate::sock::AreaView::default()
+            })
+            .collect();
+        state.theory.insert("borsuk".to_string(), theory);
+        state
+    }
+
+    /// The one action the sink received, or none.
+    fn one_action(rx: &mpsc::Receiver<Action>) -> Option<Action> {
+        let action = rx.try_recv().ok();
+        assert!(rx.try_recv().is_err(), "the row sent more than one action");
+        action
+    }
+
+    #[test]
+    fn the_presentation_table_answers_every_decision_kind() {
+        let card = DecisionKind::Card {
+            source: "merged-pr".to_string(),
+            prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+            number: Some(7),
+            entry: None,
+            recalled: false,
+        };
+        let recalled = DecisionKind::Card {
+            source: "merged-pr".to_string(),
+            prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+            number: Some(7),
+            entry: None,
+            recalled: true,
+        };
+        let first_run = DecisionKind::FirstRun {
+            area: "web-checkout".to_string(),
+            measurer: "pay-latency".to_string(),
+            sample: "180ms".to_string(),
+        };
+        let mut kinds: Vec<DecisionKind> = every_decision()
+            .into_iter()
+            .map(|decision| decision.kind)
+            .collect();
+        kinds.push(Decision::delta_hit("borsuk", ItemKind::Pr, 7, 4, OPENED).kind);
+        kinds.push(theory_row().kind);
+        kinds.push(card);
+        kinds.push(recalled);
+        kinds.push(first_run);
+
+        let table: Vec<(&str, String, &str)> = kinds
+            .iter()
+            .map(|kind| {
+                let one = presentation(kind);
+                (one.label, one.footer(), one.digits)
+            })
+            .collect();
+
+        assert_eq!(
+            table,
+            vec![
+                (
+                    "PERMISSION",
+                    "[y] allow \u{b7} [n] deny \u{b7} [enter] details".to_string(),
+                    ""
+                ),
+                (
+                    "QUESTION",
+                    "[1-9] pick \u{b7} [s] submit \u{b7} [i] write \u{b7} [enter] details".to_string(),
+                    "123456789"
+                ),
+                (
+                    "STUCK",
+                    "[r] retry \u{b7} [c] cancel task \u{b7} [enter] details".to_string(),
+                    ""
+                ),
+                (
+                    "NEEDS HUMAN",
+                    "[t] comment \u{b7} [c] clear label \u{b7} [enter] details".to_string(),
+                    ""
+                ),
+                (
+                    "RELEASE",
+                    "[1-9] include \u{b7} [space] all/none \u{b7} [g] release \u{b7} [enter] details"
+                        .to_string(),
+                    "123456789"
+                ),
+                ("DELTA", "[y] confirm".to_string(), ""),
+                (
+                    "THEORY",
+                    concat!(
+                        "[m] model \u{b7} [p] pr \u{b7} [r] recall \u{b7} [1-3] rung ",
+                        "\u{b7} [a] area \u{b7} [n] note \u{b7} [s] send"
+                    )
+                    .to_string(),
+                    "123"
+                ),
+                ("CARD", "[t] answer".to_string(), ""),
+                ("CARD", "[t] teach".to_string(), ""),
+                ("FIRST RUN", "[y] keep \u{b7} [c] discard".to_string(), ""),
+            ]
+        );
+    }
+
+    /// One card row over the merged pull request 7.
+    fn pr_card(recalled: bool) -> Decision {
+        Decision::card(
+            "borsuk",
+            &crate::theory::cards::CardView {
+                source: crate::theory::cards::MERGED_PR_SOURCE.to_string(),
+                prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+                number: Some(7),
+                entry: None,
+            },
+            recalled,
+            OPENED,
+        )
+    }
+
+    /// One card row over the stale entry INV-3.
+    fn entry_card(recalled: bool) -> Decision {
+        Decision::card(
+            "borsuk",
+            &crate::theory::cards::CardView {
+                source: crate::theory::cards::STALE_ENTRY_SOURCE.to_string(),
+                prompt: "State INV-3. What would violate it?".to_string(),
+                number: None,
+                entry: Some("INV-3".to_string()),
+            },
+            recalled,
+            OPENED,
+        )
+    }
+
+    /// One THEORY row over the event the grading of the card opened.
+    fn card_event_row() -> Decision {
+        Decision::theory_event(
+            "borsuk",
+            ItemKind::Pr,
+            7,
+            "event:0".to_string(),
+            "web-checkout".to_string(),
+            "card".to_string(),
+            "The answer misses the new retry count.".to_string(),
+            "event".to_string(),
+            OPENED,
+        )
+    }
+
+    #[test]
+    fn a_card_whose_event_the_operator_recalls_offers_the_teach_key() {
+        // The operator answers the card. The answer crosses as a text
+        // response, and the row keeps the answer key while its grading
+        // runs.
+        let state = theory_state(vec![pr_card(false)], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        assert_eq!(
+            presentation(&state.decisions[0].kind).footer(),
+            "[t] answer"
+        );
+        inbox.handle_key(&state, press('t'), &mut tx);
+        type_text(&mut inbox, &state, "nothing changed", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Answer {
+                decision_id: "card:borsuk:7".to_string(),
+                response: Response::Text {
+                    text: "nothing changed".to_string(),
+                },
+            })
+        );
+
+        // The grading opens one event, and the operator gives it the
+        // cause recall with the key r.
+        let state = theory_state(vec![card_event_row()], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('r'), &mut tx);
+        type_text(&mut inbox, &state, "INV-3", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('1'), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Answer {
+                decision_id: "theory:borsuk:p7:event:0".to_string(),
+                response: Response::Theory {
+                    cause: Cause::Recall,
+                    entry: "INV-3".to_string(),
+                    rung: 1,
+                    area: "web-checkout".to_string(),
+                    note: String::new(),
+                },
+            })
+        );
+
+        // The card row comes back recalled, and the same key teaches.
+        let state = theory_state(vec![pr_card(true)], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        assert_eq!(presentation(&state.decisions[0].kind).footer(), "[t] teach");
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "PgUp PgDn · j k move · t teach"
+        );
+        inbox.handle_key(&state, press('t'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: TeachKey::Pr(7),
+            }))
+        );
+    }
+
+    #[test]
+    fn a_recalled_entry_card_teaches_the_area_of_its_entry() {
+        let state = theory_state(vec![entry_card(true)], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('t'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: TeachKey::Area("web-checkout".to_string()),
+            }))
+        );
+    }
+
+    /// A recalled entry card whose entry maps to no area teaches the
+    /// entry itself, so the card never dead-ends.
+    #[test]
+    fn a_recalled_entry_card_that_maps_to_no_area_teaches_the_entry() {
+        let state = theory_state(vec![entry_card(true)], &[]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('t'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: TeachKey::Entry("INV-3".to_string()),
+            }))
+        );
+    }
+
+    #[test]
+    fn a_theory_row_sends_the_cause_the_entry_and_the_rung() {
+        let state = theory_state(vec![theory_row()], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('m'), &mut tx);
+        type_text(&mut inbox, &state, "INV-3", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('2'), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Answer {
+                decision_id: "theory:borsuk:p7:invariants".to_string(),
+                response: Response::Theory {
+                    cause: Cause::Model,
+                    entry: "INV-3".to_string(),
+                    rung: 2,
+                    area: "web-checkout".to_string(),
+                    note: String::new(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_theory_row_without_a_rung_shows_the_pick_a_rung_hint() {
+        let state = theory_state(vec![theory_row()], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('m'), &mut tx);
+        type_text(&mut inbox, &state, "INV-3", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(footer_text(&state, &inbox), "pick a rung");
+        assert!(one_action(&rx).is_none(), "no answer crossed");
+    }
+
+    #[test]
+    fn a_theory_row_asks_for_the_area_when_the_entry_maps_to_several() {
+        let state = theory_state(vec![theory_row()], &["web-checkout", "api-orders"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('r'), &mut tx);
+        type_text(&mut inbox, &state, "INV-3", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('1'), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+        assert_eq!(footer_text(&state, &inbox), "pick an area");
+        assert!(one_action(&rx).is_none(), "no answer crossed yet");
+
+        inbox.handle_key(&state, press('a'), &mut tx);
+        type_text(&mut inbox, &state, "api-orders", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Answer {
+                decision_id: "theory:borsuk:p7:invariants".to_string(),
+                response: Response::Theory {
+                    cause: Cause::Recall,
+                    entry: "INV-3".to_string(),
+                    rung: 1,
+                    area: "api-orders".to_string(),
+                    note: String::new(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_theory_row_refuses_an_entry_the_model_does_not_carry() {
+        let state = theory_state(vec![theory_row()], &["web-checkout"]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        inbox.handle_key(&state, press('p'), &mut tx);
+        type_text(&mut inbox, &state, "INV-9", &mut tx);
+        inbox.handle_key(&state, press_code(KeyCode::Enter), &mut tx);
+
+        assert_eq!(
+            footer_text(&state, &inbox),
+            "the model carries no such entry"
+        );
+        inbox.handle_key(&state, press('2'), &mut tx);
+        inbox.handle_key(&state, press('s'), &mut tx);
+        assert_eq!(footer_text(&state, &inbox), "type an entry id");
+        assert!(one_action(&rx).is_none(), "no answer crossed");
+    }
+
+    #[test]
+    fn a_delta_row_closes_on_one_confirmation() {
+        let row = Decision::delta_hit("borsuk", ItemKind::Pr, 7, 4, OPENED);
+        let state = state_with(vec![row]);
+        let mut inbox = selected(&state, 0);
+        let (mut tx, rx) = fake_sink();
+
+        let screen = render_at_size(&state, &inbox, OPENED, 70, 12);
+        assert!(screen.contains("DELTA"), "screen: {screen}");
+
+        inbox.handle_key(&state, press('y'), &mut tx);
+
+        assert_eq!(
+            one_action(&rx),
+            Some(Action::Answer {
+                decision_id: "delta:borsuk:p7".to_string(),
+                response: Response::Confirm,
+            })
+        );
     }
 
     #[test]
@@ -2643,7 +3304,7 @@ mod tests {
             "The agent asked a question. Read the task log for its text."
         );
         assert_eq!(
-            feed_actions(&decision),
+            presentation(&decision.kind).footer(),
             "[1-9] pick · [s] submit · [i] write · [enter] details"
         );
     }
@@ -3213,6 +3874,7 @@ mod tests {
             input: InputMode::Live,
             queued_messages: 0,
             binding: None,
+            hold: None,
         }
     }
 
@@ -4293,6 +4955,7 @@ mod tests {
             },
             settings: crate::sock::SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         }
     }
 

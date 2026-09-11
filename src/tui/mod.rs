@@ -25,12 +25,14 @@
 //! view.
 
 pub mod agents;
+pub mod editor;
 pub mod inbox;
 pub mod markdown;
 pub mod pipeline;
 pub mod session;
 pub mod settings;
 pub mod theme;
+pub mod theory;
 pub mod tickets;
 pub mod transcript;
 
@@ -54,7 +56,6 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::catalog;
-use crate::decisions::DecisionKind;
 use crate::exec::RealExec;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, Client, Push, StateView, TaskView, TicketAction, WireProtocolMismatch};
@@ -79,6 +80,8 @@ enum View {
     Tickets,
     /// The execution role settings editor.
     Settings,
+    /// What the governor knows about each repository.
+    Theory,
 }
 
 /// What the operator has marked in the visible view.
@@ -96,6 +99,7 @@ enum Selection {
 /// Every value is either an input event or a socket event. The main loop
 /// draws one frame per message and never wakes up on its own.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     /// A key press.
     Key(KeyEvent),
@@ -115,6 +119,8 @@ enum Msg {
     Ask(crate::sock::AskView),
     /// One settings save or reload result.
     SettingsResult(crate::sock::SettingsResult),
+    /// The model worktree path of one edit-model request.
+    ModelPath(crate::sock::ModelPath),
     /// The parsed `opencode models` probe result of this shell start.
     HarnessModels(Result<Vec<String>, String>),
     /// The socket reader reached the daemon.
@@ -272,6 +278,10 @@ struct App {
     tickets: Tickets,
     /// The execution role settings editor.
     settings: Settings,
+    /// The Theory view cursor and its surface input.
+    theory: theory::Theory,
+    /// The short prediction the pipeline view is taking, if any.
+    prediction: Option<pipeline::PredictionInput>,
     /// The task id the session view follows.
     session_task: Option<String>,
     /// The task the shell still waits for, from `r` or `n`.
@@ -319,6 +329,7 @@ impl App {
         };
         self.inbox.observe(&view);
         self.tickets.observe_state(&view);
+        self.theory.observe_state(&view);
         self.session.set_tabs(live_session_ids(&view));
         let wanted_task = self.wanted.as_ref().and_then(|wanted| {
             view.tasks
@@ -397,7 +408,8 @@ impl App {
             View::Inbox => self.inbox.typing(),
             View::Tickets => self.tickets.typing(),
             View::Settings => self.settings.typing(),
-            View::Pipeline => false,
+            View::Theory => self.theory.typing(),
+            View::Pipeline => self.prediction.is_some(),
         }
     }
 
@@ -547,6 +559,10 @@ impl App {
                             self.view = View::Settings;
                             return true;
                         }
+                        KeyCode::Char('6') => {
+                            self.view = View::Theory;
+                            return true;
+                        }
                         KeyCode::Char('?') => {
                             self.help = true;
                             return true;
@@ -606,6 +622,7 @@ impl App {
                     KeyCode::Char('3') => {}
                     KeyCode::Char('4') => self.view = View::Tickets,
                     KeyCode::Char('5') => self.view = View::Settings,
+                    KeyCode::Char('6') => self.view = View::Theory,
                     KeyCode::Char('?') => self.help = true,
                     KeyCode::Esc => self.view = View::Pipeline,
                     _ => {
@@ -613,12 +630,16 @@ impl App {
                     }
                 }
             }
+            View::Pipeline if self.prediction.is_some() => {
+                pipeline::typing_key(self, key, sink);
+            }
             View::Pipeline => match key.code {
                 KeyCode::Char('1') => {}
                 KeyCode::Char('2') => self.enter_session(),
                 KeyCode::Char('3') => self.view = View::Inbox,
                 KeyCode::Char('4') => self.view = View::Tickets,
                 KeyCode::Char('5') => self.view = View::Settings,
+                KeyCode::Char('6') => self.view = View::Theory,
                 KeyCode::Char('?') => self.help = true,
                 KeyCode::Char('j') | KeyCode::Down => pipeline::move_selection(self, 1),
                 KeyCode::Char('k') | KeyCode::Up => pipeline::move_selection(self, -1),
@@ -644,6 +665,10 @@ impl App {
                         KeyCode::Char('4') => return true,
                         KeyCode::Char('5') => {
                             self.view = View::Settings;
+                            return true;
+                        }
+                        KeyCode::Char('6') => {
+                            self.view = View::Theory;
                             return true;
                         }
                         KeyCode::Char('?') => {
@@ -698,6 +723,10 @@ impl App {
                             true
                         }
                         KeyCode::Char('5') => true,
+                        KeyCode::Char('6') => {
+                            self.view = View::Theory;
+                            true
+                        }
                         KeyCode::Char('?') => {
                             self.help = true;
                             true
@@ -720,6 +749,29 @@ impl App {
                     if !emit(self, sink, action, "sent settings request".to_string()) {
                         self.settings.delivery_failed(Some(&copy));
                     }
+                }
+            }
+            View::Theory => {
+                let outcome = match self.state.as_ref() {
+                    Some(state) => self.theory.handle_key(state, key),
+                    None => theory::Outcome::Pass,
+                };
+                match outcome {
+                    theory::Outcome::None => {}
+                    theory::Outcome::Send(action, toast) => {
+                        emit(self, sink, *action, toast);
+                    }
+                    theory::Outcome::Reject(reason) => self.show_toast(&reason),
+                    theory::Outcome::Pass => match key.code {
+                        KeyCode::Char('1') => self.view = View::Pipeline,
+                        KeyCode::Char('2') => self.enter_session(),
+                        KeyCode::Char('3') => self.view = View::Inbox,
+                        KeyCode::Char('4') => self.view = View::Tickets,
+                        KeyCode::Char('5') => self.view = View::Settings,
+                        KeyCode::Char('?') => self.help = true,
+                        KeyCode::Esc => self.view = View::Pipeline,
+                        _ => {}
+                    },
                 }
             }
         }
@@ -745,9 +797,13 @@ impl App {
     /// True when the kind of the selected inbox row consumes this key, so
     /// it must not reach the global handler.
     ///
-    /// A `Question` row numbers its options with the digits, and a
-    /// `ReleaseGate` row toggles pull requests with them.
+    /// The `digits` field of [`inbox::presentation`] answers it: a
+    /// `Question` row numbers its options, a `ReleaseGate` row toggles
+    /// pull requests, and a `TheoryEvent` row takes the three rungs.
     fn inbox_row_owns(&self, key: KeyEvent) -> bool {
+        let KeyCode::Char(digit) = key.code else {
+            return false;
+        };
         if !digit_key(key) {
             return false;
         }
@@ -760,10 +816,7 @@ impl App {
         let Some(decision) = state.decisions.iter().find(|decision| decision.id == id) else {
             return false;
         };
-        matches!(
-            decision.kind,
-            DecisionKind::Question { .. } | DecisionKind::ReleaseGate { .. }
-        )
+        inbox::presentation(&decision.kind).digits.contains(digit)
     }
 
     /// Apply one key to the inbox and report whether an action crossed.
@@ -1141,6 +1194,11 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    Ok(Push::ModelPath(view)) => {
+                                        if tx.send(Msg::ModelPath(view)).is_err() {
+                                            return;
+                                        }
+                                    }
                                     Err(error) => {
                                         if error.downcast_ref::<WireProtocolMismatch>().is_some() {
                                             if tx.send(Msg::Fatal(format!("{error:#}"))).is_err() {
@@ -1184,7 +1242,8 @@ fn run_loop(
         let now = Instant::now();
         let polls_log = app.view == View::Session
             || (app.view == View::Tickets && app.tickets.needs_poll())
-            || (app.view == View::Tickets && app.tickets.status_refresh_due(now));
+            || (app.view == View::Tickets && app.tickets.status_refresh_due(now))
+            || (app.view == View::Theory && app.theory.needs_poll());
         let msg = if polls_log {
             match rx.recv_timeout(session::POLL_INTERVAL) {
                 Ok(msg) => msg,
@@ -1193,6 +1252,7 @@ fn run_loop(
                     let changed = match app.view {
                         View::Session => app.session.poll(now),
                         View::Tickets => app.tickets.poll(now),
+                        View::Theory => app.theory.poll(now),
                         View::Pipeline | View::Inbox | View::Settings => false,
                     };
                     if app.view == View::Tickets {
@@ -1247,7 +1307,22 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
             Ok(true)
         }
         Msg::TicketResult(result) => {
-            app.tickets.observe_result(result);
+            // A run skill ticket has no ticket row that waits for it. The
+            // operator asked for it in the Theory view, so its result
+            // becomes a toast.
+            if result
+                .request
+                .starts_with(crate::sock::SKILL_TICKET_REQUEST)
+                || result.request.starts_with(crate::sock::PREDICTION_REQUEST)
+                || result.request.starts_with(crate::sock::LADDER_REQUEST)
+                || result
+                    .request
+                    .starts_with(crate::sock::MODEL_COMMIT_REQUEST)
+            {
+                app.show_toast(&result.message);
+            } else {
+                app.tickets.observe_result(result);
+            }
             Ok(true)
         }
         Msg::Ask(ask) => {
@@ -1256,6 +1331,12 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
         }
         Msg::SettingsResult(result) => {
             app.settings.observe_result(result);
+            Ok(true)
+        }
+        Msg::ModelPath(view) => {
+            // The editor owns the real terminal, so it runs on the shell
+            // thread and never inside the socket reader.
+            apply_model_path(app, sink, &view, editor::edit_file);
             Ok(true)
         }
         Msg::HarnessModels(result) => {
@@ -1276,12 +1357,34 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
     }
 }
 
+/// Apply one model worktree reply.
+///
+/// `edit` runs the operator's editor over the model file. What it produces
+/// either crosses to the daemon as one action or lands on a toast, so a
+/// refusal is never silent.
+fn apply_model_path(
+    app: &mut App,
+    sink: &mut impl ActionSink,
+    view: &crate::sock::ModelPath,
+    edit: impl FnOnce(&std::path::Path) -> Result<editor::EditorOutcome>,
+) {
+    match app.theory.observe_model_path(view, edit) {
+        theory::Outcome::Send(action, toast) => {
+            emit(app, sink, *action, toast);
+        }
+        theory::Outcome::Reject(reason) => app.show_toast(&reason),
+        theory::Outcome::None | theory::Outcome::Pass => {}
+    }
+}
+
 /// Read the session log and draw one frame.
 fn draw_app(surface: &mut impl Surface, app: &mut App, now: Instant) -> Result<()> {
     if app.view == View::Session {
         app.session.on_redraw(now);
     } else if app.view == View::Tickets {
         app.tickets.on_redraw(now);
+    } else if app.view == View::Theory {
+        app.theory.on_redraw(now);
     }
     surface.draw(app)
 }
@@ -1370,6 +1473,11 @@ fn render_with_clock(
                 app.settings.draw(f, body, state);
             }
         }
+        View::Theory => {
+            if let Some(state) = app.state.as_ref() {
+                theory::draw(f, body, state, &mut app.theory);
+            }
+        }
     }
     draw_toast(f, app, body);
     draw_footer(f, app, footer);
@@ -1392,6 +1500,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     tabs.push(tab_span("3", "inbox", app.view == View::Inbox));
     tabs.push(tab_span("4", "tickets", app.view == View::Tickets));
     tabs.push(tab_span("5", "settings", app.view == View::Settings));
+    tabs.push(tab_span("6", "theory", app.view == View::Theory));
     f.render_widget(Paragraph::new(Line::from(tabs)), sides[0]);
 
     let mut status = Vec::new();
@@ -1416,7 +1525,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// The styled tab label of one view.
 fn tab_span(number: &str, label: &str, active: bool) -> Span<'static> {
-    let text = format!(" {number} {label} ");
+    let text = format!("{number} {label} ");
     if active {
         Span::styled(
             text,
@@ -1481,6 +1590,7 @@ fn footer_hints(app: &App) -> String {
         View::Inbox => inbox::footer_text(state, &app.inbox),
         View::Tickets => app.tickets.footer_hints(),
         View::Settings => app.settings.footer_hints(),
+        View::Theory => app.theory.footer_hints(),
     }
 }
 
@@ -1564,7 +1674,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let panel = centered(78, HELP_ROWS as u16 / 2 + 2, area);
     f.render_widget(Clear, panel);
     let rows: [(&str, &str); HELP_ROWS] = [
-        ("1 2 3 4 5", "switch view"),
+        ("1 2 3 4 5 6", "switch view"),
         ("esc", "home / cancel settings edit"),
         ("!", "inbox, oldest decision"),
         ("j k Up Down", "move inside a lane"),
@@ -1572,7 +1682,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("?", "toggle this help"),
         ("ctrl-q", "quit"),
         ("+ -", "stage limit / repo lane"),
-        ("p P", "pause selected / all"),
+        ("p P", "predict or pause / pause all"),
         ("r n", "refine / new ticket"),
         ("x R", "abort / retry"),
         ("space", "toggle the selected PR"),
@@ -2143,6 +2253,8 @@ mod tests {
             revision: "rev-one".to_string(),
             labels: crate::labels::LabelNames::default(),
             repository_labels: std::collections::BTreeMap::new(),
+            repository_theory: std::collections::BTreeMap::new(),
+            repository_skills: std::collections::BTreeMap::new(),
             global_label_overrides: Vec::new(),
             repository_label_overrides: std::collections::BTreeMap::new(),
             global: crate::config::ExecutionRole::ALL
@@ -2929,6 +3041,288 @@ mod tests {
             let text = render_to_string(&mut app);
             assert!(text.contains("! 1 open"), "view {view:?} misses the badge");
         }
+    }
+
+    #[test]
+    fn the_theory_tab_joins_the_view_cycle_the_strip_and_the_help() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                areas: vec![crate::sock::AreaView {
+                    id: "web-checkout".to_string(),
+                    tier: crate::theory::verify::Tier::Browser,
+                    ..crate::sock::AreaView::default()
+                }],
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Theory);
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("6 theory"), "{screen}");
+        assert!(screen.contains("web-checkout \u{b7} browser"), "{screen}");
+        assert!(screen.contains("1-6 view"), "{screen}");
+
+        app.help = true;
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("1 2 3 4 5 6"), "{screen}");
+        app.help = false;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &mut sink,
+        );
+        assert_eq!(app.view, View::Pipeline);
+    }
+
+    #[test]
+    fn v_and_a_surface_name_send_the_setup_action_and_the_result_toasts() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(state),
+                key('6'),
+                key('v'),
+                key('w'),
+                key('e'),
+                key('b'),
+                key_code(KeyCode::Enter),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Theory, "the typed keys stay in the view");
+        assert_eq!(
+            sink.0,
+            vec![Action::Theory(crate::sock::TheoryAction::Setup {
+                repo: "borsuk".to_string(),
+                surface: "web".to_string(),
+            })]
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("asked for the run skill of borsuk/web")
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::TicketResult(crate::sock::TicketResult {
+                request: "skill-ticket:borsuk/web".to_string(),
+                repo: "borsuk".to_string(),
+                number: 12,
+                kind: crate::sock::TicketResultKind::Success,
+                message: "created the run skill ticket borsuk#12".to_string(),
+                issue: None,
+                conflict: None,
+            })]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.visible_toast(),
+            Some("created the run skill ticket borsuk#12")
+        );
+    }
+
+    /// A refused short prediction has no ticket row that waits for it, so
+    /// its reason becomes a toast.
+    #[test]
+    fn a_refused_short_prediction_reaches_the_operator_as_a_toast() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::TicketResult(crate::sock::TicketResult {
+                request: "prediction:borsuk/142".to_string(),
+                repo: "borsuk".to_string(),
+                number: 142,
+                kind: crate::sock::TicketResultKind::Failure,
+                message: "area gh has no entries".to_string(),
+                issue: None,
+                conflict: None,
+            })]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.visible_toast(), Some("area gh has no entries"));
+    }
+
+    #[test]
+    fn t_on_an_areas_row_sends_one_teach_request_for_that_area() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        let area = |id: &str| crate::sock::AreaView {
+            id: id.to_string(),
+            tier: crate::theory::verify::Tier::Browser,
+            ..crate::sock::AreaView::default()
+        };
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                areas: vec![area("api-orders"), area("web-checkout")],
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        // The cursor starts on the repository row, so two steps reach the
+        // second area.
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('j'), key('j'), key('t')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.0,
+            vec![Action::Theory(crate::sock::TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Area("web-checkout".to_string()),
+            })]
+        );
+        assert_eq!(
+            app.visible_toast(),
+            Some("asked to teach borsuk/web-checkout")
+        );
+        let screen = render_to_string(&mut app);
+        assert!(screen.contains("t teach"), "{screen}");
+        assert!(screen.contains("\u{25b8} web-checkout"), "{screen}");
+    }
+
+    #[test]
+    fn e_sends_the_edit_model_action_and_the_model_result_toasts() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('e')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        let [Action::Theory(crate::sock::TheoryAction::EditModel { request, repo })] =
+            sink.0.as_slice()
+        else {
+            panic!("e must send one edit-model action, sent {:?}", sink.0);
+        };
+        assert!(!request.is_empty(), "the request carries an identity");
+        assert_eq!(repo, "borsuk");
+        assert_eq!(app.visible_toast(), Some("opening the model of borsuk"));
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::TicketResult(crate::sock::TicketResult {
+                request: "model-commit:borsuk".to_string(),
+                repo: "borsuk".to_string(),
+                number: 0,
+                kind: crate::sock::TicketResultKind::Success,
+                message: "opened the model pull request 12 of borsuk".to_string(),
+                issue: None,
+                conflict: None,
+            })]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.visible_toast(),
+            Some("opened the model pull request 12 of borsuk")
+        );
+        assert!(render_to_string(&mut app).contains("e model"));
+    }
+
+    #[test]
+    fn a_refused_model_edit_reaches_the_toast_and_sends_no_action() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+        let mut state = crate::tui::pipeline::sample_view();
+        state.theory.insert(
+            "borsuk".to_string(),
+            crate::sock::TheoryView {
+                governor: true,
+                ..crate::sock::TheoryView::default()
+            },
+        );
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::State(state), key('6'), key('e')].into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+        let [Action::Theory(crate::sock::TheoryAction::EditModel { request, .. })] =
+            sink.0.as_slice()
+        else {
+            panic!("e must send one edit-model action");
+        };
+        let reply = crate::sock::ModelPath {
+            request: request.clone(),
+            repo: "borsuk".to_string(),
+            path: std::path::PathBuf::from("/state/worktrees/borsuk/model"),
+        };
+
+        apply_model_path(&mut app, &mut sink, &reply, |_| {
+            Ok(editor::EditorOutcome::Failed(
+                "the editor exited with 1".to_string(),
+            ))
+        });
+
+        assert_eq!(app.visible_toast(), Some("the editor exited with 1"));
+        assert_eq!(sink.0.len(), 1, "a refused edit sends no second action");
     }
 
     #[test]
@@ -3838,7 +4232,8 @@ mod tests {
             vec![Action::Refine {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
-                number: 140
+                number: 140,
+                prediction: None
             }]
         );
 
@@ -3857,6 +4252,7 @@ mod tests {
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
             binding: None,
+            hold: None,
         });
         run_messages(
             &mut surface,
@@ -3899,7 +4295,8 @@ mod tests {
             vec![Action::Refine {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
-                number: 140
+                number: 140,
+                prediction: None
             }]
         );
         assert_eq!(app.session.task_id(), None);
@@ -3942,6 +4339,7 @@ mod tests {
             input: crate::sock::InputMode::Live,
             queued_messages: 0,
             binding: None,
+            hold: None,
         });
         run_messages(
             &mut surface,

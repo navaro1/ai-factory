@@ -7,8 +7,13 @@
 //! minutes, so one broken repository never stops the others. [`spawn_pollers`]
 //! returns the wake sender of every repository, so the daemon holds them from
 //! the start.
+//!
+//! One more poller runs per shadow theory repository. It fetches the same
+//! way and sends [`DaemonMsg::TheoryPolled`], which the daemon files in its
+//! theory snapshot map. The code snapshot map keeps one entry per code
+//! repository.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -46,6 +51,15 @@ pub enum DaemonMsg {
         /// The complete snapshot of the repository.
         snapshot: RepoSnapshot,
     },
+    /// One finished poll pass of one shadow theory repository. The
+    /// snapshot feeds `Daemon.theory_snapshots`, never `Snapshot.repos`,
+    /// so the v0.6 derivations keep seeing one repository per alias.
+    TheoryPolled {
+        /// The `owner/repo` of the polled theory repository.
+        repo: String,
+        /// The complete snapshot of the theory repository.
+        snapshot: RepoSnapshot,
+    },
     /// One failed poll pass. The poller keeps running and backs off.
     PollFailed {
         /// The repository alias of the poller.
@@ -57,13 +71,64 @@ pub enum DaemonMsg {
     Shutdown,
 }
 
+/// The map one poller feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Feed {
+    /// The code snapshot of one repository alias.
+    Code,
+    /// The theory snapshot of one shadow theory repository.
+    Theory,
+}
+
+/// What one poller fetches and which map it feeds.
+#[derive(Debug, Clone)]
+struct Target {
+    /// The key the message carries: the alias of a code repository, the
+    /// `owner/repo` of a theory repository.
+    key: String,
+    /// The `owner/repo` the poller fetches.
+    owner_repo: String,
+    /// The map the snapshot feeds.
+    feed: Feed,
+}
+
+impl Target {
+    /// The target of one code repository.
+    fn code(alias: &str, owner_repo: &str) -> Target {
+        Target {
+            key: alias.to_string(),
+            owner_repo: owner_repo.to_string(),
+            feed: Feed::Code,
+        }
+    }
+
+    /// The target of one shadow theory repository.
+    fn theory(owner_repo: &str) -> Target {
+        Target {
+            key: owner_repo.to_string(),
+            owner_repo: owner_repo.to_string(),
+            feed: Feed::Theory,
+        }
+    }
+
+    /// The thread name of the poller.
+    fn thread_name(&self) -> String {
+        match self.feed {
+            Feed::Code => format!("poll-{}", self.key),
+            Feed::Theory => format!("poll-theory-{}", self.key),
+        }
+    }
+}
+
 /// The join handles and the wake senders of a set of spawned pollers.
 #[derive(Debug)]
 pub struct Pollers {
     /// One join handle per spawned poller, in repository alias order.
     pub handles: Vec<JoinHandle<()>>,
-    /// The wake sender of each repository, keyed by alias. The daemon sends
-    /// on a sender to force an early pass, and drops it to end that poller.
+    /// The wake sender of each poller. A code poller is keyed by its
+    /// alias and a theory poller by its `owner/repo`, which holds a slash
+    /// and so never collides with an alias. The daemon sends on a sender
+    /// to force an early pass, and drops it to end that poller.
     pub wake: BTreeMap<String, Sender<()>>,
 }
 
@@ -73,7 +138,8 @@ pub struct Pollers {
 /// [`POLL_INTERVAL`] on its wake channel. A failed pass sends
 /// [`DaemonMsg::PollFailed`] and doubles the wait, at most [`MAX_BACKOFF`].
 /// Each thread runs until the daemon drops its wake sender or the channel
-/// closes. The join handles follow repository alias order.
+/// closes. The join handles follow repository alias order, and one more
+/// handle follows per shadow theory repository.
 pub fn spawn_pollers(cfg: &Config, tx: Sender<DaemonMsg>) -> Pollers {
     let exec_for = |_alias: &str| Arc::new(RealExec) as Arc<dyn Exec>;
     spawn_all(cfg, tx, &exec_for, POLL_INTERVAL, MAX_BACKOFF)
@@ -107,8 +173,7 @@ fn spawn_poller_with(
 ) -> Option<(JoinHandle<()>, Sender<()>)> {
     let (wake_tx, wake_rx) = mpsc::channel();
     spawn_one(
-        repo.alias.clone(),
-        repo.owner_repo.clone(),
+        Target::code(&repo.alias, &repo.owner_repo),
         exec,
         tx,
         wake_rx,
@@ -116,6 +181,26 @@ fn spawn_poller_with(
         max_backoff,
     )
     .map(|handle| (handle, wake_tx))
+}
+
+/// Spawn the poller thread of one shadow theory repository.
+///
+/// The thread polls `owner_repo` like a code poller and sends
+/// [`DaemonMsg::TheoryPolled`]. The call returns the wake sender, so the
+/// caller can force an early pass and drop the sender to end the poller.
+/// It returns `None` when the thread cannot start.
+pub fn spawn_theory_poller(owner_repo: &str, tx: Sender<DaemonMsg>) -> Option<Sender<()>> {
+    let exec: Arc<dyn Exec> = Arc::new(RealExec);
+    let (wake_tx, wake_rx) = mpsc::channel();
+    spawn_one(
+        Target::theory(owner_repo),
+        exec,
+        tx,
+        wake_rx,
+        POLL_INTERVAL,
+        MAX_BACKOFF,
+    )
+    .map(|_| wake_tx)
 }
 
 /// Spawn every poller with an explicit [`Exec`] factory and waits.
@@ -126,6 +211,10 @@ fn spawn_poller_with(
 /// waits; production uses [`spawn_pollers`]. A repository whose thread cannot
 /// start contributes no handle, no sender, and sends
 /// [`DaemonMsg::PollFailed`].
+///
+/// One more poller runs per distinct shadow theory repository. Several
+/// aliases may name one theory repository, so the set is deduplicated and
+/// each poller sends [`DaemonMsg::TheoryPolled`] once per pass.
 fn spawn_all(
     cfg: &Config,
     tx: Sender<DaemonMsg>,
@@ -138,8 +227,7 @@ fn spawn_all(
     for repo in cfg.repos.values() {
         let (wake_tx, wake_rx) = mpsc::channel();
         if let Some(handle) = spawn_one(
-            repo.alias.clone(),
-            repo.owner_repo.clone(),
+            Target::code(&repo.alias, &repo.owner_repo),
             exec_for(&repo.alias),
             tx.clone(),
             wake_rx,
@@ -150,7 +238,34 @@ fn spawn_all(
             wake.insert(repo.alias.clone(), wake_tx);
         }
     }
+    for owner_repo in theory_repos(cfg) {
+        let (wake_tx, wake_rx) = mpsc::channel();
+        if let Some(handle) = spawn_one(
+            Target::theory(&owner_repo),
+            exec_for(&owner_repo),
+            tx.clone(),
+            wake_rx,
+            interval,
+            max_backoff,
+        ) {
+            handles.push(handle);
+            wake.insert(owner_repo, wake_tx);
+        }
+    }
     Pollers { handles, wake }
+}
+
+/// The distinct shadow theory repositories of a configuration, in
+/// `owner/repo` order.
+///
+/// A repository with the governor off shadows nothing: v0.6 behaviour
+/// holds for it and no theory poller runs.
+pub fn theory_repos(cfg: &Config) -> BTreeSet<String> {
+    cfg.repos
+        .values()
+        .filter(|repo| repo.theory.governor.is_on())
+        .filter_map(|repo| repo.theory_repo().map(str::to_string))
+        .collect()
 }
 
 /// Spawn the poller thread of one repository.
@@ -158,22 +273,20 @@ fn spawn_all(
 /// Returns `None` when the thread cannot start; the case sends
 /// [`DaemonMsg::PollFailed`].
 fn spawn_one(
-    repo: String,
-    owner_repo: String,
+    target: Target,
     exec: Arc<dyn Exec>,
     tx: Sender<DaemonMsg>,
     wake_rx: Receiver<()>,
     interval: Duration,
     max_backoff: Duration,
 ) -> Option<JoinHandle<()>> {
-    let name = format!("poll-{repo}");
-    let thread_repo = repo.clone();
+    let name = target.thread_name();
+    let thread_target = target.clone();
     let thread_tx = tx.clone();
     let spawned = thread::Builder::new().name(name).spawn(move || {
-        let log_repo = thread_repo.clone();
+        let log_repo = thread_target.key.clone();
         if let Err(error) = poller_loop(
-            thread_repo,
-            owner_repo,
+            thread_target,
             exec,
             thread_tx,
             wake_rx,
@@ -187,7 +300,7 @@ fn spawn_one(
         Ok(handle) => Some(handle),
         Err(error) => {
             let failed = DaemonMsg::PollFailed {
-                repo,
+                repo: target.key,
                 error: format!("cannot start the poller thread: {error}"),
             };
             if let Err(send_error) = tx.send(failed) {
@@ -201,8 +314,7 @@ fn spawn_one(
 /// Run the poll loop of one repository until its wake channel disconnects.
 /// The loop returns an error when it cannot send a message to the daemon.
 fn poller_loop(
-    repo: String,
-    owner_repo: String,
+    target: Target,
     exec: Arc<dyn Exec>,
     tx: Sender<DaemonMsg>,
     wake_rx: Receiver<()>,
@@ -213,13 +325,19 @@ fn poller_loop(
     let mut backoff = interval;
     loop {
         let started_ms = wall_clock_ms();
-        let failed = match fetch_repo(&mut client, &owner_repo) {
+        let failed = match fetch_repo(&mut client, &target.owner_repo) {
             Ok(snapshot) => {
                 backoff = interval;
-                let polled = DaemonMsg::Polled {
-                    started_ms,
-                    repo: repo.clone(),
-                    snapshot,
+                let polled = match target.feed {
+                    Feed::Code => DaemonMsg::Polled {
+                        started_ms,
+                        repo: target.key.clone(),
+                        snapshot,
+                    },
+                    Feed::Theory => DaemonMsg::TheoryPolled {
+                        repo: target.key.clone(),
+                        snapshot,
+                    },
                 };
                 tx.send(polled)
                     .context("cannot send poll result to daemon")?;
@@ -227,7 +345,7 @@ fn poller_loop(
             }
             Err(error) => {
                 let failed = DaemonMsg::PollFailed {
-                    repo: repo.clone(),
+                    repo: target.key.clone(),
                     error: format!("{error:#}"),
                 };
                 tx.send(failed)
@@ -474,8 +592,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (wake, wake_rx) = mpsc::channel();
         let handle = spawn_one(
-            REPO.to_string(),
-            OWNER_REPO.to_string(),
+            Target::code(REPO, OWNER_REPO),
             exec.clone(),
             tx,
             wake_rx,
@@ -581,8 +698,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (wake, wake_rx) = mpsc::channel();
         let handle = spawn_one(
-            REPO.to_string(),
-            OWNER_REPO.to_string(),
+            Target::code(REPO, OWNER_REPO),
             exec.clone(),
             tx,
             wake_rx,
@@ -650,8 +766,7 @@ mod tests {
         drop(rx);
 
         let error = poller_loop(
-            REPO.to_string(),
-            OWNER_REPO.to_string(),
+            Target::code(REPO, OWNER_REPO),
             exec,
             tx,
             wake_rx,
@@ -1112,5 +1227,138 @@ path = "/repos/b"
         // poller ends when the sender drops.
         drop(wake);
         handle.join().unwrap();
+    }
+
+    /// A config whose `a` and `b` both shadow into one theory repository,
+    /// and whose `c` has the governor off.
+    fn shadow_config() -> Config {
+        let mut config = two_repo_config();
+        config.repos.get_mut("a").unwrap().owner_repo = "acme/one".to_string();
+        config.repos.get_mut("b").unwrap().owner_repo = "acme/two".to_string();
+        for alias in ["a", "b"] {
+            let repo = config.repos.get_mut(alias).unwrap();
+            repo.theory.governor = crate::config::Governor::On;
+            repo.theory.theory = Some(crate::config::TheoryRepo {
+                repo: Some("acme/shadow".to_string()),
+                path: repo.path.clone(),
+            });
+        }
+        config
+    }
+
+    /// One theory repository that serves two aliases answers one poller,
+    /// and a repository with the governor off answers none.
+    #[test]
+    fn theory_repos_deduplicates_and_skips_the_governor_off() {
+        let mut config = shadow_config();
+
+        assert_eq!(
+            theory_repos(&config),
+            BTreeSet::from(["acme/shadow".to_string()]),
+            "two aliases of one theory repository take one poller"
+        );
+
+        config.repos.get_mut("a").unwrap().theory.governor = crate::config::Governor::Off;
+        config.repos.get_mut("b").unwrap().theory.governor = crate::config::Governor::Off;
+
+        assert!(
+            theory_repos(&config).is_empty(),
+            "the governor off shadows nothing"
+        );
+    }
+
+    /// The shadow poller feeds `TheoryPolled`, never `Polled`, so the
+    /// theory snapshot never reaches the code snapshot map.
+    #[test]
+    fn a_shadow_repository_gets_its_own_poller_and_its_own_message() {
+        let config = shadow_config();
+        let code = |owner: &str, etag: &str, number: u64| -> Arc<dyn Exec> {
+            Arc::new(pass_steps(
+                ScriptExec::new(),
+                (
+                    vec![
+                        "api",
+                        "-i",
+                        "-X",
+                        "GET",
+                        &format!("repos/{owner}/issues?state=open&per_page=100&page=1"),
+                    ],
+                    CmdOut::ok(response(
+                        "HTTP/2 200",
+                        &[&format!("etag: \"i{etag}\"")],
+                        &format!("[{}]", issue_json(number)),
+                    )),
+                ),
+                (
+                    vec![
+                        "api",
+                        "-i",
+                        "-X",
+                        "GET",
+                        &format!("repos/{owner}/pulls?state=open&per_page=100&page=1"),
+                    ],
+                    CmdOut::ok(response(
+                        "HTTP/2 200",
+                        &[&format!("etag: \"p{etag}\"")],
+                        "[]",
+                    )),
+                ),
+            ))
+        };
+        let a = code("acme/one", "a", 1);
+        let b = code("acme/two", "b", 3);
+        let shadow = code("acme/shadow", "s", 300);
+        let (tx, rx) = mpsc::channel();
+        let pollers = spawn_all(
+            &config,
+            tx,
+            &|key| match key {
+                "a" => a.clone(),
+                "b" => b.clone(),
+                _ => shadow.clone(),
+            },
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+        );
+
+        let mut code_polls: BTreeMap<String, RepoSnapshot> = BTreeMap::new();
+        let mut theory_polls: BTreeMap<String, RepoSnapshot> = BTreeMap::new();
+        for _ in 0..3 {
+            match next_msg(&rx, "one first poll") {
+                DaemonMsg::Polled { repo, snapshot, .. } => {
+                    code_polls.insert(repo, snapshot);
+                }
+                DaemonMsg::TheoryPolled { repo, snapshot } => {
+                    theory_polls.insert(repo, snapshot);
+                }
+                other => panic!("the first passes sent {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            code_polls.keys().collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "the code pollers keep their aliases"
+        );
+        assert_eq!(
+            theory_polls.keys().collect::<Vec<_>>(),
+            vec!["acme/shadow"],
+            "one theory poller serves both aliases"
+        );
+        assert_eq!(
+            theory_polls["acme/shadow"],
+            snapshot(vec![model_issue(300)], Vec::new()),
+            "the theory snapshot carries the shadow issues"
+        );
+        assert!(
+            pollers.wake.contains_key("acme/shadow"),
+            "the theory poller has its own wake sender"
+        );
+        assert_eq!(pollers.handles.len(), 3, "two code pollers and one theory");
+
+        drop(pollers.wake);
+        for handle in pollers.handles {
+            handle.join().unwrap();
+        }
     }
 }

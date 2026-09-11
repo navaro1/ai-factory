@@ -51,8 +51,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use crate::ask::{Ask, AskOption};
 pub use crate::config::SettingsEdit;
 use crate::config::{
-    Config, ExecutionRole, Harness, ReleasePolicy, ResolvedRoleSettings, RoleOverride,
-    RoleSettings, SettingsSource,
+    Config, ExecutionRole, Harness, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
+    TheoryConfig,
 };
 use crate::decisions::{Decision, Decisions};
 use crate::labels::{LabelKey, LabelNames};
@@ -60,7 +60,15 @@ use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
 use crate::sched::{Limits, Paused};
+use crate::state::TaskBinding;
 use crate::tasks::{TaskState, TaskTable};
+use crate::theory::answers::AnswerBlock;
+use crate::theory::cards::CardView;
+use crate::theory::model::Model;
+use crate::theory::records::{DeltaBlock, Event, FullPrediction, ShortPrediction};
+#[cfg(test)]
+use crate::theory::records::{DeltaOutcome, DeltaSlot, DeltaViolation, PredictionTag};
+use crate::theory::verify::Tier;
 use crate::trains::Train;
 use crate::usage::UsageView;
 
@@ -160,6 +168,221 @@ pub struct StateView {
     /// One usage row per billed identity, in panel order.
     #[serde(default)]
     pub usage: Vec<UsageView>,
+    /// What the governor knows about each repository, by alias. A
+    /// repository with the governor off carries an empty view.
+    #[serde(default)]
+    pub theory: BTreeMap<String, TheoryView>,
+}
+
+/// What the Theory view draws for one repository.
+///
+/// The daemon rebuilds it on every poll from the theory checkout commit,
+/// so it never outlives the files it describes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TheoryView {
+    /// Whether the governor runs for this repository.
+    #[serde(default)]
+    pub governor: bool,
+    /// The theory read error, empty when every file parsed.
+    #[serde(default)]
+    pub error: String,
+    /// The parsed model, empty when the model did not parse.
+    ///
+    /// This field replaces the flat `entries` view of C1. The full
+    /// prediction template runs in the interface and reads the relations
+    /// of each entry, and only the model carries them. The Theory view
+    /// still counts `model.entries` for its header strip.
+    #[serde(default)]
+    pub model: Model,
+    /// The areas of the verification map, in file order.
+    #[serde(default)]
+    pub areas: Vec<AreaView>,
+    /// The run skills, by surface.
+    #[serde(default)]
+    pub skills: BTreeMap<String, SurfaceView>,
+    /// The merged pull requests the daily sweep saw, newest first.
+    #[serde(default)]
+    pub merged: Vec<u64>,
+    /// The predictions the daemon refused, in refusal order. An entry
+    /// lives until a prediction of the same item posts.
+    #[serde(default)]
+    pub holds: Vec<HoldView>,
+    /// The blocks of each theory record the daemon read, by record key.
+    #[serde(default)]
+    pub records: BTreeMap<String, RecordView>,
+    /// The calibration share of the last daily sweep: the sure hits over
+    /// the sure slots. `None` until a sweep sees a sure slot.
+    #[serde(default)]
+    pub calibration: Option<f64>,
+    /// The record count that carries each ladder label, in rung order.
+    #[serde(default)]
+    pub rungs: [usize; 3],
+    /// The theory events of the last day, from the daily sweep.
+    #[serde(default)]
+    pub events_per_day: usize,
+    /// The model entries no change touched in `stale_days` days.
+    #[serde(default)]
+    pub stale_entries: Vec<String>,
+    /// One row per pull request whose record holds a delta, by pull
+    /// request number.
+    #[serde(default)]
+    pub deltas: Vec<DeltaView>,
+    /// The open record count and the window cap of the repository. A
+    /// cap of zero means the view carries no window, so the strip draws
+    /// no gauge.
+    #[serde(default)]
+    pub window: (usize, usize),
+    /// The cards of the day, in batch order. The daily sweep builds them
+    /// and a restart drops them until the next sweep.
+    #[serde(default)]
+    pub cards: Vec<CardView>,
+}
+
+/// Whether one delta still waits for the operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaState {
+    /// The record still carries `delta-open`.
+    #[default]
+    Open,
+    /// The operator removed the label, so the delta is through.
+    Closed,
+}
+
+/// One delta of one pull request, as the DELTAS panel draws it.
+///
+/// The daemon rebuilds it on every poll from the record blocks and the
+/// record labels, so a delta the operator closed leaves the panel at the
+/// next poll.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaView {
+    /// The pull request the delta belongs to.
+    #[serde(default)]
+    pub number: u64,
+    /// Whether the delta still waits for the operator.
+    #[serde(default)]
+    pub state: DeltaState,
+    /// One row per entry of a missed slot: the outcome name, one of
+    /// `sure-miss` and `unsure-miss`, and the entry the slot named.
+    #[serde(default)]
+    pub misses: Vec<(String, String)>,
+    /// The count of `sure-hit` slots.
+    #[serde(default)]
+    pub hits: usize,
+    /// The count of `unsure-hit` slots.
+    #[serde(default)]
+    pub unsure: usize,
+    /// The model rules the change broke: the entry and the finding.
+    #[serde(default)]
+    pub violations: Vec<(String, String)>,
+    /// The one question the review asked.
+    #[serde(default)]
+    pub question: String,
+}
+
+impl TheoryView {
+    /// True when the theory record of one item carries `label`.
+    ///
+    /// `key` is [`RecordKey::key_text`] and `item` the labels of the code
+    /// item. A record the daemon read answers for itself, because in
+    /// shadow mode the theory labels sit on the shadow issue. An item
+    /// with no record read yet answers from its own labels.
+    ///
+    /// [`RecordKey::key_text`]: crate::theory::records::RecordKey::key_text
+    pub fn record_carries(&self, key: &str, item: &[String], label: &str) -> bool {
+        match self.records.get(key) {
+            Some(record) => record.labels.iter().any(|one| one == label),
+            None => item.iter().any(|one| one == label),
+        }
+    }
+}
+
+/// One item the governor holds out of a stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldView {
+    /// The issue or pull request the hold names.
+    #[serde(default)]
+    pub number: u64,
+    /// Why the item waits, in one line.
+    #[serde(default)]
+    pub reason: String,
+    /// The stage the item waits for.
+    #[serde(default = "refine_stage")]
+    pub stage: Stage,
+}
+
+/// The stage of a hold that carries none, for a daemon older than C9.
+fn refine_stage() -> Stage {
+    Stage::Refine
+}
+
+/// The blocks of one theory record, as the first sight read them.
+///
+/// The daemon fetches the comments of a record once per label set and
+/// parses every block it knows. The UI never reads comments itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordView {
+    /// The last short prediction of the record.
+    #[serde(default)]
+    pub short: Option<ShortPrediction>,
+    /// The last full prediction of the record.
+    #[serde(default)]
+    pub full: Option<FullPrediction>,
+    /// The last delta of the record.
+    #[serde(default)]
+    pub delta: Option<DeltaBlock>,
+    /// Every theory event block of the record, in comment order.
+    ///
+    /// An answered event stays here. The answers say which event blocks
+    /// still wait for the operator.
+    #[serde(default)]
+    pub events: Vec<Event>,
+    /// The answers the operator posted on the record, in comment order.
+    #[serde(default)]
+    pub answers: Vec<AnswerBlock>,
+    /// The labels of the record itself.
+    ///
+    /// In shadow mode the theory labels live on the shadow issue, not on
+    /// the code ticket, so the interface reads them here. In code mode
+    /// they repeat the item labels.
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// One row of the AREAS panel.
+///
+/// The view ships the facts and the panel renders the mark, so the doctor
+/// can apply the same rule to the same numbers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AreaView {
+    #[serde(default)]
+    pub id: String,
+    /// The boundary entry of the model this area guards.
+    #[serde(default)]
+    pub boundary: String,
+    /// The highest tier of the surfaces that map to the area.
+    #[serde(default)]
+    pub tier: Tier,
+    /// The floor the operator set on the area.
+    #[serde(default)]
+    pub min_tier: Tier,
+    /// Whether a lint finding names a surface of the area.
+    #[serde(default)]
+    pub lint: bool,
+}
+
+/// One run skill, as the Theory view shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceView {
+    /// How far the surface's driver reaches.
+    #[serde(default)]
+    pub tier: Tier,
+    /// The feature ids of the surface, in path order.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// The lint findings of the surface, rendered.
+    #[serde(default)]
+    pub lint: Vec<String>,
 }
 
 /// The editable factory settings and their current file revision.
@@ -179,6 +402,11 @@ pub struct SettingsView {
     pub labels: LabelNames,
     /// The effective label names of every repository, by alias.
     pub repository_labels: BTreeMap<String, LabelNames>,
+    /// The theory settings of every repository, by alias.
+    pub repository_theory: BTreeMap<String, TheoryConfig>,
+    /// The skills checkout of every repository that set one, by alias. A
+    /// missing alias falls back to the theory checkout.
+    pub repository_skills: BTreeMap<String, String>,
     /// The label keys the global `[labels]` table sets, in key order.
     pub global_label_overrides: Vec<LabelKey>,
     /// The label keys each `[repo.<alias>.labels]` table sets, by alias.
@@ -223,6 +451,8 @@ struct SettingsViewRef<'a> {
     repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
     labels: &'a LabelNames,
     repository_labels: &'a BTreeMap<String, LabelNames>,
+    repository_theory: &'a BTreeMap<String, TheoryConfig>,
+    repository_skills: &'a BTreeMap<String, String>,
     global_label_overrides: &'a [LabelKey],
     repository_label_overrides: &'a BTreeMap<String, Vec<LabelKey>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -243,6 +473,10 @@ struct SettingsViewWire {
     labels: LabelNames,
     #[serde(default)]
     repository_labels: BTreeMap<String, LabelNames>,
+    #[serde(default)]
+    repository_theory: BTreeMap<String, TheoryConfig>,
+    #[serde(default)]
+    repository_skills: BTreeMap<String, String>,
     #[serde(default)]
     global_label_overrides: Vec<LabelKey>,
     #[serde(default)]
@@ -270,6 +504,8 @@ impl Serialize for SettingsView {
             repository_tag_routes: &self.repository_tag_routes,
             labels: &self.labels,
             repository_labels: &self.repository_labels,
+            repository_theory: &self.repository_theory,
+            repository_skills: &self.repository_skills,
             global_label_overrides: &self.global_label_overrides,
             repository_label_overrides: &self.repository_label_overrides,
             theory_global,
@@ -294,6 +530,8 @@ impl<'de> Deserialize<'de> for SettingsView {
             repository_tag_routes: wire.repository_tag_routes,
             labels: wire.labels,
             repository_labels: wire.repository_labels,
+            repository_theory: wire.repository_theory,
+            repository_skills: wire.repository_skills,
             global_label_overrides: wire.global_label_overrides,
             repository_label_overrides: wire.repository_label_overrides,
             prompts: wire.prompts,
@@ -302,6 +540,14 @@ impl<'de> Deserialize<'de> for SettingsView {
 }
 
 impl SettingsView {
+    /// The label names of one repository.
+    ///
+    /// An alias the daemon does not report falls back to the global set,
+    /// which is what a view without a repository wants.
+    pub fn labels_of(&self, repo: &str) -> &LabelNames {
+        self.repository_labels.get(repo).unwrap_or(&self.labels)
+    }
+
     /// Build the socket view from one validated configuration and the
     /// effective prompt templates.
     pub fn from_config(config: &Config, revision: &str, prompts: &[PromptView]) -> Result<Self> {
@@ -372,6 +618,20 @@ impl SettingsView {
             .keys()
             .map(|alias| (alias.clone(), config.resolved_labels(Some(alias))))
             .collect();
+        let repository_theory = config
+            .repos
+            .iter()
+            .map(|(alias, repo)| (alias.clone(), repo.theory.clone()))
+            .collect();
+        let repository_skills = config
+            .repos
+            .iter()
+            .filter_map(|(alias, repo)| {
+                repo.skills
+                    .as_ref()
+                    .map(|skills| (alias.clone(), skills.path.to_string_lossy().into_owned()))
+            })
+            .collect();
         let repository_label_overrides = config
             .repos
             .iter()
@@ -394,6 +654,8 @@ impl SettingsView {
             repository_tag_routes,
             labels: config.resolved_labels(None),
             repository_labels,
+            repository_theory,
+            repository_skills,
             global_label_overrides,
             repository_label_overrides,
             prompts: prompts.to_vec(),
@@ -652,7 +914,9 @@ pub struct StateInput<'a> {
     /// The effective prompt template of every role.
     pub prompts: &'a [PromptView],
     /// The immutable role binding of each bound task, keyed by task id.
-    pub role_bindings: &'a BTreeMap<String, ResolvedRoleSettings>,
+    pub role_bindings: &'a BTreeMap<String, TaskBinding>,
+    /// The Theory view of each repository, keyed by alias.
+    pub theory: &'a BTreeMap<String, TheoryView>,
     /// The current time in milliseconds since the Unix epoch.
     pub now_ms: u64,
 }
@@ -675,6 +939,7 @@ impl StateInput<'_> {
             usage,
             prompts,
             role_bindings,
+            theory,
             now_ms,
         } = *self;
         let repos = config
@@ -695,10 +960,16 @@ impl StateInput<'_> {
                     limit,
                     overridden: limit != config.stage(stage).limit,
                     running: running[&stage],
+                    // A measure task holds no stage slot, so it counts
+                    // neither as running nor as queued for one.
                     queued: table
                         .by_id
                         .values()
-                        .filter(|task| task.stage == stage && task.state == TaskState::Queued)
+                        .filter(|task| {
+                            task.stage == stage
+                                && task.state == TaskState::Queued
+                                && task.purpose != crate::tasks::TaskPurpose::Measure
+                        })
                         .count(),
                 }
             })
@@ -712,9 +983,17 @@ impl StateInput<'_> {
                 slots: *slots,
             })
             .collect();
+        // A measure task runs a command for a stage, not a stage of its
+        // own. The board draws the task it holds, so it stays out here.
         let tasks = table
             .order
             .iter()
+            .filter(|id| {
+                table
+                    .by_id
+                    .get(*id)
+                    .is_none_or(|task| task.purpose != crate::tasks::TaskPurpose::Measure)
+            })
             .map(|id| {
                 let task = table
                     .by_id
@@ -733,13 +1012,14 @@ impl StateInput<'_> {
                         .get(id)
                         .cloned()
                         .ok_or_else(|| anyhow!("task \"{id}\" has no input mode"))?,
-                    binding: role_bindings.get(id).map(|role| RoleBindingView {
-                        harness: role.settings.harness,
-                        model: role.settings.model.clone(),
-                        effort: role.settings.effort.clone(),
-                        tag_route: role.tag_route.clone(),
+                    binding: role_bindings.get(id).map(|binding| RoleBindingView {
+                        harness: binding.role.settings.harness,
+                        model: binding.role.settings.model.clone(),
+                        effort: binding.role.settings.effort.clone(),
+                        tag_route: binding.role.tag_route.clone(),
                     }),
                     queued_messages: 0,
+                    hold: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -867,6 +1147,7 @@ impl StateInput<'_> {
             paused,
             settings: SettingsView::from_config(config, settings_revision, prompts)?,
             usage: usage.to_vec(),
+            theory: theory.clone(),
         })
     }
 }
@@ -889,9 +1170,15 @@ fn decision_items(
                     push_item(&mut items, snapshot, &decision.repo, ItemKind::Pr, *number);
                 }
             }
+            crate::decisions::DecisionKind::DeltaHit { kind, number, .. }
+            | crate::decisions::DecisionKind::TheoryEvent { kind, number, .. } => {
+                push_item(&mut items, snapshot, &decision.repo, *kind, *number);
+            }
             crate::decisions::DecisionKind::Permission { .. }
             | crate::decisions::DecisionKind::Question { .. }
-            | crate::decisions::DecisionKind::Stuck { .. } => {}
+            | crate::decisions::DecisionKind::Stuck { .. }
+            | crate::decisions::DecisionKind::Card { .. }
+            | crate::decisions::DecisionKind::FirstRun { .. } => {}
         }
     }
     for train in trains {
@@ -1211,6 +1498,116 @@ pub struct TicketResult {
     pub conflict: Option<TicketConflict>,
 }
 
+/// One theory command inside [`Action::Theory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "theory_action", rename_all = "snake_case")]
+pub enum TheoryAction {
+    /// Create the run skill ticket of one repository surface.
+    Setup {
+        /// The repository alias.
+        repo: String,
+        /// The surface name the operator typed.
+        surface: String,
+    },
+    /// Explain one subject against the model and the skills.
+    Teach {
+        /// The repository alias.
+        repo: String,
+        /// The subject of the explanation.
+        key: crate::tasks::TeachKey,
+    },
+    /// Start one audit sweep over the model and the run skills.
+    Sweep {
+        /// The repository alias.
+        repo: String,
+    },
+    /// Take the full prediction of one refined ticket.
+    Predict {
+        /// The repository alias.
+        repo: String,
+        /// The ticket number.
+        number: u64,
+        /// The five slots the operator wrote.
+        prediction: FullPrediction,
+    },
+    /// Ask for the model worktree, so the UI can edit `theory/model.toml`.
+    ///
+    /// The daemon answers with one [`Push::ModelPath`] that carries the
+    /// same `request`, so only the UI that asked opens an editor.
+    EditModel {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+    },
+    /// Commit, push, and open the model pull request of one repository.
+    CommitModel {
+        /// The repository alias.
+        repo: String,
+    },
+    /// Start or reuse one theory conversation.
+    Chat {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// What the conversation is for.
+        purpose: ChatPurpose,
+        /// The subject of the conversation. A bootstrap chat names its
+        /// area.
+        key: String,
+    },
+}
+
+/// What one theory conversation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatPurpose {
+    /// Write the entries of one area the model does not cover.
+    Bootstrap,
+}
+
+/// The model worktree of one repository, as one edit-model reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPath {
+    /// The request identity from the UI.
+    pub request: String,
+    /// The repository alias.
+    pub repo: String,
+    /// The model worktree path. `theory/model.toml` lives under it.
+    pub path: PathBuf,
+}
+
+/// The request identity prefix of one model commit.
+///
+/// The daemon reports the outcome through [`Push::TicketResult`], the one
+/// result channel a GitHub mutation already has. The UI toasts a result
+/// that carries this prefix, because the operator asked for it in the
+/// Theory view and no ticket row waits for it.
+pub const MODEL_COMMIT_REQUEST: &str = "model-commit:";
+
+/// The request identity prefix of one run skill ticket creation.
+///
+/// The daemon reports the outcome through [`Push::TicketResult`], which is
+/// the one result channel a GitHub mutation already has. The UI toasts a
+/// result that carries this prefix, because the operator asked for it in
+/// the Theory view and no ticket row waits for it.
+pub const SKILL_TICKET_REQUEST: &str = "skill-ticket:";
+
+/// The request identity prefix of one ladder refusal.
+///
+/// The rung of a theory answer runs with no ticket row behind it, so a
+/// rung the daemon cannot climb reports through [`Push::TicketResult`]
+/// and the UI toasts the reason.
+pub const LADDER_REQUEST: &str = "ladder:";
+
+/// The request identity prefix of one prediction result.
+///
+/// The result rides [`Push::TicketResult`] like a run skill ticket does,
+/// and the UI toasts it. The operator pressed `r` or `p` in the pipeline
+/// view, so no ticket row waits for the answer.
+pub const PREDICTION_REQUEST: &str = "prediction:";
+
 /// One ticket command inside [`Action::Ticket`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "ticket_action", rename_all = "snake_case")]
@@ -1385,6 +1782,11 @@ pub struct TaskView {
     /// wire when empty, so an older daemon push still parses.
     #[serde(default)]
     pub binding: Option<RoleBindingView>,
+    /// Why the dispatch holds this queued task back, when one does. The
+    /// daemon sets `window full` on an implement task the theory window
+    /// refuses, and clears it when the window opens again.
+    #[serde(default)]
+    pub hold: Option<String>,
 }
 
 /// One release train in the state view.
@@ -1476,6 +1878,7 @@ pub struct SettingsResult {
 /// One message from the daemon to a UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Push {
     /// The whole current state.
     State(StateView),
@@ -1491,6 +1894,8 @@ pub enum Push {
     Ask(AskView),
     /// One settings save or reload result.
     SettingsResult(SettingsResult),
+    /// The model worktree path of one edit-model request.
+    ModelPath(ModelPath),
 }
 
 /// One command from a UI or from `aif stop` to the daemon.
@@ -1501,6 +1906,12 @@ pub enum Push {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     /// Queue a refine task for one item.
+    ///
+    /// On a governed repository the action carries the short prediction
+    /// the operator typed. The daemon posts it, labels the record, and
+    /// adds `to-refine`; the poll gate then queues the task. With the
+    /// governor off the prediction is absent and the daemon queues the
+    /// task itself.
     Refine {
         /// The repository alias.
         repo: String,
@@ -1508,6 +1919,9 @@ pub enum Action {
         kind: ItemKind,
         /// The issue or pull request number.
         number: u64,
+        /// The short prediction of a governed item.
+        #[serde(default)]
+        prediction: Option<ShortPrediction>,
     },
     /// Fetch the question comment of one `needs-human` item.
     ///
@@ -1598,6 +2012,8 @@ pub enum Action {
     },
     /// Perform one ticket review or mutation action.
     Ticket(TicketAction),
+    /// Perform one Theory view action.
+    Theory(TheoryAction),
     /// Save one role edit against an exact file revision.
     SaveSettings {
         /// The request identity from the UI.
@@ -2192,6 +2608,7 @@ impl Iterator for Pushes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ResolvedRoleSettings;
 
     const LEGACY_WIRE_PROTOCOL_REVISION: u32 = 2;
 
@@ -2329,6 +2746,7 @@ mod tests {
             },
             settings: SettingsView::default(),
             usage: Vec::new(),
+            theory: BTreeMap::new(),
         }
     }
 
@@ -2339,6 +2757,11 @@ mod tests {
                 repo: "borsuk".to_string(),
                 kind: ItemKind::Issue,
                 number: 142,
+                prediction: Some(ShortPrediction {
+                    kind: crate::theory::records::PREDICTION_SHORT.to_string(),
+                    text: "the poller parks on a 304".to_string(),
+                    areas: vec!["poll".to_string()],
+                }),
             },
             Action::Ask {
                 repo: "borsuk".to_string(),
@@ -2392,7 +2815,72 @@ mod tests {
             Action::TicketCreate {
                 repo: "qubitsok".to_string(),
             },
+            Action::Theory(TheoryAction::Setup {
+                repo: "borsuk".to_string(),
+                surface: "web".to_string(),
+            }),
             Action::Reconcile { repo: None },
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Area("web-checkout".to_string()),
+            }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Pr(7),
+            }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Delta(142),
+            }),
+            Action::Theory(TheoryAction::Teach {
+                repo: "borsuk".to_string(),
+                key: crate::tasks::TeachKey::Entry("INV-3".to_string()),
+            }),
+            Action::Theory(TheoryAction::Sweep {
+                repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::Predict {
+                repo: "borsuk".to_string(),
+                number: 142,
+                prediction: FullPrediction {
+                    kind: crate::theory::records::PREDICTION_FULL.to_string(),
+                    slots: crate::theory::records::PREDICTION_SLOT_NAMES
+                        .iter()
+                        .map(|name| crate::theory::records::PredictionSlot {
+                            name: (*name).to_string(),
+                            entries: vec!["B-checkout".to_string()],
+                            tag: crate::theory::records::PredictionTag::Sure,
+                        })
+                        .collect(),
+                },
+            }),
+            Action::Answer {
+                decision_id: "delta:borsuk:p7".to_string(),
+                response: crate::decisions::Response::Confirm,
+            },
+            Action::Answer {
+                decision_id: "theory:borsuk:p7:invariants".to_string(),
+                response: crate::decisions::Response::Theory {
+                    cause: crate::theory::answers::Cause::Model,
+                    entry: "INV-3".to_string(),
+                    rung: 2,
+                    area: "web-checkout".to_string(),
+                    note: String::new(),
+                },
+            },
+            Action::Theory(TheoryAction::EditModel {
+                request: "edit-model-1".to_string(),
+                repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::CommitModel {
+                repo: "borsuk".to_string(),
+            }),
+            Action::Theory(TheoryAction::Chat {
+                request: "chat-gh".to_string(),
+                repo: "borsuk".to_string(),
+                purpose: ChatPurpose::Bootstrap,
+                key: "gh".to_string(),
+            }),
             Action::Stop,
         ]
     }
@@ -2526,6 +3014,7 @@ mod tests {
             usage: &[],
             prompts: &prompts,
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -2573,6 +3062,29 @@ mod tests {
         assert!(view.repository_tag_routes.is_empty());
     }
 
+    /// A daemon that predates the settings theory and skills fields sends
+    /// a state view without them. The wire defaults must give the empty
+    /// maps, so the settings panel stays usable against an old push.
+    #[test]
+    fn a_settings_view_without_the_theory_and_skills_fields_parses_with_empty_maps() {
+        let mut value = serde_json::to_value(sample_view(1)).unwrap();
+        let settings = value
+            .as_object_mut()
+            .unwrap()
+            .get_mut("settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        settings.remove("repository_theory");
+        settings.remove("repository_skills");
+        let text = serde_json::to_string(&value).unwrap();
+
+        let view: StateView = serde_json::from_str(&text).unwrap();
+
+        assert!(view.settings.repository_theory.is_empty(), "{text}");
+        assert!(view.settings.repository_skills.is_empty(), "{text}");
+    }
+
     /// The settings view writes the theory roles into their own wire field
     /// and the prompts into a third. One round trip must return every role
     /// in role order and every prompt, so neither field eats the other.
@@ -2617,6 +3129,32 @@ mod tests {
             )),
             "a theory role carries no prompt"
         );
+    }
+
+    /// The settings view carries the theory config and the skills checkout
+    /// of every repository, so the panel can warn about the governor and
+    /// edit the checkout. The wire keeps both across a round trip.
+    #[test]
+    fn the_settings_view_ships_the_repository_theory_and_skills() {
+        let text = config_text().replace("[repo.borsuk]\n", "[repo.borsuk]\ngovernor = \"off\"\n");
+        let text = format!("{}\n[repo.borsuk.skills]\npath = \"/tmp/skills\"\n", text);
+        let config = Config::parse(&text).unwrap();
+        let view = SettingsView::from_config(&config, "content-revision", &[]).unwrap();
+
+        assert_eq!(
+            view.repository_theory["borsuk"].governor,
+            crate::config::Governor::Off
+        );
+        assert_eq!(
+            view.repository_theory["qubitsok"].governor,
+            crate::config::Governor::On
+        );
+        assert_eq!(view.repository_skills["borsuk"], "/tmp/skills");
+        assert!(!view.repository_skills.contains_key("qubitsok"));
+
+        let wire = serde_json::to_string(&view).unwrap();
+        let parsed: SettingsView = serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed, view, "wire: {wire}");
     }
 
     #[test]
@@ -2694,7 +3232,91 @@ mod tests {
 
     #[test]
     fn a_state_view_round_trips_through_json() {
+        let mut theory = BTreeMap::new();
+        theory.insert(
+            "borsuk".to_string(),
+            TheoryView {
+                governor: true,
+                error: String::new(),
+                model: Model {
+                    entries: vec![crate::theory::model::Entry::Boundary {
+                        id: "B-checkout".to_string(),
+                        title: "checkout".to_string(),
+                        statement: "the cart pays".to_string(),
+                        sides: vec!["web".to_string(), "api".to_string()],
+                        paths: vec!["web/**".to_string()],
+                    }],
+                },
+                deltas: vec![DeltaView {
+                    number: 7,
+                    state: DeltaState::Open,
+                    misses: vec![("sure-miss".to_string(), "INV-3".to_string())],
+                    hits: 4,
+                    unsure: 0,
+                    violations: vec![(
+                        "INV-3".to_string(),
+                        "the retry crosses the boundary".to_string(),
+                    )],
+                    question: "Does the cart keep the token?".to_string(),
+                }],
+                holds: vec![HoldView {
+                    number: 142,
+                    reason: "awaits full prediction".to_string(),
+                    stage: Stage::Implement,
+                }],
+                records: BTreeMap::from([(
+                    "pr-7".to_string(),
+                    RecordView {
+                        short: None,
+                        full: None,
+                        delta: Some(DeltaBlock {
+                            slots: vec![DeltaSlot {
+                                id: "invariants".to_string(),
+                                outcome: DeltaOutcome::Miss,
+                                tag: PredictionTag::Sure,
+                            }],
+                            touched: vec!["INV-3".to_string()],
+                            violations: vec![DeltaViolation {
+                                entry: "INV-3".to_string(),
+                                finding: "the retry crosses the boundary".to_string(),
+                            }],
+                            question: "Does the cart keep the token?".to_string(),
+                        }),
+                        labels: vec![crate::theory::records::DELTA_OPEN_LABEL.to_string()],
+                        ..RecordView::default()
+                    },
+                )]),
+                areas: vec![AreaView {
+                    id: "web-checkout".to_string(),
+                    boundary: "B-checkout".to_string(),
+                    tier: Tier::Browser,
+                    min_tier: Tier::Http,
+                    lint: true,
+                }],
+                skills: BTreeMap::from([(
+                    "web".to_string(),
+                    SurfaceView {
+                        tier: Tier::Browser,
+                        features: vec!["checkout".to_string()],
+                        lint: vec!["features/x.md: area nope unknown".to_string()],
+                    },
+                )]),
+                window: (2, 3),
+                calibration: Some(0.7),
+                rungs: [2, 5, 3],
+                events_per_day: 4,
+                stale_entries: vec!["INV-9".to_string()],
+                merged: vec![9, 7],
+                cards: vec![CardView {
+                    source: crate::theory::cards::MERGED_PR_SOURCE.to_string(),
+                    prompt: "PR #7 merged. Which entries changed, and how?".to_string(),
+                    number: Some(7),
+                    entry: None,
+                }],
+            },
+        );
         let view = StateView {
+            theory,
             decisions: vec![crate::decisions::Decision::release_gate(
                 "borsuk",
                 vec![7, 9],
@@ -2721,7 +3343,35 @@ mod tests {
         let text = serde_json::to_string(&push).unwrap();
         assert!(text.contains("\"type\":\"state\""), "line: {text}");
         assert!(text.contains("\"usage\":["), "line: {text}");
+        assert!(text.contains("\"tier\":\"browser\""), "line: {text}");
+        assert!(text.contains("\"sure-miss\""), "line: {text}");
+        assert!(text.contains("\"state\":\"open\""), "line: {text}");
+        assert!(text.contains("\"outcome\":\"miss\""), "line: {text}");
+        assert!(text.contains("\"tag\":\"sure\""), "line: {text}");
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn a_state_view_without_the_theory_field_parses_with_an_empty_map() {
+        let mut value = serde_json::to_value(sample_view(1)).unwrap();
+        value.as_object_mut().unwrap().remove("theory");
+        let text = serde_json::to_string(&value).unwrap();
+
+        let view: StateView = serde_json::from_str(&text).unwrap();
+
+        assert!(view.theory.is_empty());
+
+        let partial = serde_json::json!({"governor": true});
+        let one: TheoryView = serde_json::from_value(partial).unwrap();
+        assert!(one.governor);
+        assert!(one.model.entries.is_empty());
+        assert!(one.areas.is_empty());
+        assert!(one.skills.is_empty());
+        assert_eq!(one.error, "");
+        assert_eq!(one.calibration, None);
+        assert_eq!(one.rungs, [0, 0, 0]);
+        assert_eq!(one.events_per_day, 0);
+        assert!(one.stale_entries.is_empty());
     }
 
     #[test]
@@ -2891,6 +3541,23 @@ mod tests {
     }
 
     #[test]
+    fn a_model_path_push_round_trips_and_carries_the_request() {
+        let push = Push::ModelPath(ModelPath {
+            request: "edit-model-1".to_string(),
+            repo: "borsuk".to_string(),
+            path: PathBuf::from("/state/worktrees/borsuk/model"),
+        });
+
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert_eq!(
+            text,
+            "{\"type\":\"model_path\",\"request\":\"edit-model-1\",\"repo\":\"borsuk\",\"path\":\"/state/worktrees/borsuk/model\"}"
+        );
+        assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
     fn an_ask_push_round_trips_through_json_with_the_documented_tags() {
         let push = Push::Ask(AskView {
             repo: "borsuk".to_string(),
@@ -3031,6 +3698,7 @@ mod tests {
             input: InputMode::NextTurn,
             queued_messages: 2,
             binding: None,
+            hold: None,
         });
         let text = serde_json::to_string(&Push::State(view.clone())).unwrap();
         assert!(
@@ -3064,15 +3732,17 @@ mod tests {
                     matches: Vec::new(),
                 }),
             }),
+            hold: None,
         };
 
         let text = serde_json::to_string(&task).unwrap();
         assert_eq!(serde_json::from_str::<TaskView>(&text).unwrap(), task);
 
-        // An old daemon ships no binding field; the parse falls back to
-        // none and the header keeps today's line.
+        // An old daemon ships no binding and no hold field; the parse
+        // falls back to none and the header keeps today's line.
         let mut old = serde_json::to_value(&task).unwrap();
         old.as_object_mut().unwrap().remove("binding");
+        old.as_object_mut().unwrap().remove("hold");
         let parsed = serde_json::from_value::<TaskView>(old).unwrap();
         let mut expected = task;
         expected.binding = None;
@@ -3130,7 +3800,13 @@ mod tests {
             },
         };
         let mut role_bindings = BTreeMap::new();
-        role_bindings.insert(bound.id.clone(), binding);
+        role_bindings.insert(
+            bound.id.clone(),
+            TaskBinding {
+                role: binding,
+                model_commit: None,
+            },
+        );
         let mut input_modes = BTreeMap::new();
         input_modes.insert(bound.id.clone(), InputMode::NextTurn);
         input_modes.insert(queued.id.clone(), InputMode::Live);
@@ -3150,6 +3826,7 @@ mod tests {
             prompts: &[],
             role_bindings: &role_bindings,
             usage: &[],
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -3200,6 +3877,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -3344,6 +4022,7 @@ mod tests {
             repo: "borsuk".to_string(),
             kind: ItemKind::Issue,
             number: 142,
+            prediction: None,
         };
         client.send(&action).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), action);
@@ -3371,6 +4050,7 @@ mod tests {
             input: InputMode::NextTurn,
             queued_messages: 1,
             binding: None,
+            hold: None,
         });
         server.publish(second.clone());
         assert_eq!(pushes.next().unwrap().unwrap(), Push::State(second.clone()));
@@ -3492,6 +4172,7 @@ mod tests {
             },
             settings: SettingsView::default(),
             usage: Vec::new(),
+            theory: Default::default(),
         };
         let text = serde_json::to_string(&view).unwrap();
         let back: StateView = serde_json::from_str(&text).unwrap();
@@ -3559,6 +4240,7 @@ mod tests {
             input_modes: &input_modes,
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             usage: &[],
             now_ms: 0,
         }
@@ -3875,6 +4557,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -3943,6 +4626,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 1_000,
         }
         .build()
@@ -4051,6 +4735,7 @@ mod tests {
             input_modes: &BTreeMap::new(),
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             usage: &[],
@@ -4148,6 +4833,7 @@ mod tests {
             input_modes: &BTreeMap::new(),
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             snapshot: &snapshot,
             links: &BTreeMap::new(),
             usage: &[],
@@ -4194,6 +4880,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 0,
         }
         .build()
@@ -4232,6 +4919,23 @@ mod tests {
                 3_000,
             )
             .unwrap();
+        // A fast check carries the review stage for its worktree only. It
+        // holds no review slot, so no stage row counts it and no board row
+        // draws it; the build therefore never looks its input mode up.
+        table
+            .upsert_with_id(
+                crate::tasks::ScopedTask {
+                    id: "borsuk/fast-aabbccdd-checkout",
+                    repo: "borsuk",
+                    stage: Stage::Review,
+                    kind: ItemKind::Pr,
+                    number: 5,
+                },
+                PathBuf::from("/state/logs/borsuk__fast-aabbccdd-checkout.jsonl"),
+                3_500,
+            )
+            .unwrap()
+            .purpose = crate::tasks::TaskPurpose::Measure;
 
         let mut decisions = Decisions::new();
         decisions
@@ -4291,6 +4995,7 @@ mod tests {
             usage: &[],
             prompts: &[],
             role_bindings: &BTreeMap::new(),
+            theory: &BTreeMap::new(),
             now_ms: 120_000,
         }
         .build()
@@ -4326,6 +5031,20 @@ mod tests {
         assert!(!refine.overridden);
         assert_eq!(refine.running, 0);
         assert_eq!(refine.queued, 1);
+        let review = &view.stages[2];
+        assert_eq!(review.stage, Stage::Review);
+        assert_eq!(review.running, 0);
+        assert_eq!(
+            review.queued, 0,
+            "the queued fast check holds no review slot"
+        );
+        assert_eq!(
+            view.tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["borsuk/implement-i142", "qubitsok/refine-i7"]
+        );
 
         // The lane reservation of borsuk on implement appears.
         assert_eq!(

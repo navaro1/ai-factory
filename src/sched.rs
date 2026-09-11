@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::config::Config;
 use crate::model::Stage;
-use crate::tasks::{TaskState, TaskTable};
+use crate::tasks::{TaskPurpose, TaskState, TaskTable};
 
 /// A task id, as [`TaskTable`] keys it.
 pub type TaskId = String;
@@ -25,6 +25,8 @@ pub struct Limits {
     /// How many slots of one stage stay reserved for one repository, even
     /// when that repository has nothing to run.
     pub lanes: BTreeMap<(Stage, String), usize>,
+    /// How many measure tasks may run at once, over every repository.
+    pub measure: usize,
 }
 
 impl Limits {
@@ -44,7 +46,11 @@ impl Limits {
                 lanes.insert((*lane_stage, repo.alias.clone()), *count);
             }
         }
-        Limits { stage, lanes }
+        Limits {
+            stage,
+            lanes,
+            measure: config.measure.limit,
+        }
     }
 
     /// The limit of one stage.
@@ -84,6 +90,9 @@ pub enum Reason {
     LaneBlocked,
     /// The operator paused this task, lane, stage, or the whole factory.
     Paused,
+    /// The open theory records of the repository reached the window cap,
+    /// so the implement work of that repository waits.
+    WindowFull,
 }
 
 /// What the operator paused.
@@ -156,18 +165,47 @@ impl Paused {
 /// The repository's own reservation never works against itself. Queued,
 /// awaiting, and terminal tasks hold no slot; the reservation of a repository
 /// stays blocked for others even while that repository has nothing to run.
+///
+/// The `window` map holds the open record count and the cap of every
+/// governed repository. An implement task of a repository whose open
+/// count is at or above its cap reports `Verdict::No(Reason::WindowFull)`
+/// before the capacity check. Refine and review tasks never refuse for
+/// the window, and a repository absent from the map never refuses.
+#[allow(clippy::too_many_arguments)]
 pub fn can_start(
     limits: &Limits,
     paused: &Paused,
     table: &TaskTable,
+    window: &BTreeMap<String, (usize, usize)>,
     stage: Stage,
     repo: &str,
     task: &str,
+    purpose: &TaskPurpose,
 ) -> Verdict {
     if paused.blocks_task(stage, repo, task) {
         return Verdict::No(Reason::Paused);
     }
+    if *purpose == TaskPurpose::Measure {
+        return if table.running_measure() >= limits.measure {
+            Verdict::No(Reason::StageFull)
+        } else {
+            Verdict::Yes
+        };
+    }
+    if window_full(window, stage, repo) {
+        return Verdict::No(Reason::WindowFull);
+    }
     capacity_verdict(limits, table, stage, repo)
+}
+
+/// True when the window of one repository refuses its implement tasks.
+///
+/// The map holds the open record count and the cap of each governed
+/// repository, the way the daemon builds it. A repository absent from
+/// the map, and every task of a stage other than implement, never
+/// refuses.
+pub fn window_full(window: &BTreeMap<String, (usize, usize)>, stage: Stage, repo: &str) -> bool {
+    stage == Stage::Implement && window.get(repo).is_some_and(|(open, cap)| open >= cap)
 }
 
 /// The capacity result for one repository lane, without a pause check.
@@ -202,7 +240,12 @@ fn capacity_verdict(limits: &Limits, table: &TaskTable, stage: Stage, repo: &str
 /// task that may start. It never reorders: an earlier task that may start
 /// always wins over a later one, so a later task from another repository
 /// never starves the head of the queue.
-pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Option<TaskId> {
+pub fn next_dispatch(
+    limits: &Limits,
+    table: &TaskTable,
+    paused: &Paused,
+    window: &BTreeMap<String, (usize, usize)>,
+) -> Option<TaskId> {
     for id in &table.order {
         let Some(task) = table.by_id.get(id) else {
             continue;
@@ -211,7 +254,16 @@ pub fn next_dispatch(limits: &Limits, table: &TaskTable, paused: &Paused) -> Opt
             continue;
         }
         if matches!(
-            can_start(limits, paused, table, task.stage, &task.repo, &task.id),
+            can_start(
+                limits,
+                paused,
+                table,
+                window,
+                task.stage,
+                &task.repo,
+                &task.id,
+                &task.purpose,
+            ),
             Verdict::Yes
         ) {
             return Some(task.id.clone());
@@ -262,6 +314,7 @@ mod tests {
                 .iter()
                 .map(|(stage, repo, count)| ((*stage, repo.to_string()), *count))
                 .collect(),
+            measure: 2,
         }
     }
 
@@ -270,7 +323,13 @@ mod tests {
         limits(&[(Stage::Implement, 3)], &[])
     }
 
-    /// Check capacity with a task that has no exact pause state.
+    /// The empty window map: no repository is governed, so nothing
+    /// refuses for the window.
+    fn no_window() -> BTreeMap<String, (usize, usize)> {
+        BTreeMap::new()
+    }
+
+    /// Check capacity with a pipeline task that has no exact pause state.
     fn can_start(
         limits: &Limits,
         paused: &Paused,
@@ -278,7 +337,16 @@ mod tests {
         stage: Stage,
         repo: &str,
     ) -> Verdict {
-        super::can_start(limits, paused, table, stage, repo, "test-task")
+        super::can_start(
+            limits,
+            paused,
+            table,
+            &no_window(),
+            stage,
+            repo,
+            "test-task",
+            &TaskPurpose::Pipeline,
+        )
     }
 
     /// A table with one queued implement task per `(repo, number)`.
@@ -314,10 +382,10 @@ mod tests {
         let (mut table, ids) =
             queued_implement(&[("qubitsok", 1), ("qubitsok", 2), ("qubitsok", 3)]);
 
-        let first = next_dispatch(&limits, &table, &Paused::default()).unwrap();
+        let first = next_dispatch(&limits, &table, &Paused::default(), &no_window()).unwrap();
         assert_eq!(first, ids[0]);
         start(&mut table, &first);
-        let second = next_dispatch(&limits, &table, &Paused::default()).unwrap();
+        let second = next_dispatch(&limits, &table, &Paused::default(), &no_window()).unwrap();
         assert_eq!(second, ids[1]);
         start(&mut table, &second);
 
@@ -331,7 +399,10 @@ mod tests {
             ),
             Verdict::No(Reason::LaneBlocked)
         );
-        assert_eq!(next_dispatch(&limits, &table, &Paused::default()), None);
+        assert_eq!(
+            next_dispatch(&limits, &table, &Paused::default(), &no_window()),
+            None
+        );
     }
 
     /// The reserving repository takes its slot at once when its work arrives.
@@ -363,7 +434,7 @@ mod tests {
             Verdict::Yes
         );
         assert_eq!(
-            next_dispatch(&limits, &table, &Paused::default()),
+            next_dispatch(&limits, &table, &Paused::default(), &no_window()),
             Some(ids[2].clone())
         );
     }
@@ -386,7 +457,7 @@ mod tests {
                 ),
                 Verdict::Yes
             );
-            let next = next_dispatch(&limits, &table, &Paused::default()).unwrap();
+            let next = next_dispatch(&limits, &table, &Paused::default(), &no_window()).unwrap();
             assert_eq!(&next, id);
             start(&mut table, &next);
         }
@@ -447,7 +518,7 @@ mod tests {
             global: true,
             ..Paused::default()
         };
-        assert_eq!(next_dispatch(&limits, &table, &global), None);
+        assert_eq!(next_dispatch(&limits, &table, &global, &no_window()), None);
         assert_eq!(
             can_start(&limits, &global, &table, Stage::Implement, "borsuk"),
             Verdict::No(Reason::Paused)
@@ -457,7 +528,7 @@ mod tests {
             stages: BTreeMap::from([(Stage::Implement, true)]),
             ..Paused::default()
         };
-        assert_eq!(next_dispatch(&limits, &table, &stage), None);
+        assert_eq!(next_dispatch(&limits, &table, &stage, &no_window()), None);
         assert_eq!(
             can_start(&limits, &stage, &table, Stage::Implement, "qubitsok"),
             Verdict::No(Reason::Paused)
@@ -472,7 +543,7 @@ mod tests {
             Verdict::No(Reason::Paused)
         );
         assert_eq!(
-            next_dispatch(&limits, &table, &repo),
+            next_dispatch(&limits, &table, &repo, &no_window()),
             Some(ids[1].clone()),
             "the paused lane is skipped, the free one still dispatches"
         );
@@ -488,7 +559,10 @@ mod tests {
             ),
             Verdict::Yes
         );
-        assert_eq!(next_dispatch(&limits, &table, &none), Some(ids[0].clone()));
+        assert_eq!(
+            next_dispatch(&limits, &table, &none, &no_window()),
+            Some(ids[0].clone())
+        );
     }
 
     #[test]
@@ -555,7 +629,7 @@ mod tests {
             ..Paused::default()
         };
         assert_eq!(
-            next_dispatch(&limits, &table, &paused),
+            next_dispatch(&limits, &table, &paused, &no_window()),
             Some(refine),
             "the refine task dispatches while implement is paused"
         );
@@ -574,12 +648,15 @@ mod tests {
         ]);
 
         for id in &ids {
-            let next = next_dispatch(&limits, &table, &Paused::default())
+            let next = next_dispatch(&limits, &table, &Paused::default(), &no_window())
                 .unwrap_or_else(|| panic!("task {id} must stay dispatchable"));
             assert_eq!(&next, id, "the head task must never be passed over");
             start(&mut table, &next);
         }
-        assert_eq!(next_dispatch(&limits, &table, &Paused::default()), None);
+        assert_eq!(
+            next_dispatch(&limits, &table, &Paused::default(), &no_window()),
+            None
+        );
     }
 
     /// The stage limit binds before the lanes; the lanes bind before free
@@ -620,6 +697,102 @@ mod tests {
         assert_eq!(
             can_start(&lanes, &Paused::default(), &table, Stage::Implement, "c"),
             Verdict::No(Reason::LaneBlocked)
+        );
+    }
+
+    /// The window refuses the implement tasks of a repository at its cap,
+    /// while the review tasks of the same repository keep going.
+    #[test]
+    fn a_full_window_refuses_implement_and_admits_review() {
+        let limits = limits(&[(Stage::Implement, 3), (Stage::Review, 3)], &[]);
+        let full = BTreeMap::from([("borsuk".to_string(), (3usize, 3usize))]);
+        let table = TaskTable::new();
+
+        assert_eq!(
+            super::can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                &full,
+                Stage::Implement,
+                "borsuk",
+                "borsuk/implement-i142",
+                &TaskPurpose::Pipeline,
+            ),
+            Verdict::No(Reason::WindowFull)
+        );
+        assert_eq!(
+            super::can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                &full,
+                Stage::Review,
+                "borsuk",
+                "borsuk/review-p5",
+                &TaskPurpose::Pipeline,
+            ),
+            Verdict::Yes,
+            "review never waits for the window"
+        );
+
+        let room = BTreeMap::from([("borsuk".to_string(), (2usize, 3usize))]);
+        assert_eq!(
+            super::can_start(
+                &limits,
+                &Paused::default(),
+                &table,
+                &room,
+                Stage::Implement,
+                "borsuk",
+                "borsuk/implement-i142",
+                &TaskPurpose::Pipeline,
+            ),
+            Verdict::Yes
+        );
+    }
+
+    /// The dispatch walk passes a windowed implement task over and starts
+    /// the review task behind it.
+    #[test]
+    fn next_dispatch_skips_a_windowed_implement_task() {
+        let limits = limits(&[(Stage::Implement, 3), (Stage::Review, 3)], &[]);
+        let window = BTreeMap::from([("borsuk".to_string(), (3usize, 3usize))]);
+        let mut table = TaskTable::new();
+        let implement = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Implement,
+                ItemKind::Issue,
+                142,
+                PathBuf::from("log"),
+                NOW,
+            )
+            .unwrap()
+            .id
+            .clone();
+        let review = table
+            .upsert_queued(
+                "borsuk",
+                Stage::Review,
+                ItemKind::Pr,
+                5,
+                PathBuf::from("log"),
+                NOW,
+            )
+            .unwrap()
+            .id
+            .clone();
+
+        assert_eq!(
+            next_dispatch(&limits, &table, &Paused::default(), &window),
+            Some(review),
+            "the windowed implement task waits, the review task starts"
+        );
+        assert_eq!(
+            next_dispatch(&limits, &table, &Paused::default(), &no_window()),
+            Some(implement),
+            "with no window the implement task starts"
         );
     }
 
@@ -671,6 +844,68 @@ mod tests {
         assert_eq!(limits.reserve(Stage::Review, "borsuk"), 0);
     }
 
+    /// The `[measure]` limit caps the measure tasks and nothing else.
+    #[test]
+    fn the_measure_limit_caps_measure_tasks_alone() {
+        let text = concat!(
+            "schema_version = 1\n",
+            "[stage.refine]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[stage.implement]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 3\n",
+            "[stage.review]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 3\n",
+            "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[ticket.create]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[measure]\nlimit = 2\n",
+            "[repo.borsuk]\npath = \"/tmp/b\"\n",
+        );
+        let limits = Limits::from_config(&Config::parse(text).unwrap());
+        assert_eq!(limits.measure, 2);
+
+        let mut table = TaskTable::new();
+        let mut ids = Vec::new();
+        for number in 1..=3u64 {
+            let id = format!("borsuk/fast-aabbccdd-f{number}");
+            let task = table
+                .upsert_with_id(
+                    crate::tasks::ScopedTask {
+                        id: &id,
+                        repo: "borsuk",
+                        stage: Stage::Review,
+                        kind: ItemKind::Pr,
+                        number: 7,
+                    },
+                    PathBuf::from("log"),
+                    NOW,
+                )
+                .unwrap();
+            task.purpose = TaskPurpose::Measure;
+            ids.push(id);
+        }
+        let measure = |table: &TaskTable, id: &str| {
+            super::can_start(
+                &limits,
+                &Paused::default(),
+                table,
+                &no_window(),
+                Stage::Review,
+                "borsuk",
+                id,
+                &TaskPurpose::Measure,
+            )
+        };
+
+        assert_eq!(measure(&table, &ids[0]), Verdict::Yes);
+        start(&mut table, &ids[0]);
+        start(&mut table, &ids[1]);
+
+        assert_eq!(measure(&table, &ids[2]), Verdict::No(Reason::StageFull));
+        assert_eq!(
+            can_start(&limits, &Paused::default(), &table, Stage::Review, "borsuk"),
+            Verdict::Yes,
+            "two running measure tasks hold no review slot"
+        );
+    }
+
     /// Only queued tasks dispatch.
     #[test]
     fn next_dispatch_skips_tasks_that_are_not_queued() {
@@ -681,7 +916,10 @@ mod tests {
             .transition(&ids[0], TaskState::AwaitingUser, NOW + 2)
             .unwrap();
 
-        assert_eq!(next_dispatch(&limits, &table, &Paused::default()), None);
+        assert_eq!(
+            next_dispatch(&limits, &table, &Paused::default(), &no_window()),
+            None
+        );
         assert_eq!(
             can_start(
                 &limits,
@@ -733,7 +971,7 @@ mod tests {
     fn an_empty_table_yields_no_dispatch() {
         let limits = plain_limits();
         assert_eq!(
-            next_dispatch(&limits, &TaskTable::new(), &Paused::default()),
+            next_dispatch(&limits, &TaskTable::new(), &Paused::default(), &no_window()),
             None
         );
         assert_eq!(

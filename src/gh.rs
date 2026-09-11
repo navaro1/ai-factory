@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -15,6 +17,9 @@ use crate::sock::RepoLabel;
 
 /// The page size every list request asks for.
 const PAGE_SIZE: usize = 100;
+
+/// How many open pull requests one `gh pr list` call asks for.
+pub const PR_LIST_LIMIT: &str = "200";
 
 /// The server refused the call and named a wait in its `Retry-After` head.
 ///
@@ -58,6 +63,32 @@ pub struct IssueComment {
     pub body: String,
 }
 
+/// One row of the repository record list: one issue or one pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordRow {
+    /// The issue or pull request number.
+    pub number: u64,
+    /// The label names on the record.
+    pub labels: Vec<String>,
+    /// Whether the row is a pull request.
+    pub pull_request: bool,
+    /// The merge moment of a merged pull request, as GitHub reports it.
+    /// `None` for an issue and for a pull request that never merged.
+    pub merged_at: Option<String>,
+    /// The body of the record, empty when the row carries none. A pull
+    /// request body names the tickets the merge closes.
+    pub body: String,
+}
+
+/// One comment page with the ETag the next call sends back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentPage {
+    /// The ETag of the page; the caller passes it back as `If-None-Match`.
+    pub etag: Option<String>,
+    /// The comments of the page, oldest first.
+    pub comments: Vec<IssueComment>,
+}
+
 /// Which GitHub list a page belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ListKind {
@@ -92,6 +123,34 @@ struct CachedPage<T> {
     items: BTreeMap<u64, T>,
 }
 
+/// What the reader remembers about one comment page.
+#[derive(Debug, Clone)]
+struct CachedComments {
+    /// The ETag of the last 200 answer.
+    etag: Option<String>,
+    /// The mapped comments of the page.
+    comments: Vec<IssueComment>,
+}
+
+/// The exec a client runs its calls through.
+///
+/// A poller borrows its exec for the length of one poll. A holder that
+/// keeps a client alive across calls, such as the daemon's theory client,
+/// owns the exec as an [`Arc`] instead.
+enum ExecSource<'a> {
+    Borrowed(&'a dyn Exec),
+    Owned(Arc<dyn Exec>),
+}
+
+impl Exec for ExecSource<'_> {
+    fn run(&self, program: &str, args: &[&str], cwd: Option<&Path>) -> anyhow::Result<CmdOut> {
+        match self {
+            Self::Borrowed(exec) => exec.run(program, args, cwd),
+            Self::Owned(exec) => exec.run(program, args, cwd),
+        }
+    }
+}
+
 /// A GitHub reader for one poller thread.
 ///
 /// The client runs `gh api` through the [`Exec`] indirection and remembers,
@@ -99,19 +158,49 @@ struct CachedPage<T> {
 /// The next request for that page sends
 /// `If-None-Match`. A page that answers 304 keeps its cache entry.
 pub struct GhClient<'a> {
-    exec: &'a dyn Exec,
+    exec: ExecSource<'a>,
     issue_pages: BTreeMap<(String, u64), CachedPage<Issue>>,
     pull_pages: BTreeMap<(String, u64), CachedPage<Pr>>,
+    comment_pages: BTreeMap<(String, u64), CachedComments>,
 }
 
 impl<'a> GhClient<'a> {
     /// A client with an empty page cache.
     pub fn new(exec: &'a dyn Exec) -> Self {
         GhClient {
-            exec,
+            exec: ExecSource::Borrowed(exec),
             issue_pages: BTreeMap::new(),
             pull_pages: BTreeMap::new(),
+            comment_pages: BTreeMap::new(),
         }
+    }
+
+    /// A client that owns its exec, so a caller can hold it across calls.
+    pub fn new_owned(exec: Arc<dyn Exec>) -> GhClient<'static> {
+        GhClient {
+            exec: ExecSource::Owned(exec),
+            issue_pages: BTreeMap::new(),
+            pull_pages: BTreeMap::new(),
+            comment_pages: BTreeMap::new(),
+        }
+    }
+
+    /// The GitHub login of the account the `gh` CLI runs as.
+    ///
+    /// One call answers `gh api user`. The caller caches the answer, so
+    /// the login costs one call per daemon run.
+    pub fn viewer_login(&self) -> Result<String> {
+        let out = self
+            .exec
+            .run("gh", &["api", "user"], None)
+            .context("gh api user failed to run")?;
+        if out.status != 0 {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            bail!("gh api user exited with status {}: {detail}", out.status);
+        }
+        let body: Value =
+            serde_json::from_str(&out.stdout).context("gh api user returned a broken body")?;
+        Ok(str_field(&body, "login")?.to_string())
     }
 
     /// Fetch the open issues of `owner_repo` and follow pagination.
@@ -121,7 +210,7 @@ impl<'a> GhClient<'a> {
     /// on while the cached flags of that page know a next page.
     pub fn fetch_issues(&mut self, owner_repo: &str) -> Result<Collection<Issue>> {
         Self::fetch_list(
-            self.exec,
+            &self.exec,
             &mut self.issue_pages,
             owner_repo,
             ListKind::Issues,
@@ -132,7 +221,7 @@ impl<'a> GhClient<'a> {
     /// Fetch the open pull requests of `owner_repo` and follow pagination.
     pub fn fetch_pulls(&mut self, owner_repo: &str) -> Result<Collection<Pr>> {
         Self::fetch_list(
-            self.exec,
+            &self.exec,
             &mut self.pull_pages,
             owner_repo,
             ListKind::Pulls,
@@ -261,19 +350,119 @@ impl<'a> GhClient<'a> {
             let response = checked_response(&out)?;
             let values: Vec<Value> = serde_json::from_str(&response.body)
                 .context("gh api returned a broken issue comment body")?;
-            for value in &values {
-                comments.push(IssueComment {
-                    author: author_login(value)?.to_string(),
-                    created_at: str_field(value, "created_at")?.to_string(),
-                    body: str_field(value, "body")?.to_string(),
-                });
-            }
+            comments.extend(comments_from_values(&values)?);
             if values.len() < PAGE_SIZE || !response.link_next {
                 break;
             }
             page += 1;
         }
         Ok(comments)
+    }
+
+    /// Fetch one page of the comments of one issue or pull request.
+    ///
+    /// The call asks for one page of [`PAGE_SIZE`] comments. The client
+    /// owns the ETag and the page together: it sends the ETag it cached
+    /// at the last fetch as `If-None-Match`, and a 304 answer then
+    /// returns that cached page. A 304 with no cached page is an error.
+    pub fn fetch_comments(&mut self, owner_repo: &str, number: u64) -> Result<CommentPage> {
+        let url = format!("repos/{owner_repo}/issues/{number}/comments?per_page={PAGE_SIZE}");
+        let key = (owner_repo.to_string(), number);
+        let mut args: Vec<&str> = vec!["api", "-i"];
+        let header;
+        if let Some(etag) = self
+            .comment_pages
+            .get(&key)
+            .and_then(|cached| cached.etag.as_deref())
+        {
+            header = format!("If-None-Match: {etag}");
+            args.push("-H");
+            args.push(&header);
+        }
+        args.extend(["-X", "GET", url.as_str()]);
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        let response = checked_response(&out)?;
+        if response.status == 304 {
+            let cached = self.comment_pages.get(&key).ok_or_else(|| {
+                anyhow!(
+                    "gh api returned 304 for the comments of \
+                     {owner_repo}#{number} with no cached page"
+                )
+            })?;
+            return Ok(CommentPage {
+                etag: cached.etag.clone(),
+                comments: cached.comments.clone(),
+            });
+        }
+        let values: Vec<Value> = serde_json::from_str(&response.body)
+            .context("gh api returned a broken comment page body")?;
+        let comments = comments_from_values(&values)?;
+        self.comment_pages.insert(
+            key,
+            CachedComments {
+                etag: response.etag.clone(),
+                comments: comments.clone(),
+            },
+        );
+        Ok(CommentPage {
+            etag: response.etag,
+            comments,
+        })
+    }
+
+    /// Fetch one page of every issue and pull request updated since
+    /// `since`, an RFC 3339 timestamp.
+    ///
+    /// The GitHub issues list serves both kinds in `state=all`: a row that
+    /// carries a `pull_request` key is a pull request. The caller filters
+    /// the rows to its theory records; the method maps only what the row
+    /// shares.
+    pub fn fetch_record_rows(&mut self, owner_repo: &str, since: &str) -> Result<Vec<RecordRow>> {
+        let mut rows = Vec::new();
+        let mut page: u64 = 1;
+        loop {
+            let url = format!(
+                "repos/{owner_repo}/issues?state=all&since={since}&per_page={PAGE_SIZE}&page={page}"
+            );
+            let args = ["api", "-i", "-X", "GET", url.as_str()];
+            let out = self
+                .exec
+                .run("gh", &args, None)
+                .context("gh api failed to run")?;
+            let response = checked_response(&out)?;
+            let values: Vec<Value> = serde_json::from_str(&response.body)
+                .context("gh api returned a broken record list body")?;
+            for value in &values {
+                rows.push(record_row_from_value(value)?);
+            }
+            // A full page whose head names `rel="next"` has one more.
+            if values.len() < PAGE_SIZE || !response.link_next {
+                return Ok(rows);
+            }
+            page += 1;
+        }
+    }
+
+    /// Post one comment on an issue or pull request.
+    ///
+    /// The call is the plain `gh api` form post the daemon used before
+    /// [`GhClient`] owned it, so a comment needs no response head.
+    pub fn post_comment(&self, owner_repo: &str, number: u64, text: &str) -> Result<()> {
+        let url = format!("repos/{owner_repo}/issues/{number}/comments");
+        let field = format!("body={text}");
+        let args = ["api", "-X", "POST", url.as_str(), "-f", field.as_str()];
+        let out = self
+            .exec
+            .run("gh", &args, None)
+            .context("gh api failed to run")?;
+        if out.status != 0 {
+            let detail = out.stderr.lines().next().unwrap_or("no stderr");
+            bail!("gh api exited with status {}: {detail}", out.status);
+        }
+        Ok(())
     }
 
     /// Create one repository label and return GitHub's label.
@@ -303,6 +492,41 @@ impl<'a> GhClient<'a> {
             name: str_field(&value, "name")?.to_string(),
             color: str_field(&value, "color")?.to_string(),
         })
+    }
+
+    /// Create one repository label, or find the existing one.
+    ///
+    /// GitHub answers HTTP 422 when the label exists; the method then
+    /// fetches the catalog and returns the existing label together with
+    /// the refreshed catalog, so the caller can refresh its cache. A
+    /// fresh creation carries no catalog. Every error carries the
+    /// operator message of the ticket controller as its text.
+    pub fn create_label_if_missing(
+        &self,
+        owner_repo: &str,
+        name: &str,
+        color: &str,
+    ) -> Result<(RepoLabel, Option<Vec<RepoLabel>>)> {
+        match self.create_label(owner_repo, name, color) {
+            Ok(label) => Ok((label, None)),
+            Err(error) if error.to_string().contains("HTTP 422") => {
+                let labels = self.fetch_labels(owner_repo).map_err(|refresh_error| {
+                    anyhow!(
+                        "GitHub reported an existing label, but the catalog refresh failed: {refresh_error:#}"
+                    )
+                })?;
+                match labels
+                    .iter()
+                    .find(|label| label.name.eq_ignore_ascii_case(name))
+                {
+                    Some(label) => Ok((label.clone(), Some(labels))),
+                    None => Err(anyhow!(
+                        "GitHub rejected label creation, and the refreshed catalog has no matching label"
+                    )),
+                }
+            }
+            Err(error) => Err(anyhow!("GitHub rejected label creation: {error:#}")),
+        }
     }
 
     /// Update one issue title and description and return GitHub's issue.
@@ -511,11 +735,24 @@ impl<'a> GhClient<'a> {
     }
 
     /// Create an issue and return the issue GitHub answered with.
-    pub fn create_issue(&self, owner_repo: &str, title: &str, body: &str) -> Result<Issue> {
+    ///
+    /// Each label name becomes one `labels[]` form field on the creation
+    /// call, so GitHub attaches the labels at once.
+    pub fn create_issue(
+        &self,
+        owner_repo: &str,
+        title: &str,
+        body: &str,
+        labels: &[&str],
+    ) -> Result<Issue> {
         let url = format!("repos/{owner_repo}/issues");
         let title_field = format!("title={title}");
         let body_field = format!("body={body}");
-        let args = [
+        let label_fields: Vec<String> = labels
+            .iter()
+            .map(|label| format!("labels[]={label}"))
+            .collect();
+        let mut args: Vec<&str> = vec![
             "api",
             "-i",
             "-X",
@@ -526,6 +763,10 @@ impl<'a> GhClient<'a> {
             "-f",
             body_field.as_str(),
         ];
+        for field in &label_fields {
+            args.push("-f");
+            args.push(field.as_str());
+        }
         let out = self
             .exec
             .run("gh", &args, None)
@@ -536,6 +777,63 @@ impl<'a> GhClient<'a> {
         issue_from_value(&value)?
             .ok_or_else(|| anyhow!("create_issue returned a pull request object"))
     }
+}
+
+/// The number and head branch of the open pull request of `owner_repo`
+/// whose head branch starts with `prefix`.
+///
+/// The daemon derives the open model branch this way, and the doctor asks
+/// the same question before it removes a model worktree. No caller stores
+/// the branch name. The first match of the listing wins.
+///
+/// `gh pr list` answers 30 pull requests without a limit, so the call asks
+/// for [`PR_LIST_LIMIT`] of them and a busy repository still shows its
+/// model branch.
+pub fn open_pr_with_head_prefix(
+    exec: &dyn Exec,
+    owner_repo: &str,
+    prefix: &str,
+) -> Result<Option<(u64, String)>> {
+    let out = exec
+        .run(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--repo",
+                owner_repo,
+                "--state",
+                "open",
+                "--limit",
+                PR_LIST_LIMIT,
+                "--json",
+                "number,headRefName",
+            ],
+            None,
+        )
+        .context("gh pr list failed to run")?;
+    if out.status != 0 {
+        bail!(
+            "gh pr list exited with status {}: {}",
+            out.status,
+            out.stderr.trim()
+        );
+    }
+    let rows: Vec<Value> =
+        serde_json::from_str(&out.stdout).context("gh pr list returned a broken body")?;
+    for row in rows {
+        let Some(head) = row.get("headRefName").and_then(Value::as_str) else {
+            continue;
+        };
+        if !head.starts_with(prefix) {
+            continue;
+        }
+        let Some(number) = row.get("number").and_then(Value::as_u64) else {
+            continue;
+        };
+        return Ok(Some((number, head.to_string())));
+    }
+    Ok(None)
 }
 
 /// The raw status fields of one mentioned GitHub object.
@@ -569,6 +867,20 @@ fn label_array_names(body: &str, operation: &str) -> Result<Vec<String>> {
     labels
         .iter()
         .map(|label| Ok(str_field(label, "name")?.to_string()))
+        .collect()
+}
+
+/// Map one comment-array body into the comment model, oldest first.
+fn comments_from_values(values: &[Value]) -> Result<Vec<IssueComment>> {
+    values
+        .iter()
+        .map(|value| {
+            Ok(IssueComment {
+                author: author_login(value)?.to_string(),
+                created_at: str_field(value, "created_at")?.to_string(),
+                body: str_field(value, "body")?.to_string(),
+            })
+        })
         .collect()
 }
 
@@ -661,6 +973,24 @@ fn ensure_ok(response: &Response, stderr: &str) -> Result<()> {
     let status = response.status;
     let detail = stderr.lines().next().unwrap_or("no stderr");
     bail!("gh api returned HTTP {status}: {detail}")
+}
+
+/// Map one GitHub object of the record list to a [`RecordRow`].
+fn record_row_from_value(value: &Value) -> Result<RecordRow> {
+    Ok(RecordRow {
+        number: u64_field(value, "number")?,
+        labels: label_names(value)?,
+        pull_request: value.get("pull_request").is_some(),
+        merged_at: value
+            .pointer("/pull_request/merged_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        body: value
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 /// Map one GitHub object to an [`Issue`]; `None` for a pull request object.
@@ -1760,7 +2090,7 @@ mod tests {
         );
         let client = GhClient::new(&exec);
         let issue = client
-            .create_issue("acme/borsuk", "decision", "why")
+            .create_issue("acme/borsuk", "decision", "why", &[])
             .unwrap();
 
         assert_eq!(issue.number, 42);
@@ -1849,6 +2179,126 @@ mod tests {
     }
 
     #[test]
+    fn fetch_record_rows_walks_a_link_next_page_and_merges_in_order() {
+        let next_link = "link: <https://api.github.com/repositories/1/issues?page=2>\
+             ; rel=\"next\", <https://api.github.com/repositories/1/issues?page=2>\
+             ; rel=\"last\"";
+        let full = format!(
+            "[{}]",
+            (0..100)
+                .map(|index| {
+                    format!(
+                        "{{\"number\":{index},\"state\":\"open\",\
+                         \"labels\":[{{\"name\":\"ladder-1\"}}]}}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c1\"", next_link],
+                    &full,
+                )),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=2",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &["etag: \"c2\""],
+                    "[{\"number\":100,\"state\":\"open\",\"pull_request\":{},\
+                     \"labels\":[{\"name\":\"ladder-2\"}]}]",
+                )),
+            );
+        let mut client = GhClient::new(&exec);
+        let rows = client
+            .fetch_record_rows("acme/borsuk", "2026-08-11T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows[0].number, 0);
+        assert_eq!(rows[99].number, 99);
+        assert_eq!(rows[100].number, 100);
+        assert!(rows[100].pull_request);
+        assert_eq!(
+            rows[100].merged_at, None,
+            "an open pull request never merged"
+        );
+        let calls = exec.calls();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn a_record_row_reports_the_merge_moment_of_a_merged_pull_request() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues?state=all&since=2026-08-11T00:00:00Z&per_page=100&page=1",
+            ]),
+            CmdOut::ok(response(
+                "HTTP/2 200",
+                &[],
+                "[{\"number\":7,\"state\":\"closed\",\"labels\":[],\
+                 \"body\":\"Closes #142\",\
+                 \"pull_request\":{\"merged_at\":\"2026-09-10T10:00:00Z\"}},\
+                 {\"number\":9,\"state\":\"closed\",\"labels\":[],\"body\":null,\
+                 \"pull_request\":{\"merged_at\":null}}]",
+            )),
+        );
+        let mut client = GhClient::new(&exec);
+
+        let rows = client
+            .fetch_record_rows("acme/borsuk", "2026-08-11T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(rows[0].merged_at.as_deref(), Some("2026-09-10T10:00:00Z"));
+        assert_eq!(rows[0].body, "Closes #142", "the body names the ticket");
+        assert_eq!(
+            rows[1].merged_at, None,
+            "a closed pull request never merged"
+        );
+        assert_eq!(rows[1].body, "", "a null body reads as no body");
+    }
+
+    #[test]
+    fn the_viewer_login_names_the_account_the_cli_runs_as() {
+        let exec = ScriptExec::new().expect(
+            gh(&["api", "user"]),
+            CmdOut::ok("{\"login\":\"piotr\",\"id\":42}"),
+        );
+
+        assert_eq!(
+            GhClient::new(&exec).viewer_login().unwrap(),
+            "piotr".to_string()
+        );
+
+        let broken = ScriptExec::new().expect(gh(&["api", "user"]), CmdOut::ok("{\"id\":42}"));
+        let error = GhClient::new(&broken).viewer_login().unwrap_err();
+        assert!(
+            error.to_string().contains("login"),
+            "the error names the missing field: {error}"
+        );
+    }
+
+    #[test]
     fn fetch_issue_comments_walks_a_link_next_page_and_merges_in_order() {
         let next_link = "link: <https://api.github.com/repositories/1/issues/9/comments?page=2>\
              ; rel=\"next\", <https://api.github.com/repositories/1/issues/9/comments?page=2>\
@@ -1897,6 +2347,382 @@ mod tests {
                 "GET",
                 "repos/acme/borsuk/issues/9/comments?per_page=100&page=2"
             ]
+        );
+    }
+
+    #[test]
+    fn fetch_comments_asks_for_one_page_of_100_and_maps_it() {
+        let body = r#"[{"user":{"login":"agent"},"created_at":"2026-09-01T10:00:00Z","body":"Which mode ships first?"},{"user":{"login":"human"},"created_at":"2026-09-02T11:30:00Z","body":"plain prose"}]"#;
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100",
+            ]),
+            CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], body)),
+        );
+        let mut client = GhClient::new(&exec);
+        let page = client.fetch_comments("acme/borsuk", 9).unwrap();
+
+        assert_eq!(page.etag, Some("\"c1\"".to_string()));
+        assert_eq!(page.comments.len(), 2);
+        assert_eq!(page.comments[0].author, "agent");
+        assert_eq!(page.comments[0].body, "Which mode ships first?");
+        assert_eq!(page.comments[1].author, "human");
+        assert_eq!(page.comments[1].created_at, "2026-09-02T11:30:00Z");
+        assert_eq!(
+            exec.calls()[0].argv(),
+            [
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100"
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_comments_sends_if_none_match_and_returns_the_cached_page_on_a_304() {
+        let first_body = comments_json(2);
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues/9/comments?per_page=100",
+                ]),
+                CmdOut::ok(response("HTTP/2 200", &["etag: \"c1\""], &first_body)),
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-H",
+                    "If-None-Match: \"c1\"",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/issues/9/comments?per_page=100",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: response("HTTP/2 304", &["etag: \"c1\""], ""),
+                    stderr: "gh: HTTP 304\n".to_string(),
+                },
+            );
+        let mut client = GhClient::new(&exec);
+        let first = client.fetch_comments("acme/borsuk", 9).unwrap();
+        // The second call sends the ETag of the cached page itself; the
+        // caller passes no ETag.
+        let second = client.fetch_comments("acme/borsuk", 9).unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(second.comments[1].body, "comment 1");
+        assert_eq!(second.etag, Some("\"c1\"".to_string()));
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn fetch_comments_rejects_a_304_without_a_cached_page() {
+        // A cold cache sends no `If-None-Match`, so a first-call 304 has
+        // no cached page to answer with.
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "GET",
+                "repos/acme/borsuk/issues/9/comments?per_page=100",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: response("HTTP/2 304", &["etag: \"c9\""], ""),
+                stderr: "gh: HTTP 304\n".to_string(),
+            },
+        );
+        let mut client = GhClient::new(&exec);
+        let error = client.fetch_comments("acme/borsuk", 9).unwrap_err();
+
+        assert!(error.to_string().contains("no cached page"), "{error:#}");
+    }
+
+    #[test]
+    fn post_comment_runs_the_exact_gh_call() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/9/comments",
+                "-f",
+                "body=done",
+            ]),
+            CmdOut::ok(""),
+        );
+        let client = GhClient::new(&exec);
+        client.post_comment("acme/borsuk", 9, "done").unwrap();
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn post_comment_reports_a_failed_call() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/9/comments",
+                "-f",
+                "body=nope",
+            ]),
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "validation failed".to_string(),
+            },
+        );
+        let client = GhClient::new(&exec);
+        let error = client.post_comment("acme/borsuk", 9, "nope").unwrap_err();
+        assert!(error.to_string().contains("status 1"));
+        assert!(error.to_string().contains("validation failed"));
+    }
+
+    #[test]
+    fn create_label_if_missing_returns_a_fresh_label_with_no_catalog() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/labels",
+                "-f",
+                "name=event-open",
+                "-f",
+                "color=d4c5f9",
+            ]),
+            CmdOut::ok(response(
+                "HTTP/2 201",
+                &[],
+                r#"{"name":"event-open","color":"d4c5f9"}"#,
+            )),
+        );
+        let client = GhClient::new(&exec);
+        let (label, refreshed) = client
+            .create_label_if_missing("acme/borsuk", "event-open", "d4c5f9")
+            .unwrap();
+        assert_eq!(label.name, "event-open");
+        assert_eq!(refreshed, None);
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn create_label_if_missing_finds_the_existing_label_and_the_catalog() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=triage",
+                    "-f",
+                    "color=55e6ff",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: "HTTP/2 422\r\n\r\n{}".to_string(),
+                    stderr: "already_exists".to_string(),
+                },
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/labels?per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &[],
+                    r#"[{"name":"ui","color":"000000"},{"name":"Triage","color":"ff0000"}]"#,
+                )),
+            );
+        let client = GhClient::new(&exec);
+        let (label, refreshed) = client
+            .create_label_if_missing("acme/borsuk", "triage", "55e6ff")
+            .unwrap();
+        assert_eq!(label.name, "Triage");
+        assert_eq!(label.color, "ff0000");
+        let refreshed = refreshed.expect("the refreshed catalog rides along");
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(exec.calls().len(), 2);
+    }
+
+    #[test]
+    fn create_label_if_missing_fails_when_the_catalog_has_no_match() {
+        let exec = ScriptExec::new()
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "POST",
+                    "repos/acme/borsuk/labels",
+                    "-f",
+                    "name=triage",
+                    "-f",
+                    "color=55e6ff",
+                ]),
+                CmdOut {
+                    status: 1,
+                    stdout: "HTTP/2 422\r\n\r\n{}".to_string(),
+                    stderr: "already_exists".to_string(),
+                },
+            )
+            .expect(
+                gh(&[
+                    "api",
+                    "-i",
+                    "-X",
+                    "GET",
+                    "repos/acme/borsuk/labels?per_page=100&page=1",
+                ]),
+                CmdOut::ok(response(
+                    "HTTP/2 200",
+                    &[],
+                    r#"[{"name":"ui","color":"000000"}]"#,
+                )),
+            );
+        let client = GhClient::new(&exec);
+        let error = client
+            .create_label_if_missing("acme/borsuk", "triage", "55e6ff")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "GitHub rejected label creation, and the refreshed catalog has no matching label"
+        );
+    }
+
+    #[test]
+    fn create_issue_passes_one_label_field_per_label() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Eliminate: INV-3",
+                "-f",
+                "body=why",
+                "-f",
+                "labels[]=to-refine",
+                "-f",
+                "labels[]=ladder-1",
+            ]),
+            CmdOut::ok(response("HTTP/2 201", &[], &issue_json(12))),
+        );
+        let client = GhClient::new(&exec);
+        let issue = client
+            .create_issue(
+                "acme/borsuk",
+                "Eliminate: INV-3",
+                "why",
+                &["to-refine", "ladder-1"],
+            )
+            .unwrap();
+        assert_eq!(issue.number, 12);
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn create_issue_with_no_labels_sends_no_label_field() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues",
+                "-f",
+                "title=Direct title",
+                "-f",
+                "body=Direct body",
+            ]),
+            CmdOut::ok(response("HTTP/2 201", &[], &issue_json(12))),
+        );
+        let client = GhClient::new(&exec);
+        let issue = client
+            .create_issue("acme/borsuk", "Direct title", "Direct body", &[])
+            .unwrap();
+        assert_eq!(issue.number, 12);
+    }
+
+    #[test]
+    fn the_head_prefix_search_asks_for_a_bounded_open_listing() {
+        let exec = ScriptExec::new().expect(
+            gh(&[
+                "pr",
+                "list",
+                "--repo",
+                "acme/borsuk",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,headRefName",
+            ]),
+            CmdOut::ok(
+                r#"[{"number":4,"headRefName":"aif/borsuk/issue-9"},
+                    {"number":9,"headRefName":"aif/borsuk/model-a1b2c3d4"},
+                    {"number":11,"headRefName":"aif/borsuk/model-bbbbbbbb"}]"#,
+            ),
+        );
+
+        let found = open_pr_with_head_prefix(&exec, "acme/borsuk", "aif/borsuk/model-").unwrap();
+
+        assert_eq!(found, Some((9, "aif/borsuk/model-a1b2c3d4".to_string())));
+    }
+
+    #[test]
+    fn a_listing_without_a_model_head_finds_none() {
+        let exec = ScriptExec::new().expect(
+            |call: &Call| call.program == "gh",
+            CmdOut::ok(r#"[{"number":4,"headRefName":"aif/borsuk/issue-9"}]"#),
+        );
+
+        let found = open_pr_with_head_prefix(&exec, "acme/borsuk", "aif/borsuk/model-").unwrap();
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_failed_head_prefix_search_names_the_status() {
+        let exec = ScriptExec::new().expect(
+            |call: &Call| call.program == "gh",
+            CmdOut {
+                status: 1,
+                stdout: String::new(),
+                stderr: "no such repository\n".to_string(),
+            },
+        );
+
+        let error = open_pr_with_head_prefix(&exec, "acme/borsuk", "aif/borsuk/model-")
+            .expect_err("a failed listing must not look empty");
+
+        assert!(
+            error.to_string().contains("no such repository"),
+            "error was: {error:#}"
         );
     }
 }
