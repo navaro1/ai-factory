@@ -495,7 +495,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C1 · **Traces to:** R23, R33
 
 ### C26 — One measurer run
-**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; missing: the base and head measurers, and `queue_measure` is unused in production until C27 and C28)
+**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; C27 and C28 added the base and head measurers on 2026-09-11, so AC4 holds; missing: the timeout test does not yet assert attempt 1 and no `Stuck` decision)
 **Build:** Add `ScriptRunner` in `src/runner/script.rs` that implements `Runner` over `proc::spawn` with a timeout thread that stops the child. Change `RunnerFactory::build(role, purpose)` (`src/runner/mod.rs:48-66`) so `DefaultRunnerFactory` returns `ScriptRunner` for `TaskPurpose::Measure` with a synthetic role; the fake factory in the daemon tests follows. Add `src/theory/measure.rs` with `Record { id, value, unit, direction }` and `parse_lines`: a malformed line, including a missing `direction`, yields one `incomparable` record with the reason, and a run never fails. Add `TaskPurpose::Measure` with its `PurposeSpec` (no stage, limit key `measure`) and the id `<alias>/measure-<tree8>-<area>-<measurer>`, where `<tree8>` is `git rev-parse HEAD^{tree}` of the worktree until C27 replaces it with `tree_hash`; add `[measure] limit` to the config and `Limits`. Add `Daemon::queue_measure(alias, worktree, areas, mode) -> Vec<String>`. On `Exit`, regardless of `ok`, parse the log into records, or one `incomparable` record with the reason on a timeout or a non-zero exit, and post them as an `<aif-measure-v1>` comment on the theory record. On review admission of a governed PR, `queue_measure` one task per area of `areas_for_paths` of the diff at the head in `pr` mode.
 **AC:**
 - A runner test with a script that sleeps past `timeout_s = 1` ends within 3 s, the task ends `Done` at attempt 1, no `Stuck` decision appears, and the comment carries `incomparable: timeout`.
@@ -505,7 +505,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C25, C16, C10 · **Traces to:** R24, N4
 
 ### C27 — The cache, the comparison, and the policy
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-11 (branch verification-toolbelt, package F6; every area counts as `observe` until C25 ships the properties, so `apply_policy` never fails and no production caller reads its verdict yet)
 **Build:** Add to `src/theory/measure.rs`: `tree_hash(exec, worktree)` through a temporary index (`GIT_INDEX_FILE=<state_dir>/measure/tmp-index-<pid> git read-tree HEAD`, `git add -A`, `git write-tree`); the cache at `<state_dir>/measure/<alias>/<tree>/<area>-<measurer_hash>.json` with `read_cache` and `write_cache`; `compare(before, after) -> Vec<Comparison>` with the six states; `apply_policy(area, comparisons) -> MeasureVerdict`; `agent_text(comparisons)` that renders `id  before → after  unit  state` under `AREA <id>`. `queue_measure` skips a cached tree and uses `tree_hash` for the task id.
 **AC:**
 - A real-git test in a temporary repository with one modified tracked file and one new file returns a hash that differs from `HEAD^{tree}` and leaves `git status` of the live index unchanged.
@@ -515,7 +515,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C26 · **Traces to:** R24, R25
 
 ### C28 — Before and after on every PR
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-11 (branch verification-toolbelt, package F6; the implement prompt carries no `{comparison}` slot yet, and the value renders `none` there)
 **Build:** Add `WorktreeKind::Base` at `worktrees/<alias>/base-<sha8>` with `ensure_detached(path, sha)` and a cleanable rule (`src/worktree.rs:44-63`). On review admission of a governed PR, compute the merge base (`git merge-base <default_base> <head>` in the item's worktree), queue measure tasks for the base tree in the base worktree and the head tree in `pr` mode, and hold the review task in `prior_stage_active` (`src/daemon.rs:1191-1220`) until both finish; replace the raw-records comment of C26 with one `<aif-measure-v1>` comment of the comparison on the theory record. Fill `{comparison}` with the agent text and `{skills}` with the touched areas' skill names in the review prompt; in the implement prompt `{comparison}` renders `none` and `{skills}` fills from the full prediction's areas. A new head sha re-queues the head measurement, like the review supersede (`src/daemon.rs:821-843`).
 **AC:**
 - A daemon test asserts two measure tasks, the held review, then the comment with `poll_p95 12 → 14 ms worsened`, and a review prompt that contains the table and `skills: control-app`.
