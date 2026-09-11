@@ -37,11 +37,9 @@ use crate::config::{
 };
 use crate::decisions::{self, Decision, DecisionKind, Decisions, Response};
 use crate::exec::{CmdOut, Exec, RealExec};
-use crate::gates::{
-    self, implement_ready, review_ready, unmet_blockers, GateTracker, ReadyWork, NEEDS_HUMAN_LABEL,
-    TO_REFINE,
-};
+use crate::gates::{self, implement_ready, review_ready, unmet_blockers, GateTracker, ReadyWork};
 use crate::gh::{self, GhClient};
+use crate::labels::{LabelKey, LabelNames};
 use crate::links::{self, Links};
 use crate::model::{Issue, ItemKind, RepoSnapshot, Snapshot, Stage};
 use crate::poll::DaemonMsg;
@@ -89,7 +87,7 @@ use crate::theory::records::{
 use crate::theory::skills::{self, Feature, SkillSet, SkillTicket, SKILLS_DIR};
 use crate::theory::verify::{Measurer, Mode, Tier, VerifyMap};
 use crate::ticket::TicketController;
-use crate::trains::{Train, STACKED_LABEL};
+use crate::trains::Train;
 use crate::usage::{self, SpendTotals, UsageRecord, UsageView};
 use crate::worktree::{self, Cleanable, WorktreeKind, WorktreeManager, TRAIN_DIR};
 
@@ -2498,9 +2496,10 @@ impl Daemon {
 
     /// Observe pipeline gates and reserve issue refinement for ticket chat.
     fn observe_ready_work(&mut self, repo: &str, fresh: &RepoSnapshot) -> bool {
+        let names = self.config.resolved_labels(Some(repo));
         let ready: Vec<ReadyWork> = self
             .gates
-            .observe(repo, fresh, &self.theory_records)
+            .observe(repo, fresh, &self.theory_records, &names)
             .into_iter()
             .filter(|work| {
                 !(work.stage == Stage::Refine
@@ -2688,6 +2687,7 @@ impl Daemon {
     /// not leave the stage, so it keeps its task; the dispatch defers it
     /// instead.
     fn reconcile_unready(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let names = self.config.resolved_labels(Some(repo));
         let links = self.links.get(repo).cloned().unwrap_or_default();
         let ids: Vec<String> = self
             .table
@@ -2700,12 +2700,10 @@ impl Daemon {
                 // moves it down the queue and `next_eligible` holds it
                 // there until the blocker closes.
                 Stage::Implement => {
-                    fresh
-                        .issues
-                        .get(&task.number)
-                        .is_none_or(|issue| !implement_ready(issue, repo, &self.theory_records))
-                        && !(task.state == TaskState::Running
-                            && implementation_transitioned(fresh, &links, task.number))
+                    fresh.issues.get(&task.number).is_none_or(|issue| {
+                        !implement_ready(issue, repo, &self.theory_records, &names)
+                    }) && !(task.state == TaskState::Running
+                        && implementation_transitioned(fresh, &links, task.number, &names))
                 }
                 // A fast check carries the review stage of its pull
                 // request, so it leaves the gate with the review. That is
@@ -2715,10 +2713,10 @@ impl Daemon {
                     fresh
                         .prs
                         .get(&task.number)
-                        .is_none_or(|pr| !review_ready(pr))
+                        .is_none_or(|pr| !review_ready(pr, &names))
                         && !(task.state == TaskState::Running
                             && (review_transitioned(fresh, task.number)
-                                || review_handed_off(fresh, task.number)))
+                                || review_handed_off(fresh, task.number, &names)))
                 }
                 Stage::Refine | Stage::Release => false,
             })
@@ -2734,6 +2732,7 @@ impl Daemon {
     /// A poll can follow the turn end. In that order, GitHub confirms that the
     /// parked task finished its requested transition.
     fn complete_parked_refines(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let names = self.config.resolved_labels(Some(repo));
         let tasks: Vec<Task> = self
             .table
             .active()
@@ -2743,7 +2742,7 @@ impl Daemon {
                 task.stage == Stage::Refine
                     && task.purpose == TaskPurpose::Pipeline
                     && task.state == TaskState::AwaitingUser
-                    && refine_transitioned(fresh, task.number)
+                    && refine_transitioned(fresh, task.number, &names)
             })
             .cloned()
             .collect();
@@ -2780,6 +2779,7 @@ impl Daemon {
     /// truth. Returns true when any row opened, refreshed, or closed.
     fn derive_needs_human(&mut self, repo: &str, fresh: &RepoSnapshot) -> bool {
         let now_ms = self.now_ms;
+        let names = self.config.resolved_labels(Some(repo));
         let records = fresh
             .issues
             .iter()
@@ -2802,7 +2802,7 @@ impl Daemon {
         let rows = Self::derive_label_rows(
             repo,
             records,
-            NEEDS_HUMAN_LABEL,
+            names.get(LabelKey::NeedsHuman),
             |repo, kind, number, title| Decision::needs_human(repo, kind, number, title, now_ms),
         );
         let mut changed = false;
@@ -2993,7 +2993,11 @@ impl Daemon {
                 .repos
                 .get(alias)
                 .and_then(|snapshot| snapshot.issues.get(&number))
-                .is_some_and(|issue| issue.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+                .is_some_and(|issue| {
+                    self.config
+                        .resolved_labels(Some(alias))
+                        .has(LabelKey::NeedsHuman, &issue.labels)
+                })
     }
 
     /// Check the contract of one ticket that the implement gate admits.
@@ -3079,10 +3083,11 @@ impl Daemon {
             .or_default();
         failure.count += 1;
         failure.finding = finding.to_string();
+        let names = self.config.resolved_labels(Some(alias));
         let label = if failure.count >= tasks::MAX_ATTEMPTS {
-            NEEDS_HUMAN_LABEL
+            names.get(LabelKey::NeedsHuman)
         } else {
-            gates::TO_REFINE
+            names.get(LabelKey::ToRefine)
         };
         let gh = GhClient::new(&*self.exec);
         if let Err(error) = gh.add_label(&repo_cfg.owner_repo, number, label) {
@@ -3098,10 +3103,11 @@ impl Daemon {
             let Some(snapshot) = self.snapshot.repos.get(&alias) else {
                 continue;
             };
+            let names = self.config.resolved_labels(Some(&alias));
             let labeled: Vec<u64> = snapshot
                 .prs
                 .values()
-                .filter(|pr| pr.labels.iter().any(|label| label == STACKED_LABEL))
+                .filter(|pr| names.has(LabelKey::ReleaseStacked, &pr.labels))
                 .map(|pr| pr.number)
                 .collect();
             let Some(train) = self.trains.get_mut(&alias) else {
@@ -4410,12 +4416,17 @@ impl Daemon {
         let Some(owner_repo) = self.config.repos.get(repo).map(|r| r.owner_repo.clone()) else {
             return;
         };
+        let stacked_label = self
+            .config
+            .resolved_labels(Some(repo))
+            .get(LabelKey::ReleaseStacked)
+            .to_string();
         let Some(train) = self.trains.get_mut(repo) else {
             return;
         };
         let task_id = train.in_flight.clone();
         let gh = GhClient::new(&*self.exec);
-        match train.finish(ok, &owner_repo, &gh) {
+        match train.finish(ok, &owner_repo, &gh, &stacked_label) {
             Ok(batch) => {
                 if let Some(task_id) = task_id {
                     if ok || batch.is_empty() || !retain_failed_batch {
@@ -4573,11 +4584,13 @@ impl Daemon {
         // refine stage with the parked sessions, so they must not park
         // with them.
         if task.stage == Stage::Refine && !Self::is_teach(&task) && !Self::is_audit(&task) {
-            let transitioned = self
-                .snapshot
-                .repos
-                .get(&task.repo)
-                .is_some_and(|fresh| refine_transitioned(fresh, task.number));
+            let transitioned = self.snapshot.repos.get(&task.repo).is_some_and(|fresh| {
+                refine_transitioned(
+                    fresh,
+                    task.number,
+                    &self.config.resolved_labels(Some(&task.repo)),
+                )
+            });
             if ok && transitioned {
                 self.stop_session(id, "cannot stop the completed refine session");
                 self.complete_task(&task);
@@ -4701,21 +4714,22 @@ impl Daemon {
             return false;
         };
         let number = task.number;
+        let names = self.config.resolved_labels(Some(&task.repo));
         let needs_human = match task.kind {
             ItemKind::Issue => fresh
                 .issues
                 .get(&number)
-                .is_some_and(|issue| issue.labels.iter().any(|l| l == NEEDS_HUMAN_LABEL)),
+                .is_some_and(|issue| names.has(LabelKey::NeedsHuman, &issue.labels)),
             ItemKind::Pr => fresh
                 .prs
                 .get(&number)
-                .is_some_and(|pull| pull.labels.iter().any(|l| l == NEEDS_HUMAN_LABEL)),
+                .is_some_and(|pull| names.has(LabelKey::NeedsHuman, &pull.labels)),
         };
         if needs_human {
             return true;
         }
         match task.stage {
-            Stage::Refine => refine_transitioned(fresh, number),
+            Stage::Refine => refine_transitioned(fresh, number, &names),
             // The `refined` label is not part of the check. The agent is
             // asked to remove it, and `complete_task` removes a forgotten
             // one, so a pull request alone proves the implementation.
@@ -4818,11 +4832,13 @@ impl Daemon {
         if task.purpose != TaskPurpose::Pipeline {
             return;
         }
+        let names = self.config.resolved_labels(Some(&task.repo));
+        let refined = names.get(LabelKey::Refined);
         let labelled = self.snapshot.repos.get(&task.repo).is_some_and(|fresh| {
             fresh
                 .issues
                 .get(&task.number)
-                .is_some_and(|issue| issue.labels.iter().any(|l| l == gates::REFINED))
+                .is_some_and(|issue| names.has(LabelKey::Refined, &issue.labels))
         });
         if !labelled {
             return;
@@ -4836,12 +4852,10 @@ impl Daemon {
             return;
         };
         let gh = GhClient::new(&*self.exec);
-        if let Err(error) = gh.remove_label(&owner_repo, task.number, gates::REFINED) {
+        if let Err(error) = gh.remove_label(&owner_repo, task.number, refined) {
             eprintln!(
-                "cannot remove {} from {} issue {}: {error:#}",
-                gates::REFINED,
-                task.repo,
-                task.number
+                "cannot remove {refined} from {} issue {}: {error:#}",
+                task.repo, task.number
             );
         }
     }
@@ -4853,8 +4867,11 @@ impl Daemon {
                 Ok(true) => {}
                 Ok(false) => {
                     let reason = format!(
-                        "the review left pull request {} a draft with no {NEEDS_HUMAN_LABEL} label",
-                        task.number
+                        "the review left pull request {} a draft with no {} label",
+                        task.number,
+                        self.config
+                            .resolved_labels(Some(&task.repo))
+                            .get(LabelKey::NeedsHuman)
                     );
                     eprintln!("task {}: {reason}", task.id);
                     self.fail_run(task, &reason);
@@ -4984,7 +5001,8 @@ impl Daemon {
             bail!("no such repository \"{}\"", task.repo);
         };
         let pr = GhClient::new(&*self.exec).fetch_pull(&repo_cfg.owner_repo, task.number)?;
-        Ok(!pr.open || !pr.draft || pr.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+        let names = self.config.resolved_labels(Some(&task.repo));
+        Ok(!pr.open || !pr.draft || names.has(LabelKey::NeedsHuman, &pr.labels))
     }
 
     /// Write the `.aif/reviewed-sha` marker of a finished review.
@@ -5076,12 +5094,17 @@ impl Daemon {
                     eprintln!("cannot stack {repo}#{pr}: no such repository");
                     return;
                 };
+                let stacked_label = self
+                    .config
+                    .resolved_labels(Some(&repo))
+                    .get(LabelKey::ReleaseStacked)
+                    .to_string();
                 let Some(train) = self.trains.get_mut(&repo) else {
                     eprintln!("cannot stack {repo}#{pr}: no train");
                     return;
                 };
                 let gh = GhClient::new(&*self.exec);
-                if let Err(e) = train.stack(pr, on, &repo_cfg.owner_repo, &gh) {
+                if let Err(e) = train.stack(pr, on, &repo_cfg.owner_repo, &gh, &stacked_label) {
                     eprintln!("cannot stack {repo}#{pr}: {e:#}");
                     return;
                 }
@@ -6744,9 +6767,14 @@ impl Daemon {
             }
         }
         let gh = GhClient::new(&*self.exec);
-        if let Err(e) = gh.remove_label(&repo_cfg.owner_repo, number, NEEDS_HUMAN_LABEL) {
+        let needs_human = self
+            .config
+            .resolved_labels(Some(&repo))
+            .get(LabelKey::NeedsHuman)
+            .to_string();
+        if let Err(e) = gh.remove_label(&repo_cfg.owner_repo, number, &needs_human) {
             eprintln!(
-                "cannot remove {NEEDS_HUMAN_LABEL} from {repo} {} {number}: {e:#}",
+                "cannot remove {needs_human} from {repo} {} {number}: {e:#}",
                 kind.as_str()
             );
             self.decisions.push(decision);
@@ -7673,7 +7701,8 @@ impl Daemon {
         gh.post_comment(&record_repo, record_number, &block)?;
         gh.create_label_if_missing(&record_repo, THEORY_SHORT_LABEL, THEORY_SHORT_COLOR)?;
         gh.add_label(&record_repo, record_number, THEORY_SHORT_LABEL)?;
-        gh.add_label(&repo_cfg.owner_repo, number, TO_REFINE)
+        let names = self.config.resolved_labels(Some(alias));
+        gh.add_label(&repo_cfg.owner_repo, number, names.get(LabelKey::ToRefine))
     }
 
     /// Validate one full prediction, post it, and label the record.
@@ -7854,11 +7883,12 @@ impl Daemon {
         let Some(snapshot) = self.snapshot.repos.get(repo) else {
             return holds;
         };
+        let names = self.config.resolved_labels(Some(repo));
         for issue in snapshot.issues.values() {
-            let found = gates::refine_hold(issue, repo, &self.theory_records)
+            let found = gates::refine_hold(issue, repo, &self.theory_records, &names)
                 .map(|reason| (Stage::Refine, reason))
                 .or_else(|| {
-                    gates::implement_hold(issue, repo, &self.theory_records)
+                    gates::implement_hold(issue, repo, &self.theory_records, &names)
                         .map(|reason| (Stage::Implement, reason))
                 });
             let Some((stage, reason)) = found else {
@@ -7986,11 +8016,12 @@ impl Daemon {
         let gh = GhClient::new(&*self.exec);
         gh.create_label_if_missing(&repo_cfg.owner_repo, VERIFY_SKILL_LABEL, VERIFY_SKILL_COLOR)?;
         let provisional = self.skill_ticket_body(repo_cfg, surface, 0, body_template)?;
+        let names = self.config.resolved_labels(Some(alias));
         let issue = gh.create_issue(
             &repo_cfg.owner_repo,
             &title,
             &provisional,
-            &[TO_REFINE, VERIFY_SKILL_LABEL],
+            &[names.get(LabelKey::ToRefine), VERIFY_SKILL_LABEL],
         )?;
         let body = self.skill_ticket_body(repo_cfg, surface, issue.number, body_template)?;
         if body == provisional {
@@ -8805,12 +8836,13 @@ impl Daemon {
 
     /// Queue or reuse one issue conversation.
     fn ticket_chat(&mut self, repo: &str, number: u64) {
+        let names = self.config.resolved_labels(Some(repo));
         let handoff_active = self
             .snapshot
             .repos
             .get(repo)
             .and_then(|snapshot| snapshot.issues.get(&number))
-            .is_some_and(|issue| issue.labels.iter().any(|label| label == "to-refine"));
+            .is_some_and(|issue| names.has(LabelKey::ToRefine, &issue.labels));
         self.ticket_conversations
             .entry((repo.to_string(), ChatKey::Ticket(number)))
             .or_insert_with(|| TicketConversationState {
@@ -8835,6 +8867,7 @@ impl Daemon {
 
     /// Restore, hand off, or end each conversation after GitHub changes.
     fn reconcile_ticket_conversations(&mut self, repo: &str, fresh: &RepoSnapshot) {
+        let names = self.config.resolved_labels(Some(repo));
         let keys: Vec<(String, ChatKey)> = self
             .ticket_conversations
             .keys()
@@ -8847,7 +8880,7 @@ impl Daemon {
             };
             let issue = fresh.issues.get(&number).filter(|issue| issue.open);
             let ended = issue.is_none()
-                || issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "refined"));
+                || issue.is_some_and(|issue| names.has(LabelKey::Refined, &issue.labels));
             if ended {
                 self.end_ticket_conversation(&key);
                 continue;
@@ -8876,8 +8909,7 @@ impl Daemon {
                 self.changed = true;
             }
 
-            let has_label =
-                issue.is_some_and(|issue| issue.labels.iter().any(|label| label == "to-refine"));
+            let has_label = issue.is_some_and(|issue| names.has(LabelKey::ToRefine, &issue.labels));
             let (was_active, has_session) = self
                 .ticket_conversations
                 .get(&key)
@@ -9551,10 +9583,11 @@ impl Daemon {
             Stage::Refine | Stage::Release => return None,
         };
         let repo = self.snapshot.repos.get(&task.repo);
+        let names = self.config.resolved_labels(Some(&task.repo));
         let mut matches = Vec::new();
         let mut add_labels = |kind: ItemKind, number: u64, labels: &[String]| {
             for label in labels {
-                if level_from_label(stage, label).is_some() {
+                if level_from_label(stage, label, &names).is_some() {
                     matches.push(TagRouteMatch {
                         kind,
                         number,
@@ -9594,7 +9627,7 @@ impl Daemon {
             .iter()
             .map(|matched| matched.label.clone())
             .collect::<Vec<_>>();
-        let level = select_level(stage, &labels).level;
+        let level = select_level(stage, &labels, &names).level;
         Some(TagRouteBinding {
             key: TagRouteKey::new(stage, level),
             matches,
@@ -9882,6 +9915,7 @@ impl Daemon {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        let names = self.config.resolved_labels(Some(&task.repo));
         Ok(vec![
             ("repo", task.repo.clone()),
             ("owner_repo", repo_cfg.owner_repo.clone()),
@@ -9901,6 +9935,17 @@ impl Daemon {
             ("rules", String::new()),
             ("why_rule", why_rule),
             ("finding", finding),
+            ("label_to_refine", names.to_refine.clone()),
+            ("label_refined", names.refined.clone()),
+            ("label_epic", names.epic.clone()),
+            ("label_chunk", names.chunk.clone()),
+            ("label_needs_human", names.needs_human.clone()),
+            ("label_release_stacked", names.release_stacked.clone()),
+            ("label_complexity", names.complexity_prefix.clone()),
+            (
+                "label_review_complexity",
+                names.review_complexity_prefix.clone(),
+            ),
         ])
     }
 
@@ -10785,14 +10830,12 @@ fn proposal_marker_text(text: &str) -> bool {
 /// carries `refined`. A parent that the run split into sub-tickets carries
 /// `epic` instead, because `refined` on a parent would start a second
 /// implementation of work the sub-tickets already own.
-fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
+fn refine_transitioned(fresh: &RepoSnapshot, number: u64, names: &LabelNames) -> bool {
     fresh.issues.get(&number).is_some_and(|issue| {
         issue.open
-            && issue
-                .labels
-                .iter()
-                .any(|label| label == gates::REFINED || label == gates::EPIC)
-            && !issue.labels.iter().any(|label| label == gates::TO_REFINE)
+            && (names.has(LabelKey::Refined, &issue.labels)
+                || names.has(LabelKey::Epic, &issue.labels))
+            && !names.has(LabelKey::ToRefine, &issue.labels)
     })
 }
 
@@ -10800,11 +10843,16 @@ fn refine_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
 ///
 /// The links table holds the open pull requests of the last poll, so the
 /// branch rule and the body rule both count here.
-fn implementation_transitioned(fresh: &RepoSnapshot, links: &Links, number: u64) -> bool {
+fn implementation_transitioned(
+    fresh: &RepoSnapshot,
+    links: &Links,
+    number: u64,
+    names: &LabelNames,
+) -> bool {
     fresh.issues.get(&number).is_some_and(|issue| {
         issue.open
-            && !issue.labels.iter().any(|label| label == "refined")
-            && !issue.labels.iter().any(|label| label == "to-refine")
+            && !names.has(LabelKey::Refined, &issue.labels)
+            && !names.has(LabelKey::ToRefine, &issue.labels)
     }) && !links.prs_of(number).is_empty()
 }
 
@@ -10822,11 +10870,11 @@ fn review_transitioned(fresh: &RepoSnapshot, number: u64) -> bool {
 /// comment after. The label closes the review gate, so a poll between those
 /// two steps would otherwise cancel the run and leave the operator a label
 /// with no question. This transition is as valid as the ready flip.
-fn review_handed_off(fresh: &RepoSnapshot, number: u64) -> bool {
+fn review_handed_off(fresh: &RepoSnapshot, number: u64, names: &LabelNames) -> bool {
     fresh
         .prs
         .get(&number)
-        .is_some_and(|pr| pr.open && pr.labels.iter().any(|label| label == NEEDS_HUMAN_LABEL))
+        .is_some_and(|pr| pr.open && names.has(LabelKey::NeedsHuman, &pr.labels))
 }
 
 /// The effective prompt view of every role that has a template, in role
@@ -10912,6 +10960,10 @@ mod tests {
         ExecutionRole, Governor, Harness, RoleOverride, RoleSettings, StageConfig,
     };
     use crate::exec::{Call, CmdOut, ScriptExec};
+    use crate::labels::{
+        DEFAULT_EPIC as EPIC, DEFAULT_NEEDS_HUMAN as NEEDS_HUMAN_LABEL,
+        DEFAULT_TO_REFINE as TO_REFINE,
+    };
     use crate::model::{Pr, RepoSnapshot};
     use crate::prompts::{
         scan_placeholders, IMPLEMENT_PROMPT, REFINE_PROMPT, RELEASE_PROMPT, REVIEW_PROMPT,
@@ -11451,6 +11503,7 @@ mod tests {
                 skills: None,
                 role_overrides: BTreeMap::new(),
                 tag_route_overrides: BTreeMap::new(),
+                label_overrides: BTreeMap::new(),
             },
         );
         let route_override = complete_role_override(&role_settings);
@@ -11469,6 +11522,7 @@ mod tests {
             stages,
             repos,
             tag_route_overrides,
+            labels: crate::labels::LabelNames::default(),
             ticket_chat: crate::config::TicketChatConfig {
                 model: Some("m".to_string()),
             },
@@ -12164,7 +12218,7 @@ mod tests {
 
         rig.poll(
             vec![
-                issue(142, &[gates::EPIC]),
+                issue(142, &[EPIC]),
                 issue(143, &["refined", "chunk"]),
                 wave_two(),
             ],
@@ -12185,7 +12239,7 @@ mod tests {
         );
 
         // Wave one closes, which frees the slot and settles the blocker.
-        rig.poll(vec![issue(142, &[gates::EPIC]), wave_two()], vec![]);
+        rig.poll(vec![issue(142, &[EPIC]), wave_two()], vec![]);
         rig.event(exited("borsuk/implement-i143", false, "cancelled"));
 
         assert_eq!(rig.task("borsuk/implement-i144").state, TaskState::Running);
@@ -17609,7 +17663,7 @@ mod tests {
     #[test]
     fn builtin_prompts_advance_the_github_gates() {
         assert!(
-            REFINE_PROMPT.contains("--remove-label to-refine --add-label refined"),
+            REFINE_PROMPT.contains("--remove-label {label_to_refine} --add-label {label_refined}"),
             "the refine prompt must open the implement gate"
         );
         assert!(
@@ -17617,7 +17671,7 @@ mod tests {
             "the implement prompt must leave the pull request in the review gate"
         );
         assert!(
-            IMPLEMENT_PROMPT.contains("--remove-label refined"),
+            IMPLEMENT_PROMPT.contains("--remove-label {label_refined}"),
             "the implement prompt must close its issue gate"
         );
         assert!(
@@ -21386,10 +21440,7 @@ mod tests {
 
         // The run created the sub-tickets and marked the parent an epic.
         rig.poll(
-            vec![
-                issue(142, &[gates::EPIC]),
-                issue(143, &["refined", "chunk"]),
-            ],
+            vec![issue(142, &[EPIC]), issue(143, &["refined", "chunk"])],
             vec![],
         );
 
@@ -21406,10 +21457,10 @@ mod tests {
         });
         rig.poll(vec![issue(142, &["to-refine"])], vec![]);
         rig.event(exited("borsuk/refine-i142", true, "code 0"));
-        rig.poll(vec![issue(142, &[gates::EPIC])], vec![]);
+        rig.poll(vec![issue(142, &[EPIC])], vec![]);
 
         // A second poll would fire any gate the first one opened.
-        rig.poll(vec![issue(142, &[gates::EPIC])], vec![]);
+        rig.poll(vec![issue(142, &[EPIC])], vec![]);
 
         assert!(
             !rig.daemon.table.by_id.contains_key("borsuk/implement-i142"),

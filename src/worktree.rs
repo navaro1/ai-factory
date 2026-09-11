@@ -861,6 +861,7 @@ mod tests {
             skills: None,
             role_overrides: BTreeMap::new(),
             tag_route_overrides: BTreeMap::new(),
+            label_overrides: BTreeMap::new(),
         }
     }
 

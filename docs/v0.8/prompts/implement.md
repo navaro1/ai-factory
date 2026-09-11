@@ -125,10 +125,10 @@ Open a draft PR with `gh pr create --draft` when the work is done. Put
 `Closes #{number}` in the body. When the ticket body names a parent ticket and
 marks this ticket as the final chunk, add a second `Closes` line for the parent
 number, so the merge closes the parent too. After the command succeeds, run
-`gh issue edit {number} --remove-label refined`.
+`gh issue edit {number} --remove-label {label_refined}`.
 
 If the specification is incomplete, or you need a human decision, add the
-`needs-human` label to ticket #{number} with `gh`, write the question into a
+`{label_needs_human}` label to ticket #{number} with `gh`, write the question into a
 comment on it, and stop. Do not guess. When the decision is a choice between
 named answers, end the comment with one strict block in this form. Keep the JSON
 on one line:

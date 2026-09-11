@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+use crate::labels::{LabelKey, LabelNames};
 use crate::model::ItemKind;
 
 /// The two pipeline stages that use tag routes.
@@ -24,11 +25,17 @@ impl TagRouteStage {
         }
     }
 
-    pub const fn label_prefix(self) -> &'static str {
+    /// The configurable label whose value is this stage's prefix.
+    pub const fn prefix_key(self) -> LabelKey {
         match self {
-            Self::Implement => "complexity:",
-            Self::Review => "review-complexity:",
+            Self::Implement => LabelKey::ComplexityPrefix,
+            Self::Review => LabelKey::ReviewComplexityPrefix,
         }
+    }
+
+    /// This stage's prefix under one label set.
+    pub fn label_prefix(self, names: &LabelNames) -> &str {
+        names.get(self.prefix_key())
     }
 }
 
@@ -83,8 +90,9 @@ impl TagRouteKey {
         format!("tag_routes.{}.{}", self.stage, self.level)
     }
 
-    pub fn label(self) -> String {
-        format!("{}{}", self.stage.label_prefix(), self.level)
+    /// The full label that selects this route under one label set.
+    pub fn label(self, names: &LabelNames) -> String {
+        format!("{}{}", self.stage.label_prefix(names), self.level)
     }
 }
 
@@ -117,11 +125,11 @@ pub struct TagRouteBinding {
 }
 
 /// Select the highest exact label, or medium when no valid label exists.
-pub fn select_level(stage: TagRouteStage, labels: &[String]) -> TagSelection {
+pub fn select_level(stage: TagRouteStage, labels: &[String], names: &LabelNames) -> TagSelection {
     let mut level = None;
     let mut matched_labels = Vec::new();
     for label in labels {
-        let candidate = level_from_label(stage, label);
+        let candidate = level_from_label(stage, label, names);
         if let Some(candidate) = candidate {
             level =
                 Some(level.map_or(candidate, |current: ComplexityLevel| current.max(candidate)));
@@ -135,10 +143,15 @@ pub fn select_level(stage: TagRouteStage, labels: &[String]) -> TagSelection {
 }
 
 /// Parse one exact label for the selected stage.
-pub fn level_from_label(stage: TagRouteStage, label: &str) -> Option<ComplexityLevel> {
+pub fn level_from_label(
+    stage: TagRouteStage,
+    label: &str,
+    names: &LabelNames,
+) -> Option<ComplexityLevel> {
+    let prefix = stage.label_prefix(names);
     ComplexityLevel::ALL
         .into_iter()
-        .find(|candidate| label == format!("{}{}", stage.label_prefix(), candidate.as_str()))
+        .find(|candidate| label == format!("{prefix}{}", candidate.as_str()))
 }
 
 /// The vendor family of one model slug: the text before the first `-`.
@@ -165,13 +178,14 @@ mod tests {
     #[test]
     fn missing_and_unknown_labels_select_medium() {
         assert_eq!(
-            select_level(TagRouteStage::Implement, &[]).level,
+            select_level(TagRouteStage::Implement, &[], &LabelNames::default()).level,
             ComplexityLevel::Medium
         );
         assert_eq!(
             select_level(
                 TagRouteStage::Review,
                 &labels(&["review-complexity:urgent", "complexity:high"]),
+                &LabelNames::default(),
             ),
             TagSelection {
                 level: ComplexityLevel::Medium,
@@ -190,6 +204,7 @@ mod tests {
                 "complexity:very-high",
                 "review-complexity:high",
             ]),
+            &LabelNames::default(),
         );
         assert_eq!(selection.level, ComplexityLevel::VeryHigh);
         assert_eq!(
@@ -198,13 +213,48 @@ mod tests {
         );
     }
 
+    /// A repository can rename the prefix. The selector then matches the
+    /// configured prefix and ignores the historical one.
+    #[test]
+    fn a_renamed_prefix_replaces_the_default_prefix() {
+        let mut names = LabelNames::default();
+        names.set(LabelKey::ComplexityPrefix, "size/".to_string());
+
+        let selection = select_level(
+            TagRouteStage::Implement,
+            &labels(&["size/high", "complexity:very-high"]),
+            &names,
+        );
+        assert_eq!(selection.level, ComplexityLevel::High);
+        assert_eq!(selection.matched_labels, labels(&["size/high"]));
+
+        assert_eq!(
+            TagRouteKey::new(TagRouteStage::Implement, ComplexityLevel::High).label(&names),
+            "size/high"
+        );
+    }
+
+    /// Renaming one stage prefix leaves the other stage alone.
+    #[test]
+    fn a_renamed_implement_prefix_leaves_review_alone() {
+        let mut names = LabelNames::default();
+        names.set(LabelKey::ComplexityPrefix, "size/".to_string());
+        let found = select_level(
+            TagRouteStage::Review,
+            &labels(&["review-complexity:very-high"]),
+            &names,
+        );
+        assert_eq!(found.level, ComplexityLevel::VeryHigh);
+    }
+
     #[test]
     fn every_exact_label_selects_its_typed_level() {
         for stage in TagRouteStage::ALL {
             for level in ComplexityLevel::ALL {
-                let label = format!("{}{}", stage.label_prefix(), level);
+                let names = LabelNames::default();
+                let label = format!("{}{}", stage.label_prefix(&names), level);
                 assert_eq!(
-                    select_level(stage, std::slice::from_ref(&label)),
+                    select_level(stage, std::slice::from_ref(&label), &names),
                     TagSelection {
                         level,
                         matched_labels: vec![label],

@@ -18,7 +18,7 @@ use super::inbox::ActionSink;
 use super::theme::THEME;
 use crate::config::ReleasePolicy;
 use crate::daemon::FAST_CHECK_FAILED;
-use crate::gates::{REFINED, TO_REFINE};
+use crate::labels::LabelKey;
 use crate::model::{ItemKind, Stage};
 use crate::sock::{Action, LaneView, PauseScope, StateView, TaskView, TheoryAction};
 use crate::tasks::TaskState;
@@ -968,12 +968,12 @@ fn full_prediction_target(app: &App) -> Option<(String, u64)> {
         .tickets
         .iter()
         .find(|ticket| ticket.repo == task.repo && ticket.number == task.number)?;
-    let carries = |label: &str| ticket.labels.iter().any(|one| one == label);
+    let names = state.settings.labels_of(&task.repo);
     let theory = state.theory.get(&task.repo)?;
     let key = RecordKey::Issue(task.number).key_text();
     if skips_prediction_gates(&ticket.labels)
-        || !carries(REFINED)
-        || carries(TO_REFINE)
+        || !names.has(LabelKey::Refined, &ticket.labels)
+        || names.has(LabelKey::ToRefine, &ticket.labels)
         || theory.record_carries(&key, &ticket.labels, THEORY_FULL_LABEL)
     {
         return None;
@@ -2611,6 +2611,7 @@ use ratatui::Terminal;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels::{DEFAULT_REFINED as REFINED, DEFAULT_TO_REFINE as TO_REFINE};
 
     /// A state view with no repositories, tasks, and trains.
     fn empty_view() -> StateView {

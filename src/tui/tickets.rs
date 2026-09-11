@@ -9,13 +9,13 @@ use ratatui::Frame;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+use crate::labels::LabelNames;
 use crate::sock::{
     Action, StateView, TicketAction, TicketConflict, TicketContent, TicketContentSource,
     TicketDetails, TicketGroup, TicketLabels, TicketMentions, TicketResult, TicketResultKind,
     TicketSummary,
 };
 
-use crate::gates::REFINED;
 use crate::theory::records::{
     skips_prediction_gates, RecordKey, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
 };
@@ -213,7 +213,8 @@ impl Tickets {
         if !theory.record_carries(&key, labels, THEORY_SHORT_LABEL) {
             return Some(CHAT_WAITS_SHORT);
         }
-        if self.focus_has_label(REFINED) && !theory.record_carries(&key, labels, THEORY_FULL_LABEL)
+        if self.focus_has_label(&state.settings.labels_of(repo).refined)
+            && !theory.record_carries(&key, labels, THEORY_FULL_LABEL)
         {
             return Some(CHAT_WAITS_FULL);
         }
@@ -1146,7 +1147,7 @@ impl Tickets {
                 if !lines.is_empty() {
                     lines.push(Line::from(""));
                 }
-                lines.push(group_line(ticket.group));
+                lines.push(group_line(ticket.group, &state.settings.labels));
                 previous = Some(ticket.group);
             }
             let selected = ticket_index == self.selected;
@@ -1635,11 +1636,14 @@ fn ticket_chat_harness<'a>(state: &'a StateView, repo: &str) -> &'a str {
 }
 
 /// The word and symbol for one workflow group.
-fn group_line(group: TicketGroup) -> Line<'static> {
+///
+/// The group spans every repository, so the header shows the global label
+/// name. A repository that renamed the label still sorts into this group.
+fn group_line(group: TicketGroup, names: &LabelNames) -> Line<'static> {
     let (symbol, word, color) = match group {
-        TicketGroup::Untouched => ("○", "untouched", THEME.text),
-        TicketGroup::ToRefine => ("◇", "to-refine", THEME.warn),
-        TicketGroup::Refined => ("◆", "refined", THEME.ok),
+        TicketGroup::Untouched => ("○", "untouched".to_string(), THEME.text),
+        TicketGroup::ToRefine => ("◇", names.to_refine.clone(), THEME.warn),
+        TicketGroup::Refined => ("◆", names.refined.clone(), THEME.ok),
     };
     Line::from(vec![
         Span::styled(format!(" {symbol} "), Style::default().fg(color)),
@@ -2848,7 +2852,10 @@ mod tests {
         let mut tickets = Tickets::default();
         tickets.handle_key(&state, key(KeyCode::Enter));
         let mut issue_details = details();
-        issue_details.issue.labels = vec![THEORY_SHORT_LABEL.to_string(), REFINED.to_string()];
+        issue_details.issue.labels = vec![
+            THEORY_SHORT_LABEL.to_string(),
+            crate::labels::DEFAULT_REFINED.to_string(),
+        ];
         tickets.observe_details(issue_details.clone());
 
         let action = tickets.handle_key(&state, key(KeyCode::Char('c')));

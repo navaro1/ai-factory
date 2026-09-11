@@ -16,28 +16,19 @@
 
 use std::collections::BTreeSet;
 
+use crate::labels::{LabelKey, LabelNames};
 use crate::model::{Issue, ItemKind, Pr, RepoSnapshot, Stage};
 use crate::theory::records::{
     skips_prediction_gates, RecordKey, TheoryRecords, THEORY_FULL_LABEL, THEORY_SHORT_LABEL,
 };
 
-/// The label that asks the factory to shape a raw issue.
-pub const TO_REFINE: &str = "to-refine";
-
-/// The label that marks a shaped issue as ready to implement.
-pub const REFINED: &str = "refined";
-
-/// The label that marks a parent whose chunks became sub-tickets.
-///
-/// A refine run has two outcomes. It shapes one ticket and adds
-/// [`REFINED`], or it splits the work and adds this label to the parent.
-/// A parent never carries [`REFINED`], so [`implement_ready`] stays false
-/// on it and only the sub-tickets reach the implement stage. The parent
-/// closes when the PR of the final chunk merges.
-pub const EPIC: &str = "epic";
-
-/// The label that asks a human to decide something on GitHub.
-pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
+// The names of these labels are configuration, not constants. The
+// `labels` module owns them, and `Config::resolved_labels` gives one set
+// per repository. A refine run has two outcomes: it shapes one ticket and
+// adds the refined label, or it splits the work and adds the epic label to
+// the parent. A parent never carries the refined label, so
+// `implement_ready` stays false on it and only the sub-tickets reach the
+// implement stage. The parent closes when the PR of the final chunk merges.
 
 /// Work that a stage gate reports as ready to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +60,16 @@ pub struct ReadyWork {
 /// model pull request is how the operator repairs it. Every other
 /// governed item holds while the model does not parse, because a broken
 /// model can validate no area.
-pub fn refine_ready(issue: &Issue, alias: &str, records: &TheoryRecords) -> bool {
-    if !issue.open || !has_label(&issue.labels, TO_REFINE) {
+///
+/// `names` carries the configured label names of the repository, so a
+/// repository that renamed its refine label opens the same gate.
+pub fn refine_ready(
+    issue: &Issue,
+    alias: &str,
+    records: &TheoryRecords,
+    names: &LabelNames,
+) -> bool {
+    if !issue.open || !names.has(LabelKey::ToRefine, &issue.labels) {
         return false;
     }
     if !records.is_governed(alias) || skips_prediction_gates(&issue.labels) {
@@ -96,8 +95,16 @@ pub const MODEL_ERROR_HINT: &str = "model error";
 /// The hint is the reason the pipeline draws where the refine task would
 /// stand, so a held ticket never leaves the lane silent. A ticket that is
 /// not refine work at all, and a ticket the gate admits, hold nothing.
-pub fn refine_hold(issue: &Issue, alias: &str, records: &TheoryRecords) -> Option<&'static str> {
-    if !issue.open || !has_label(&issue.labels, TO_REFINE) || refine_ready(issue, alias, records) {
+pub fn refine_hold(
+    issue: &Issue,
+    alias: &str,
+    records: &TheoryRecords,
+    names: &LabelNames,
+) -> Option<&'static str> {
+    if !issue.open
+        || !names.has(LabelKey::ToRefine, &issue.labels)
+        || refine_ready(issue, alias, records, names)
+    {
         return None;
     }
     if records.model_error(alias) {
@@ -131,8 +138,16 @@ pub fn refine_hold(issue: &Issue, alias: &str, records: &TheoryRecords) -> Optio
 /// closed, or is absent, because that ticket left the stage. A ticket that
 /// waits for a blocker is still implement work. It keeps its task, and the
 /// dispatch defers that task.
-pub fn implement_ready(issue: &Issue, alias: &str, records: &TheoryRecords) -> bool {
-    if !issue.open || !has_label(&issue.labels, REFINED) || has_label(&issue.labels, TO_REFINE) {
+pub fn implement_ready(
+    issue: &Issue,
+    alias: &str,
+    records: &TheoryRecords,
+    names: &LabelNames,
+) -> bool {
+    if !issue.open
+        || !names.has(LabelKey::Refined, &issue.labels)
+        || names.has(LabelKey::ToRefine, &issue.labels)
+    {
         return false;
     }
     if !records.is_governed(alias) || skips_prediction_gates(&issue.labels) {
@@ -155,11 +170,16 @@ pub const AWAITS_FULL_HINT: &str = "awaits full prediction";
 /// The hint mirrors [`refine_hold`]: a ticket that is not implement work
 /// at all, and a ticket the gate admits, hold nothing. An open blocker is
 /// not a hold, because a blocked ticket keeps its task and its row.
-pub fn implement_hold(issue: &Issue, alias: &str, records: &TheoryRecords) -> Option<&'static str> {
+pub fn implement_hold(
+    issue: &Issue,
+    alias: &str,
+    records: &TheoryRecords,
+    names: &LabelNames,
+) -> Option<&'static str> {
     if !issue.open
-        || !has_label(&issue.labels, REFINED)
-        || has_label(&issue.labels, TO_REFINE)
-        || implement_ready(issue, alias, records)
+        || !names.has(LabelKey::Refined, &issue.labels)
+        || names.has(LabelKey::ToRefine, &issue.labels)
+        || implement_ready(issue, alias, records, names)
     {
         return None;
     }
@@ -196,6 +216,15 @@ pub fn unmet_blockers(snap: &RepoSnapshot, issue: &Issue) -> Vec<u64> {
         .collect()
 }
 
+/// True when the label list contains `wanted`.
+///
+/// The theory labels are constants, not configuration, so the gates read
+/// them through this helper. Every configurable label goes through
+/// [`LabelNames::has`] instead.
+fn has_label(labels: &[String], wanted: &str) -> bool {
+    labels.iter().any(|label| label == wanted)
+}
+
 /// True when the pull request is open, still a draft, and carries no
 /// `needs-human` label.
 ///
@@ -213,18 +242,13 @@ pub fn unmet_blockers(snap: &RepoSnapshot, issue: &Issue) -> Vec<u64> {
 /// operator answers and the daemon removes the label, the gate goes from
 /// false to true and fires one fresh review, which reads the answer in the
 /// comments of the pull request.
-pub fn review_ready(pr: &Pr) -> bool {
-    pr.open && pr.draft && !has_label(&pr.labels, NEEDS_HUMAN_LABEL)
+pub fn review_ready(pr: &Pr, names: &LabelNames) -> bool {
+    pr.open && pr.draft && !names.has(LabelKey::NeedsHuman, &pr.labels)
 }
 
 /// True when the pull request is open and is no longer a draft.
 pub fn release_ready(pr: &Pr) -> bool {
     pr.open && !pr.draft
-}
-
-/// True when the label list contains `wanted`.
-fn has_label(labels: &[String], wanted: &str) -> bool {
-    labels.iter().any(|label| label == wanted)
 }
 
 /// Collect the issue numbers that a body names as blockers.
@@ -360,18 +384,23 @@ impl GateTracker {
     ///
     /// `records` is the theory read model of the same poll. The refine
     /// and implement gates of a governed repository read their record
-    /// labels from it.
+    /// labels from it. `names` carries the configured label names of the
+    /// repository.
     pub fn observe(
         &mut self,
         repo: &str,
         snap: &RepoSnapshot,
         records: &TheoryRecords,
+        names: &LabelNames,
     ) -> Vec<ReadyWork> {
         let mut now_ready = BTreeSet::new();
         for issue in snap.issues.values() {
             for (stage, open) in [
-                (Stage::Refine, refine_ready(issue, repo, records)),
-                (Stage::Implement, implement_ready(issue, repo, records)),
+                (Stage::Refine, refine_ready(issue, repo, records, names)),
+                (
+                    Stage::Implement,
+                    implement_ready(issue, repo, records, names),
+                ),
             ] {
                 if open {
                     now_ready.insert(GateKey {
@@ -386,7 +415,7 @@ impl GateTracker {
         }
         for pr in snap.prs.values() {
             for (stage, open) in [
-                (Stage::Review, review_ready(pr)),
+                (Stage::Review, review_ready(pr, names)),
                 (Stage::Release, release_ready(pr)),
             ] {
                 if open {
@@ -439,6 +468,10 @@ impl GateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names() -> LabelNames {
+        LabelNames::default()
+    }
 
     fn issue(number: u64, labels: &[&str]) -> Issue {
         Issue {
@@ -512,53 +545,83 @@ mod tests {
     /// not parse holds every governed ticket.
     #[test]
     fn the_refine_gate_of_a_governed_ticket_waits_for_theory_short() {
-        let waiting = issue(1, &[TO_REFINE]);
+        let waiting = issue(1, &["to-refine"]);
         assert!(
-            !refine_ready(&waiting, "borsuk", &records_of("on", &waiting, false)),
+            !refine_ready(
+                &waiting,
+                "borsuk",
+                &records_of("on", &waiting, false),
+                &names()
+            ),
             "to-refine alone yields no refine work"
         );
 
-        let ready = issue(1, &[TO_REFINE, THEORY_SHORT_LABEL]);
+        let ready = issue(1, &["to-refine", THEORY_SHORT_LABEL]);
         assert!(
-            refine_ready(&ready, "borsuk", &records_of("on", &ready, false)),
+            refine_ready(&ready, "borsuk", &records_of("on", &ready, false), &names()),
             "both labels yield work"
         );
 
         assert!(
-            refine_ready(&waiting, "borsuk", &records_of("off", &waiting, false)),
+            refine_ready(
+                &waiting,
+                "borsuk",
+                &records_of("off", &waiting, false),
+                &names()
+            ),
             "with the governor off to-refine alone yields work"
         );
 
         assert!(
-            !refine_ready(&ready, "borsuk", &records_of("on", &ready, true)),
+            !refine_ready(&ready, "borsuk", &records_of("on", &ready, true), &names()),
             "a model in error holds both labels"
         );
 
-        let skipped = issue(1, &[TO_REFINE, "verify-skill"]);
+        let skipped = issue(1, &["to-refine", "verify-skill"]);
         assert!(
-            refine_ready(&skipped, "borsuk", &records_of("on", &skipped, false)),
+            refine_ready(
+                &skipped,
+                "borsuk",
+                &records_of("on", &skipped, false),
+                &names()
+            ),
             "a verify-skill ticket needs no prediction"
         );
 
         // The skip wins over the model error. The model pull request is
         // how the operator repairs a broken model, so it may not wait for
         // that model to parse.
-        let model_pr = issue(1, &[TO_REFINE, "model-pr"]);
+        let model_pr = issue(1, &["to-refine", "model-pr"]);
         assert!(
-            refine_ready(&model_pr, "borsuk", &records_of("on", &model_pr, true)),
+            refine_ready(
+                &model_pr,
+                "borsuk",
+                &records_of("on", &model_pr, true),
+                &names()
+            ),
             "a model-pr moves while the model is broken"
         );
         assert_eq!(
-            refine_hold(&model_pr, "borsuk", &records_of("on", &model_pr, true)),
+            refine_hold(
+                &model_pr,
+                "borsuk",
+                &records_of("on", &model_pr, true),
+                &names()
+            ),
             None,
             "a skipped ticket is never held"
         );
         assert_eq!(
-            refine_hold(&ready, "borsuk", &records_of("on", &ready, true)),
+            refine_hold(&ready, "borsuk", &records_of("on", &ready, true), &names()),
             Some(MODEL_ERROR_HINT)
         );
         assert_eq!(
-            refine_hold(&waiting, "borsuk", &records_of("on", &waiting, false)),
+            refine_hold(
+                &waiting,
+                "borsuk",
+                &records_of("on", &waiting, false),
+                &names()
+            ),
             Some(AWAITS_SHORT_HINT)
         );
     }
@@ -568,18 +631,23 @@ mod tests {
     #[test]
     fn the_tracker_reports_a_governed_refine_only_after_theory_short() {
         let mut tracker = GateTracker::new();
-        let waiting = issue(1, &[TO_REFINE]);
+        let waiting = issue(1, &["to-refine"]);
         let held = repo(vec![waiting.clone()], Vec::new());
         assert!(
             tracker
-                .observe("borsuk", &held, &records_of("on", &waiting, false))
+                .observe(
+                    "borsuk",
+                    &held,
+                    &records_of("on", &waiting, false),
+                    &names()
+                )
                 .is_empty(),
             "the held ticket reports nothing"
         );
 
-        let ready = issue(1, &[TO_REFINE, THEORY_SHORT_LABEL]);
+        let ready = issue(1, &["to-refine", THEORY_SHORT_LABEL]);
         let open = repo(vec![ready.clone()], Vec::new());
-        let fired = tracker.observe("borsuk", &open, &records_of("on", &ready, false));
+        let fired = tracker.observe("borsuk", &open, &records_of("on", &ready, false), &names());
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Refine);
         assert_eq!(fired[0].number, 1);
@@ -589,6 +657,81 @@ mod tests {
     /// keeps its v0.6 rule.
     fn ungoverned() -> TheoryRecords {
         TheoryRecords::default()
+    }
+
+    /// A repository that renamed its gate labels. Every predicate reads
+    /// the configured name, so the new name opens the gate and the
+    /// historical name opens nothing. The governed rules stay on top of
+    /// the renamed names.
+    #[test]
+    fn the_gates_read_the_configured_label_names() {
+        let mut renamed = LabelNames::default();
+        renamed.set(LabelKey::ToRefine, "state/shape".to_string());
+        renamed.set(LabelKey::Refined, "state/build".to_string());
+
+        let shaped = issue(1, &["state/shape"]);
+        assert!(refine_ready(&shaped, "borsuk", &ungoverned(), &renamed));
+        assert!(!refine_ready(
+            &issue(1, &["to-refine"]),
+            "borsuk",
+            &ungoverned(),
+            &renamed
+        ));
+
+        let built = issue(2, &["state/build"]);
+        assert!(implement_ready(&built, "borsuk", &ungoverned(), &renamed));
+        assert!(!implement_ready(
+            &issue(2, &["refined"]),
+            "borsuk",
+            &ungoverned(),
+            &renamed
+        ));
+        assert!(
+            !implement_ready(
+                &issue(2, &["state/build", "state/shape"]),
+                "borsuk",
+                &ungoverned(),
+                &renamed
+            ),
+            "the renamed refine label still holds the implement gate"
+        );
+
+        assert!(
+            !refine_ready(
+                &shaped,
+                "borsuk",
+                &records_of("on", &shaped, false),
+                &renamed
+            ),
+            "a governed ticket still waits for its short prediction"
+        );
+        assert_eq!(
+            refine_hold(
+                &shaped,
+                "borsuk",
+                &records_of("on", &shaped, false),
+                &renamed
+            ),
+            Some(AWAITS_SHORT_HINT)
+        );
+        assert_eq!(
+            implement_hold(&built, "borsuk", &records_of("on", &built, false), &renamed),
+            Some(AWAITS_FULL_HINT)
+        );
+
+        let mut tracker = GateTracker::new();
+        let work = tracker.observe(
+            "borsuk",
+            &repo(vec![shaped.clone()], Vec::new()),
+            &ungoverned(),
+            &renamed,
+        );
+        assert_eq!(
+            work.len(),
+            1,
+            "the renamed label fires one refine: {work:?}"
+        );
+        assert_eq!(work[0].stage, Stage::Refine);
     }
 
     fn repo(issues: Vec<Issue>, prs: Vec<Pr>) -> RepoSnapshot {
@@ -603,16 +746,18 @@ mod tests {
         assert!(refine_ready(
             &issue(1, &["to-refine"]),
             "borsuk",
-            &ungoverned()
+            &ungoverned(),
+            &names()
         ));
         assert!(!refine_ready(
             &issue(2, &["refined"]),
             "borsuk",
-            &ungoverned()
+            &ungoverned(),
+            &names()
         ));
         let mut closed = issue(3, &["to-refine"]);
         closed.open = false;
-        assert!(!refine_ready(&closed, "borsuk", &ungoverned()));
+        assert!(!refine_ready(&closed, "borsuk", &ungoverned(), &names()));
     }
 
     /// The implement gate of a governed ticket needs the full prediction:
@@ -621,49 +766,74 @@ mod tests {
     /// parse holds every governed ticket. The hint names each hold.
     #[test]
     fn the_implement_gate_of_a_governed_ticket_waits_for_theory_full() {
-        let waiting = issue(1, &[REFINED]);
+        let waiting = issue(1, &["refined"]);
         assert!(
-            !implement_ready(&waiting, "borsuk", &records_of("on", &waiting, false)),
+            !implement_ready(
+                &waiting,
+                "borsuk",
+                &records_of("on", &waiting, false),
+                &names()
+            ),
             "refined alone yields no implement work"
         );
 
-        let ready = issue(1, &[REFINED, THEORY_FULL_LABEL]);
+        let ready = issue(1, &["refined", THEORY_FULL_LABEL]);
         assert!(
-            implement_ready(&ready, "borsuk", &records_of("on", &ready, false)),
+            implement_ready(&ready, "borsuk", &records_of("on", &ready, false), &names()),
             "both labels yield work"
         );
 
         assert!(
-            implement_ready(&waiting, "borsuk", &records_of("off", &waiting, false)),
+            implement_ready(
+                &waiting,
+                "borsuk",
+                &records_of("off", &waiting, false),
+                &names()
+            ),
             "with the governor off refined alone yields work"
         );
 
         assert!(
-            !implement_ready(&ready, "borsuk", &records_of("on", &ready, true)),
+            !implement_ready(&ready, "borsuk", &records_of("on", &ready, true), &names()),
             "a model in error holds both labels"
         );
 
-        let skipped = issue(1, &[REFINED, "model-pr"]);
+        let skipped = issue(1, &["refined", "model-pr"]);
         assert!(
-            implement_ready(&skipped, "borsuk", &records_of("on", &skipped, false)),
+            implement_ready(
+                &skipped,
+                "borsuk",
+                &records_of("on", &skipped, false),
+                &names()
+            ),
             "a model-pr ticket needs no prediction"
         );
 
         assert_eq!(
-            implement_hold(&waiting, "borsuk", &records_of("on", &waiting, false)),
+            implement_hold(
+                &waiting,
+                "borsuk",
+                &records_of("on", &waiting, false),
+                &names()
+            ),
             Some(AWAITS_FULL_HINT)
         );
         assert_eq!(
-            implement_hold(&ready, "borsuk", &records_of("on", &ready, true)),
+            implement_hold(&ready, "borsuk", &records_of("on", &ready, true), &names()),
             Some(MODEL_ERROR_HINT)
         );
         assert_eq!(
-            implement_hold(&ready, "borsuk", &records_of("on", &ready, false)),
+            implement_hold(&ready, "borsuk", &records_of("on", &ready, false), &names()),
             None,
             "an admitted ticket holds nothing"
         );
         assert_eq!(
-            implement_hold(&issue(1, &[]), "borsuk", &records_of("on", &waiting, false)),
+            implement_hold(
+                &issue(1, &[]),
+                "borsuk",
+                &records_of("on", &waiting, false),
+                &names()
+            ),
             None,
             "a ticket that never entered the stage holds nothing"
         );
@@ -673,19 +843,24 @@ mod tests {
     /// implement work and the labelled one reports it once.
     #[test]
     fn the_tracker_reports_implement_work_only_after_theory_full() {
-        let waiting = issue(1, &[REFINED]);
+        let waiting = issue(1, &["refined"]);
         let mut tracker = GateTracker::new();
         let snap = repo(vec![waiting.clone()], Vec::new());
         assert!(
             tracker
-                .observe("borsuk", &snap, &records_of("on", &waiting, false))
+                .observe(
+                    "borsuk",
+                    &snap,
+                    &records_of("on", &waiting, false),
+                    &names()
+                )
                 .is_empty(),
             "the gate holds the ticket"
         );
 
-        let ready = issue(1, &[REFINED, THEORY_FULL_LABEL]);
+        let ready = issue(1, &["refined", THEORY_FULL_LABEL]);
         let snap = repo(vec![ready.clone()], Vec::new());
-        let work = tracker.observe("borsuk", &snap, &records_of("on", &ready, false));
+        let work = tracker.observe("borsuk", &snap, &records_of("on", &ready, false), &names());
         assert_eq!(work.len(), 1, "the label opens the gate once: {work:?}");
         assert_eq!(work[0].stage, Stage::Implement);
         assert_eq!(work[0].number, 1);
@@ -696,17 +871,24 @@ mod tests {
         assert!(implement_ready(
             &issue(1, &["refined"]),
             "borsuk",
-            &ungoverned()
+            &ungoverned(),
+            &names()
         ));
         assert!(!implement_ready(
             &issue(1, &["refined", "to-refine"]),
             "borsuk",
-            &ungoverned()
+            &ungoverned(),
+            &names()
         ));
-        assert!(!implement_ready(&issue(1, &[]), "borsuk", &ungoverned()));
+        assert!(!implement_ready(
+            &issue(1, &[]),
+            "borsuk",
+            &ungoverned(),
+            &names()
+        ));
         let mut closed = issue(1, &["refined"]);
         closed.open = false;
-        assert!(!implement_ready(&closed, "borsuk", &ungoverned()));
+        assert!(!implement_ready(&closed, "borsuk", &ungoverned(), &names()));
     }
 
     /// The parent of a split carries `epic` and never `refined`, so the
@@ -714,16 +896,21 @@ mod tests {
     #[test]
     fn an_epic_parent_never_opens_the_implement_gate() {
         let snap = repo(
-            vec![issue(1, &[EPIC]), issue(2, &[REFINED, "chunk"])],
+            vec![issue(1, &["epic"]), issue(2, &["refined", "chunk"])],
             vec![],
         );
-        assert!(!implement_ready(&snap.issues[&1], "borsuk", &ungoverned()));
+        assert!(!implement_ready(
+            &snap.issues[&1],
+            "borsuk",
+            &ungoverned(),
+            &names()
+        ));
         assert!(
-            !refine_ready(&snap.issues[&1], "borsuk", &ungoverned()),
+            !refine_ready(&snap.issues[&1], "borsuk", &ungoverned(), &names()),
             "the parent is not refined again"
         );
         assert!(
-            implement_ready(&snap.issues[&2], "borsuk", &ungoverned()),
+            implement_ready(&snap.issues[&2], "borsuk", &ungoverned(), &names()),
             "the sub-ticket carries the work"
         );
     }
@@ -735,26 +922,36 @@ mod tests {
     fn an_open_dependency_leaves_the_implement_gate_open() {
         let blocked = issue_with_body(1, &["refined"], "blocked by #2");
         let held = repo(vec![blocked, issue(2, &[])], vec![]);
-        assert!(implement_ready(&held.issues[&1], "borsuk", &ungoverned()));
+        assert!(implement_ready(
+            &held.issues[&1],
+            "borsuk",
+            &ungoverned(),
+            &names()
+        ));
         assert_eq!(unmet_blockers(&held, &held.issues[&1]), vec![2]);
 
         let free = repo(
             vec![issue_with_body(1, &["refined"], "blocked by #2")],
             vec![],
         );
-        assert!(implement_ready(&free.issues[&1], "borsuk", &ungoverned()));
+        assert!(implement_ready(
+            &free.issues[&1],
+            "borsuk",
+            &ungoverned(),
+            &names()
+        ));
         assert!(unmet_blockers(&free, &free.issues[&1]).is_empty());
     }
 
     #[test]
     fn review_takes_open_drafts_and_release_takes_ready_ones() {
-        assert!(review_ready(&pr(1, true, "aaa")));
-        assert!(!review_ready(&pr(2, false, "bbb")));
+        assert!(review_ready(&pr(1, true, "aaa"), &names()));
+        assert!(!review_ready(&pr(2, false, "bbb"), &names()));
         assert!(release_ready(&pr(3, false, "ccc")));
         assert!(!release_ready(&pr(4, true, "ddd")));
         let mut closed = pr(5, false, "eee");
         closed.open = false;
-        assert!(!review_ready(&closed));
+        assert!(!review_ready(&closed, &names()));
         assert!(!release_ready(&closed));
     }
 
@@ -765,13 +962,17 @@ mod tests {
     fn a_needs_human_draft_rests_until_the_label_goes_away() {
         let mut tracker = GateTracker::new();
         let mut waiting = pr(7, true, "aaa");
-        waiting.labels = vec![NEEDS_HUMAN_LABEL.to_string()];
-        assert!(!review_ready(&waiting), "the label closes the review gate");
+        waiting.labels = vec!["needs-human".to_string()];
+        assert!(
+            !review_ready(&waiting, &names()),
+            "the label closes the review gate"
+        );
 
         let fired = tracker.observe(
             "borsuk",
             &repo(Vec::new(), vec![waiting.clone()]),
             &ungoverned(),
+            &names(),
         );
         assert!(
             !fired.iter().any(|work| work.stage == Stage::Review),
@@ -786,6 +987,7 @@ mod tests {
             "borsuk",
             &repo(Vec::new(), vec![pushed.clone()]),
             &ungoverned(),
+            &names(),
         );
         assert!(
             !fired.iter().any(|work| work.stage == Stage::Review),
@@ -800,6 +1002,7 @@ mod tests {
             "borsuk",
             &repo(Vec::new(), vec![answered.clone()]),
             &ungoverned(),
+            &names(),
         );
         let review: Vec<&ReadyWork> = fired
             .iter()
@@ -809,7 +1012,12 @@ mod tests {
         assert_eq!(review[0].number, 7);
         assert_eq!(review[0].head_sha.as_deref(), Some("bbb"));
 
-        let again = tracker.observe("borsuk", &repo(Vec::new(), vec![answered]), &ungoverned());
+        let again = tracker.observe(
+            "borsuk",
+            &repo(Vec::new(), vec![answered]),
+            &ungoverned(),
+            &names(),
+        );
         assert!(
             !again.iter().any(|work| work.stage == Stage::Review),
             "the open gate reports once"
@@ -931,7 +1139,7 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        let first = tracker.observe("borsuk", &ready, &ungoverned());
+        let first = tracker.observe("borsuk", &ready, &ungoverned(), &names());
         assert_eq!(
             first,
             vec![ReadyWork {
@@ -942,7 +1150,9 @@ mod tests {
                 head_sha: None,
             }]
         );
-        assert!(tracker.observe("borsuk", &ready, &ungoverned()).is_empty());
+        assert!(tracker
+            .observe("borsuk", &ready, &ungoverned(), &names())
+            .is_empty());
     }
 
     #[test]
@@ -952,9 +1162,21 @@ mod tests {
         // No gate label, so neither the refine nor the implement gate is open.
         let idle = repo(vec![issue(1, &["question"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
-        assert!(tracker.observe("borsuk", &idle, &ungoverned()).is_empty());
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
+        assert!(tracker
+            .observe("borsuk", &idle, &ungoverned(), &names())
+            .is_empty());
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -964,15 +1186,15 @@ mod tests {
 
         assert_eq!(
             tracker
-                .observe("borsuk", &draft("aaa"), &ungoverned())
+                .observe("borsuk", &draft("aaa"), &ungoverned(), &names())
                 .len(),
             1
         );
         assert!(tracker
-            .observe("borsuk", &draft("aaa"), &ungoverned())
+            .observe("borsuk", &draft("aaa"), &ungoverned(), &names())
             .is_empty());
 
-        let again = tracker.observe("borsuk", &draft("bbb"), &ungoverned());
+        let again = tracker.observe("borsuk", &draft("bbb"), &ungoverned(), &names());
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].head_sha.as_deref(), Some("bbb"));
     }
@@ -987,13 +1209,23 @@ mod tests {
 
         assert_eq!(
             tracker
-                .observe("borsuk", &repo(vec![], vec![first]), &ungoverned())
+                .observe(
+                    "borsuk",
+                    &repo(vec![], vec![first]),
+                    &ungoverned(),
+                    &names()
+                )
                 .len(),
             1
         );
         assert_eq!(
             tracker
-                .observe("borsuk", &repo(vec![], vec![renamed]), &ungoverned())
+                .observe(
+                    "borsuk",
+                    &repo(vec![], vec![renamed]),
+                    &ungoverned(),
+                    &names()
+                )
                 .len(),
             1
         );
@@ -1016,14 +1248,18 @@ mod tests {
             vec![],
         );
 
-        let fired = tracker.observe("borsuk", &held, &ungoverned());
+        let fired = tracker.observe("borsuk", &held, &ungoverned(), &names());
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Implement);
         assert_eq!(fired[0].number, 7);
 
         // The blocker closing is not a gate edge, so no second task fires.
-        assert!(tracker.observe("borsuk", &held, &ungoverned()).is_empty());
-        assert!(tracker.observe("borsuk", &free, &ungoverned()).is_empty());
+        assert!(tracker
+            .observe("borsuk", &held, &ungoverned(), &names())
+            .is_empty());
+        assert!(tracker
+            .observe("borsuk", &free, &ungoverned(), &names())
+            .is_empty());
     }
 
     #[test]
@@ -1032,9 +1268,21 @@ mod tests {
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
         let gone = repo(vec![], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
-        assert!(tracker.observe("borsuk", &gone, &ungoverned()).is_empty());
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
+        assert!(tracker
+            .observe("borsuk", &gone, &ungoverned(), &names())
+            .is_empty());
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1042,13 +1290,25 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
         tracker.forget("borsuk", ItemKind::Issue, 1);
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
 
         // Forgetting another item does not revive this one.
         tracker.forget("borsuk", ItemKind::Issue, 2);
-        assert!(tracker.observe("borsuk", &ready, &ungoverned()).is_empty());
+        assert!(tracker
+            .observe("borsuk", &ready, &ungoverned(), &names())
+            .is_empty());
     }
 
     #[test]
@@ -1056,14 +1316,29 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
-        assert_eq!(tracker.observe("qubitsok", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
+        assert_eq!(
+            tracker
+                .observe("qubitsok", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
         tracker.forget_repo("borsuk");
         // The removed repository fires again on a return; the kept one
         // holds its memory.
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
         assert!(tracker
-            .observe("qubitsok", &ready, &ungoverned())
+            .observe("qubitsok", &ready, &ungoverned(), &names())
             .is_empty());
     }
 
@@ -1077,7 +1352,8 @@ mod tests {
                 .observe(
                     "borsuk",
                     &repo(vec![], vec![pr(3, true, "aaa")]),
-                    &ungoverned()
+                    &ungoverned(),
+                    &names()
                 )
                 .len(),
             1
@@ -1087,6 +1363,7 @@ mod tests {
             "borsuk",
             &repo(vec![], vec![pr(3, false, "aaa")]),
             &ungoverned(),
+            &names(),
         );
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].stage, Stage::Release);
@@ -1096,7 +1373,8 @@ mod tests {
             .observe(
                 "borsuk",
                 &repo(vec![], vec![pr(3, false, "aaa")]),
-                &ungoverned()
+                &ungoverned(),
+                &names()
             )
             .is_empty());
     }
@@ -1106,12 +1384,19 @@ mod tests {
         let mut tracker = GateTracker::new();
         let ready = repo(vec![issue(1, &["to-refine"])], vec![]);
 
-        assert_eq!(tracker.observe("borsuk", &ready, &ungoverned()).len(), 1);
+        assert_eq!(
+            tracker
+                .observe("borsuk", &ready, &ungoverned(), &names())
+                .len(),
+            1
+        );
         assert!(tracker
-            .observe("qubitsok", &repo(vec![], vec![]), &ungoverned())
+            .observe("qubitsok", &repo(vec![], vec![]), &ungoverned(), &names())
             .is_empty());
         // The empty qubitsok poll must not clear borsuk's memory.
-        assert!(tracker.observe("borsuk", &ready, &ungoverned()).is_empty());
+        assert!(tracker
+            .observe("borsuk", &ready, &ungoverned(), &names())
+            .is_empty());
     }
 
     #[test]
@@ -1127,13 +1412,15 @@ mod tests {
         );
 
         assert_eq!(
-            tracker.observe("borsuk", &to_refine, &ungoverned()).len(),
+            tracker
+                .observe("borsuk", &to_refine, &ungoverned(), &names())
+                .len(),
             1
         );
 
         // The label moved, so the implement gate opens. Issue 9 is still
         // open, and the daemon defers the task it gets from this report.
-        let fired = tracker.observe("borsuk", &refined, &ungoverned());
+        let fired = tracker.observe("borsuk", &refined, &ungoverned(), &names());
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].stage, Stage::Implement);
         assert_eq!(unmet_blockers(&refined, &refined.issues[&1]), vec![9]);

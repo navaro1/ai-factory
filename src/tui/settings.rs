@@ -14,6 +14,7 @@ use crate::config::{
     validate_extra_args, ExecutionRole, Harness, RoleOverride, RoleSettings, SettingsEdit,
     SettingsSource, CLAUDE_PERMISSION_MODES, CODEX_APPROVAL_POLICIES, CODEX_SANDBOXES,
 };
+use crate::labels::{LabelKey, LabelNames};
 use crate::prompts;
 use crate::routing::{ComplexityLevel, TagRouteKey, TagRouteStage};
 use crate::sock::{
@@ -46,11 +47,14 @@ enum Field {
     Sandbox,
     Limit,
     Prompt,
+    /// One configurable label name. Only the labels target shows these.
+    Label(LabelKey),
 }
 
 impl Field {
     fn label(self) -> &'static str {
         match self {
+            Self::Label(key) => key.as_str(),
             Self::Harness => "harness",
             Self::Program => "program",
             Self::Model => "model",
@@ -100,6 +104,11 @@ impl Field {
 
 #[derive(Debug, Clone)]
 enum DraftValue {
+    /// The edited label set of one scope, with the set it falls back to.
+    Labels {
+        names: LabelNames,
+        fallback: LabelNames,
+    },
     Global {
         settings: RoleSettings,
         limit: Option<usize>,
@@ -115,6 +124,15 @@ enum DraftValue {
 enum SettingsTarget {
     Role(ExecutionRole),
     TagRoute(TagRouteKey),
+    /// The label name set. It carries no execution role and no harness.
+    Labels,
+}
+
+impl SettingsTarget {
+    /// True when this target edits label names instead of a harness role.
+    const fn is_labels(self) -> bool {
+        matches!(self, Self::Labels)
+    }
 }
 
 impl SettingsTarget {
@@ -125,6 +143,9 @@ impl SettingsTarget {
                 TagRouteStage::Implement => ExecutionRole::Implement,
                 TagRouteStage::Review => ExecutionRole::Review,
             },
+            // The labels target has no role. Callers that branch on the
+            // target check `is_labels` first; this keeps the type total.
+            Self::Labels => ExecutionRole::Refine,
         }
     }
 }
@@ -139,12 +160,20 @@ struct Draft {
 }
 
 impl Draft {
-    fn settings(&self) -> &RoleSettings {
+    /// The harness settings of this draft. `None` on the labels target,
+    /// which edits names instead.
+    fn settings_opt(&self) -> Option<&RoleSettings> {
         match &self.value {
             DraftValue::Global { settings, .. } | DraftValue::Repository { settings, .. } => {
-                settings
+                Some(settings)
             }
+            DraftValue::Labels { .. } => None,
         }
+    }
+
+    fn settings(&self) -> &RoleSettings {
+        self.settings_opt()
+            .expect("the labels draft carries no harness settings")
     }
 
     fn settings_mut(&mut self) -> &mut RoleSettings {
@@ -152,6 +181,24 @@ impl Draft {
             DraftValue::Global { settings, .. } | DraftValue::Repository { settings, .. } => {
                 settings
             }
+            DraftValue::Labels { .. } => {
+                unreachable!("the labels draft carries no harness settings")
+            }
+        }
+    }
+
+    /// The edited label set of this draft, when it is a labels draft.
+    fn label_names_mut(&mut self) -> Option<(&mut LabelNames, &LabelNames)> {
+        match &mut self.value {
+            DraftValue::Labels { names, fallback } => Some((names, fallback)),
+            _ => None,
+        }
+    }
+
+    fn label_names(&self) -> Option<(&LabelNames, &LabelNames)> {
+        match &self.value {
+            DraftValue::Labels { names, fallback } => Some((names, fallback)),
+            _ => None,
         }
     }
 
@@ -169,7 +216,8 @@ impl Draft {
             DraftValue::Global {
                 override_settings: None,
                 ..
-            } => None,
+            }
+            | DraftValue::Labels { .. } => None,
         }
     }
 
@@ -185,7 +233,8 @@ impl Draft {
             DraftValue::Global {
                 override_settings: None,
                 ..
-            } => None,
+            }
+            | DraftValue::Labels { .. } => None,
         }
     }
 }
@@ -1361,6 +1410,25 @@ impl Settings {
                 key,
                 settings: Some(*override_settings),
             },
+            (SettingsTarget::Labels, DraftValue::Labels { names, fallback }) => {
+                // Send only the keys the operator changed. A name equal to
+                // the fallback removes the key, so typing the inherited
+                // name clears the override.
+                let mut changed = std::collections::BTreeMap::new();
+                for key in LabelKey::ALL {
+                    let value = names.get(key);
+                    if value == fallback.get(key) {
+                        changed.insert(key, None);
+                    } else {
+                        changed.insert(key, Some(value.to_string()));
+                    }
+                }
+                SettingsEdit::Labels {
+                    repository: (draft.scope > 0)
+                        .then(|| self.repositories(state)[draft.scope - 1].clone()),
+                    names: changed,
+                }
+            }
             _ => unreachable!("each settings target has one draft shape"),
         };
         Some(Action::SaveSettings {
@@ -1396,6 +1464,12 @@ impl Settings {
                 repository,
                 key,
                 settings: None,
+            },
+            // Clearing the labels override drops every key, so the
+            // repository falls back to the global set.
+            SettingsTarget::Labels => SettingsEdit::Labels {
+                repository: Some(repository),
+                names: LabelKey::ALL.into_iter().map(|key| (key, None)).collect(),
             },
         };
         Some(Action::SaveSettings {
@@ -1557,6 +1631,34 @@ impl Settings {
         let Some(draft) = self.draft.as_mut() else {
             return;
         };
+        if let Field::Label(key) = field {
+            let trimmed = value.trim().to_string();
+            let Some((names, _)) = draft.label_names_mut() else {
+                return;
+            };
+            if trimmed.is_empty() {
+                self.errors
+                    .insert(field, "a label name must not be empty".to_string());
+                self.discard_confirm = false;
+                return;
+            }
+            names.set(key, trimmed);
+            let clash = LabelKey::ALL.into_iter().any(|other| {
+                other != key
+                    && draft
+                        .label_names()
+                        .is_some_and(|(n, _)| n.get(other) == n.get(key))
+            });
+            if clash {
+                self.errors
+                    .insert(field, "another label already uses this name".to_string());
+            } else {
+                self.errors.remove(&field);
+            }
+            draft.changed.insert(field);
+            self.discard_confirm = false;
+            return;
+        }
         let settings = draft.settings_mut();
         match field {
             Field::Program => settings.program = value,
@@ -1608,6 +1710,23 @@ impl Settings {
             return;
         }
         let value = match (scope, target) {
+            (_, SettingsTarget::Labels) => {
+                // The global scope falls back to the built-in defaults. A
+                // repository scope falls back to the global set, so typing
+                // the global name there removes the override.
+                let (names, fallback) = if scope == 0 {
+                    (state.settings.labels.clone(), LabelNames::default())
+                } else {
+                    let Some(alias) = self.repositories(state).get(scope - 1).cloned() else {
+                        return;
+                    };
+                    let Some(names) = state.settings.repository_labels.get(&alias) else {
+                        return;
+                    };
+                    (names.clone(), state.settings.labels.clone())
+                };
+                DraftValue::Labels { names, fallback }
+            }
             (0, SettingsTarget::Role(role)) => {
                 let Some(source) = state
                     .settings
@@ -1708,9 +1827,11 @@ impl Settings {
             .as_ref()
             .filter(|draft| draft.scope == self.scope && draft.target == target)
         {
-            return Some(draft.settings());
+            return draft.settings_opt();
         }
         match (self.scope, target) {
+            // The labels target edits names, not harness settings.
+            (_, SettingsTarget::Labels) => None,
             (0, SettingsTarget::Role(role)) => state
                 .settings
                 .global
@@ -1747,6 +1868,9 @@ impl Settings {
     }
 
     fn visible_fields(&self, state: &StateView) -> Vec<Field> {
+        if self.selected_target().is_labels() {
+            return LabelKey::ALL.into_iter().map(Field::Label).collect();
+        }
         let Some(settings) = self.current_settings_ref(state) else {
             return Vec::new();
         };
@@ -1794,6 +1918,67 @@ impl Settings {
         targets[self.role.min(targets.len() - 1)]
     }
 
+    /// The label names of the scope the panel shows.
+    ///
+    /// The global scope uses the global set. A repository scope uses that
+    /// repository's set, so a renamed prefix shows the name the factory
+    /// really matches.
+    fn scoped_labels<'a>(&self, state: &'a StateView) -> &'a LabelNames {
+        if self.scope == 0 {
+            return &state.settings.labels;
+        }
+        self.repositories(state)
+            .get(self.scope - 1)
+            .and_then(|alias| state.settings.repository_labels.get(alias))
+            .unwrap_or(&state.settings.labels)
+    }
+
+    /// The name one label key shows now: the draft value when the panel
+    /// holds one, otherwise the effective value of the scope.
+    fn label_value(&self, state: &StateView, key: LabelKey) -> String {
+        if let Some((names, _)) = self
+            .draft
+            .as_ref()
+            .filter(|draft| draft.scope == self.scope && draft.target == self.selected_target())
+            .and_then(Draft::label_names)
+        {
+            return names.get(key).to_string();
+        }
+        self.scoped_labels(state).get(key).to_string()
+    }
+
+    /// Where the shown name of one label comes from.
+    ///
+    /// The panel colours a set name differently from an inherited one, so
+    /// the operator sees which table owns it.
+    fn label_source(&self, state: &StateView, field: Field) -> SettingsSource {
+        let Field::Label(key) = field else {
+            return SettingsSource::BuiltIn;
+        };
+        if self.scope == 0 {
+            return if state.settings.global_label_overrides.contains(&key) {
+                SettingsSource::Global
+            } else {
+                SettingsSource::BuiltIn
+            };
+        }
+        let Some(alias) = self.repositories(state).get(self.scope - 1).cloned() else {
+            return SettingsSource::BuiltIn;
+        };
+        if state
+            .settings
+            .repository_label_overrides
+            .get(&alias)
+            .is_some_and(|keys| keys.contains(&key))
+        {
+            return SettingsSource::Repository { alias };
+        }
+        if state.settings.global_label_overrides.contains(&key) {
+            return SettingsSource::Global;
+        }
+        SettingsSource::BuiltIn
+    }
+
     fn selected_role_for(&self) -> ExecutionRole {
         self.selected_target().execution_role()
     }
@@ -1830,10 +2015,14 @@ impl Settings {
     }
 
     fn field_value(&self, state: &StateView, field: Field) -> String {
+        if let Field::Label(key) = field {
+            return self.label_value(state, key);
+        }
         let Some(settings) = self.current_settings_ref(state) else {
             return String::new();
         };
         match field {
+            Field::Label(_) => unreachable!("the labels field returns above"),
             Field::Harness => settings.harness.program().to_string(),
             Field::Program => settings.program.clone(),
             Field::Model => settings.model.clone(),
@@ -1867,7 +2056,7 @@ impl Settings {
                         DraftValue::Global { limit, .. } => {
                             limit.map(|value| value.to_string()).unwrap_or_default()
                         }
-                        DraftValue::Repository { .. } => String::new(),
+                        DraftValue::Repository { .. } | DraftValue::Labels { .. } => String::new(),
                     }
                 } else {
                     state
@@ -1970,9 +2159,27 @@ impl Settings {
     fn draw_form(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
         let fields = self.visible_fields(state);
         let mut lines = Vec::new();
+        if self.selected_target().is_labels() {
+            let scope = if self.scope == 0 {
+                "global".to_string()
+            } else {
+                self.repositories(state)
+                    .get(self.scope - 1)
+                    .cloned()
+                    .unwrap_or_else(|| "global".to_string())
+            };
+            lines.push(Line::from(vec![
+                Span::styled("labels  ", THEME.dim()),
+                Span::raw(format!("{scope} · the names this scope matches on GitHub")),
+            ]));
+            lines.push(Line::from(""));
+        }
         if let SettingsTarget::TagRoute(key) = self.selected_target() {
             lines.push(Line::from(vec![
-                Span::styled(format!("tag {}  ", key.label()), THEME.dim()),
+                Span::styled(
+                    format!("tag {}  ", key.label(self.scoped_labels(state))),
+                    THEME.dim(),
+                ),
                 Span::raw(self.current_settings_ref(state).map_or_else(
                     || "unavailable".to_string(),
                     |settings| {
@@ -2336,6 +2543,10 @@ impl Settings {
             return Some(local);
         }
         let sources = match (self.scope, target) {
+            // A label name is set or inherited; the panel marks it below.
+            (_, SettingsTarget::Labels) => {
+                return Some(self.label_source(state, field));
+            }
             (0, SettingsTarget::Role(_)) => return Some(SettingsSource::Global),
             (0, SettingsTarget::TagRoute(key)) => {
                 &state
@@ -2440,6 +2651,15 @@ impl Settings {
     }
 
     #[cfg(test)]
+    fn set_labels_target(&mut self) {
+        self.role = settings_targets()
+            .iter()
+            .position(|value| *value == SettingsTarget::Labels)
+            .unwrap();
+        self.field = 0;
+    }
+
+    #[cfg(test)]
     fn set_field(&mut self, field: Field) {
         self.field = match field {
             Field::Harness => 0,
@@ -2455,6 +2675,10 @@ impl Settings {
             Field::StrictMcp => 10,
             Field::Limit => 11,
             Field::Prompt => 12,
+            Field::Label(key) => LabelKey::ALL
+                .into_iter()
+                .position(|candidate| candidate == key)
+                .unwrap_or(0),
         };
     }
 
@@ -2585,6 +2809,7 @@ fn settings_targets() -> Vec<SettingsTarget> {
             targets.push(SettingsTarget::TagRoute(TagRouteKey::new(stage, level)));
         }
     }
+    targets.push(SettingsTarget::Labels);
     targets
 }
 
@@ -2592,6 +2817,7 @@ fn target_label(target: SettingsTarget) -> String {
     match target {
         SettingsTarget::Role(role) => role_label(role).to_string(),
         SettingsTarget::TagRoute(key) => format!("{} · {}", key.stage, key.level),
+        SettingsTarget::Labels => "labels".to_string(),
     }
 }
 
@@ -2697,6 +2923,7 @@ fn sync_override(draft: &mut Draft, field: Field) {
         return;
     }
     match field {
+        Field::Label(_) => {}
         Field::Program => override_settings.program = Some(settings.program.clone()),
         Field::Model => override_settings.model = Some(settings.model.clone()),
         Field::Effort => override_settings.effort = settings.effort.clone(),
@@ -2724,8 +2951,29 @@ fn sync_override(draft: &mut Draft, field: Field) {
 }
 
 fn validate_draft(draft: &Draft) -> BTreeMap<Field, String> {
-    let settings = draft.settings();
     let mut errors = BTreeMap::new();
+    // A labels draft carries names, not harness settings. Its own rules
+    // run in `set_text`, which marks an empty or duplicate name there.
+    if let Some((names, _)) = draft.label_names() {
+        for key in LabelKey::ALL {
+            let value = names.get(key);
+            if value.trim().is_empty() {
+                errors.insert(Field::Label(key), "must not be empty".to_string());
+                continue;
+            }
+            if LabelKey::ALL
+                .into_iter()
+                .any(|other| other != key && names.get(other) == value)
+            {
+                errors.insert(
+                    Field::Label(key),
+                    "another label already uses this name".to_string(),
+                );
+            }
+        }
+        return errors;
+    }
+    let settings = draft.settings();
     if settings.program.trim().is_empty() {
         errors.insert(Field::Program, "must not be empty".to_string());
     }
@@ -2840,6 +3088,9 @@ fn harness_notice(previous: &RoleSettings, next: Harness, model: &str) -> String
 
 fn source_for_field(sources: &RoleFieldSources, field: Field) -> &SettingsSource {
     match field {
+        // A label name has no role field source; `label_source` answers
+        // for the labels target before this function is reached.
+        Field::Label(_) => &SettingsSource::BuiltIn,
         Field::Harness => &sources.harness,
         Field::Program => &sources.program,
         Field::Model => &sources.model,
@@ -3015,6 +3266,10 @@ mod tests {
         ];
         state.settings = SettingsView {
             revision: "rev-one".to_string(),
+            labels: crate::labels::LabelNames::default(),
+            repository_labels: std::collections::BTreeMap::new(),
+            global_label_overrides: Vec::new(),
+            repository_label_overrides: std::collections::BTreeMap::new(),
             global: ExecutionRole::ALL
                 .into_iter()
                 .zip(harnesses)
@@ -3865,6 +4120,95 @@ mod tests {
         assert_eq!(
             settings.field_error(Field::Limit),
             Some("must be at least 1")
+        );
+    }
+
+    /// The labels target is reachable, shows every key, and saves the
+    /// keys the operator changed.
+    #[test]
+    fn the_labels_target_saves_only_the_changed_keys() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_labels_target();
+
+        assert_eq!(
+            settings.visible_fields(&state).len(),
+            LabelKey::ALL.len(),
+            "every label key gets a row"
+        );
+        assert_eq!(
+            settings.field_value(&state, Field::Label(LabelKey::Epic)),
+            "epic",
+            "the row starts at the effective name"
+        );
+
+        settings.set_field(Field::Label(LabelKey::Epic));
+        settings.replace_selected_text(&state, "type:epic");
+        assert_eq!(
+            settings.field_value(&state, Field::Label(LabelKey::Epic)),
+            "type:epic"
+        );
+
+        let save = settings
+            .handle_key(&state, key(KeyCode::Char('s')))
+            .expect("save action");
+        let Action::SaveSettings {
+            edit: SettingsEdit::Labels { repository, names },
+            ..
+        } = save
+        else {
+            panic!("the labels target must send a labels edit");
+        };
+        assert_eq!(repository, None, "the global scope writes [labels]");
+        assert_eq!(
+            names.get(&LabelKey::Epic),
+            Some(&Some("type:epic".to_string())),
+            "the changed key carries its new name"
+        );
+        assert_eq!(
+            names.get(&LabelKey::Refined),
+            Some(&None),
+            "an unchanged key is removed, so it follows the default"
+        );
+    }
+
+    /// A name that another key already uses marks the row and blocks save.
+    #[test]
+    fn a_duplicate_label_name_blocks_the_save() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_labels_target();
+        settings.set_field(Field::Label(LabelKey::Epic));
+        settings.replace_selected_text(&state, "refined");
+
+        assert!(
+            settings.field_error(Field::Label(LabelKey::Epic)).is_some(),
+            "the duplicate must mark the row"
+        );
+        assert!(
+            settings
+                .handle_key(&state, key(KeyCode::Char('s')))
+                .is_none(),
+            "the save must not leave the panel"
+        );
+    }
+
+    /// An empty name is refused and leaves the previous name in place.
+    #[test]
+    fn an_empty_label_name_is_refused() {
+        let state = state();
+        let mut settings = Settings::default();
+        settings.set_labels_target();
+        settings.set_field(Field::Label(LabelKey::Chunk));
+        settings.replace_selected_text(&state, "   ");
+
+        assert!(settings
+            .field_error(Field::Label(LabelKey::Chunk))
+            .is_some());
+        assert_eq!(
+            settings.field_value(&state, Field::Label(LabelKey::Chunk)),
+            "chunk",
+            "the old name stays"
         );
     }
 

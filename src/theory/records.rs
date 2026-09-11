@@ -1362,6 +1362,7 @@ mod tests {
                         skills: None,
                         role_overrides: BTreeMap::new(),
                         tag_route_overrides: BTreeMap::new(),
+                        label_overrides: BTreeMap::new(),
                     },
                 )
             })
@@ -1372,6 +1373,7 @@ mod tests {
             stages: BTreeMap::new(),
             repos: config_repos,
             tag_route_overrides: BTreeMap::new(),
+            labels: crate::labels::LabelNames::default(),
             ticket_chat: Default::default(),
             usage: Default::default(),
             measure: Default::default(),

@@ -54,6 +54,20 @@ extra_args = []
 # model = "claude-opus-5[1m]"
 # permission_mode = "bypassPermissions"
 
+# The factory owns six labels and two complexity prefixes. The names below
+# are the defaults. Set a key here to rename that label everywhere: the
+# gates, the release train, the router, and the agent prompts.
+#
+# [labels]
+# to_refine = "to-refine"
+# refined = "refined"
+# epic = "epic"
+# chunk = "chunk"
+# needs_human = "needs-human"
+# release_stacked = "release-stacked"
+# complexity_prefix = "complexity:"
+# review_complexity_prefix = "review-complexity:"
+
 # Usage probes. When enabled, the daemon reads the quota and spend of each
 # billed identity and shows it in the USAGE band of the pipeline view.
 # minutes is the cadence per identity, from 1 to 1440.
@@ -69,3 +83,9 @@ release = { policy = "manual" }
 # A repository can override one global tag route.
 # [repo.borsuk.tag_routes.implement.high]
 # effort = "max"
+
+# A repository can rename any label. This suits a repository that already
+# prefixes every type label.
+# [repo.borsuk.labels]
+# epic = "type:epic"
+# chunk = "type:chunk"

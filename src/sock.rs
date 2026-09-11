@@ -8,9 +8,29 @@
 //! A pusher thread coalesces publishes to at most one push every
 //! [`PUSH_COALESCE_MS`] milliseconds. Every connected UI owns a bounded
 //! channel; the server drops a subscriber whose channel fills, so a slow or
-//! dead UI can never stall the factory. The only locks in this module guard
-//! the one-slot publish buffer and the subscriber list. Both are plumbing,
-//! not domain state.
+//! dead UI can never stall the factory. A push write also carries a timeout,
+//! so a client that stops reading cannot park a writer thread. The only
+//! locks in this module guard the one-slot publish buffer and the subscriber
+//! list. Both are plumbing, not domain state.
+//!
+//! Every writer here builds a complete line and sends it once. A Unix
+//! socket charges its send buffer per send, not per byte. One send costs at
+//! least about 768 bytes of the 212992-byte buffer, however short it is. A
+//! longer send costs its own length plus that overhead. These are the
+//! measured limits on Linux 6.2:
+//!
+//! | Bytes per send | Sends the buffer takes |
+//! |---|---|
+//! | 1 | 278 |
+//! | 100 | 278 |
+//! | 1000 | 93 |
+//! | 8192 | 24 |
+//!
+//! A writer that spends one send per JSON token therefore blocks on a line
+//! of 300 tokens, even though that line is under one kilobyte. `writeln!`
+//! on a raw socket does exactly that. So no writer here calls `writeln!` on
+//! a raw socket. A writer formats the whole line first, or it writes
+//! through a [`BufWriter`].
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -34,6 +54,7 @@ use crate::config::{
     Config, ExecutionRole, Harness, ReleasePolicy, RoleOverride, RoleSettings, SettingsSource,
 };
 use crate::decisions::{Decision, Decisions};
+use crate::labels::{LabelKey, LabelNames};
 use crate::links::Links;
 use crate::model::{Issue, ItemKind, Snapshot, Stage};
 use crate::routing::{ComplexityLevel, TagRouteBinding, TagRouteKey, TagRouteStage};
@@ -86,6 +107,24 @@ impl std::error::Error for WireProtocolMismatch {}
 /// A client that stops reading fills this buffer in about one second at the
 /// coalesced push rate. The drop protects the daemon, never the client.
 const SUBSCRIBER_CAPACITY: usize = 16;
+
+/// How long one push write may block before the server drops the subscriber.
+///
+/// The bounded channel above frees a stalled subscriber only while new
+/// pushes keep arriving. A daemon that falls quiet leaves the writer thread
+/// parked in the kernel with an open socket. This timeout ends that park.
+/// The value is far above the coalesce window, so it never drops a healthy
+/// client.
+#[cfg(not(test))]
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The same bound, shortened for the library tests.
+///
+/// One test stalls a client on purpose and waits for the daemon to drop it.
+/// A five-second bound would make that test the slowest in the suite. The
+/// short value keeps it under a second and changes nothing else.
+#[cfg(test)]
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Everything the UI draws, in one snapshot.
 ///
@@ -355,6 +394,14 @@ pub struct SettingsView {
     pub global_tag_routes: Vec<GlobalTagRouteSettingsView>,
     /// Every effective repository tag route, in repository and route order.
     pub repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
+    /// The global label names, from the defaults and the `[labels]` table.
+    pub labels: LabelNames,
+    /// The effective label names of every repository, by alias.
+    pub repository_labels: BTreeMap<String, LabelNames>,
+    /// The label keys the global `[labels]` table sets, in key order.
+    pub global_label_overrides: Vec<LabelKey>,
+    /// The label keys each `[repo.<alias>.labels]` table sets, by alias.
+    pub repository_label_overrides: BTreeMap<String, Vec<LabelKey>>,
     /// The effective prompt template of every role that has one, in role
     /// order. The theory roles carry no template, so they are absent.
     pub prompts: Vec<PromptView>,
@@ -393,6 +440,10 @@ struct SettingsViewRef<'a> {
     repositories: &'a [RepositoryRoleSettingsView],
     global_tag_routes: &'a [GlobalTagRouteSettingsView],
     repository_tag_routes: &'a [RepositoryTagRouteSettingsView],
+    labels: &'a LabelNames,
+    repository_labels: &'a BTreeMap<String, LabelNames>,
+    global_label_overrides: &'a [LabelKey],
+    repository_label_overrides: &'a BTreeMap<String, Vec<LabelKey>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     theory_global: Vec<&'a GlobalRoleSettingsView>,
     prompts: &'a [PromptView],
@@ -407,6 +458,14 @@ struct SettingsViewWire {
     global_tag_routes: Vec<GlobalTagRouteSettingsView>,
     #[serde(default)]
     repository_tag_routes: Vec<RepositoryTagRouteSettingsView>,
+    #[serde(default)]
+    labels: LabelNames,
+    #[serde(default)]
+    repository_labels: BTreeMap<String, LabelNames>,
+    #[serde(default)]
+    global_label_overrides: Vec<LabelKey>,
+    #[serde(default)]
+    repository_label_overrides: BTreeMap<String, Vec<LabelKey>>,
     #[serde(default)]
     theory_global: Vec<GlobalRoleSettingsView>,
     #[serde(default)]
@@ -428,6 +487,10 @@ impl Serialize for SettingsView {
             repositories: &self.repositories,
             global_tag_routes: &self.global_tag_routes,
             repository_tag_routes: &self.repository_tag_routes,
+            labels: &self.labels,
+            repository_labels: &self.repository_labels,
+            global_label_overrides: &self.global_label_overrides,
+            repository_label_overrides: &self.repository_label_overrides,
             theory_global,
             prompts: &self.prompts,
         }
@@ -448,12 +511,24 @@ impl<'de> Deserialize<'de> for SettingsView {
             repositories: wire.repositories,
             global_tag_routes: wire.global_tag_routes,
             repository_tag_routes: wire.repository_tag_routes,
+            labels: wire.labels,
+            repository_labels: wire.repository_labels,
+            global_label_overrides: wire.global_label_overrides,
+            repository_label_overrides: wire.repository_label_overrides,
             prompts: wire.prompts,
         })
     }
 }
 
 impl SettingsView {
+    /// The label names of one repository.
+    ///
+    /// An alias the daemon does not report falls back to the global set,
+    /// which is what a view without a repository wants.
+    pub fn labels_of(&self, repo: &str) -> &LabelNames {
+        self.repository_labels.get(repo).unwrap_or(&self.labels)
+    }
+
     /// Build the socket view from one validated configuration and the
     /// effective prompt templates.
     pub fn from_config(config: &Config, revision: &str, prompts: &[PromptView]) -> Result<Self> {
@@ -519,12 +594,35 @@ impl SettingsView {
                 });
             }
         }
+        let repository_labels = config
+            .repos
+            .keys()
+            .map(|alias| (alias.clone(), config.resolved_labels(Some(alias))))
+            .collect();
+        let repository_label_overrides = config
+            .repos
+            .iter()
+            .map(|(alias, repo)| {
+                (
+                    alias.clone(),
+                    repo.label_overrides.keys().copied().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let global_label_overrides = LabelKey::ALL
+            .into_iter()
+            .filter(|key| config.labels.get(*key) != key.default_value())
+            .collect::<Vec<_>>();
         Ok(Self {
             revision: revision.to_string(),
             global,
             repositories,
             global_tag_routes,
             repository_tag_routes,
+            labels: config.resolved_labels(None),
+            repository_labels,
+            global_label_overrides,
+            repository_label_overrides,
             prompts: prompts.to_vec(),
         })
     }
@@ -923,17 +1021,18 @@ impl StateInput<'_> {
             .keys()
             .filter_map(|repo| snapshot.repos.get(repo).map(|items| (repo, items)))
             .flat_map(|(repo, items)| {
+                let names = config.resolved_labels(Some(repo));
                 items
                     .issues
                     .values()
                     .filter(|issue| issue.open)
-                    .map(|issue| TicketSummary {
+                    .map(move |issue| TicketSummary {
                         repo: repo.clone(),
                         number: issue.number,
                         title: issue.title.clone(),
                         labels: issue.labels.clone(),
                         updated_at: issue.updated_at.clone(),
-                        group: TicketGroup::from_labels(&issue.labels),
+                        group: TicketGroup::from_labels(&issue.labels, &names),
                     })
             })
             .collect();
@@ -1151,10 +1250,10 @@ pub enum TicketGroup {
 
 impl TicketGroup {
     /// Classify one label set.
-    fn from_labels(labels: &[String]) -> Self {
-        if labels.iter().any(|label| label == "to-refine") {
+    fn from_labels(labels: &[String], names: &LabelNames) -> Self {
+        if names.has(LabelKey::ToRefine, labels) {
             TicketGroup::ToRefine
-        } else if labels.iter().any(|label| label == "refined") {
+        } else if names.has(LabelKey::Refined, labels) {
             TicketGroup::Refined
         } else {
             TicketGroup::Untouched
@@ -2228,6 +2327,31 @@ fn unregister(registry: &Mutex<Vec<Subscriber>>, id: u64) {
     lock(registry).retain(|subscriber| subscriber.id != id);
 }
 
+/// Bound how long a push write may block.
+///
+/// A Unix socket charges its send buffer per send, so a client that stops
+/// reading fills the buffer and parks the next send in the kernel. The
+/// timeout turns that park into an error the writer thread reports.
+///
+/// The timeout belongs to the socket, not to one descriptor. It therefore
+/// covers every clone of `stream`.
+fn bound_push_writes(stream: &UnixStream) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(PUSH_WRITE_TIMEOUT))
+}
+
+/// Whether `error` means the write timeout expired.
+///
+/// Unix reports an expired socket write timeout as `WouldBlock`. Windows
+/// reports `TimedOut`. This module builds on Unix only, so the second kind
+/// never reaches here. The check still accepts both, because both name the
+/// same event.
+fn is_write_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Register one accepted client and start its reader and writer threads.
 ///
 /// The writer thread drains the subscriber channel into the socket. The
@@ -2246,6 +2370,10 @@ fn attach_client(
             return;
         }
     };
+    if let Err(error) = bound_push_writes(&write_half) {
+        eprintln!("aifd: cannot bound the push writes of a control client: {error}");
+        return;
+    }
     let shutdown_half = match stream.try_clone() {
         Ok(shutdown_half) => shutdown_half,
         Err(error) => {
@@ -2286,15 +2414,22 @@ fn attach_client(
                         break;
                     }
                 };
-                if let Err(error) = writeln!(writer, "{line}") {
-                    eprintln!("aifd: cannot write a state push: {error}");
-                    break;
-                }
-                if let Err(error) = writer.flush() {
-                    eprintln!("aifd: cannot flush a state push: {error}");
+                if let Err(error) = writeln!(writer, "{line}").and_then(|()| writer.flush()) {
+                    if is_write_timeout(&error) {
+                        eprintln!(
+                            "aifd: a control client stopped reading for {PUSH_WRITE_TIMEOUT:?}; dropping it"
+                        );
+                    } else {
+                        eprintln!("aifd: cannot write a state push: {error}");
+                    }
                     break;
                 }
             }
+            // Unregister before `writer` drops. The drop of the subscriber
+            // shuts the socket down, so the final flush inside `BufWriter`
+            // fails at once. In the other order that flush meets a stalled
+            // socket and parks for a second whole timeout. Keep this call
+            // last in the closure.
             unregister(&registry, id);
         });
     }
@@ -2351,11 +2486,15 @@ impl Client {
 
     /// Send one action to the daemon.
     ///
-    /// The call writes one JSON line and flushes it.
+    /// The call writes one JSON line and flushes it. It builds the whole
+    /// line first, because a Unix socket charges its send buffer per send,
+    /// not per byte. One send per line keeps that charge at one buffer slot.
     pub fn send(&mut self, action: &Action) -> Result<()> {
-        let line = serde_json::to_string(action).context("cannot encode the action")?;
-        writeln!(self.stream, "{line}")
-            .and_then(|_| self.stream.flush())
+        let mut line = serde_json::to_string(action).context("cannot encode the action")?;
+        line.push('\n');
+        self.stream
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stream.flush())
             .context("cannot send the action to the daemon")
     }
 
@@ -2494,6 +2633,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// How long a test write may block before the test fails.
+    ///
+    /// The bound turns a stalled socket into one failed test. Without it a
+    /// stalled socket blocks the whole library suite until a person kills
+    /// it, and the report names no test at all.
+    const TEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// A socket pair whose writes fail instead of blocking.
+    ///
+    /// The timeout sits on the sockets, not on one write helper, so every
+    /// write a test makes through this pair is bounded. A test that stalls
+    /// the socket then fails by name in [`TEST_WRITE_TIMEOUT`] seconds. The
+    /// suite keeps running.
+    fn bounded_pair() -> (UnixStream, UnixStream) {
+        let (client, daemon) = UnixStream::pair().unwrap();
+        for stream in [&client, &daemon] {
+            stream
+                .set_write_timeout(Some(TEST_WRITE_TIMEOUT))
+                .expect("a test socket must accept a write timeout");
+        }
+        (client, daemon)
+    }
+
+    /// Send `line` and a newline to `stream` in one write.
+    ///
+    /// Never write a wire line with `writeln!` on a raw socket. `writeln!`
+    /// asks the value to format itself into the socket, and a
+    /// `serde_json::Value` formats one JSON token per write. A Unix socket
+    /// charges its send buffer per write, so about 278 short writes fill the
+    /// whole 212992-byte buffer and the next write blocks. A state line
+    /// needs 300 writes in that form. This helper formats the line first, so
+    /// one line costs one write.
+    fn send_line(stream: &UnixStream, line: &str) {
+        let mut writer = stream;
+        writer
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("a single write of one wire line must not block");
     }
 
     /// A state view with one stage and one repository, marked by `label`.
@@ -3149,8 +3327,8 @@ mod tests {
     fn a_client_rejects_a_state_from_an_older_wire_protocol() {
         let mut old = serde_json::to_value(Push::State(sample_view(1))).unwrap();
         old.as_object_mut().unwrap().remove("protocol_revision");
-        let (client, mut daemon) = UnixStream::pair().unwrap();
-        writeln!(daemon, "{old}").unwrap();
+        let (client, daemon) = bounded_pair();
+        send_line(&daemon, &old.to_string());
         drop(daemon);
         let mut pushes = Pushes {
             reader: std::io::BufReader::new(client),
@@ -3182,8 +3360,8 @@ mod tests {
             "protocol_revision".to_string(),
             serde_json::json!(WIRE_PROTOCOL_REVISION),
         );
-        let (client, mut daemon) = UnixStream::pair().unwrap();
-        writeln!(daemon, "{current}").unwrap();
+        let (client, daemon) = bounded_pair();
+        send_line(&daemon, &current.to_string());
         drop(daemon);
         let mut pushes = Pushes {
             reader: std::io::BufReader::new(client),
@@ -3191,6 +3369,78 @@ mod tests {
         };
 
         assert!(matches!(pushes.next(), Some(Ok(Push::State(_)))));
+    }
+
+    /// A writer that counts its calls and keeps the bytes.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_state_line_costs_one_write_but_one_write_per_token_costs_hundreds() {
+        // A Unix socket charges its send buffer per write, not per byte.
+        // One write costs at least about 768 bytes of the 212992-byte
+        // buffer, so the buffer takes only about 278 short writes. The
+        // smallest state line already needs 300 writes in the per-token
+        // form, so that form blocks. This test pins the rule that fixes it:
+        // one line costs one write, however many tokens the line holds.
+        let state = serde_json::to_value(Push::State(sample_view(1))).unwrap();
+
+        // The old form. `writeln!` asks the value to format itself into the
+        // writer, and `serde_json::Value` writes one token at a time.
+        let mut per_token = CountingWriter::default();
+        writeln!(per_token, "{state}").unwrap();
+
+        // The form every writer in this module uses: format first, write once.
+        let mut once = CountingWriter::default();
+        once.write_all(format!("{state}\n").as_bytes()).unwrap();
+
+        assert_eq!(once.writes, 1, "one line must cost one write");
+        assert!(
+            per_token.writes > 100,
+            "the per-token form must cost hundreds of writes, got {}",
+            per_token.writes
+        );
+        assert!(
+            once.bytes.len() < 212992,
+            "the byte count is never the problem, got {} bytes",
+            once.bytes.len()
+        );
+        assert_eq!(
+            per_token.bytes, once.bytes,
+            "both forms must produce the same bytes"
+        );
+    }
+
+    #[test]
+    fn a_write_timeout_reports_either_error_kind() {
+        // Unix reports an expired socket write timeout as `WouldBlock`.
+        // Windows reports `TimedOut`. The writer thread must drop the
+        // subscriber for both, and must not confuse them with a real socket
+        // failure.
+        assert!(is_write_timeout(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(is_write_timeout(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(!is_write_timeout(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
     }
 
     #[test]
@@ -3932,6 +4182,18 @@ mod tests {
         view
     }
 
+    /// A view whose JSON line is larger than one socket send buffer.
+    ///
+    /// One push of this view fills the 212992-byte buffer and parks the
+    /// writer thread inside a single write. One push also leaves 15 free
+    /// slots in the subscriber channel, so the full-channel rule cannot
+    /// free that thread. Only the write timeout can.
+    fn oversized_view(label: usize) -> StateView {
+        let mut view = sample_view(label);
+        view.repos[0].owner_repo = "x".repeat(400_000);
+        view
+    }
+
     #[test]
     fn a_subscriber_that_never_reads_is_dropped_and_the_daemon_keeps_running() {
         let dir = TempDir::new("slow");
@@ -4014,6 +4276,65 @@ mod tests {
             stalled_seen < healthy.len(),
             "the stalled client must be cut off: {stalled_seen} vs {}",
             healthy.len()
+        );
+    }
+
+    #[test]
+    fn the_daemon_drops_a_stalled_client_when_no_later_push_arrives() {
+        // The full-channel rule frees a stalled subscriber only while new
+        // pushes keep arriving. This test sends exactly one push and then
+        // falls quiet, so the channel never fills. Without the write
+        // timeout the writer thread parks in the kernel for good and keeps
+        // the client socket open. With it the daemon drops the client.
+        use std::io::Read;
+
+        let dir = TempDir::new("stalled-quiet");
+        let path = dir.path().join("daemon.sock");
+        let (server, _rx) = Server::bind(&path).unwrap();
+        // Publish before the client connects. The push then reaches the
+        // client as its initial state, so the pusher thread never runs and
+        // the test does not depend on the coalesce window.
+        server.publish(oversized_view(1));
+
+        let mut stalled = UnixStream::connect(&path).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Wait for the daemon to give up. A client write costs the parked
+        // writer thread nothing and drains no bytes, so this poll cannot
+        // hide the stall. The daemon shuts the socket down when it drops
+        // the subscriber, and the next client write then reports a broken
+        // pipe.
+        let mut poke = serde_json::to_string(&Action::Reconcile { repo: None }).unwrap();
+        poke.push('\n');
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut dropped = false;
+        while Instant::now() < deadline {
+            if stalled.write_all(poke.as_bytes()).is_err() {
+                dropped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            dropped,
+            "the daemon must drop a client that stopped reading for {PUSH_WRITE_TIMEOUT:?}"
+        );
+
+        // The client keeps the bytes the daemon sent before it gave up, and
+        // then reaches the end of the stream. The line never completes, so
+        // the client never sees a whole push.
+        let mut received = Vec::new();
+        stalled.read_to_end(&mut received).unwrap();
+        assert!(
+            !received.is_empty(),
+            "the daemon must have started the push"
+        );
+        assert!(
+            !received.contains(&b'\n'),
+            "the stalled client must never receive a whole line, got {} bytes",
+            received.len()
         );
     }
 

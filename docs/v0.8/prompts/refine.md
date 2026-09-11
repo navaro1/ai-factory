@@ -61,12 +61,12 @@ that answered it. A question an experiment can answer is not the operator's.
 Run the experiment in a scratch directory under the worktree, never
 committed, and record the result.
 Remove the scratch directory before you finish. Only a product or preference
-call earns `needs-human`.
+call earns `{label_needs_human}`.
 
 `## Repro` belongs to a ticket with the `bug` label only. Drive the surface
 on the base until the defect reproduces twice. Write the exact command, the
-two observed outputs, and the exit code. A third miss goes to `needs-human`
-with the attempts.
+two observed outputs, and the exit code. A third miss goes to
+`{label_needs_human}` with the attempts.
 
 `## Acceptance criteria` holds one falsifiable line per criterion, in this
 grammar.
@@ -121,16 +121,16 @@ the error that reports an existing label:
 Give two complexity labels to every ticket that an agent implements. The
 factory reads them to select the model of the implement stage and of the
 review stage. The scale is `low`, `medium`, `high`, and `very-high`. The
-implementation label is `complexity:<level>`. The review label is
-`review-complexity:<level>`. Rate the size and the risk of that one ticket,
+implementation label is `{label_complexity}<level>`. The review label is
+`{label_review_complexity}<level>`. Rate the size and the risk of that one ticket,
 not of the whole feature. An absent label means `medium`, so state the level
 even when you choose medium.
 
 # One chunk
 
 When the plan holds one chunk, the ticket stays one ticket. Run
-`gh issue edit {number} --remove-label to-refine --add-label refined` and add
-the two complexity labels in the same command. Report one line that says the
+`gh issue edit {number} --remove-label {label_to_refine} --add-label {label_refined}`
+and add the two complexity labels in the same command. Report one line that says the
 ticket is refined.
 
 # Several chunks
@@ -161,9 +161,9 @@ When a chunk depends on an earlier chunk, add one line `Blocked by #A and #B`
 to the body of the sub-ticket. Name every earlier chunk it needs. The factory
 holds the sub-ticket until those tickets close.
 
-Give each sub-ticket the `refined` label, the `chunk` label, one
-`complexity:<level>` label, and one `review-complexity:<level>` label. Never
-give a sub-ticket the `to-refine` label.
+Give each sub-ticket the `{label_refined}` label, the `{label_chunk}` label, one
+`{label_complexity}<level>` label, and one `{label_review_complexity}<level>`
+label. Never give a sub-ticket the `{label_to_refine}` label.
 
 The last sub-ticket is the coordinator. Add this line to its body:
 
@@ -176,9 +176,9 @@ Then edit the parent:
   the form `- [ ] #A short goal`.
 - Add a `## Definition of done` section. State that the parent closes when the
   PR of the final chunk merges.
-- Run `gh issue edit {number} --remove-label to-refine --add-label epic`.
+- Run `gh issue edit {number} --remove-label {label_to_refine} --add-label {label_epic}`.
 
-Never give the parent the `refined` label. That label starts a second
+Never give the parent the `{label_refined}` label. That label starts a second
 implementation of work the sub-tickets already own, and it leaves the parent
 open forever.
 
@@ -186,7 +186,7 @@ Report one line that says the ticket is refined, and name the sub-tickets.
 
 # A second run on the same parent
 
-A parent carries the `epic` label and a `## Chunks` section. When you refine
+A parent carries the `{label_epic}` label and a `## Chunks` section. When you refine
 such a ticket again, do not create the sub-tickets a second time. Read the
 sub-tickets the section names. Update the body and the labels of each open
 one. Create a sub-ticket only for a chunk that has none. Close a sub-ticket
@@ -194,8 +194,8 @@ that the new plan drops, and state the reason in a comment.
 
 # A human decision
 
-When you need a human decision, add the `needs-human` label to the ticket with
-`gh` and state the question in a comment. Stop after the label is on. When the
+When you need a human decision, add the `{label_needs_human}` label to the ticket
+with `gh` and state the question in a comment. Stop after the label is on. When the
 decision is a choice between named answers, end the comment with one strict
 block in this form. Keep the JSON on one line:
 <aif-ask-v1>
