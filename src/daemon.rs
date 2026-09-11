@@ -7287,9 +7287,9 @@ impl Daemon {
     /// The check runs for every pull request of a governed repository whose
     /// theory parses. A pull request that closes a ticket takes the whole
     /// contract, because that ticket carries the criteria and the plan the
-    /// contract traces to. A pull request that closes none takes the model
-    /// file rule, the heading rules, the sections rule, and the prose
-    /// rules, and the context it gets says so.
+    /// contract traces to. A pull request that closes none stands the three
+    /// ticket-bound rules down through `has_ticket`, and every rule that
+    /// reads the body or the verification map still answers.
     ///
     /// The context unions every linked ticket, because one pull request
     /// can close several and each carries its own criteria and plan.
@@ -25871,6 +25871,57 @@ mod tests {
                 .any(|job| job.task == "borsuk/review-p7"),
             "a failed body check dispatches no review"
         );
+    }
+
+    /// One pull request in the shape `push_model_worktree` opens: open,
+    /// not a draft, labelled `model-pr`, on a model branch, with a plain
+    /// body of one sentence.
+    fn daemon_model_pr(number: u64) -> Pr {
+        let mut pull = pr(number, false, &[MODEL_PR_LABEL]);
+        pull.head_ref = "aif/borsuk/model-a1b2c3d4".to_string();
+        pull.body = "The theory model of borsuk.".to_string();
+        pull
+    }
+
+    /// The daemon opens its own pull requests for the model worktree and
+    /// the skills worktree, and neither body carries the three sections.
+    /// Neither passes `--draft` to `gh pr create`, so the review gate
+    /// never admits one and the body check never reads one. This pins that
+    /// invariant, because the body check would refuse the body.
+    #[test]
+    fn a_model_pull_request_of_the_daemon_never_reaches_the_body_check() {
+        let dir = temp_root();
+        let steps = body_theory_steps(&rig_repo(&dir));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        let pull = daemon_model_pr(7);
+        let ctx = contract::ContractContext {
+            criteria: Vec::new(),
+            features: Vec::new(),
+            areas: Vec::new(),
+            measurers: Vec::new(),
+            owned_paths: Vec::new(),
+            changed_paths: Vec::new(),
+            manifests: &contract::MANIFESTS,
+            ticket_names_dependency: false,
+            has_ticket: false,
+        };
+        let refused = records::check_pr(&pull.body, &pull.head_ref, &ctx)
+            .expect_err("the body carries no Why section");
+        assert_eq!(refused.reason, "section Why missing");
+
+        rig.poll(Vec::new(), vec![pull]);
+
+        assert!(
+            !rig.daemon.table.by_id.contains_key("borsuk/review-p7"),
+            "a pull request that is no draft is release work, not review work"
+        );
+        assert_eq!(
+            rig.daemon.trains["borsuk"].queue,
+            vec![7],
+            "the pull request joined the merge train instead"
+        );
+        assert_eq!(findings(&rig, "PR: section Why missing"), 0);
+        assert_eq!(rig.job_count(), 0, "the held lane dispatches nothing");
     }
 
     #[test]
