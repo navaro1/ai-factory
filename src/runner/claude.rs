@@ -167,7 +167,7 @@ fn user_message(message: &Outbound) -> anyhow::Result<String> {
 fn image_block(image: &std::path::Path) -> anyhow::Result<Value> {
     let bytes = std::fs::read(image)
         .with_context(|| format!("cannot read the image {}", image.display()))?;
-    let media_type = sniff_media_type(&bytes).ok_or_else(|| {
+    let media = crate::clipboard::sniff_media_type(&bytes).ok_or_else(|| {
         anyhow!(
             "the image {} carries neither png nor jpeg magic bytes",
             image.display()
@@ -177,25 +177,17 @@ fn image_block(image: &std::path::Path) -> anyhow::Result<Value> {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": media_type,
+            "media_type": media_type(media),
             "data": base64_encode(&bytes),
         },
     }))
 }
 
-/// Sniff the media type of an image from its magic bytes.
-///
-/// The claude harness takes png and jpeg images. Every other byte stream
-/// returns none.
-fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
-    const PNG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    const JPEG: [u8; 3] = [0xff, 0xd8, 0xff];
-    if bytes.starts_with(&PNG) {
-        Some("image/png")
-    } else if bytes.starts_with(&JPEG) {
-        Some("image/jpeg")
-    } else {
-        None
+/// The claude media-type string of one sniffed image format.
+fn media_type(media: crate::clipboard::ImageFormat) -> &'static str {
+    match media {
+        crate::clipboard::ImageFormat::Png => "image/png",
+        crate::clipboard::ImageFormat::Jpeg => "image/jpeg",
     }
 }
 
@@ -1967,9 +1959,22 @@ done
 
     #[test]
     fn image_magic_bytes_map_to_media_types_and_base64_matches_vectors() {
-        assert_eq!(sniff_media_type(&PNG_MAGIC), Some("image/png"));
-        assert_eq!(sniff_media_type(&JPEG_MAGIC), Some("image/jpeg"));
-        assert_eq!(sniff_media_type(b"not an image"), None);
+        // The sniffer is the clipboard module's, so both surfaces read the
+        // same magic bytes.
+        assert_eq!(
+            crate::clipboard::sniff_media_type(&PNG_MAGIC),
+            Some(crate::clipboard::ImageFormat::Png)
+        );
+        assert_eq!(
+            crate::clipboard::sniff_media_type(&JPEG_MAGIC),
+            Some(crate::clipboard::ImageFormat::Jpeg)
+        );
+        assert_eq!(crate::clipboard::sniff_media_type(b"not an image"), None);
+        assert_eq!(media_type(crate::clipboard::ImageFormat::Png), "image/png");
+        assert_eq!(
+            media_type(crate::clipboard::ImageFormat::Jpeg),
+            "image/jpeg"
+        );
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
