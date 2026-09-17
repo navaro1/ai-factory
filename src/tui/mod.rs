@@ -25,6 +25,7 @@
 //! view.
 
 pub mod agents;
+pub mod crt;
 pub mod editor;
 pub mod inbox;
 pub mod markdown;

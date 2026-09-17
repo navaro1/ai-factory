@@ -255,12 +255,12 @@ All questions are resolved. None waits for clarification.
 <!-- implement-chunk appends ✅ IMPLEMENTED / notes / Last updated below -->
 
 ### C1 — Walking skeleton: the model read, the state view, and the Theory view
-**Status:** `[~]` partial on 2026-09-10 (branch verification-toolbelt, as the v0.8 substrate; missing: the CRT palette, and `TheoryView.entries` shipped as `model`)
+**Status:** `[x]` implemented on 2026-09-11 (branch aif/ai-factory/issue-18; `TheoryView.entries` ships as `model`, the recorded replacement of the flat `entries` view of `src/sock.rs`)
 **Build:** In the daemon, on every `apply_poll` (`src/daemon.rs:601-631`) run `git rev-parse <default_base>` on the theory checkout, `TheoryConfig::checkout`, through the `git` helper (`src/worktree.rs:509-515`, `:437-452`); when the commit moved, read `git show <commit>:theory/model.toml` and cache `(commit, Result<Model, String>)` per alias; a missing file caches `theory/model.toml: missing`. Add `StateView.theory: BTreeMap<String, TheoryView>` with `#[serde(default)]` (`src/sock.rs:84-114`) carrying `governor`, `entries: Vec<EntryView>` with the relation arrays, `error`. Add `src/tui/crt.rs` with the Amber CRT palette (`amber #FFB000`, `dim #9A6A00`, `bright #FFD866`, `frame #C98A00`, `white #FFF7E0`, `background #0B0A06`) locked by a test like `src/tui/theme.rs:76-84`, plus `frame(title)` that returns a `Block` with `BorderType::Double` and an uppercase title. Add `View::Theory` as tab `6` (`src/tui/mod.rs:60-72`, `:370-523`, `:1039-1107`, `:1110-1156`) and `src/tui/theory.rs` that draws the header strip `GOVERNOR ON · ENTRIES n · AREAS n` or the error. Add the help line and the footer digit (`src/tui/mod.rs:1184-1187`, `:1253-1284`).
 **AC:**
 - A daemon test with a `ScriptExec` that answers `rev-parse` and `git show` ships four entries in the state view; a second poll with the same commit runs no `git show`; a moved commit runs one.
 - A `ScriptExec` that fails `git show` with `does not exist` ships `error = "theory/model.toml: missing"` and zero entries; a bad file ships its error; the daemon's next `drive` still runs in both cases.
-- A TUI test renders `6` and asserts the strip `GOVERNOR ON · ENTRIES 4 · AREAS 1` inside a double-line frame; a palette test asserts the six CRT colors. Not yet built: the CRT palette. The v0.8 substrate drew tab `6` with the existing theme and no `src/tui/crt.rs`.
+- A TUI test renders `6` and asserts the strip `GOVERNOR ON · ENTRIES 4 · AREAS 1` inside a double-line frame; a palette test asserts the six CRT colors.
 - `a_state_view_round_trips_through_json` carries the entries and a view without `theory` parses with an empty map.
 **Depends on:** C0 · **Traces to:** R4, R33, N3
 
