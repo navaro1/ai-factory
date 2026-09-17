@@ -22,7 +22,7 @@ Start the terminal UI with `aif`, then press `6`. The strip draws under the `THE
 ## Driving it
 
     tmux new-session -d -s aif-tui -c "$PWD"
-    tmux send-keys -t aif-tui 'cargo run -- tui' Enter
+    tmux send-keys -t aif-tui 'cargo run --bin aif -- tui' Enter
     tmux send-keys -t aif-tui 6
     tmux capture-pane -t aif-tui -p
 

@@ -9,7 +9,7 @@ blind: true color output, mouse events
 
 ## Run
 
-`cargo run -- tui` at the repository root. The command starts the daemon when none runs, then opens the terminal UI. The ready signal is the pipeline view with the tab bar and the footer hints. Stop with `tmux kill-session -t aif-tui`; stop the daemon with `cargo run -- stop`.
+`cargo run --bin aif -- tui` at the repository root. The command starts the daemon when none runs, then opens the terminal UI. The ready signal is the pipeline view with the tab bar and the footer hints. Stop with `tmux kill-session -t aif-tui`; stop the daemon with `cargo run --bin aif -- stop`.
 
 ## Fast
 
@@ -22,7 +22,7 @@ None. The TUI reads the factory config at `~/.config/aif/factory.toml` and needs
 ## Drive
 
     tmux new-session -d -s aif-tui -c "$PWD"
-    tmux send-keys -t aif-tui 'cargo run -- tui' Enter
+    tmux send-keys -t aif-tui 'cargo run --bin aif -- tui' Enter
     tmux send-keys -t aif-tui 6
     tmux capture-pane -t aif-tui -p
 
@@ -30,7 +30,7 @@ Tab `6` opens the Theory view. The strip `GOVERNOR ON · ENTRIES n · AREAS n` o
 
 ## Logs
 
-The TUI prints to the terminal only. The daemon writes its log at `$XDG_STATE_HOME/aif/daemon.log`; a grep for the repository alias finds one poll.
+The TUI prints to the terminal only. The daemon prints to stderr; under its systemd unit the output lands in the journal. `journalctl --user -u aif-daemon` finds the polls, and a grep for the repository alias finds one poll.
 
 ## Gotchas
 
