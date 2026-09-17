@@ -144,6 +144,8 @@ pub struct Tickets {
     marked: BTreeSet<u64>,
     /// True while the batch label picker is visible.
     batch_picker_open: bool,
+    /// The repository whose catalog the open batch picker waits for.
+    batch_repo: Option<String>,
     /// The selected repository label in the batch picker.
     batch_selected: usize,
     /// The toast the view asks the shell to show.
@@ -457,13 +459,15 @@ impl Tickets {
     /// Apply one label catalog response.
     ///
     /// The open focus accepts the answer for its repository, and the batch
-    /// label picker accepts one while no focus is open.
+    /// label picker accepts one for the repository it opened on.
     pub fn observe_labels(&mut self, labels: TicketLabels) {
         let focus_waits = self
             .focus_key
             .as_ref()
             .is_some_and(|(repo, _)| repo == &labels.repo);
-        let batch_waits = !self.focus && self.batch_picker_open;
+        let batch_waits = !self.focus
+            && self.batch_picker_open
+            && self.batch_repo.as_deref() == Some(labels.repo.as_str());
         if !focus_waits && !batch_waits {
             return;
         }
@@ -501,6 +505,7 @@ impl Tickets {
         match key.code {
             KeyCode::Esc => {
                 self.batch_picker_open = false;
+                self.batch_repo = None;
                 None
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -870,6 +875,7 @@ impl Tickets {
                 }
                 let repo = self.tab(state)?;
                 self.batch_picker_open = true;
+                self.batch_repo = Some(repo.clone());
                 self.batch_selected = 0;
                 self.labels = None;
                 return Some(Action::Ticket(TicketAction::Labels {
@@ -3706,5 +3712,40 @@ mod tests {
         assert_eq!(numbers, vec![7, 8]);
         assert_eq!(label, "ui");
         assert!(!on, "every marked ticket carries ui");
+    }
+
+    #[test]
+    fn tickets_batch_picker_ignores_a_catalog_answer_for_another_repo() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('a')));
+        let action = tickets.handle_key(&state, key(KeyCode::Char('L')));
+        let Some(Action::Ticket(TicketAction::Labels { repo, .. })) = action else {
+            panic!("L must request the repository catalog");
+        };
+        assert_eq!(repo, "borsuk");
+
+        // A stale answer of another repository must not fill the picker.
+        tickets.observe_labels(TicketLabels {
+            request: "labels-b3".to_string(),
+            repo: "other".to_string(),
+            labels: vec![crate::sock::RepoLabel {
+                name: "ghost".to_string(),
+                color: "000000".to_string(),
+            }],
+            error: None,
+        });
+
+        assert!(tickets.batch_picker_open);
+        assert!(
+            tickets.labels.is_none(),
+            "the picker must keep waiting for its own catalog"
+        );
+        assert!(
+            tickets
+                .handle_key(&state, key(KeyCode::Char(' ')))
+                .is_none(),
+            "space without the own catalog must send nothing"
+        );
     }
 }
