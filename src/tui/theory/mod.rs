@@ -296,11 +296,11 @@ impl Theory {
                 self.move_mark(state, -1);
                 Outcome::None
             }
-            KeyCode::Char('h') => {
+            KeyCode::Char('h') | KeyCode::Left => {
                 self.cycle_area(state, -1);
                 Outcome::None
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('l') | KeyCode::Right => {
                 self.cycle_area(state, 1);
                 Outcome::None
             }
@@ -2056,6 +2056,15 @@ mod tests {
         pane.handle_key(&state, press(KeyCode::Char('h')));
         assert!(
             render_with(&state, &mut pane).contains("╔ WEB-CHECKOUT "),
+            "screen was:\n{}",
+            render_with(&state, &mut pane)
+        );
+
+        // The arrow keys cycle the same way the file pairs them with
+        // h and l.
+        pane.handle_key(&state, press(KeyCode::Right));
+        assert!(
+            render_with(&state, &mut pane).contains("╔ API-ORDERS "),
             "screen was:\n{}",
             render_with(&state, &mut pane)
         );
