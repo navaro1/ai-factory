@@ -3828,7 +3828,8 @@ mod tests {
             sink.0,
             vec![Action::Chat {
                 task: "borsuk/refine-i142".to_string(),
-                text: "hi".to_string()
+                text: "hi".to_string(),
+                images: Vec::new(),
             }]
         );
     }
@@ -4051,7 +4052,8 @@ mod tests {
             sink.0,
             vec![Action::Chat {
                 task: "borsuk/refine-i143".to_string(),
-                text: "hi".to_string()
+                text: "hi".to_string(),
+                images: Vec::new(),
             }]
         );
     }

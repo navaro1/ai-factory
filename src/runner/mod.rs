@@ -17,6 +17,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Harness, ResolvedRoleSettings};
 use crate::model::Stage;
@@ -79,6 +80,54 @@ impl RunnerFactory for DefaultRunnerFactory {
     }
 }
 
+/// One message the daemon sends into an agent conversation.
+///
+/// A message is its text plus the image files it carries, saved under the
+/// AIF state root as absolute paths. The queued form of a chat message and
+/// the steering form are the same type, so text and images cannot part.
+///
+/// The deserialize side also reads one bare JSON string, so a `state.json`
+/// written before images existed loads its queued texts with no images.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Outbound {
+    /// The message text.
+    pub text: String,
+    /// The attached image files, absolute paths under the state root.
+    pub images: Vec<PathBuf>,
+}
+
+impl Outbound {
+    /// One text-only message.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Outbound {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Text(String),
+            Full {
+                text: String,
+                #[serde(default)]
+                images: Vec<PathBuf>,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Text(text) => Ok(Self::text(text)),
+            Wire::Full { text, images } => Ok(Self { text, images }),
+        }
+    }
+}
+
 /// One permission rule a job grants before its first run.
 ///
 /// A one-shot harness cannot answer a live ask, so the daemon records the
@@ -107,6 +156,9 @@ pub struct Job {
     pub variant: Option<String>,
     /// The fully rendered prompt for the agent.
     pub prompt: String,
+    /// The image files that ride with the prompt, when a chat message
+    /// carries them. Empty for every stage task.
+    pub images: Vec<PathBuf>,
     /// The working directory for the agent: a worktree or a checkout.
     pub cwd: PathBuf,
     /// The task log the runner's raw output is teed into.
@@ -223,10 +275,10 @@ pub trait Runner: Send {
 
 /// The control handle for one live agent session.
 pub trait Session: Send {
-    /// Send an extra user message into a live session.
+    /// Send an extra user message, with its images, into a live session.
     ///
     /// The default body refuses: the runner has no steering channel.
-    fn send_user(&mut self, _text: &str) -> anyhow::Result<()> {
+    fn send_user(&mut self, _message: &Outbound) -> anyhow::Result<()> {
         Err(unsupported_steering("send_user"))
     }
 
@@ -263,7 +315,9 @@ mod tests {
     #[test]
     fn the_default_session_methods_refuse_steering() {
         let mut session = StopOnly;
-        let send_error = session.send_user("one more turn").unwrap_err();
+        let send_error = session
+            .send_user(&Outbound::text("one more turn"))
+            .unwrap_err();
         assert!(send_error.to_string().contains("does not support steering"));
 
         let answer_error = session
@@ -279,6 +333,18 @@ mod tests {
             .contains("does not support steering"));
 
         session.stop().unwrap();
+    }
+
+    #[test]
+    fn a_message_with_images_round_trips_and_a_plain_string_loads_with_no_images() {
+        let message = Outbound {
+            text: "check this screenshot".to_string(),
+            images: vec![PathBuf::from("/state/aif/images/shot.png")],
+        };
+        let line = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<Outbound>(&line).unwrap(), message);
+        let old = serde_json::from_str::<Outbound>(r#""add a regression test""#).unwrap();
+        assert_eq!(old, Outbound::text("add a regression test"));
     }
 
     #[test]
