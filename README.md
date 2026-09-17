@@ -615,6 +615,7 @@ issues inside the active tab.
 | Label picker | `n` | Create and attach a repository label. |
 | Batch picker | Space | Add or remove the label on every marked ticket. |
 | Batch picker | `j` / `k` | Move the label selection. |
+| Batch picker | `esc` | Return to the list. The marks stay. |
 | Conflict | `g` | Keep the GitHub version. |
 | Conflict | `p` | Reapply the pending version after another fetch. |
 | Nested view | `esc` | Return one level. |
