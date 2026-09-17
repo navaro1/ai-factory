@@ -1148,7 +1148,7 @@ mod tests {
         let Outcome::Send(action, toast) = outcome else {
             panic!("enter sends the typed message, got {outcome:?}");
         };
-        let Action::Chat { task, text } = *action else {
+        let Action::Chat { task, text, .. } = *action else {
             panic!("the chat bar sends one Action::Chat");
         };
         assert_eq!(task, "borsuk/bootstrap-gh");

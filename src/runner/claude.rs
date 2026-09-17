@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::config::Harness;
 use crate::config::RoleSettings;
 use crate::proc::{self, ProcEvent, ProcHandle, RunSpec, StopOutcome};
-use crate::runner::{Answer, Job, RunEvent, Runner, Session};
+use crate::runner::{Answer, Job, Outbound, RunEvent, Runner, Session};
 
 /// The program the runner starts.
 #[cfg(test)]
@@ -140,8 +140,78 @@ fn legacy_settings(job: &Job) -> RoleSettings {
 }
 
 /// Build one user message line in the verified wire shape.
-fn user_message(text: &str) -> String {
-    json!({"type": "user", "message": {"role": "user", "content": text}}).to_string()
+///
+/// A message without images keeps its content a plain string, so the
+/// recorded wire shape of a text-only turn does not move. A message with
+/// images writes an array of one text block plus one image block per
+/// image, each with base64 data and the media type sniffed from the file's
+/// magic bytes.
+fn user_message(message: &Outbound) -> anyhow::Result<String> {
+    let content = if message.images.is_empty() {
+        Value::String(message.text.clone())
+    } else {
+        let mut blocks = vec![json!({"type": "text", "text": message.text})];
+        for image in &message.images {
+            blocks.push(image_block(image)?);
+        }
+        Value::Array(blocks)
+    };
+    Ok(json!({"type": "user", "message": {"role": "user", "content": content}}).to_string())
+}
+
+/// Build the verified image block of one attached image file.
+///
+/// The claude input protocol takes base64 data under `source`, with the
+/// media type the model accepts. A file that cannot be read, or whose
+/// magic bytes name neither png nor jpeg, is an error that names the file.
+fn image_block(image: &std::path::Path) -> anyhow::Result<Value> {
+    let bytes = std::fs::read(image)
+        .with_context(|| format!("cannot read the image {}", image.display()))?;
+    let media = crate::clipboard::sniff_media_type(&bytes).ok_or_else(|| {
+        anyhow!(
+            "the image {} carries neither png nor jpeg magic bytes",
+            image.display()
+        )
+    })?;
+    Ok(json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type(media),
+            "data": base64_encode(&bytes),
+        },
+    }))
+}
+
+/// The claude media-type string of one sniffed image format.
+fn media_type(media: crate::clipboard::ImageFormat) -> &'static str {
+    match media {
+        crate::clipboard::ImageFormat::Png => "image/png",
+        crate::clipboard::ImageFormat::Jpeg => "image/jpeg",
+    }
+}
+
+/// Encode `data` in standard base64 with padding.
+///
+/// The claude image block carries base64 data, and the crate takes no
+/// base64 dependency, so the encoder lives here.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let byte = |index: usize| -> u8 { chunk.get(index).copied().unwrap_or_default() };
+        let triple = (u32::from(byte(0)) << 16) | (u32::from(byte(1)) << 8) | u32::from(byte(2));
+        for position in [18, 12, 6, 0] {
+            let index = ((triple >> position) & 0x3f) as usize;
+            let missing = (position == 6 && chunk.len() < 2) || (position == 0 && chunk.len() < 3);
+            out.push(if missing {
+                '='
+            } else {
+                ALPHABET[index] as char
+            });
+        }
+    }
+    out
 }
 
 /// Build the initialize handshake request line.
@@ -452,11 +522,15 @@ impl ClaudeRunner {
         }
 
         let (hs_tx, hs_rx) = channel::<anyhow::Result<()>>();
+        let prompt_line = user_message(&Outbound {
+            text: job.prompt.clone(),
+            images: job.images.clone(),
+        })?;
         let worker = SessionWorker {
             task: job.task.clone(),
             yolo: job.yolo,
             handle: Some(handle),
-            prompt_line: user_message(&job.prompt),
+            prompt_line,
             timeout: self.handshake_timeout,
             phase: Phase::Handshake {
                 deadline: Instant::now() + self.handshake_timeout,
@@ -547,9 +621,9 @@ impl ClaudeSession {
 }
 
 impl Session for ClaudeSession {
-    /// Send an extra user message into the live session.
-    fn send_user(&mut self, text: &str) -> anyhow::Result<()> {
-        self.write_via_worker(user_message(text))
+    /// Send an extra user message, with its images, into the live session.
+    fn send_user(&mut self, message: &Outbound) -> anyhow::Result<()> {
+        self.write_via_worker(user_message(message)?)
     }
 
     /// Answer the [`RunEvent::Ask`] named by `request_id`.
@@ -1050,6 +1124,7 @@ not json at all
             allowed_tools: None,
             allowed_permissions: Vec::new(),
             timeout_s: None,
+            images: Vec::new(),
         }
     }
 
@@ -1849,7 +1924,7 @@ done
             test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
-        session.send_user("one more turn").unwrap();
+        session.send_user(&Outbound::text("one more turn")).unwrap();
         session.stop().unwrap();
         let events = collect_until_exit(&rx);
         assert!(matches!(
@@ -1859,13 +1934,174 @@ done
 
         let logged = log_lines(&dir);
         assert!(
-            logged.contains(&user_message("Refine issue 7.")),
+            logged.contains(&user_message(&Outbound::text("Refine issue 7.")).unwrap()),
             "the prompt line never reached the child: {logged:?}"
         );
         assert!(
-            logged.contains(&user_message("one more turn")),
+            logged.contains(&user_message(&Outbound::text("one more turn")).unwrap()),
             "the extra user line never reached the child: {logged:?}"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Write one fake image file with the given magic bytes and payload.
+    fn image_file(dir: &std::path::Path, name: &str, magic: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(b"payload-bytes");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// The png and jpeg magic prefixes the sniffer reads.
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    const JPEG_MAGIC: [u8; 3] = [0xff, 0xd8, 0xff];
+
+    #[test]
+    fn image_magic_bytes_map_to_media_types_and_base64_matches_vectors() {
+        // The sniffer is the clipboard module's, so both surfaces read the
+        // same magic bytes.
+        assert_eq!(
+            crate::clipboard::sniff_media_type(&PNG_MAGIC),
+            Some(crate::clipboard::ImageFormat::Png)
+        );
+        assert_eq!(
+            crate::clipboard::sniff_media_type(&JPEG_MAGIC),
+            Some(crate::clipboard::ImageFormat::Jpeg)
+        );
+        assert_eq!(crate::clipboard::sniff_media_type(b"not an image"), None);
+        assert_eq!(media_type(crate::clipboard::ImageFormat::Png), "image/png");
+        assert_eq!(
+            media_type(crate::clipboard::ImageFormat::Jpeg),
+            "image/jpeg"
+        );
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn an_image_message_writes_text_and_image_blocks_through_the_child() {
+        let dir = temp_dir("send-user-image");
+        // The parrot echoes every non-handshake line back verbatim and exits
+        // on the interrupt, so the log carries the exact lines we wrote.
+        let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) printf '%s\n' '__INIT__' ;;
+    *'"interrupt"'*) exit 0 ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+done
+"#
+        .replace("__INIT__", INIT_RESPONSE);
+        script(&dir, PROGRAM, &body);
+        let mut runner =
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+
+        let png = image_file(&dir, "shot.png", &PNG_MAGIC);
+        let jpg = image_file(&dir, "cam.jpg", &JPEG_MAGIC);
+        let mut prompt_job = job(&dir, None, true);
+        prompt_job.images = vec![png.clone()];
+        let (mut session, rx) = start_with_retry(&mut runner, &prompt_job);
+        session
+            .send_user(&Outbound {
+                text: "check this screenshot".to_string(),
+                images: vec![jpg.clone()],
+            })
+            .unwrap();
+        session.stop().unwrap();
+        let events = collect_until_exit(&rx);
+        assert!(matches!(
+            events.last(),
+            Some(RunEvent::Exit { ok: true, .. })
+        ));
+
+        let logged = log_lines(&dir);
+        let user_lines: Vec<Value> = logged
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("type").and_then(Value::as_str) == Some("user"))
+            .collect();
+        assert_eq!(
+            user_lines.len(),
+            2,
+            "the prompt and the extra turn: {logged:?}"
+        );
+        let expected_blocks = |image: &std::path::Path, media: &str| {
+            vec![
+                json!({"type": "text", "text": "check this screenshot"}),
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media,
+                        "data": base64_encode(&fs::read(image).unwrap()),
+                    },
+                }),
+            ]
+        };
+        assert_eq!(
+            user_lines[0].pointer("/message/content"),
+            Some(&Value::Array({
+                let mut blocks = expected_blocks(&png, "image/png");
+                blocks[0] = json!({"type": "text", "text": "Refine issue 7."});
+                blocks
+            })),
+            "the prompt line carries the text block and one image block"
+        );
+        assert_eq!(
+            user_lines[1].pointer("/message/content"),
+            Some(&Value::Array(expected_blocks(&jpg, "image/jpeg"))),
+            "the extra turn carries the text block and one image block"
+        );
+        // The base64 data decodes back to the file bytes.
+        let data = user_lines[1]
+            .pointer("/message/content/1/source/data")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(data, base64_encode(&fs::read(&jpg).unwrap()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_or_unknown_image_fails_the_send_naming_the_file() {
+        let dir = temp_dir("send-user-bad-image");
+        // The child answers the handshake, then drains its input.
+        script(
+            &dir,
+            PROGRAM,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{INIT_RESPONSE}'\ncat > /dev/null\n"),
+        );
+        let mut runner =
+            test_runner(&dir, Arc::new(|_| {})).with_handshake_timeout(TestDuration::from_secs(5));
+
+        let (mut session, _rx) = start_with_retry(&mut runner, &job(&dir, None, true));
+        let missing = dir.join("missing.png");
+        let error = session
+            .send_user(&Outbound {
+                text: "see this".to_string(),
+                images: vec![missing.clone()],
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "wrong error: {error:#}"
+        );
+
+        let plain = dir.join("notes.txt");
+        fs::write(&plain, b"just text").unwrap();
+        let error = session
+            .send_user(&Outbound {
+                text: "see this".to_string(),
+                images: vec![plain.clone()],
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("neither png nor jpeg"),
+            "wrong error: {error:#}"
+        );
+        session.stop().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2200,7 +2436,7 @@ done
         assert!(session.idle_for() >= TestDuration::from_millis(100));
 
         // One emitted event resets the idle clock to about zero.
-        session.send_user("tick").unwrap();
+        session.send_user(&Outbound::text("tick")).unwrap();
         let deadline = Instant::now() + TEST_TIMEOUT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());

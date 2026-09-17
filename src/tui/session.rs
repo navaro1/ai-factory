@@ -655,7 +655,11 @@ impl SessionView {
                 // The daemon appends one user line to the log for every
                 // accepted message. The log tail delivers the line to the
                 // transcript at the next poll, so no local echo lives here.
-                Some(Action::Chat { task, text })
+                Some(Action::Chat {
+                    task,
+                    text,
+                    images: Vec::new(),
+                })
             }
             (KeyCode::Char(letter), modifiers)
                 if !disabled
@@ -1766,6 +1770,7 @@ mod tests {
             Some(Action::Chat {
                 task: "borsuk/implement-i142".to_string(),
                 text: " hi ".to_string(),
+                images: Vec::new(),
             })
         );
         assert_eq!(
@@ -1815,6 +1820,7 @@ mod tests {
             Some(Action::Chat {
                 task: "borsuk/implement-i142".to_string(),
                 text: "steer".to_string(),
+                images: Vec::new(),
             })
         );
 
@@ -2415,6 +2421,7 @@ mod tests {
             Some(Action::Chat {
                 task: "borsuk/implement-i142".to_string(),
                 text: "hi".to_string(),
+                images: Vec::new(),
             })
         );
         assert!(
