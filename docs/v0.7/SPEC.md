@@ -393,7 +393,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C13 · **Traces to:** R15, R16, N3
 
 ### C15 — The map panel
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-17 (branch aif/ai-factory/issue-32; `src/tui/theory.rs` moved to `src/tui/theory/mod.rs`, the map pane takes the rows the panels leave free at the bottom of the body)
 **Build:** Add `src/tui/theory/map.rs`: a layered layout for one area at a time (states as boxes on rows by transition depth, transitions as `──<title>──▶` arrows labeled with the transition title truncated to 8 characters, the boundary as the outer double-line frame, failures as `⚠ <id> CROSSES <boundary>` lines under the frame), sized to the pane and truncated with `…` when the area does not fit. Add `h`/`l` to cycle areas and `j`/`k` to move the entry cursor; the cursor shows the entry statement in a bottom strip.
 **AC:**
 - A render test with two states and one transition asserts `[IDLE]──poll──▶[BUSY]` on one line inside a frame titled with the area id in uppercase.
