@@ -197,7 +197,9 @@ impl Theory {
     ///
     /// The repository the mark acts on also contributes one stop per map
     /// entry of the area the map shows, between its header row and its
-    /// area rows.
+    /// area rows. The marked stop names that repository itself, so an
+    /// entry mark keeps its own repository; a view with no mark takes the
+    /// first one.
     fn stops(&self, state: &StateView) -> Vec<Stop> {
         let marked = self.marked.as_ref();
         let mut all = Vec::new();
@@ -216,11 +218,14 @@ impl Theory {
                 all.push(Stop::Delta(alias.clone(), delta.number));
             }
         }
-        if let Some(stop) = Self::at_in(&all, marked) {
-            let repo = stop.repo().to_string();
+        let repo = match marked {
+            Some(stop) => Some(stop.repo().to_string()),
+            None => all.first().map(|stop| stop.repo().to_string()),
+        };
+        if let Some(repo) = repo {
             if let Some(view) = state.theory.get(&repo) {
                 if let Some(one) = shown_area(view, marked, self.map_area.as_ref()) {
-                    let head = all.iter().position(|one| one.repo() == repo);
+                    let head = all.iter().position(|one| one.repo() == repo.as_str());
                     for (offset, line) in map::lines(&view.model, &one.boundary)
                         .into_iter()
                         .enumerate()
@@ -2053,6 +2058,49 @@ mod tests {
             render_with(&state, &mut pane).contains("╔ WEB-CHECKOUT "),
             "screen was:\n{}",
             render_with(&state, &mut pane)
+        );
+    }
+
+    /// `j` walks the map entries of the marked repository, even when it
+    /// is not the first one the state view lists.
+    #[test]
+    fn j_walks_the_entries_of_the_marked_repository_not_the_first_one() {
+        let mut state = map_view(map_model(), vec![area_on("web-checkout", "B-checkout")]);
+        let second = state.theory["borsuk"].clone();
+        state.theory.insert("zulu".to_string(), second);
+        let mut pane = Theory::default();
+
+        // Four steps walk from the borsuk header past its two entries
+        // and its area row onto the zulu header.
+        for _ in 0..4 {
+            pane.handle_key(&state, press(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Repo("zulu".to_string())),
+            "the mark reaches the second repository"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Entry(
+                "zulu".to_string(),
+                "web-checkout".to_string(),
+                "T-poll".to_string()
+            )),
+            "the first entry of the second repository"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Entry(
+                "zulu".to_string(),
+                "web-checkout".to_string(),
+                "FM-2".to_string()
+            )),
+            "the mark stays in the second repository"
         );
     }
 }
