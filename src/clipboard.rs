@@ -52,16 +52,6 @@ impl ImageFormat {
     }
 }
 
-impl std::fmt::Display for ImageFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            ImageFormat::Png => "image/png",
-            ImageFormat::Jpeg => "image/jpeg",
-        };
-        f.write_str(name)
-    }
-}
-
 /// Why the reader saved no image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardError {
@@ -323,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn select_tool_prefers_wayland_then_x11_then_names_no_display() {
+    fn select_tool_for_the_image_paste_prefers_wayland_then_x11() {
         assert_eq!(
             select_tool(Some("wayland-1"), Some(":1")),
             Ok(ClipboardTool::Wayland)
