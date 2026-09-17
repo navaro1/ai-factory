@@ -206,6 +206,7 @@ pub(super) fn draw(
     f.render_widget(block, frame);
 
     let width = pane.width as usize;
+    let inner_width = inner.width as usize;
     let cut = core.len() > core_rows;
     let shown = if cut {
         core_rows.saturating_sub(1)
@@ -222,7 +223,7 @@ pub(super) fn draw(
             } else {
                 Style::default().fg(THEME.text)
             };
-            Line::from(Span::styled(fit(&line.text, width), style))
+            Line::from(Span::styled(fit(&line.text, inner_width), style))
         })
         .collect();
     if cut {
