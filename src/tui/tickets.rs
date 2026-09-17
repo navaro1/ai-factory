@@ -7,13 +7,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::labels::LabelNames;
 use crate::sock::{
     Action, StateView, TicketAction, TicketConflict, TicketContent, TicketContentSource,
     TicketDetails, TicketGroup, TicketLabels, TicketMentions, TicketResult, TicketResultKind,
-    TicketSummary,
+    TicketSummary, BATCH_LABEL_REQUEST,
 };
 
 use crate::theory::records::{
@@ -139,6 +140,16 @@ pub struct Tickets {
     new_label_form: Option<NewLabelForm>,
     /// The open new-ticket form.
     new_ticket: Option<NewTicketForm>,
+    /// The marked issue numbers of the active tab.
+    marked: BTreeSet<u64>,
+    /// True while the batch label picker is visible.
+    batch_picker_open: bool,
+    /// The repository whose catalog the open batch picker waits for.
+    batch_repo: Option<String>,
+    /// The selected repository label in the batch picker.
+    batch_selected: usize,
+    /// The toast the view asks the shell to show.
+    pending_toast: Option<String>,
     /// The last mutation result.
     result: Option<TicketResult>,
     /// The retained direct edit draft.
@@ -173,6 +184,16 @@ impl Tickets {
     /// True when the focus view is open.
     pub fn focus_open(&self) -> bool {
         self.focus
+    }
+
+    /// True while at least one list row stays marked.
+    pub fn holds_marks(&self) -> bool {
+        !self.marked.is_empty()
+    }
+
+    /// Take the toast the view asks the shell to show.
+    pub fn take_toast(&mut self) -> Option<String> {
+        self.pending_toast.take()
     }
 
     /// True while the plain ticket focus holds the keyboard.
@@ -294,7 +315,13 @@ impl Tickets {
         if self.searching {
             return "type filter · enter apply · esc clear".to_string();
         }
-        "h l tabs · / search · n new · enter open · ? help".to_string()
+        if self.batch_picker_open {
+            return "space apply · j k move · esc back".to_string();
+        }
+        if !self.marked.is_empty() {
+            return "space mark · a all · L batch · esc clear · enter open · ? help".to_string();
+        }
+        "h l tabs · / search · space mark · n new · enter open · ? help".to_string()
     }
 
     /// True when the open focus shows a proposal that `a` applies.
@@ -430,16 +457,87 @@ impl Tickets {
     }
 
     /// Apply one label catalog response.
+    ///
+    /// The open focus accepts the answer for its repository, and the batch
+    /// label picker accepts one for the repository it opened on.
     pub fn observe_labels(&mut self, labels: TicketLabels) {
-        let current = self
+        let focus_waits = self
             .focus_key
             .as_ref()
             .is_some_and(|(repo, _)| repo == &labels.repo);
-        if current {
+        let batch_waits = !self.focus
+            && self.batch_picker_open
+            && self.batch_repo.as_deref() == Some(labels.repo.as_str());
+        if !focus_waits && !batch_waits {
+            return;
+        }
+        if focus_waits {
             self.label_selected = self
                 .label_selected
                 .min(labels.labels.len().saturating_sub(1));
-            self.labels = Some(labels);
+        } else {
+            self.batch_selected = self
+                .batch_selected
+                .min(labels.labels.len().saturating_sub(1));
+        }
+        self.labels = Some(labels);
+    }
+
+    /// The active-tab summaries of the marked numbers, in state order.
+    ///
+    /// The rows come from the whole tab, so a later search change never
+    /// hides a marked ticket from the batch.
+    fn marked_rows<'a>(&self, state: &'a StateView) -> Vec<&'a TicketSummary> {
+        let tab = self.tab(state);
+        state
+            .tickets
+            .iter()
+            .filter(|ticket| Some(&ticket.repo) == tab.as_ref())
+            .filter(|ticket| self.marked.contains(&ticket.number))
+            .collect()
+    }
+
+    /// Apply one key inside the batch label picker.
+    ///
+    /// `space` sends one batch action: it adds the label when not every
+    /// marked ticket carries it, and removes it when every one does.
+    fn handle_batch_key(&mut self, state: &StateView, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.batch_picker_open = false;
+                self.batch_repo = None;
+                None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.labels.as_ref()?.labels.len();
+                self.batch_selected = (self.batch_selected + 1).min(count.saturating_sub(1));
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.batch_selected = self.batch_selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Char(' ') => {
+                let labels = self.labels.as_ref()?;
+                let label = labels.labels.get(self.batch_selected)?.name.clone();
+                let repo = self.tab(state)?;
+                let marked = self.marked_rows(state);
+                if marked.is_empty() {
+                    return None;
+                }
+                let numbers = marked.iter().map(|row| row.number).collect();
+                let on = !marked
+                    .iter()
+                    .all(|row| row.labels.iter().any(|current| current == &label));
+                Some(Action::Ticket(TicketAction::BatchToggleLabel {
+                    request: format!("{BATCH_LABEL_REQUEST}{}", request_code()),
+                    repo,
+                    numbers,
+                    label,
+                    on,
+                }))
+            }
+            _ => None,
         }
     }
 
@@ -558,6 +656,7 @@ impl Tickets {
         let next = (current + step).rem_euclid(tabs.len() as isize) as usize;
         self.tab = Some(tabs[next].clone());
         self.selected = 0;
+        self.marked.clear();
     }
 
     /// The active-tab summaries that match the active search text.
@@ -724,6 +823,9 @@ impl Tickets {
             }
             return None;
         }
+        if self.batch_picker_open {
+            return self.handle_batch_key(state, key);
+        }
         match key.code {
             KeyCode::Char('/') => self.searching = true,
             KeyCode::Char('n') => {
@@ -747,6 +849,39 @@ impl Tickets {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::Char(' ') => {
+                if let Some(ticket) = self.filtered(state).get(self.selected).copied() {
+                    let number = ticket.number;
+                    if !self.marked.remove(&number) {
+                        self.marked.insert(number);
+                    }
+                }
+                let count = self.filtered(state).len();
+                if count > 0 {
+                    self.selected = (self.selected + 1).min(count - 1);
+                }
+            }
+            KeyCode::Char('a') => {
+                for ticket in self.filtered(state) {
+                    self.marked.insert(ticket.number);
+                }
+            }
+            KeyCode::Esc if !self.marked.is_empty() => self.marked.clear(),
+            KeyCode::Char('L') => {
+                if self.marked.is_empty() {
+                    self.pending_toast = Some("mark tickets with space first".to_string());
+                    return None;
+                }
+                let repo = self.tab(state)?;
+                self.batch_picker_open = true;
+                self.batch_repo = Some(repo.clone());
+                self.batch_selected = 0;
+                self.labels = None;
+                return Some(Action::Ticket(TicketAction::Labels {
+                    request: request_code(),
+                    repo,
+                }));
             }
             KeyCode::Enter => {
                 let selected = self.filtered(state).get(self.selected).copied().cloned()?;
@@ -1099,6 +1234,8 @@ impl Tickets {
             self.draw_focus(frame, area, state);
         } else if self.new_ticket.is_some() {
             self.draw_new_ticket(frame, area);
+        } else if self.batch_picker_open {
+            self.draw_batch_picker(frame, area, state);
         } else {
             self.draw_list(frame, area, state);
         }
@@ -1152,9 +1289,14 @@ impl Tickets {
             }
             let selected = ticket_index == self.selected;
             let marker = if selected { "›" } else { " " };
+            let mark = if self.marked.contains(&ticket.number) {
+                "*"
+            } else {
+                " "
+            };
             let mut spans = vec![
                 Span::styled(
-                    format!("{marker} {} ", ticket.repo),
+                    format!("{marker}{mark} {} ", ticket.repo),
                     Style::default().fg(THEME.repo).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("#{} ", ticket.number), THEME.dim()),
@@ -1464,6 +1606,70 @@ impl Tickets {
         frame.render_widget(
             Paragraph::new(lines)
                 .block(Block::bordered().title(" labels // space toggle · n new · esc ticket ")),
+            area,
+        );
+    }
+
+    /// Draw the batch label picker over the marked tickets.
+    ///
+    /// Every row counts how many marked tickets carry the label, so the
+    /// operator reads the coverage before one `space` flips the whole set.
+    fn draw_batch_picker(&self, frame: &mut Frame<'_>, area: Rect, state: &StateView) {
+        let marked = self.marked_rows(state);
+        let count = marked.len();
+        let title = format!(" batch labels // {count} marked // space apply · esc back ");
+        let Some(catalog) = self.labels.as_ref() else {
+            frame.render_widget(
+                Paragraph::new("Loading repository labels…")
+                    .style(THEME.dim())
+                    .block(Block::bordered().title(title)),
+                area,
+            );
+            return;
+        };
+        let mut lines = Vec::new();
+        if let Some(error) = catalog.error.as_deref() {
+            lines.push(Line::from(Span::styled(
+                format!("× catalog failure: {error}"),
+                Style::default().fg(THEME.error),
+            )));
+            lines.push(Line::from(""));
+        }
+        for (index, label) in catalog.labels.iter().enumerate() {
+            let covered = marked
+                .iter()
+                .filter(|row| row.labels.iter().any(|current| current == &label.name))
+                .count();
+            let complete = count > 0 && covered == count;
+            let marker = if index == self.batch_selected {
+                "›"
+            } else {
+                " "
+            };
+            let mut line = Line::from(vec![
+                Span::styled(
+                    format!("{marker} {covered}/{count} "),
+                    Style::default().fg(if complete { THEME.ok } else { THEME.dim }),
+                ),
+                Span::styled(
+                    label.name.clone(),
+                    Style::default().fg(repo_label_color(&label.color)),
+                ),
+                Span::styled(format!("  #{}", label.color), THEME.dim()),
+            ]);
+            if index == self.batch_selected {
+                line = line.style(THEME.selected());
+            }
+            lines.push(line);
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No repository labels are available.",
+                THEME.dim(),
+            )));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(title)),
             area,
         );
     }
@@ -2955,7 +3161,7 @@ mod tests {
         let mut tickets = Tickets::default();
         assert_eq!(
             tickets.footer_hints(),
-            "h l tabs · / search · n new · enter open · ? help"
+            "h l tabs · / search · space mark · n new · enter open · ? help"
         );
 
         tickets.handle_key(&state, key(KeyCode::Char('/')));
@@ -3043,7 +3249,9 @@ mod tests {
     #[test]
     fn every_ticket_hint_stays_within_the_bottom_row_cap() {
         for hint in [
-            "h l tabs · / search · n new · enter open · ? help",
+            "h l tabs · / search · space mark · n new · enter open · ? help",
+            "space mark · a all · L batch · esc clear · enter open · ? help",
+            "space apply · j k move · esc back",
             "type filter · enter apply · esc clear",
             "ctrl-s create · tab field · esc cancel",
             "e edit · L labels · c chat · m refine · esc back · ? help",
@@ -3318,6 +3526,226 @@ mod tests {
         assert!(
             !screen.contains("must not be empty"),
             "typing cleared the error: {screen}"
+        );
+    }
+
+    #[test]
+    fn tickets_batch_space_marks_the_row_advances_and_renders_a_marker() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+
+        tickets.handle_key(&state, key(KeyCode::Char(' ')));
+        assert_eq!(tickets.marked, BTreeSet::from([7]));
+        assert_eq!(tickets.selected, 1, "the mark must advance the selection");
+
+        tickets.handle_key(&state, key(KeyCode::Char(' ')));
+        assert_eq!(tickets.marked, BTreeSet::from([7, 8]));
+        assert_eq!(tickets.selected, 1, "the last row stops the advance");
+
+        tickets.handle_key(&state, key(KeyCode::Char(' ')));
+        assert_eq!(
+            tickets.marked,
+            BTreeSet::from([7]),
+            "space toggles the mark"
+        );
+
+        let screen = render_focus(&tickets, &state, 100, 24);
+        let marked = screen.iter().find(|row| row.contains("#7")).expect("#7");
+        assert!(
+            marked.contains('*'),
+            "the marked row needs a marker: {marked}"
+        );
+        let plain = screen.iter().find(|row| row.contains("#8")).expect("#8");
+        assert!(
+            !plain.contains('*'),
+            "the unmarked row stays plain: {plain}"
+        );
+    }
+
+    #[test]
+    fn tickets_batch_a_marks_every_filtered_row_and_esc_clears_the_marks() {
+        let state = two_ticket_state();
+        let mut filtered = Tickets {
+            query: "#8".to_string(),
+            ..Tickets::default()
+        };
+        filtered.handle_key(&state, key(KeyCode::Char('a')));
+        assert_eq!(
+            filtered.marked,
+            BTreeSet::from([8]),
+            "the active filter bounds the mark"
+        );
+
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('a')));
+        assert_eq!(tickets.marked, BTreeSet::from([7, 8]));
+
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert!(tickets.marked.is_empty(), "esc must clear the marks");
+        assert!(
+            !tickets.focus_open(),
+            "esc with marks must stay in the tickets view"
+        );
+    }
+
+    #[test]
+    fn tickets_batch_marks_survive_a_search_change_and_clear_on_a_tab_switch() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char(' ')));
+        assert_eq!(tickets.marked, BTreeSet::from([7]));
+
+        tickets.handle_key(&state, key(KeyCode::Char('/')));
+        tickets.handle_key(&state, key(KeyCode::Char('i')));
+        tickets.handle_key(&state, key(KeyCode::Esc));
+        assert_eq!(
+            tickets.marked,
+            BTreeSet::from([7]),
+            "a search change must keep the marks"
+        );
+
+        tickets.handle_key(&state, key(KeyCode::Char('l')));
+        assert!(
+            tickets.marked.is_empty(),
+            "a tab switch must clear the marks"
+        );
+    }
+
+    #[test]
+    fn tickets_batch_l_opens_the_picker_and_shows_coverage_counts() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('a')));
+
+        let action = tickets.handle_key(&state, key(KeyCode::Char('L')));
+        let Some(Action::Ticket(TicketAction::Labels { repo, .. })) = action else {
+            panic!("L must request the repository catalog");
+        };
+        assert_eq!(repo, "borsuk");
+        assert!(tickets.batch_picker_open);
+
+        tickets.observe_labels(TicketLabels {
+            request: "labels-b1".to_string(),
+            repo: "borsuk".to_string(),
+            labels: vec![
+                crate::sock::RepoLabel {
+                    name: "ui".to_string(),
+                    color: "55e6ff".to_string(),
+                },
+                crate::sock::RepoLabel {
+                    name: "urgent".to_string(),
+                    color: "ff6b7a".to_string(),
+                },
+            ],
+            error: None,
+        });
+
+        let screen = render_focus(&tickets, &state, 100, 24).join("\n");
+        assert!(
+            screen.contains("batch labels // 2 marked"),
+            "screen:\n{screen}"
+        );
+        assert!(screen.contains("1/2"), "ui covers one of two: {screen}");
+        assert!(screen.contains("0/2"), "urgent covers none: {screen}");
+    }
+
+    #[test]
+    fn tickets_batch_l_without_marks_toasts_and_opens_nothing() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+
+        let action = tickets.handle_key(&state, key(KeyCode::Char('L')));
+
+        assert!(action.is_none());
+        assert!(!tickets.batch_picker_open);
+        assert_eq!(
+            tickets.take_toast().as_deref(),
+            Some("mark tickets with space first")
+        );
+        assert!(tickets.take_toast().is_none(), "the toast must drain once");
+    }
+
+    #[test]
+    fn tickets_batch_picker_space_sends_add_then_remove_over_every_marked_number() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('a')));
+        tickets.handle_key(&state, key(KeyCode::Char('L')));
+        tickets.observe_labels(TicketLabels {
+            request: "labels-b2".to_string(),
+            repo: "borsuk".to_string(),
+            labels: vec![crate::sock::RepoLabel {
+                name: "ui".to_string(),
+                color: "55e6ff".to_string(),
+            }],
+            error: None,
+        });
+
+        let add = tickets.handle_key(&state, key(KeyCode::Char(' ')));
+        let Some(Action::Ticket(TicketAction::BatchToggleLabel {
+            request,
+            repo,
+            numbers,
+            label,
+            on,
+        })) = add
+        else {
+            panic!("space must send one batch toggle");
+        };
+        assert!(request.starts_with(crate::sock::BATCH_LABEL_REQUEST));
+        assert_eq!(repo, "borsuk");
+        assert_eq!(numbers, vec![7, 8]);
+        assert_eq!(label, "ui");
+        assert!(on, "not every marked ticket carries ui");
+
+        // The state push shows both tickets with the label, so the next
+        // space removes it from every one.
+        let mut updated = two_ticket_state();
+        updated.tickets[1].labels.push("ui".to_string());
+        let remove = tickets.handle_key(&updated, key(KeyCode::Char(' ')));
+        let Some(Action::Ticket(TicketAction::BatchToggleLabel {
+            numbers, label, on, ..
+        })) = remove
+        else {
+            panic!("the second space must send one batch toggle");
+        };
+        assert_eq!(numbers, vec![7, 8]);
+        assert_eq!(label, "ui");
+        assert!(!on, "every marked ticket carries ui");
+    }
+
+    #[test]
+    fn tickets_batch_picker_ignores_a_catalog_answer_for_another_repo() {
+        let state = two_ticket_state();
+        let mut tickets = Tickets::default();
+        tickets.handle_key(&state, key(KeyCode::Char('a')));
+        let action = tickets.handle_key(&state, key(KeyCode::Char('L')));
+        let Some(Action::Ticket(TicketAction::Labels { repo, .. })) = action else {
+            panic!("L must request the repository catalog");
+        };
+        assert_eq!(repo, "borsuk");
+
+        // A stale answer of another repository must not fill the picker.
+        tickets.observe_labels(TicketLabels {
+            request: "labels-b3".to_string(),
+            repo: "other".to_string(),
+            labels: vec![crate::sock::RepoLabel {
+                name: "ghost".to_string(),
+                color: "000000".to_string(),
+            }],
+            error: None,
+        });
+
+        assert!(tickets.batch_picker_open);
+        assert!(
+            tickets.labels.is_none(),
+            "the picker must keep waiting for its own catalog"
+        );
+        assert!(
+            tickets
+                .handle_key(&state, key(KeyCode::Char(' ')))
+                .is_none(),
+            "space without the own catalog must send nothing"
         );
     }
 }

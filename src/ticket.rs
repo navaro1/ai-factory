@@ -28,8 +28,9 @@ const STATUS_TTL_MS: u64 = 90_000;
 pub struct TicketEffects {
     /// Detail, label, and result messages for the UI.
     pub pushes: Vec<Push>,
-    /// A GitHub mutation that must replace the issue in the daemon snapshot.
-    pub confirmed: Option<(String, Issue, u64)>,
+    /// GitHub mutations that must replace the issues in the daemon
+    /// snapshot.
+    pub confirmed: Vec<(String, Issue, u64)>,
 }
 
 /// The one controller for every ticket action.
@@ -116,7 +117,7 @@ impl TicketController {
                         proposal: None,
                         chat_error: config.ticket_chat_model().err(),
                     })],
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 },
                 None => TicketEffects {
                     pushes: vec![Push::TicketResult(result(
@@ -126,7 +127,7 @@ impl TicketController {
                         TicketResultKind::Failure,
                         "The ticket is not open in the current GitHub state.",
                     ))],
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 },
             },
             TicketAction::UpdateContent {
@@ -147,6 +148,15 @@ impl TicketController {
                 label,
                 on,
             } => self.toggle_label(request, repo, number, label, on, snapshot, config, now_ms),
+            TicketAction::BatchToggleLabel {
+                request,
+                repo,
+                numbers,
+                label,
+                on,
+            } => {
+                self.batch_toggle_label(request, repo, numbers, label, on, snapshot, config, now_ms)
+            }
             TicketAction::CreateLabel {
                 request,
                 repo,
@@ -174,7 +184,7 @@ impl TicketController {
                             TicketResultKind::Failure,
                             &error,
                         ))],
-                        confirmed: None,
+                        confirmed: Vec::new(),
                     };
                 }
                 let issue = snapshot
@@ -191,7 +201,7 @@ impl TicketController {
                             TicketResultKind::Failure,
                             "The ticket is not open in the current GitHub state.",
                         ))],
-                        confirmed: None,
+                        confirmed: Vec::new(),
                     };
                 }
                 let names = config.resolved_labels(Some(&repo));
@@ -204,7 +214,7 @@ impl TicketController {
                             TicketResultKind::Failure,
                             "The refined ticket no longer has an active conversation.",
                         ))],
-                        confirmed: None,
+                        confirmed: Vec::new(),
                     };
                 }
                 TicketEffects::default()
@@ -398,7 +408,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let gh = GhClient::new(&*self.exec);
@@ -414,7 +424,7 @@ impl TicketController {
                 )));
                 return TicketEffects {
                     pushes,
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 };
             }
         };
@@ -434,7 +444,7 @@ impl TicketController {
             }));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         }
         let confirmed = match gh.update_issue(
@@ -454,7 +464,7 @@ impl TicketController {
                 )));
                 return TicketEffects {
                     pushes,
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 };
             }
         };
@@ -470,7 +480,7 @@ impl TicketController {
         }));
         TicketEffects {
             pushes,
-            confirmed: Some((repo, confirmed, now_ms)),
+            confirmed: vec![(repo, confirmed, now_ms)],
         }
     }
 
@@ -484,7 +494,7 @@ impl TicketController {
                     labels: Vec::new(),
                     error: Some("The repository is not configured.".to_string()),
                 })],
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let gh = GhClient::new(&*self.exec);
@@ -498,7 +508,7 @@ impl TicketController {
                         labels,
                         error: None,
                     })],
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 }
             }
             Err(error) => TicketEffects {
@@ -510,7 +520,7 @@ impl TicketController {
                         "GitHub could not load repository labels: {error:#}"
                     )),
                 })],
-                confirmed: None,
+                confirmed: Vec::new(),
             },
         }
     }
@@ -545,7 +555,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let Some(mut issue) = snapshot
@@ -563,7 +573,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let gh = GhClient::new(&*self.exec);
@@ -589,7 +599,7 @@ impl TicketController {
                 )));
                 return TicketEffects {
                     pushes,
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 };
             }
         };
@@ -606,8 +616,123 @@ impl TicketController {
         }));
         TicketEffects {
             pushes,
-            confirmed: Some((repo, issue, now_ms)),
+            confirmed: vec![(repo, issue, now_ms)],
         }
+    }
+
+    /// Add or remove one existing label on every marked ticket.
+    ///
+    /// One Pending push starts the run, and exactly one final push reports
+    /// the batch: Success when every number applies, PartialFailure when
+    /// some apply, and Failure when none does. The confirmed issues carry
+    /// only the numbers that applied.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_toggle_label(
+        &mut self,
+        request: String,
+        repo: String,
+        numbers: Vec<u64>,
+        label: String,
+        on: bool,
+        snapshot: &Snapshot,
+        config: &Config,
+        now_ms: u64,
+    ) -> TicketEffects {
+        let mut pushes = vec![Push::TicketResult(result(
+            request.clone(),
+            repo.clone(),
+            0,
+            TicketResultKind::Pending,
+            "GitHub batch label update pending.",
+        ))];
+        let Some(repo_config) = config.repos.get(&repo) else {
+            pushes.push(Push::TicketResult(result(
+                request,
+                repo,
+                0,
+                TicketResultKind::Failure,
+                "The repository is not configured.",
+            )));
+            return TicketEffects {
+                pushes,
+                confirmed: Vec::new(),
+            };
+        };
+        let gh = GhClient::new(&*self.exec);
+        let mut confirmed = Vec::new();
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        for number in &numbers {
+            let Some(mut issue) = snapshot
+                .repos
+                .get(&repo)
+                .and_then(|items| items.issues.get(number))
+                .cloned()
+            else {
+                failed.push(*number);
+                continue;
+            };
+            let labels = if on {
+                gh.add_label_names(&repo_config.owner_repo, *number, &label)
+                    .map(Some)
+            } else {
+                gh.remove_label_names(&repo_config.owner_repo, *number, &label)
+            };
+            let labels = match labels {
+                Ok(Some(labels)) => labels,
+                Ok(None) => {
+                    issue.labels.retain(|current| current != &label);
+                    issue.labels.clone()
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| format!("{error:#}"));
+                    failed.push(*number);
+                    continue;
+                }
+            };
+            issue.labels = labels;
+            confirmed.push((repo.clone(), issue, now_ms));
+        }
+        let verb = if on { "Added" } else { "Removed" };
+        let (kind, message) = match (confirmed.len(), failed.len()) {
+            (_, 0) => (
+                TicketResultKind::Success,
+                format!("{verb} {label} on {} tickets.", confirmed.len()),
+            ),
+            (0, _) => (
+                TicketResultKind::Failure,
+                format!(
+                    "GitHub rejected {label} on every marked ticket: {}",
+                    first_error.as_deref().unwrap_or("the tickets are not open")
+                ),
+            ),
+            (_, _) => (
+                TicketResultKind::PartialFailure,
+                format!(
+                    "{verb} {label} on {} tickets; {} failed: {}.",
+                    confirmed.len(),
+                    failed.len(),
+                    failed
+                        .iter()
+                        .map(|number| format!("#{number}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+        };
+        if !confirmed.is_empty() {
+            self.last_mutation_ms.insert(repo.clone(), now_ms);
+        }
+        pushes.push(Push::TicketResult(TicketResult {
+            request,
+            repo,
+            number: 0,
+            kind,
+            message,
+            issue: None,
+            conflict: None,
+        }));
+        TicketEffects { pushes, confirmed }
     }
 
     /// Create one repository label and attach it to the issue.
@@ -641,7 +766,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         }
         let color = match normalize_label_color(&color) {
@@ -656,7 +781,7 @@ impl TicketController {
                 )));
                 return TicketEffects {
                     pushes,
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 };
             }
         };
@@ -670,7 +795,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let Some(mut issue) = snapshot
@@ -688,7 +813,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let gh = GhClient::new(&*self.exec);
@@ -707,7 +832,7 @@ impl TicketController {
                     )));
                     return TicketEffects {
                         pushes,
-                        confirmed: None,
+                        confirmed: Vec::new(),
                     };
                 }
             };
@@ -747,7 +872,7 @@ impl TicketController {
                 )));
                 return TicketEffects {
                     pushes,
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 };
             }
         };
@@ -764,7 +889,7 @@ impl TicketController {
         }));
         TicketEffects {
             pushes,
-            confirmed: Some((repo, issue, now_ms)),
+            confirmed: vec![(repo, issue, now_ms)],
         }
     }
 
@@ -796,7 +921,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         }
         let Some(repo_config) = config.repos.get(&repo) else {
@@ -809,7 +934,7 @@ impl TicketController {
             )));
             return TicketEffects {
                 pushes,
-                confirmed: None,
+                confirmed: Vec::new(),
             };
         };
         let gh = GhClient::new(&*self.exec);
@@ -825,7 +950,7 @@ impl TicketController {
                 )));
                 return TicketEffects {
                     pushes,
-                    confirmed: None,
+                    confirmed: Vec::new(),
                 };
             }
         };
@@ -842,7 +967,7 @@ impl TicketController {
         }));
         TicketEffects {
             pushes,
-            confirmed: Some((repo, issue, now_ms)),
+            confirmed: vec![(repo, issue, now_ms)],
         }
     }
 }
@@ -1043,7 +1168,7 @@ mod tests {
         };
         assert_eq!(success.kind, TicketResultKind::Success);
         assert_eq!(success.issue.as_ref().unwrap().title, "New title");
-        assert_eq!(effects.confirmed.as_ref().unwrap().1.title, "New title");
+        assert_eq!(effects.confirmed[0].1.title, "New title");
         assert_eq!(controller.last_mutation_ms("borsuk"), Some(5_000));
         assert_eq!(exec.calls().len(), 2);
     }
@@ -1079,7 +1204,7 @@ mod tests {
         let comparison = conflict.conflict.as_ref().unwrap();
         assert_eq!(comparison.remote.title, "Remote title");
         assert_eq!(comparison.pending, desired);
-        assert!(effects.confirmed.is_none());
+        assert!(effects.confirmed.is_empty());
         assert_eq!(exec.calls().len(), 1, "a conflict must not patch GitHub");
     }
 
@@ -1236,7 +1361,7 @@ mod tests {
             success.issue.as_ref().unwrap().labels,
             vec!["ui".to_string(), "urgent".to_string()]
         );
-        assert_eq!(effects.confirmed.as_ref().unwrap().2, 3_000);
+        assert_eq!(effects.confirmed[0].2, 3_000);
     }
 
     #[test]
@@ -1276,7 +1401,197 @@ mod tests {
         };
         assert_eq!(failure.kind, TicketResultKind::Failure);
         assert!(failure.issue.is_none());
-        assert!(effects.confirmed.is_none());
+        assert!(effects.confirmed.is_empty());
+    }
+
+    fn two_issue_snapshot() -> Snapshot {
+        let mut nine = issue("Second", "Second body");
+        nine.number = 9;
+        Snapshot {
+            repos: [(
+                "borsuk".to_string(),
+                RepoSnapshot {
+                    issues: [(7, issue("First", "First body")), (9, nine)]
+                        .into_iter()
+                        .collect(),
+                    prs: BTreeMap::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn tickets_batch_action(numbers: Vec<u64>, on: bool) -> TicketAction {
+        TicketAction::BatchToggleLabel {
+            request: "batch-1".to_string(),
+            repo: "borsuk".to_string(),
+            numbers,
+            label: "urgent".to_string(),
+            on,
+        }
+    }
+
+    #[test]
+    fn tickets_batch_adds_to_every_marked_ticket_and_returns_each_confirmed_issue() {
+        let exec = Arc::new(
+            ScriptExec::new()
+                .expect(
+                    gh(&[
+                        "api",
+                        "-i",
+                        "-X",
+                        "POST",
+                        "repos/acme/borsuk/issues/7/labels",
+                        "-f",
+                        "labels[]=urgent",
+                    ]),
+                    ok(r#"[{"name":"ui"},{"name":"urgent"}]"#),
+                )
+                .expect(
+                    gh(&[
+                        "api",
+                        "-i",
+                        "-X",
+                        "POST",
+                        "repos/acme/borsuk/issues/9/labels",
+                        "-f",
+                        "labels[]=urgent",
+                    ]),
+                    ok(r#"[{"name":"ui"},{"name":"urgent"}]"#),
+                ),
+        );
+        let mut controller = TicketController::new(exec);
+        let effects = controller.handle(
+            tickets_batch_action(vec![7, 9], true),
+            &two_issue_snapshot(),
+            &config(),
+            3_000,
+        );
+
+        assert_eq!(effects.pushes.len(), 2);
+        let Push::TicketResult(pending) = &effects.pushes[0] else {
+            panic!("the first push must report pending");
+        };
+        assert_eq!(pending.kind, TicketResultKind::Pending);
+        assert_eq!(pending.number, 0);
+        let Push::TicketResult(success) = &effects.pushes[1] else {
+            panic!("the final push must report success");
+        };
+        assert_eq!(success.kind, TicketResultKind::Success);
+        assert_eq!(success.message, "Added urgent on 2 tickets.");
+        assert_eq!(success.number, 0);
+        assert_eq!(
+            effects
+                .confirmed
+                .iter()
+                .map(|(_, issue, _)| issue.number)
+                .collect::<Vec<_>>(),
+            vec![7, 9]
+        );
+        assert_eq!(controller.last_mutation_ms("borsuk"), Some(3_000));
+    }
+
+    #[test]
+    fn tickets_batch_reports_partial_failure_when_one_marked_ticket_is_not_open() {
+        let exec = Arc::new(ScriptExec::new().expect(
+            gh(&[
+                "api",
+                "-i",
+                "-X",
+                "DELETE",
+                "repos/acme/borsuk/issues/7/labels/urgent",
+            ]),
+            ok(r#"[{"name":"ui"}]"#),
+        ));
+        let mut controller = TicketController::new(exec);
+        let effects = controller.handle(
+            tickets_batch_action(vec![7, 9], false),
+            &two_issue_snapshot(),
+            &config(),
+            3_000,
+        );
+
+        let Push::TicketResult(partial) = &effects.pushes[1] else {
+            panic!("the final push must report a partial failure");
+        };
+        assert_eq!(partial.kind, TicketResultKind::PartialFailure);
+        assert_eq!(
+            partial.message,
+            "Removed urgent on 1 tickets; 1 failed: #9."
+        );
+        assert_eq!(
+            effects
+                .confirmed
+                .iter()
+                .map(|(_, issue, _)| issue.number)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(
+            effects.confirmed[0].1.labels,
+            vec!["ui".to_string()],
+            "the removal must confirm the shorter label list"
+        );
+        assert_eq!(controller.last_mutation_ms("borsuk"), Some(3_000));
+    }
+
+    #[test]
+    fn tickets_batch_reports_failure_when_every_marked_ticket_fails() {
+        let exec = Arc::new(
+            ScriptExec::new()
+                .expect(
+                    gh(&[
+                        "api",
+                        "-i",
+                        "-X",
+                        "POST",
+                        "repos/acme/borsuk/issues/7/labels",
+                        "-f",
+                        "labels[]=urgent",
+                    ]),
+                    CmdOut {
+                        status: 1,
+                        stdout: "HTTP/2 500\r\n\r\n{}".to_string(),
+                        stderr: "server error".to_string(),
+                    },
+                )
+                .expect(
+                    gh(&[
+                        "api",
+                        "-i",
+                        "-X",
+                        "POST",
+                        "repos/acme/borsuk/issues/9/labels",
+                        "-f",
+                        "labels[]=urgent",
+                    ]),
+                    CmdOut {
+                        status: 1,
+                        stdout: "HTTP/2 500\r\n\r\n{}".to_string(),
+                        stderr: "server error".to_string(),
+                    },
+                ),
+        );
+        let mut controller = TicketController::new(exec);
+        let effects = controller.handle(
+            tickets_batch_action(vec![7, 9], true),
+            &two_issue_snapshot(),
+            &config(),
+            3_000,
+        );
+
+        let Push::TicketResult(failure) = &effects.pushes[1] else {
+            panic!("the final push must report failure");
+        };
+        assert_eq!(failure.kind, TicketResultKind::Failure);
+        assert!(
+            failure.message.contains("every marked ticket"),
+            "{}",
+            failure.message
+        );
+        assert!(effects.confirmed.is_empty());
+        assert_eq!(controller.last_mutation_ms("borsuk"), None);
     }
 
     #[test]
@@ -1343,7 +1658,7 @@ mod tests {
             .unwrap()
             .labels
             .contains(&"triage".to_string()));
-        assert_eq!(effects.confirmed.as_ref().unwrap().2, 4_000);
+        assert_eq!(effects.confirmed[0].2, 4_000);
     }
 
     #[test]
@@ -1401,7 +1716,7 @@ mod tests {
         assert_eq!(partial.kind, TicketResultKind::PartialFailure);
         assert!(partial.message.contains("created"));
         assert!(partial.message.contains("not attached"));
-        assert!(effects.confirmed.is_none());
+        assert!(effects.confirmed.is_empty());
     }
 
     #[test]
@@ -1533,7 +1848,7 @@ mod tests {
         assert_eq!(
             effects
                 .confirmed
-                .as_ref()
+                .first()
                 .map(|(repo, issue, _)| (repo.as_str(), issue.number)),
             Some(("borsuk", 12))
         );
@@ -1587,7 +1902,7 @@ mod tests {
         assert_eq!(failure.kind, TicketResultKind::Failure);
         assert_eq!(failure.message, "The repository is not configured.");
         assert!(exec.calls().is_empty());
-        assert!(effects.confirmed.is_none());
+        assert!(effects.confirmed.is_empty());
     }
 
     #[test]
@@ -1630,7 +1945,7 @@ mod tests {
         assert_eq!(failure.kind, TicketResultKind::Failure);
         assert!(failure.message.contains("GitHub"), "{}", failure.message);
         assert!(failure.issue.is_none());
-        assert!(effects.confirmed.is_none());
+        assert!(effects.confirmed.is_empty());
     }
 
     #[test]
