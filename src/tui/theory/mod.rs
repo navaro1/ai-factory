@@ -3,13 +3,17 @@
 //! The view draws one block per repository: the header strip with the
 //! governor state and the counts, then the AREAS panel with the tier each
 //! area reaches, then the HOLDS panel with the items the governor holds,
-//! then the DELTAS panel with the deltas the reviews reported. The
-//! operator moves the cursor with `j` and `k`. On a repository row `v`
-//! asks for the run skill of one surface. On an area row `t` asks the
-//! agent to teach that area. On a repository row `e` opens
-//! `theory/model.toml` in the operator's editor. On a hold row that names
-//! an area with no entries `b` starts the bootstrap chat of that area and
-//! opens its session view in place of the panels.
+//! then the DELTAS panel with the deltas the reviews reported. The MAP
+//! panel at the bottom of the body draws one area of the marked
+//! repository as a picture. The operator moves the cursor with `j` and
+//! `k`. The keys `h` and `l` cycle the area of the map. On a repository
+//! row `v` asks for the run skill of one surface. On an area row `t`
+//! asks the agent to teach that area. On a repository row `e` opens
+//! `theory/model.toml` in the operator's editor. On a hold row that
+//! names an area with no entries `b` starts the bootstrap chat of that
+//! area and opens its session view in place of the panels.
+
+mod map;
 
 use std::fs;
 use std::path::Path;
@@ -63,14 +67,17 @@ pub(super) enum Outcome {
 
 /// One stop of the Theory cursor.
 ///
-/// Each governed repository contributes its header row, one row per area,
-/// and one row per delta, in draw order. A delta that draws several miss
-/// rows is one stop. An ungoverned repository draws no panel, so it
-/// contributes its header row alone.
+/// Each governed repository contributes its header row, one stop per map
+/// entry of the area the map shows, one row per area, and one row per
+/// delta, in draw order. A delta that draws several miss rows is one
+/// stop. An ungoverned repository draws no panel, so it contributes its
+/// header row alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Stop {
     /// The header row of one repository.
     Repo(String),
+    /// One map entry of one area of one repository.
+    Entry(String, String, String),
     /// One area row of one repository.
     Area(String, String),
     /// One hold row of one repository, named by its item number.
@@ -84,6 +91,7 @@ impl Stop {
     fn repo(&self) -> &str {
         match self {
             Stop::Repo(alias)
+            | Stop::Entry(alias, _, _)
             | Stop::Area(alias, _)
             | Stop::Hold(alias, _)
             | Stop::Delta(alias, _) => alias,
@@ -91,25 +99,26 @@ impl Stop {
     }
 }
 
-/// The stops of one state view, in draw order.
-fn stops(state: &StateView) -> Vec<Stop> {
-    let mut all = Vec::new();
-    for (alias, view) in &state.theory {
-        all.push(Stop::Repo(alias.clone()));
-        if !view.governor {
-            continue;
-        }
-        for area in &view.areas {
-            all.push(Stop::Area(alias.clone(), area.id.clone()));
-        }
-        for hold in &view.holds {
-            all.push(Stop::Hold(alias.clone(), hold.number));
-        }
-        for delta in &view.deltas {
-            all.push(Stop::Delta(alias.clone(), delta.number));
+/// The area the map shows of one repository: the one the marked entry or
+/// area row names, else the stored area, else the first area.
+fn shown_area<'a>(
+    row: &'a TheoryView,
+    marked: Option<&Stop>,
+    stored: Option<&String>,
+) -> Option<&'a AreaView> {
+    if !row.governor || row.areas.is_empty() {
+        return None;
+    }
+    let named = marked.and_then(|stop| match stop {
+        Stop::Entry(_, area, _) | Stop::Area(_, area) => Some(area),
+        _ => None,
+    });
+    if let Some(id) = named.or(stored) {
+        if let Some(one) = row.areas.iter().find(|one| &one.id == id) {
+            return Some(one);
         }
     }
-    all
+    row.areas.first()
 }
 
 /// The Theory view state.
@@ -120,6 +129,12 @@ fn stops(state: &StateView) -> Vec<Stop> {
 pub(super) struct Theory {
     /// The stop the operator marked.
     marked: Option<Stop>,
+    /// The area the map shows of the marked repository.
+    ///
+    /// The mark names the area itself on an entry or area row, so this
+    /// only carries the choice of `h` and `l` past rows that name no
+    /// area, such as the header, a hold, or a delta.
+    map_area: Option<String>,
     /// The surface name typed so far, while the input is open.
     input: Option<String>,
     /// The identity of the edit-model request this UI sent.
@@ -169,13 +184,66 @@ impl Theory {
         self.chat.task_id().is_some() && self.chat.poll(now)
     }
 
+    /// The stop the keys act on within `all`: the marked one when `all`
+    /// still holds it, else the first one.
+    fn at_in(all: &[Stop], marked: Option<&Stop>) -> Option<Stop> {
+        match marked.filter(|stop| all.contains(stop)) {
+            Some(stop) => Some(stop.clone()),
+            None => all.first().cloned(),
+        }
+    }
+
+    /// The stops of the state view, in draw order.
+    ///
+    /// The repository the mark acts on also contributes one stop per map
+    /// entry of the area the map shows, between its header row and its
+    /// area rows. The marked stop names that repository itself, so an
+    /// entry mark keeps its own repository; a view with no mark takes the
+    /// first one.
+    fn stops(&self, state: &StateView) -> Vec<Stop> {
+        let marked = self.marked.as_ref();
+        let mut all = Vec::new();
+        for (alias, view) in &state.theory {
+            all.push(Stop::Repo(alias.clone()));
+            if !view.governor {
+                continue;
+            }
+            for area in &view.areas {
+                all.push(Stop::Area(alias.clone(), area.id.clone()));
+            }
+            for hold in &view.holds {
+                all.push(Stop::Hold(alias.clone(), hold.number));
+            }
+            for delta in &view.deltas {
+                all.push(Stop::Delta(alias.clone(), delta.number));
+            }
+        }
+        let repo = match marked {
+            Some(stop) => Some(stop.repo().to_string()),
+            None => all.first().map(|stop| stop.repo().to_string()),
+        };
+        if let Some(repo) = repo {
+            if let Some(view) = state.theory.get(&repo) {
+                if let Some(one) = shown_area(view, marked, self.map_area.as_ref()) {
+                    let head = all.iter().position(|one| one.repo() == repo.as_str());
+                    for (offset, line) in map::lines(&view.model, &one.boundary)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        all.insert(
+                            head.unwrap_or(0) + 1 + offset,
+                            Stop::Entry(repo.clone(), one.id.clone(), line.id),
+                        );
+                    }
+                }
+            }
+        }
+        all
+    }
+
     /// The stop the keys act on: the marked one, else the first one.
     fn at(&self, state: &StateView) -> Option<Stop> {
-        let all = stops(state);
-        match self.marked.as_ref().filter(|stop| all.contains(stop)) {
-            Some(stop) => Some(stop.clone()),
-            None => all.into_iter().next(),
-        }
+        Self::at_in(&self.stops(state), self.marked.as_ref())
     }
 
     /// The alias the keys act on: the repository of the marked stop.
@@ -191,7 +259,7 @@ impl Theory {
         match &self.input {
             Some(buffer) => format!("surface: {buffer}_{DOT}enter send{DOT}esc cancel"),
             None => format!(
-                "1-6 view{DOT}j/k row{DOT}v run skill{DOT}t teach{DOT}b bootstrap{DOT}e model{DOT}esc home"
+                "1-6 view{DOT}j/k row{DOT}h/l area{DOT}v run skill{DOT}t teach{DOT}b bootstrap{DOT}e model{DOT}esc home"
             ),
         }
     }
@@ -226,6 +294,14 @@ impl Theory {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.move_mark(state, -1);
+                Outcome::None
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.cycle_area(state, -1);
+                Outcome::None
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.cycle_area(state, 1);
                 Outcome::None
             }
             KeyCode::Char('v') => match self.at(state) {
@@ -305,7 +381,8 @@ impl Theory {
 
     /// Send the teach action of the marked area or delta row.
     ///
-    /// A repository or hold row names neither, so it sends nothing.
+    /// A repository, map entry, or hold row names neither, so it sends
+    /// nothing.
     fn send_teach(&self, state: &StateView) -> Outcome {
         match self.at(state) {
             Some(Stop::Area(repo, id)) => {
@@ -371,9 +448,9 @@ impl Theory {
 
     /// Ask the daemon for the model worktree of the marked repository.
     ///
-    /// An area row names one area, not the repository model, so it sends
-    /// nothing. The identity of the request stays here until the reply
-    /// arrives.
+    /// An area or map entry row names one area, not the repository model,
+    /// so it sends nothing. The identity of the request stays here until
+    /// the reply arrives.
     fn send_edit_model(&mut self, state: &StateView) -> Outcome {
         let Some(Stop::Repo(repo)) = self.at(state) else {
             return Outcome::None;
@@ -425,8 +502,11 @@ impl Theory {
     }
 
     /// Move the mark by `delta` rows, without wrapping.
+    ///
+    /// A move into another repository drops the stored area of the map,
+    /// so the map of the new repository starts at its own first area.
     fn move_mark(&mut self, state: &StateView, delta: isize) {
-        let all = stops(state);
+        let all = self.stops(state);
         if all.is_empty() {
             return;
         }
@@ -435,7 +515,38 @@ impl Theory {
             .and_then(|stop| all.iter().position(|one| *one == stop))
             .unwrap_or(0);
         let next = (at as isize + delta).clamp(0, all.len() as isize - 1) as usize;
-        self.marked = Some(all[next].clone());
+        let stop = all[next].clone();
+        if self.marked.as_ref().map(|one| one.repo()) != Some(stop.repo()) {
+            self.map_area = None;
+        }
+        self.marked = Some(stop);
+    }
+
+    /// Show the previous or the next area of the marked repository.
+    ///
+    /// The index moves without wrapping, and the mark moves onto the
+    /// area row of the area the map now shows.
+    fn cycle_area(&mut self, state: &StateView, delta: isize) {
+        let Some(alias) = self.current(state) else {
+            return;
+        };
+        let Some(row) = state.theory.get(&alias) else {
+            return;
+        };
+        if !row.governor || row.areas.is_empty() {
+            return;
+        }
+        let marked = self
+            .marked
+            .as_ref()
+            .filter(|stop| stop.repo() == alias.as_str());
+        let at = shown_area(row, marked, self.map_area.as_ref())
+            .and_then(|one| row.areas.iter().position(|area| area.id == one.id))
+            .unwrap_or(0);
+        let next = (at as isize + delta).clamp(0, row.areas.len() as isize - 1) as usize;
+        let id = row.areas[next].id.clone();
+        self.map_area = Some(id.clone());
+        self.marked = Some(Stop::Area(alias, id));
     }
 }
 
@@ -452,7 +563,9 @@ fn plain_name(surface: &str) -> bool {
 /// Draw the Theory view.
 ///
 /// An open bootstrap chat replaces the panels, so the operator reads the
-/// interview and the panels do not compete with it for rows.
+/// interview and the panels do not compete with it for rows. The map
+/// pane of the marked repository takes the rows the panels leave free at
+/// the bottom of the body.
 pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theory) {
     if let Some((repo, id)) = view.chat_key.clone() {
         let block = Block::bordered().title(format!(" bootstrap {repo}/{id} "));
@@ -478,6 +591,8 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
                 .add_modifier(Modifier::BOLD),
         ));
     let at = view.at(state);
+    let body = block.inner(area);
+    f.render_widget(block, area);
     let marked = at.as_ref().map(|stop| stop.repo().to_string());
     let mut lines: Vec<Line> = Vec::new();
     for (alias, row) in &state.theory {
@@ -526,7 +641,88 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no repository", THEME.dim())));
     }
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let used = lines.len().min(body.height as usize) as u16;
+    let pane = map_pane(state, at.as_ref(), view, body, body.height - used);
+    let top = match &pane {
+        Some(pane) => Rect {
+            height: body.height - pane.rect.height,
+            ..body
+        },
+        None => body,
+    };
+    f.render_widget(Paragraph::new(lines), top);
+    if let Some(pane) = pane {
+        map::draw(
+            f,
+            pane.rect,
+            &pane.area,
+            &pane.lines,
+            pane.cursor.as_deref(),
+            pane.strip.as_deref(),
+        );
+    }
+}
+
+/// The map pane of the marked repository, ready to draw.
+struct MapPane {
+    /// The rect the pane draws in, at the bottom of the body.
+    rect: Rect,
+    /// The id of the area the map shows.
+    area: String,
+    /// The lines of the map, in draw order.
+    lines: Vec<map::MapLine>,
+    /// The id of the map entry under the cursor.
+    cursor: Option<String>,
+    /// The statement strip of that entry.
+    strip: Option<String>,
+}
+
+/// The map pane of the marked repository.
+///
+/// The pane renders only when the marked repository is governed and has
+/// at least one area, and only on the rows the panels above leave free.
+fn map_pane(
+    state: &StateView,
+    at: Option<&Stop>,
+    view: &Theory,
+    body: Rect,
+    free: u16,
+) -> Option<MapPane> {
+    let stop = at?;
+    let row = state.theory.get(stop.repo())?;
+    if !row.governor {
+        return None;
+    }
+    let one = shown_area(row, Some(stop), view.map_area.as_ref())?;
+    let lines = map::lines(&row.model, &one.boundary);
+    let cursor = match stop {
+        Stop::Entry(_, area, entry) if *area == one.id => Some(entry.clone()),
+        _ => None,
+    };
+    let strip = cursor.as_ref().and_then(|id| {
+        row.model
+            .entries
+            .iter()
+            .find(|candidate| candidate.id() == id.as_str())
+            .map(|entry| format!("{}: {}", entry.id(), entry.statement()))
+    });
+    let needed = 2 + lines.len() + usize::from(strip.is_some());
+    let height = needed.min(free as usize);
+    if height == 0 {
+        return None;
+    }
+    Some(MapPane {
+        rect: Rect {
+            x: body.x,
+            y: body.y + body.height - height as u16,
+            width: body.width,
+            height: height as u16,
+        },
+        area: one.id.clone(),
+        lines,
+        cursor,
+        strip,
+    })
 }
 
 /// The header strip of one repository: the governor state and the counts,
@@ -1675,6 +1871,245 @@ mod tests {
         assert!(
             text.contains(&format!("{gauge} · IMPLEMENT \u{25b8} PAUSED")),
             "screen was:\n{text}"
+        );
+    }
+
+    // --- The map panel. ---
+
+    /// One area row bound to one boundary of the model.
+    fn area_on(id: &str, boundary: &str) -> AreaView {
+        AreaView {
+            id: id.to_string(),
+            boundary: boundary.to_string(),
+            tier: Tier::Browser,
+            min_tier: Tier::None,
+            lint: false,
+        }
+    }
+
+    /// One state entry of the map model.
+    fn box_state(id: &str, statement: &str) -> Entry {
+        Entry::State {
+            id: id.to_string(),
+            title: id.to_string(),
+            statement: statement.to_string(),
+        }
+    }
+
+    /// The model of the map tests: the checkout boundary with the IDLE
+    /// and BUSY states, one `poll` transition, and one crossing failure.
+    fn map_model() -> crate::theory::model::Model {
+        crate::theory::model::Model {
+            entries: vec![
+                Entry::Boundary {
+                    id: "B-checkout".to_string(),
+                    title: "checkout".to_string(),
+                    statement: "the cart pays".to_string(),
+                    sides: vec!["IDLE".to_string(), "BUSY".to_string()],
+                    paths: vec!["web/**".to_string()],
+                },
+                box_state("IDLE", "the cart waits"),
+                box_state("BUSY", "the cart pays"),
+                Entry::Transition {
+                    id: "T-poll".to_string(),
+                    title: "poll".to_string(),
+                    statement: "the poller starts the cart".to_string(),
+                    from: "IDLE".to_string(),
+                    to: "BUSY".to_string(),
+                },
+                Entry::Failure {
+                    id: "FM-2".to_string(),
+                    title: "replay".to_string(),
+                    statement: "a replay pays twice".to_string(),
+                    crosses: "B-checkout".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// A state whose repository carries `model` on the given areas.
+    fn map_view(model: crate::theory::model::Model, areas: Vec<AreaView>) -> StateView {
+        let mut state = view(areas, 0);
+        state.theory.get_mut("borsuk").unwrap().model = model;
+        state
+    }
+
+    /// The map draws the transition inside a double-line frame titled
+    /// with the area id in uppercase.
+    #[test]
+    fn the_map_draws_the_transition_in_a_frame_titled_by_the_area() {
+        let state = map_view(map_model(), vec![area_on("web-checkout", "B-checkout")]);
+
+        let screen = render(&state);
+
+        assert!(screen.contains('╔'), "screen was:\n{screen}");
+        assert!(screen.contains('╚'), "screen was:\n{screen}");
+        assert!(screen.contains("╔ WEB-CHECKOUT"), "screen was:\n{screen}");
+        assert!(
+            screen.contains("[IDLE]──poll──▶[BUSY]"),
+            "screen was:\n{screen}"
+        );
+    }
+
+    /// The failure that crosses the shown boundary draws on a line under
+    /// the frame.
+    #[test]
+    fn the_map_draws_a_crossing_failure_under_the_frame() {
+        let state = map_view(map_model(), vec![area_on("web-checkout", "B-checkout")]);
+
+        let screen = render(&state);
+
+        let rows: Vec<&str> = screen.lines().collect();
+        let frame_bottom = rows
+            .iter()
+            .position(|row| row.contains('╚'))
+            .expect("the frame draws a bottom border");
+        let failure = rows
+            .iter()
+            .position(|row| row.contains("⚠ FM-2 CROSSES B-checkout"))
+            .expect("the failure draws");
+        assert!(failure > frame_bottom, "screen was:\n{screen}");
+    }
+
+    /// A map wider than the pane truncates with `…` and renders without
+    /// a panic.
+    #[test]
+    fn a_map_wider_than_the_pane_truncates_with_an_ellipsis_without_panic() {
+        let model = crate::theory::model::Model {
+            entries: vec![
+                Entry::Boundary {
+                    id: "B-checkout".to_string(),
+                    title: "checkout".to_string(),
+                    statement: "the cart pays".to_string(),
+                    sides: vec!["CHECKOUT-START".to_string(), "PAYMENT-FINISH".to_string()],
+                    paths: vec!["web/**".to_string()],
+                },
+                box_state("CHECKOUT-START", "the cart opens"),
+                box_state("PAYMENT-FINISH", "the cart closes"),
+                Entry::Transition {
+                    id: "T-refresh".to_string(),
+                    title: "overnight-refresh".to_string(),
+                    statement: "the nightly refresh restarts the cart".to_string(),
+                    from: "CHECKOUT-START".to_string(),
+                    to: "PAYMENT-FINISH".to_string(),
+                },
+            ],
+        };
+        let state = map_view(model, vec![area_on("web-checkout", "B-checkout")]);
+
+        let screen = render_at(&state, &mut Theory::default(), 40);
+
+        assert!(
+            screen.contains("[CHECKOUT-START]──overnig…"),
+            "screen was:\n{screen}"
+        );
+        assert!(screen.contains('…'), "screen was:\n{screen}");
+    }
+
+    /// From the repository header, `j` walks the map entries, and the
+    /// strip shows the statement of the entry under the cursor.
+    #[test]
+    fn j_walks_the_map_entries_and_the_strip_shows_their_statements() {
+        let state = map_view(map_model(), vec![area_on("web-checkout", "B-checkout")]);
+        let mut pane = Theory::default();
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Repo("borsuk".to_string())),
+            "the mark starts on the repository header"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert!(
+            render_with(&state, &mut pane).contains("T-poll: the poller starts the cart"),
+            "screen was:\n{}",
+            render_with(&state, &mut pane)
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert!(
+            render_with(&state, &mut pane).contains("FM-2: a replay pays twice"),
+            "screen was:\n{}",
+            render_with(&state, &mut pane)
+        );
+    }
+
+    /// `l` shows the next area of the marked repository in the frame
+    /// title, and `h` shows the previous one again.
+    #[test]
+    fn h_and_l_cycle_the_area_of_the_map() {
+        let state = map_view(
+            map_model(),
+            vec![
+                area_on("web-checkout", "B-checkout"),
+                area_on("api-orders", "B-api"),
+            ],
+        );
+        let mut pane = Theory::default();
+
+        pane.handle_key(&state, press(KeyCode::Char('l')));
+        assert!(
+            render_with(&state, &mut pane).contains("╔ API-ORDERS "),
+            "screen was:\n{}",
+            render_with(&state, &mut pane)
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('h')));
+        assert!(
+            render_with(&state, &mut pane).contains("╔ WEB-CHECKOUT "),
+            "screen was:\n{}",
+            render_with(&state, &mut pane)
+        );
+
+        // The arrow keys cycle the same way the file pairs them with
+        // h and l.
+        pane.handle_key(&state, press(KeyCode::Right));
+        assert!(
+            render_with(&state, &mut pane).contains("╔ API-ORDERS "),
+            "screen was:\n{}",
+            render_with(&state, &mut pane)
+        );
+    }
+
+    /// `j` walks the map entries of the marked repository, even when it
+    /// is not the first one the state view lists.
+    #[test]
+    fn j_walks_the_entries_of_the_marked_repository_not_the_first_one() {
+        let mut state = map_view(map_model(), vec![area_on("web-checkout", "B-checkout")]);
+        let second = state.theory["borsuk"].clone();
+        state.theory.insert("zulu".to_string(), second);
+        let mut pane = Theory::default();
+
+        // Four steps walk from the borsuk header past its two entries
+        // and its area row onto the zulu header.
+        for _ in 0..4 {
+            pane.handle_key(&state, press(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Repo("zulu".to_string())),
+            "the mark reaches the second repository"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Entry(
+                "zulu".to_string(),
+                "web-checkout".to_string(),
+                "T-poll".to_string()
+            )),
+            "the first entry of the second repository"
+        );
+
+        pane.handle_key(&state, press(KeyCode::Char('j')));
+        assert_eq!(
+            pane.at(&state),
+            Some(Stop::Entry(
+                "zulu".to_string(),
+                "web-checkout".to_string(),
+                "FM-2".to_string()
+            )),
+            "the mark stays in the second repository"
         );
     }
 }
