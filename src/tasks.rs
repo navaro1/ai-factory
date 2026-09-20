@@ -112,6 +112,8 @@ pub enum AuditJob {
     Sweep,
     /// The grading of one answered card.
     Card(CardKey),
+    /// The audit review of one model-only pull request.
+    ModelPr,
 }
 
 /// The workflow purpose of one task.
@@ -273,11 +275,14 @@ pub fn bootstrap_id(repo: &str, area: &str) -> String {
 }
 
 /// The task id for one audit task: `<repo>/audit-sweep` or
-/// `<repo>/audit-card-<key>`.
+/// `<repo>/audit-card-<key>`. A model-PR audit keeps the id of the review
+/// task it re-purposes, `<repo>/review-pr<n>`, so it derives no id of its
+/// own.
 pub fn audit_id(repo: &str, job: &AuditJob) -> String {
     match job {
         AuditJob::Sweep => format!("{repo}/audit-sweep"),
         AuditJob::Card(key) => format!("{repo}/audit-card-{}", key.slug()),
+        AuditJob::ModelPr => format!("{repo}/audit-model-pr"),
     }
 }
 

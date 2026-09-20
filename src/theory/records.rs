@@ -139,7 +139,10 @@ fn check_headings(body: &str) -> Result<(), Finding> {
 
 /// True when one branch is a model branch, in the form
 /// `aif/<alias>/model-<n>`.
-fn is_model_branch(branch: &str) -> bool {
+///
+/// The review admission reads this beside the `model-pr` label, because a
+/// model pull request is one of the two, never always both.
+pub fn is_model_branch(branch: &str) -> bool {
     let mut parts = branch.split('/');
     parts.next() == Some("aif")
         && parts.next().is_some_and(|alias| !alias.is_empty())
