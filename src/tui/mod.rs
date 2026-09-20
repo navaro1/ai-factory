@@ -1199,6 +1199,10 @@ fn spawn_socket_thread(tx: Sender<Msg>, socket: PathBuf) {
                                             return;
                                         }
                                     }
+                                    // The measure lever answers only the
+                                    // client that asked, and the TUI never
+                                    // asks.
+                                    Ok(Push::MeasureResult(_)) => {}
                                     Err(error) => {
                                         if error.downcast_ref::<WireProtocolMismatch>().is_some() {
                                             if tx.send(Msg::Fatal(format!("{error:#}"))).is_err() {

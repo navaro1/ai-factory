@@ -1033,7 +1033,8 @@ fn paused_check(client: &Client) -> Check {
                 | Push::TicketResult(_)
                 | Push::Ask(_)
                 | Push::SettingsResult(_)
-                | Push::ModelPath(_),
+                | Push::ModelPath(_)
+                | Push::MeasureResult(_),
             )) => {}
             Some(Err(error)) => return no_state_check(error),
             None => {
