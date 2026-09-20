@@ -525,7 +525,7 @@ All questions are resolved. None waits for clarification.
 **Depends on:** C27 · **Traces to:** R25, R30
 
 ### C29 — The lever: `aif measure`
-**Status:** `[ ]` pending
+**Status:** `[x]` implemented on 2026-09-20 (branch aif/ai-factory/issue-46, PR #143; every area still counts as `observe` until C25 ships the properties, so the lever verdict never fails)
 **Build:** Add `Command::Measure { area: Vec<String> }` to `aif` (`src/bin/aif.rs:50-71`) and `TheoryAction::Measure { path, areas, request }` with a `Push::MeasureResult { request, text, pass }` reply. The daemon resolves the repository by the worktree path, takes the touched areas from `git diff --name-only <merge-base>` against the working tree, runs them at the worktree tree hash in `fast` mode, compares against the cached merge base, queued and awaited when absent, and replies with the agent text. `aif measure` prints it and exits 0 on pass, 1 on a failed verdict, 3 on an error.
 **AC:**
 - `tests/cli.rs` pins `aif measure --help`.
