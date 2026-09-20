@@ -119,17 +119,35 @@ fn measure_lever_help_lists_the_area_option_and_the_root_row() {
 ///
 /// The helper binds the socket of `dir` before it returns, and the
 /// thread reads the action line and answers `reply` with the request of
-/// the action. `None` closes the stream without a reply.
+/// the action. `None` closes the stream without a reply. The thread
+/// gives up after a bounded wait, so a client that never connects fails
+/// the test instead of hanging it.
 fn measure_lever_fake_daemon(dir: &Path, reply: Option<String>) -> std::thread::JoinHandle<()> {
+    use std::time::{Duration, Instant};
+
     let socket_dir = dir.join("aif");
     fs::create_dir_all(&socket_dir).expect("the socket directory must be creatable");
     let listener = UnixListener::bind(socket_dir.join("daemon.sock"))
         .expect("the fake daemon must bind the socket");
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader, Write};
-        let (mut stream, _) = listener
-            .accept()
-            .expect("the fake daemon must accept one client");
+        listener
+            .set_nonblocking(true)
+            .expect("the fake listener must turn non-blocking");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the client never connected to the fake daemon"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the fake daemon must accept one client: {error}"),
+            }
+        };
         let mut line = String::new();
         BufReader::new(&stream)
             .read_line(&mut line)
