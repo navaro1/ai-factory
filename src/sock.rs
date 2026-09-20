@@ -82,7 +82,7 @@ pub const PUSH_COALESCE_MS: u64 = 50;
 ///
 /// Increment this value when an older peer cannot safely provide a new wire
 /// behavior. A missing revision identifies the legacy protocol as revision 0.
-pub const WIRE_PROTOCOL_REVISION: u32 = 5;
+pub const WIRE_PROTOCOL_REVISION: u32 = 6;
 
 /// A permanent mismatch between the connected daemon and client protocols.
 #[derive(Debug)]
@@ -1608,6 +1608,14 @@ pub const LADDER_REQUEST: &str = "ladder:";
 /// view, so no ticket row waits for the answer.
 pub const PREDICTION_REQUEST: &str = "prediction:";
 
+/// The request identity prefix of one batch label mutation.
+///
+/// The batch adds or removes one label on every marked ticket of the
+/// Tickets list. The daemon reports the outcome through
+/// [`Push::TicketResult`], and the UI toasts the one summary result,
+/// because no single ticket row waits for it.
+pub const BATCH_LABEL_REQUEST: &str = "batch-label:";
+
 /// One ticket command inside [`Action::Ticket`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "ticket_action", rename_all = "snake_case")]
@@ -1651,6 +1659,19 @@ pub enum TicketAction {
         repo: String,
         /// The issue number.
         number: u64,
+        /// The label name.
+        label: String,
+        /// True adds the label. False removes it.
+        on: bool,
+    },
+    /// Add or remove one existing label on every marked ticket at once.
+    BatchToggleLabel {
+        /// The unique request identity.
+        request: String,
+        /// The repository alias.
+        repo: String,
+        /// The marked issue numbers.
+        numbers: Vec<u64>,
         /// The label name.
         label: String,
         /// True adds the label. False removes it.
@@ -4328,13 +4349,17 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // The healthy client receives every coalesced push and the final
-        // push, in order.
+        // push, in order. The reader thread may lag under load, so the
+        // drain waits for the final push instead of the first quiet gap.
         let mut healthy = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            match healthy_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(push) => healthy.push(push),
-                Err(_) => break,
+            if let Ok(push) = healthy_rx.recv_timeout(Duration::from_millis(200)) {
+                let done = push == Push::State(final_view.clone());
+                healthy.push(push);
+                if done {
+                    break;
+                }
             }
         }
         assert!(

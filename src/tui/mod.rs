@@ -690,6 +690,9 @@ impl App {
                     return true;
                 }
                 let nested = self.tickets.focus_open() || self.tickets.typing();
+                // A mark under the key makes esc clear the marks inside
+                // the view, so the shell must not leave on the same key.
+                let held_marks = self.tickets.holds_marks();
                 if let Some(action) = self
                     .state
                     .as_ref()
@@ -700,7 +703,10 @@ impl App {
                         self.tickets.delivery_failed(Some(&copy));
                     }
                 }
-                if key.code == KeyCode::Esc && !nested {
+                if let Some(text) = self.tickets.take_toast() {
+                    self.show_toast(&text);
+                }
+                if key.code == KeyCode::Esc && !nested && !held_marks {
                     self.view = View::Pipeline;
                 }
             }
@@ -1319,6 +1325,7 @@ fn handle_message(app: &mut App, msg: Msg, sink: &mut impl ActionSink) -> Result
                 || result
                     .request
                     .starts_with(crate::sock::MODEL_COMMIT_REQUEST)
+                || result.request.starts_with(crate::sock::BATCH_LABEL_REQUEST)
             {
                 app.show_toast(&result.message);
             } else {
@@ -1702,7 +1709,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Up Down enter", "panel select and open"),
         ("y n i t c s w 1-9", "inbox answers"),
         ("g", "fire the release gate"),
-        ("/ n e L c a m", "search and ticket keys"),
+        ("/ a L n e c m", "search, mark, and ticket keys"),
         ("h l", "repo / ticket / settings scope"),
         ("j k", "settings role or tag route"),
         ("Tab", "select settings field"),
@@ -2449,7 +2456,7 @@ mod tests {
             "PageUp PageDown",
             "PageDown",
             "End",
-            "/ n e L c a m",
+            "/ a L n e c m",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
         }
@@ -3184,6 +3191,62 @@ mod tests {
         assert_eq!(app.visible_toast(), Some("area gh has no entries"));
     }
 
+    /// A batch label summary has no single ticket row behind it, so the
+    /// operator reads it on a toast.
+    #[test]
+    fn tickets_batch_result_toasts_the_summary() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![Msg::TicketResult(crate::sock::TicketResult {
+                request: "batch-label:one".to_string(),
+                repo: "borsuk".to_string(),
+                number: 0,
+                kind: crate::sock::TicketResultKind::PartialFailure,
+                message: "Added urgent on 2 tickets; 1 failed: #123.".to_string(),
+                issue: None,
+                conflict: None,
+            })]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.visible_toast(),
+            Some("Added urgent on 2 tickets; 1 failed: #123.")
+        );
+    }
+
+    /// The `L` key without marks answers on a toast and sends nothing.
+    #[test]
+    fn tickets_batch_l_without_marks_toasts_through_the_shell() {
+        let mut surface = CountingSurface { draws: 0 };
+        let mut app = App::default();
+        let mut sink = FakeSink::default();
+
+        run_messages(
+            &mut surface,
+            &mut app,
+            vec![
+                Msg::State(crate::tui::pipeline::sample_view()),
+                key('4'),
+                key('L'),
+            ]
+            .into_iter(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(app.view, View::Tickets);
+        assert!(sink.0.is_empty(), "no request may leave without marks");
+        assert_eq!(app.visible_toast(), Some("mark tickets with space first"));
+    }
+
     #[test]
     fn t_on_an_areas_row_sends_one_teach_request_for_that_area() {
         let mut surface = CountingSurface { draws: 0 };
@@ -3795,8 +3858,8 @@ mod tests {
         };
         let text = render_to_string(&mut app);
         for entry in [
-            "/ n e L c a m",
-            "search and ticket keys",
+            "/ a L n e c m",
+            "search, mark, and ticket keys",
             "repo / ticket / settings scope",
         ] {
             assert!(text.contains(entry), "the help misses {entry}");
@@ -4609,7 +4672,7 @@ mod tests {
             (View::Inbox, "j k move · ! oldest"),
             (
                 View::Tickets,
-                "h l tabs · / search · n new · enter open · ? help",
+                "h l tabs · / search · space mark · n new · enter open · ? help",
             ),
             (
                 View::Settings,
