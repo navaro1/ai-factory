@@ -66,7 +66,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::RoleSettings;
 use crate::proc::{self, ProcEvent, ProcHandle, RunSpec, StopOutcome};
-use crate::runner::{Answer, Job, RunEvent, Runner, Session};
+use crate::runner::{Answer, Job, Outbound, RunEvent, Runner, Session};
 
 /// The request id of the `initialize` handshake.
 const INITIALIZE_ID: i64 = 1;
@@ -187,11 +187,22 @@ fn thread_resume_request(thread_id: &str) -> String {
 /// Build one `turn/start` request line.
 ///
 /// The model always rides on the turn; the effort rides with it when the
-/// role sets one.
-fn turn_start_request(id: i64, thread_id: &str, text: &str, settings: &RoleSettings) -> String {
+/// role sets one. The input holds the text item plus one
+/// `{"type":"localImage","path":...}` item per attached image, each with
+/// an absolute path.
+fn turn_start_request(
+    id: i64,
+    thread_id: &str,
+    message: &Outbound,
+    settings: &RoleSettings,
+) -> String {
+    let mut input = vec![json!({"type": "text", "text": message.text})];
+    for image in &message.images {
+        input.push(json!({"type": "localImage", "path": image.display().to_string()}));
+    }
     let mut params = Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
-    params.insert("input".to_string(), json!([{"type": "text", "text": text}]));
+    params.insert("input".to_string(), Value::Array(input));
     params.insert("model".to_string(), json!(settings.model));
     if let Some(effort) = settings.effort.as_ref() {
         params.insert("effort".to_string(), json!(effort));
@@ -660,7 +671,10 @@ impl CodexRunner {
             handle: Some(handle),
             cwd: job.cwd.display().to_string(),
             resume: job.resume.clone(),
-            prompt: job.prompt.clone(),
+            prompt: Outbound {
+                text: job.prompt.clone(),
+                images: job.images.clone(),
+            },
             timeout: self.handshake_timeout,
             phase: Phase::Initialize {
                 deadline: Instant::now() + self.handshake_timeout,
@@ -743,15 +757,15 @@ impl CodexSession {
 }
 
 impl Session for CodexSession {
-    /// Send an extra user message into the live session.
+    /// Send an extra user message, with its images, into the live session.
     ///
     /// The message opens a new turn on the same thread, with a fresh
     /// request id.
-    fn send_user(&mut self, text: &str) -> anyhow::Result<()> {
+    fn send_user(&mut self, message: &Outbound) -> anyhow::Result<()> {
         let (reply_tx, reply_rx) = channel();
         self.cmd_tx
             .send(WorkerMsg::SendUser {
-                text: text.to_string(),
+                message: message.clone(),
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("task {}: the codex session worker is gone", self.task))?;
@@ -793,10 +807,10 @@ impl Drop for CodexSession {
 enum WorkerMsg {
     /// One event from the supervised child, forwarded from the proc channel.
     Proc(ProcEvent),
-    /// Open one more turn with this text.
+    /// Open one more turn with this message.
     SendUser {
-        /// The user text of the new turn.
-        text: String,
+        /// The user message, with its images, of the new turn.
+        message: Outbound,
         /// Where the write result goes back to the caller.
         reply: Sender<anyhow::Result<()>>,
     },
@@ -853,8 +867,8 @@ struct SessionWorker {
     cwd: String,
     /// The thread id to resume, when the job continues one.
     resume: Option<String>,
-    /// The prompt of the first turn.
-    prompt: String,
+    /// The prompt message of the first turn, with its images.
+    prompt: Outbound,
     /// The handshake wait, for the timeout message.
     timeout: Duration,
     /// The start phase the worker is in.
@@ -941,8 +955,8 @@ impl SessionWorker {
                     eprintln!("task {}: {message}", self.task);
                     true
                 }
-                WorkerMsg::SendUser { text, reply } => {
-                    let result = self.start_turn(&text);
+                WorkerMsg::SendUser { message, reply } => {
+                    let result = self.start_turn(&message);
                     let _ = reply.send(result);
                     true
                 }
@@ -1126,8 +1140,7 @@ impl SessionWorker {
             task: self.task.clone(),
             session_id: Some(thread_id.to_string()),
         });
-        let prompt = self.prompt.clone();
-        let line = turn_start_request(FIRST_TURN_ID, thread_id, &prompt, &self.settings);
+        let line = turn_start_request(FIRST_TURN_ID, thread_id, &self.prompt, &self.settings);
         if let Err(error) = self.write_line(&line) {
             let message = format!(
                 "task {}: the codex prompt could not be written: {error}",
@@ -1143,15 +1156,15 @@ impl SessionWorker {
         true
     }
 
-    /// Open one more turn with `text` on the open thread.
-    fn start_turn(&mut self, text: &str) -> anyhow::Result<()> {
+    /// Open one more turn with `message` on the open thread.
+    fn start_turn(&mut self, message: &Outbound) -> anyhow::Result<()> {
         let thread_id = self
             .thread_id
             .clone()
             .ok_or_else(|| anyhow!("task {}: the codex thread is not open", self.task))?;
         let id = self.next_id;
         self.next_id += 1;
-        let line = turn_start_request(id, &thread_id, text, &self.settings);
+        let line = turn_start_request(id, &thread_id, message, &self.settings);
         self.write_line(&line)
     }
 
@@ -1528,6 +1541,7 @@ mod tests {
             allowed_tools: None,
             allowed_permissions: Vec::new(),
             timeout_s: None,
+            images: Vec::new(),
         }
     }
 
@@ -1901,8 +1915,13 @@ done
             json!({"id": 2, "method": "thread/resume", "params": {"threadId": "thr-1"}})
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&turn_start_request(3, "thr-1", "go", &settings()))
-                .unwrap(),
+            serde_json::from_str::<Value>(&turn_start_request(
+                3,
+                "thr-1",
+                &Outbound::text("go"),
+                &settings(),
+            ))
+            .unwrap(),
             json!({
                 "id": 3,
                 "method": "turn/start",
@@ -2542,7 +2561,7 @@ done
 
         let (mut session, rx) = start_with_retry(&mut runner, &job(&dir, None, true));
         collect_until(&rx, |event| matches!(event, RunEvent::TurnEnd { .. }));
-        session.send_user("one more turn").unwrap();
+        session.send_user(&Outbound::text("one more turn")).unwrap();
         collect_until(&rx, |event| matches!(event, RunEvent::TurnEnd { .. }));
         session.stop().unwrap();
         collect_until_exit(&rx);
@@ -2566,6 +2585,66 @@ done
             turns[1].pointer("/params/threadId"),
             Some(&json!("thr-1")),
             "the second turn stays on the same thread"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_image_message_sends_local_image_items_with_absolute_paths() {
+        let dir = temp_dir("send-user-image");
+        parrot_child(&dir);
+        let mut runner = test_runner(&dir);
+
+        let png = dir.join("shot.png");
+        let jpg = dir.join("cam.jpg");
+        fs::write(&png, b"png-bytes").unwrap();
+        fs::write(&jpg, b"jpeg-bytes").unwrap();
+        let mut prompt_job = job(&dir, None, true);
+        prompt_job.images = vec![png.clone()];
+        let (mut session, rx) = start_with_retry(&mut runner, &prompt_job);
+        collect_until(&rx, |event| matches!(event, RunEvent::TurnEnd { .. }));
+        session
+            .send_user(&Outbound {
+                text: "check this screenshot".to_string(),
+                images: vec![png.clone(), jpg.clone()],
+            })
+            .unwrap();
+        collect_until(&rx, |event| matches!(event, RunEvent::TurnEnd { .. }));
+        session.stop().unwrap();
+        collect_until_exit(&rx);
+
+        let turns: Vec<Value> = client_lines(&dir)
+            .into_iter()
+            .filter(|line| line.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .collect();
+        assert_eq!(turns.len(), 2, "one turn per message: {turns:?}");
+        assert_eq!(
+            turns[0].pointer("/params/input"),
+            Some(&json!([
+                {"type": "text", "text": "Review pull request 142."},
+                {"type": "localImage", "path": png.display().to_string()},
+            ])),
+            "the first turn carries the prompt text and the job image"
+        );
+        assert_eq!(
+            turns[1].pointer("/params/input"),
+            Some(&json!([
+                {"type": "text", "text": "check this screenshot"},
+                {"type": "localImage", "path": png.display().to_string()},
+                {"type": "localImage", "path": jpg.display().to_string()},
+            ])),
+            "the extra turn carries the text item and one localImage item per image"
+        );
+        assert!(
+            turns[1]
+                .pointer("/params/input")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.get("path"))
+                .filter_map(Value::as_str)
+                .all(|path| path.starts_with('/')),
+            "every image path is absolute"
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2712,7 +2791,7 @@ done
         std::thread::sleep(TestDuration::from_millis(150));
         assert!(session.idle_for() >= TestDuration::from_millis(100));
 
-        session.send_user("tick").unwrap();
+        session.send_user(&Outbound::text("tick")).unwrap();
         collect_until(&rx, |event| matches!(event, RunEvent::TurnEnd { .. }));
         assert!(session.idle_for() < TestDuration::from_millis(100));
 

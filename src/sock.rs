@@ -1941,6 +1941,10 @@ pub enum Action {
         task: String,
         /// The message text.
         text: String,
+        /// The attached image files, saved under the AIF state root as
+        /// absolute paths. Empty for a text-only message.
+        #[serde(default)]
+        images: Vec<PathBuf>,
     },
     /// Answer one open decision.
     Answer {
@@ -2771,6 +2775,7 @@ mod tests {
             Action::Chat {
                 task: "borsuk/refine-i142".to_string(),
                 text: "use sqlite".to_string(),
+                images: vec![PathBuf::from("/state/aif/images/shot.png")],
             },
             Action::Answer {
                 decision_id: "perm:borsuk/implement-i142:req-1".to_string(),
@@ -2896,6 +2901,34 @@ mod tests {
                 "line: {text}"
             );
         }
+    }
+
+    #[test]
+    fn a_chat_action_with_images_round_trips_and_a_text_only_line_loads() {
+        let action = Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "check this screenshot".to_string(),
+            images: vec![
+                PathBuf::from("/state/aif/images/one.png"),
+                PathBuf::from("/state/aif/images/two.jpg"),
+            ],
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(!line.contains('\n'), "a wire line must not hold a newline");
+        assert_eq!(serde_json::from_str::<Action>(&line).unwrap(), action);
+        let old = serde_json::from_str::<Action>(
+            r#"{"action":"chat","task":"borsuk/implement-i142","text":"no image here"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old,
+            Action::Chat {
+                task: "borsuk/implement-i142".to_string(),
+                text: "no image here".to_string(),
+                images: Vec::new(),
+            },
+            "a line written before the images field must still load"
+        );
     }
 
     #[test]

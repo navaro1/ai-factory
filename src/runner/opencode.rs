@@ -64,9 +64,11 @@ const QUESTION_PERMISSION: &str = "question";
 /// Build the exact argument vector for one factory task.
 ///
 /// The shape is `run --format json [--auto] [--agent <agent>] -m <model>
-/// [--variant <v>] [--session <id>] --dir <cwd> [extra args] <prompt>`.
-/// A configured automatic approval adds `--auto`. A resume adds the known
-/// session identity. Every configured extra argument stays one argument.
+/// [--variant <v>] [--session <id>] --dir <cwd> [extra args] [-f <image>]*
+/// <prompt>`. A configured automatic approval adds `--auto`. A resume adds
+/// the known session identity. Every configured extra argument stays one
+/// argument. One `-f <path>` flag rides per attached image, before the
+/// prompt positional, which stays the last argument.
 fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -93,6 +95,10 @@ fn build_args(job: &Job, settings: &RoleSettings) -> Vec<String> {
     args.push("--dir".to_string());
     args.push(job.cwd.display().to_string());
     args.extend(settings.extra_args.iter().cloned());
+    for image in &job.images {
+        args.push("-f".to_string());
+        args.push(image.display().to_string());
+    }
     args.push(job.prompt.clone());
     args
 }
@@ -686,6 +692,7 @@ not json at all
             allowed_tools: None,
             allowed_permissions: Vec::new(),
             timeout_s: None,
+            images: Vec::new(),
         }
     }
 
@@ -811,6 +818,32 @@ not json at all
                 "build",
                 "Fix issue 142.",
             ]
+        );
+    }
+
+    #[test]
+    fn the_argument_vector_carries_one_file_flag_per_image_before_the_prompt() {
+        let dir = Path::new("/state/worktrees/borsuk/issue-142");
+        let mut job = job(dir, None);
+        job.images = vec![
+            Path::new("/state/aif/images/one.png").to_path_buf(),
+            Path::new("/state/aif/images/two.jpg").to_path_buf(),
+        ];
+        let args = build_args(&job, &complete_settings());
+        let flags: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-f")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            flags,
+            vec!["/state/aif/images/one.png", "/state/aif/images/two.jpg"],
+            "one -f flag per image: {args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("Fix issue 142."),
+            "the message stays the last argument"
         );
     }
 

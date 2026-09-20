@@ -54,7 +54,7 @@ use crate::routing::{
 use crate::runner::Runner;
 use crate::runner::{
     capabilities, script, AllowedPermission, Answer, Capabilities, DefaultRunnerFactory, Job,
-    RunEvent, RunnerFactory, Session,
+    Outbound, RunEvent, RunnerFactory, Session,
 };
 use crate::sched::{self, Limits, Paused, Verdict};
 use crate::sock::{
@@ -716,7 +716,8 @@ pub struct Daemon {
     /// The stage keeps each process inside its live-process limit.
     stopping_sessions: BTreeMap<String, Stage>,
     /// Chat messages that wait for a stopped process or a live-process slot.
-    pending_chats: BTreeMap<String, Vec<String>>,
+    /// Each message keeps its text and its images together.
+    pending_chats: BTreeMap<String, Vec<Outbound>>,
     /// The time of the last event of each task, for the idle reaper.
     last_event_ms: BTreeMap<String, u64>,
     /// The tasks the snapshot restored from state `running`. Their first
@@ -914,7 +915,7 @@ impl Daemon {
         }
         let restored_task_ids: BTreeSet<&str> =
             restored_table.by_id.keys().map(String::as_str).collect();
-        let pending_chats: BTreeMap<String, Vec<String>> = runtime
+        let pending_chats: BTreeMap<String, Vec<Outbound>> = runtime
             .pending_chats
             .into_iter()
             .filter(|(id, _)| restored_task_ids.contains(id.as_str()))
@@ -4126,7 +4127,7 @@ impl Daemon {
                 continue;
             }
             if !self.task_capabilities(&task).live_input {
-                let leftover: Vec<String> = messages.into_iter().skip(1).collect();
+                let leftover: Vec<Outbound> = messages.into_iter().skip(1).collect();
                 if !leftover.is_empty() {
                     self.pending_chats.insert(id, leftover);
                 }
@@ -4145,7 +4146,7 @@ impl Daemon {
                         eprintln!("the pending chat for {id}: {error:#}");
                         // The session refuses the rest of the turn. Keep the
                         // undelivered messages; the next turn carries them.
-                        let leftover: Vec<String> = messages[delivered..].to_vec();
+                        let leftover: Vec<Outbound> = messages[delivered..].to_vec();
                         self.pending_chats
                             .entry(id.clone())
                             .or_default()
@@ -4537,7 +4538,7 @@ impl Daemon {
         } else {
             prompt
         };
-        if let Err(e) = self.launch_task(&task, prompt, resume) {
+        if let Err(e) = self.launch_task(&task, Outbound::text(prompt), resume) {
             let reason = format!("the runner could not start: {e:#}");
             self.log_dispatch_failure(&task, &reason);
             self.fail_run(&task, &reason);
@@ -4549,8 +4550,14 @@ impl Daemon {
     /// Start a run for `task` and move the task to `Running`.
     ///
     /// Both fresh dispatches and chat resumes of parked tasks come through
-    /// here; a resume carries the session id to continue.
-    fn launch_task(&mut self, task: &Task, prompt: String, resume: Option<String>) -> Result<()> {
+    /// here; a resume carries the session id to continue. The message text
+    /// becomes the prompt and its images ride with the job.
+    fn launch_task(
+        &mut self,
+        task: &Task,
+        message: Outbound,
+        resume: Option<String>,
+    ) -> Result<()> {
         let role = if task.purpose == TaskPurpose::Measure {
             Self::measure_role()
         } else {
@@ -4566,7 +4573,8 @@ impl Daemon {
             repo: task.repo.clone(),
             model: settings.model.clone(),
             variant: settings.effort.clone(),
-            prompt,
+            prompt: message.text,
+            images: message.images,
             cwd,
             log: task.log_path.clone(),
             resume,
@@ -5383,8 +5391,8 @@ impl Daemon {
                 }
             }
             Action::Ask { repo, kind, number } => self.fetch_ask(&repo, kind, number),
-            Action::Chat { task, text } => {
-                self.chat(&task, &text);
+            Action::Chat { task, text, images } => {
+                self.chat(&task, Outbound { text, images });
             }
             Action::Answer {
                 decision_id,
@@ -5652,7 +5660,10 @@ impl Daemon {
                         let id = tasks::ticket_chat_id(&repo, number);
                         self.chat(
                             &id,
-                            "AIF applied the shown proposal to the GitHub ticket. Continue with the confirmed content.",
+                            Outbound::text(
+                                "AIF applied the shown proposal to the GitHub ticket. \
+                                 Continue with the confirmed content.",
+                            ),
                         );
                     }
                 }
@@ -6319,7 +6330,7 @@ impl Daemon {
         }
     }
 
-    /// Send a chat message to one task.
+    /// Send a chat message, with its images, to one task.
     ///
     /// A live-input session receives the message at once. Every other case
     /// queues the message as the next turn: the daemon reopens a terminal
@@ -6333,7 +6344,7 @@ impl Daemon {
     /// log, so the transcript keeps what the human typed across session
     /// switches, refocus, and restarts. The result is true when the daemon
     /// delivered or queued the message.
-    fn chat(&mut self, id: &str, text: &str) -> bool {
+    fn chat(&mut self, id: &str, message: Outbound) -> bool {
         let Some(task) = self.table.by_id.get(id).cloned() else {
             eprintln!("the chat message for {id}: no such task");
             return false;
@@ -6345,9 +6356,9 @@ impl Daemon {
         // Only a runner with live-input support receives a steering message.
         if self.task_capabilities(&task).live_input {
             if let Some(session) = self.sessions.get_mut(id) {
-                match session.send_user(text) {
+                match session.send_user(&message) {
                     Ok(()) => {
-                        self.log_chat_line(&task, text);
+                        self.log_chat_line(&task, &message);
                         self.last_event_ms.insert(id.to_string(), self.now_ms);
                         if task.state == TaskState::AwaitingUser {
                             if let Err(error) =
@@ -6361,13 +6372,13 @@ impl Daemon {
                     }
                     Err(error) => {
                         eprintln!("the chat message for {id}: {error:#}");
-                        self.log_chat_line(&task, text);
+                        self.log_chat_line(&task, &message);
                         // The process can exit before its event reaches the
                         // daemon. Keep the message for the resumed turn.
                         self.pending_chats
                             .entry(id.to_string())
                             .or_default()
-                            .push(text.to_string());
+                            .push(message.clone());
                         self.changed = true;
                         if task.state.is_terminal() {
                             self.reopen_for_pending_chat(id);
@@ -6400,8 +6411,8 @@ impl Daemon {
         self.pending_chats
             .entry(id.to_string())
             .or_default()
-            .push(text.to_string());
-        self.log_chat_line(&task, text);
+            .push(message.clone());
+        self.log_chat_line(&task, &message);
         // The queued count rides on the state view, so the queueing marks
         // the state dirty even when the task state stays as it was.
         self.changed = true;
@@ -6419,9 +6430,11 @@ impl Daemon {
     /// Append one user line for an accepted chat message to the task log.
     ///
     /// The line uses the claude user shape, so the transcript parser of
-    /// every harness renders it as the human voice. The runner itself never
-    /// echoes a typed message into the log, so this line is the only
-    /// durable record of the text.
+    /// every harness renders it as the human voice. The content stays a
+    /// plain string, and it names every attached image file, so the record
+    /// of one message with images stays one JSON line that the transcript
+    /// still renders. The runner itself never echoes a typed message into
+    /// the log, so this line is the only durable record of the text.
     ///
     /// `chat` calls this exactly once per accepted message: on the live
     /// delivery success, on the live delivery failure, and on the queue
@@ -6434,10 +6447,14 @@ impl Daemon {
     /// refinement handoff and the applied-proposal note. The agent receives
     /// both as user text, so both get the same line and the transcript
     /// stays a true record of the conversation.
-    fn log_chat_line(&self, task: &Task, text: &str) {
+    fn log_chat_line(&self, task: &Task, message: &Outbound) {
         // `serde_json` escapes the text, so a quotation mark, a backslash,
         // or a newline stays inside one JSON line.
-        let content = serde_json::Value::String(text.to_string());
+        let mut text = message.text.clone();
+        for image in &message.images {
+            text.push_str(&format!("\n[image] {}", image.display()));
+        }
+        let content = serde_json::Value::String(text);
         self.append_task_log(
             task,
             &format!(
@@ -7015,13 +7032,14 @@ impl Daemon {
         if let InputMode::Closed { reason } = self.input_mode(&task_value) {
             bail!("{reason}");
         }
+        let message = Outbound::text(text);
         self.pending_chats
             .entry(task.to_string())
             .or_default()
-            .push(text.to_string());
+            .push(message.clone());
         // The queue path owns the log line. Without it the answer reaches
         // the agent and leaves no record in the transcript.
-        self.log_chat_line(&task_value, text);
+        self.log_chat_line(&task_value, &message);
         self.reopen_for_pending_chat(task);
         Ok(())
     }
@@ -7040,7 +7058,7 @@ impl Daemon {
             .sessions
             .get_mut(task)
             .ok_or_else(|| anyhow!("no live session holds it"))?;
-        session.send_user(text)
+        session.send_user(&Outbound::text(text))
     }
 
     /// Apply a `NeedsHuman` answer: comment on GitHub, then drop the label.
@@ -7108,7 +7126,7 @@ impl Daemon {
         // text as a chat message instead of a new run.
         if let Some(text) = comment {
             if let Some(id) = self.parked_task_of(&repo, kind, number) {
-                self.chat(&id, text);
+                self.chat(&id, Outbound::text(text));
             }
         }
         self.reconcile(Some(&repo));
@@ -9577,7 +9595,7 @@ impl Daemon {
             } else if !was_active
                 && has_label
                 && has_session
-                && self.chat(&id, TICKET_REFINEMENT_MESSAGE)
+                && self.chat(&id, Outbound::text(TICKET_REFINEMENT_MESSAGE))
             {
                 if let Some(conversation) = self.ticket_conversations.get_mut(&key) {
                     conversation.handoff_active = true;
@@ -9959,7 +9977,10 @@ impl Daemon {
 
     /// Tell the chat and the operator why one proposal wrote no model.
     fn refuse_model_proposal(&mut self, alias: &str, id: &str, reason: &str) {
-        self.chat(id, &format!("AIF refused the model proposal. {reason}"));
+        self.chat(
+            id,
+            Outbound::text(format!("AIF refused the model proposal. {reason}")),
+        );
         self.report_model(alias, TicketResultKind::Failure, reason.to_string());
     }
 
@@ -12094,7 +12115,7 @@ mod tests {
     struct SessionHandle {
         stopped: Arc<AtomicBool>,
         answers: Arc<Mutex<Vec<(String, Answer)>>>,
-        sends: Arc<Mutex<Vec<String>>>,
+        sends: Arc<Mutex<Vec<Outbound>>>,
         fail_answer: Arc<AtomicBool>,
         fail_send: Arc<AtomicBool>,
     }
@@ -12117,11 +12138,11 @@ mod tests {
     }
 
     impl Session for FakeSession {
-        fn send_user(&mut self, text: &str) -> anyhow::Result<()> {
+        fn send_user(&mut self, message: &Outbound) -> anyhow::Result<()> {
             if self.handle.fail_send.load(Ordering::SeqCst) {
                 bail!("the fake session refuses the message");
             }
-            self.handle.sends.lock().unwrap().push(text.to_string());
+            self.handle.sends.lock().unwrap().push(message.clone());
             Ok(())
         }
 
@@ -13294,7 +13315,9 @@ mod tests {
 
         // The operator types while attempt 2 runs. A one-shot harness takes
         // no live input, so the message waits for the next turn.
-        assert!(rig.daemon.chat("borsuk/implement-i142", "check the parser"));
+        assert!(rig
+            .daemon
+            .chat("borsuk/implement-i142", Outbound::text("check the parser")));
 
         rig.event(exited("borsuk/implement-i142", false, "boom"));
 
@@ -14034,7 +14057,7 @@ mod tests {
             },
         });
         let sends = rig.session(0).sends.lock().unwrap().clone();
-        assert_eq!(sends, vec!["use postgres".to_string()]);
+        assert_eq!(sends, vec![Outbound::text("use postgres")]);
     }
 
     // ------------------------------------------------------------------
@@ -14787,12 +14810,13 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "continue with Postgres".to_string(),
+            images: Vec::new(),
         });
 
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
         assert_eq!(
             rig.session(0).sends.lock().unwrap().as_slice(),
-            &["continue with Postgres".to_string()]
+            &[Outbound::text("continue with Postgres")]
         );
         // The running process has one deadline left: the silence limit.
         assert_eq!(
@@ -14860,6 +14884,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "resume this exact message".to_string(),
+            images: Vec::new(),
         });
 
         assert_eq!(rig.job_count(), 2, "the running task keeps the only slot");
@@ -14923,6 +14948,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "resume after the parked session".to_string(),
+            images: Vec::new(),
         });
 
         assert!(
@@ -14985,6 +15011,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "wait until the pause ends".to_string(),
+            images: Vec::new(),
         });
 
         assert!(
@@ -14997,7 +15024,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/refine-i142")
                 .map(Vec::as_slice),
-            Some(&["wait until the pause ends".to_string()][..])
+            Some(&[Outbound::text("wait until the pause ends")][..])
         );
         assert_eq!(rig.daemon.live_sessions(Stage::Refine), 1);
     }
@@ -15020,6 +15047,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "queued for the parked turn".to_string(),
+            images: Vec::new(),
         });
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
 
@@ -15038,7 +15066,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/refine-i142")
                 .map(Vec::as_slice),
-            Some(&["queued for the parked turn".to_string()][..])
+            Some(&[Outbound::text("queued for the parked turn")][..])
         );
         assert_eq!(rig.job_count(), 1, "the queued task stays back");
         assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Queued);
@@ -15476,7 +15504,7 @@ mod tests {
         state
             .runtime
             .pending_chats
-            .insert("gone/refine-i5".to_string(), vec!["hello".to_string()]);
+            .insert("gone/refine-i5".to_string(), vec![Outbound::text("hello")]);
         state
             .runtime
             .paused
@@ -15607,9 +15635,10 @@ mod tests {
             let mut first = opencode_rig(&dir, 0);
             first.poll(vec![issue(142, &["refined"])], vec![]);
             first.event(started("borsuk/implement-i142", "ses-142"));
-            first
-                .daemon
-                .chat("borsuk/implement-i142", "add a regression test");
+            first.daemon.chat(
+                "borsuk/implement-i142",
+                Outbound::text("add a regression test"),
+            );
             assert!(first
                 .daemon
                 .pending_chats
@@ -15642,7 +15671,7 @@ mod tests {
         assert_eq!(restart.resume.as_deref(), Some("ses-142"));
         assert_eq!(
             second.daemon.pending_chats["borsuk/implement-i142"],
-            vec!["add a regression test".to_string()]
+            vec![Outbound::text("add a regression test")]
         );
 
         second.poll_implemented();
@@ -17681,9 +17710,9 @@ mod tests {
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 1, "the refusal reaches the chat: {sends:?}");
         assert!(
-            sends[0].contains("B-gh") && sends[0].contains("duplicate entry id"),
+            sends[0].text.contains("B-gh") && sends[0].text.contains("duplicate entry id"),
             "the refusal names the id: {}",
-            sends[0]
+            sends[0].text
         );
     }
 
@@ -18120,7 +18149,7 @@ mod tests {
 
         assert_eq!(
             rig.session(0).sends.lock().unwrap().as_slice(),
-            &["use Postgres".to_string()],
+            &[Outbound::text("use Postgres")],
             "the parked agent reads the answer"
         );
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
@@ -18359,6 +18388,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "hello".to_string(),
+            images: Vec::new(),
         });
 
         assert_eq!(
@@ -18370,7 +18400,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/refine-i142")
                 .map(Vec::as_slice),
-            Some(&["hello".to_string()][..]),
+            Some(&[Outbound::text("hello")][..]),
             "a failed live send must not lose the message"
         );
 
@@ -18407,6 +18437,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "continue after this process exits".to_string(),
+            images: Vec::new(),
         });
 
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
@@ -18437,6 +18468,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/implement-i142".to_string(),
             text: "carry this message into the next turn".to_string(),
+            images: Vec::new(),
         });
         rig.event(turn_finished("borsuk/implement-i142", true, "done"));
 
@@ -18446,7 +18478,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["carry this message into the next turn".to_string()][..])
+            Some(&[Outbound::text("carry this message into the next turn")][..])
         );
 
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
@@ -18482,6 +18514,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "keep this accepted message".to_string(),
+            images: Vec::new(),
         });
 
         rig.poll(vec![issue(142, &["refined"])], vec![]);
@@ -18492,7 +18525,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/refine-i142")
                 .map(Vec::as_slice),
-            Some(&["keep this accepted message".to_string()][..])
+            Some(&[Outbound::text("keep this accepted message")][..])
         );
 
         rig.act(Action::Pause {
@@ -18866,6 +18899,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "continue".to_string(),
+            images: Vec::new(),
         });
 
         let roles = rig.roles.lock().unwrap();
@@ -20086,17 +20120,18 @@ mod tests {
             first.act(Action::Chat {
                 task: "borsuk/ticket-i7".to_string(),
                 text: "check the acceptance criteria".to_string(),
+                images: Vec::new(),
             });
             assert_eq!(
                 first.daemon.pending_chats["borsuk/ticket-i7"],
-                vec!["check the acceptance criteria".to_string()]
+                vec![Outbound::text("check the acceptance criteria")]
             );
         }
 
         let mut second = Rig::make_in(dir, vec![], |_| {});
         assert_eq!(
             second.daemon.pending_chats["borsuk/ticket-i7"],
-            vec!["check the acceptance criteria".to_string()]
+            vec![Outbound::text("check the acceptance criteria")]
         );
         assert_eq!(
             second.daemon.paused.tasks.get("borsuk/ticket-i7"),
@@ -20145,7 +20180,9 @@ mod tests {
 
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 2);
-        assert!(sends.iter().all(|text| text.contains("refinement")));
+        assert!(sends
+            .iter()
+            .all(|message| message.text.contains("refinement")));
         drop(sends);
         assert!(!rig.daemon.table.by_id.contains_key("borsuk/refine-i7"));
         // The agent received each handoff as user text, so each handoff
@@ -20608,8 +20645,8 @@ mod tests {
         );
         let sends = session.sends.lock().unwrap();
         assert_eq!(sends.len(), 1);
-        assert!(sends[0].contains("proposal"));
-        assert!(sends[0].contains("applied"));
+        assert!(sends[0].text.contains("proposal"));
+        assert!(sends[0].text.contains("applied"));
     }
 
     #[test]
@@ -22457,8 +22494,10 @@ mod tests {
 
         rig.poll(vec![blocked()], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
         assert_eq!(rig.job_count(), 1, "the message waits for the turn to end");
 
         // #9 opens while the agent still runs, so the run finishes.
@@ -22513,8 +22552,10 @@ mod tests {
             .unwrap()
             .session_id = None;
 
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
         assert_eq!(
@@ -22522,7 +22563,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["add a regression test".to_string()][..])
+            Some(&[Outbound::text("add a regression test")][..])
         );
         assert_eq!(rig.job_count(), 1, "the chat alone starts no run");
     }
@@ -22541,8 +22582,10 @@ mod tests {
             .get_mut("borsuk/implement-i142")
             .unwrap()
             .session_id = None;
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         rig.drive();
 
@@ -22562,8 +22605,10 @@ mod tests {
         rig.event(started("borsuk/implement-i142", "ses-142"));
         rig.poll_implemented();
 
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         assert_eq!(rig.job_count(), 1, "the relaunch waits for the exit");
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Running);
@@ -22583,8 +22628,10 @@ mod tests {
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
 
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         // The fake session records every send. The empty record proves the
         // daemon never calls send_user on an opencode session, so the
@@ -22596,7 +22643,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["add a regression test".to_string()][..])
+            Some(&[Outbound::text("add a regression test")][..])
         );
     }
 
@@ -22608,8 +22655,10 @@ mod tests {
         rig.event(started("borsuk/implement-i142", "ses-142"));
         rig.poll_implemented();
 
-        rig.daemon.chat("borsuk/implement-i142", "first follow-up");
-        rig.daemon.chat("borsuk/implement-i142", "second follow-up");
+        rig.daemon
+            .chat("borsuk/implement-i142", Outbound::text("first follow-up"));
+        rig.daemon
+            .chat("borsuk/implement-i142", Outbound::text("second follow-up"));
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
 
         assert_eq!(rig.job_count(), 2);
@@ -22623,7 +22672,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["second follow-up".to_string()][..])
+            Some(&[Outbound::text("second follow-up")][..])
         );
 
         rig.event(exited("borsuk/implement-i142", true, "code 0"));
@@ -22631,6 +22680,87 @@ mod tests {
         assert_eq!(rig.job_count(), 3);
         assert_eq!(rig.job(2).prompt, "second follow-up");
         assert_eq!(rig.job(2).resume.as_deref(), Some("ses-142"));
+    }
+
+    #[test]
+    fn a_queued_image_chat_carries_text_and_images_into_the_next_opencode_turn() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+        rig.poll_implemented();
+
+        let png = Path::new("/state/aif/images/shot.png").to_path_buf();
+        let jpg = Path::new("/state/aif/images/cam.jpg").to_path_buf();
+        rig.act(Action::Chat {
+            task: "borsuk/implement-i142".to_string(),
+            text: "check this screenshot".to_string(),
+            images: vec![png.clone(), jpg.clone()],
+        });
+
+        assert!(rig.session(0).sends.lock().unwrap().is_empty());
+        assert_eq!(
+            rig.daemon
+                .pending_chats
+                .get("borsuk/implement-i142")
+                .map(Vec::as_slice),
+            Some(
+                &[Outbound {
+                    text: "check this screenshot".to_string(),
+                    images: vec![png.clone(), jpg.clone()],
+                }][..]
+            ),
+            "the queue keeps the text and the images together"
+        );
+
+        rig.event(exited("borsuk/implement-i142", true, "code 0"));
+
+        assert_eq!(rig.job_count(), 2);
+        assert_eq!(rig.job(1).prompt, "check this screenshot");
+        assert_eq!(
+            rig.job(1).images,
+            vec![png, jpg],
+            "the next turn carries both image files"
+        );
+        assert_eq!(rig.job(1).resume.as_deref(), Some("ses-142"));
+        assert!(
+            !rig.daemon
+                .pending_chats
+                .contains_key("borsuk/implement-i142"),
+            "the delivered message leaves the queue"
+        );
+    }
+
+    #[test]
+    fn a_chat_with_images_writes_one_user_line_that_names_each_image_file() {
+        let dir = temp_root();
+        let mut rig = opencode_rig(&dir, 1);
+        rig.poll(vec![issue(142, &["refined"])], vec![]);
+        rig.event(started("borsuk/implement-i142", "ses-142"));
+
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound {
+                text: "check this screenshot".to_string(),
+                images: vec![
+                    Path::new("/state/aif/images/shot.png").to_path_buf(),
+                    Path::new("/state/aif/images/cam.jpg").to_path_buf(),
+                ],
+            },
+        );
+
+        let log = rig.task("borsuk/implement-i142").log_path;
+        let lines = logged_user_lines(&log);
+        assert_eq!(lines.len(), 1, "one message stays one JSON line");
+        let logged: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let expected = "check this screenshot\n[image] /state/aif/images/shot.png\n\
+                        [image] /state/aif/images/cam.jpg";
+        assert_eq!(
+            logged.pointer("/message/content").and_then(|v| v.as_str()),
+            Some(expected),
+            "the user line names every attached image file: {}",
+            lines[0]
+        );
     }
 
     #[test]
@@ -22668,8 +22798,10 @@ mod tests {
         let stuck = rig.decision("stuck:borsuk/implement-i142:3");
         assert!(stuck.is_some(), "the finished run left a stuck row");
 
-        rig.daemon
-            .chat("borsuk/implement-i142", "try one more typed turn");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("try one more typed turn"),
+        );
 
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
         assert_eq!(rig.task("borsuk/implement-i142").attempt, 3);
@@ -22707,6 +22839,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/implement-i142".to_string(),
             text: "check the review feedback".to_string(),
+            images: Vec::new(),
         });
 
         let review_id = rig
@@ -22787,8 +22920,10 @@ mod tests {
                  that task is terminal."
             )
         );
-        rig.daemon
-            .chat("borsuk/implement-i142", "adjust the implementation");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("adjust the implementation"),
+        );
 
         assert!(
             rig.daemon.pending_chats.is_empty(),
@@ -22824,8 +22959,10 @@ mod tests {
             InputMode::Closed { .. }
         ));
 
-        rig.daemon
-            .chat("borsuk/implement-i142", "do not steer this task");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("do not steer this task"),
+        );
 
         assert!(
             session.sends.lock().unwrap().is_empty(),
@@ -22867,8 +23004,10 @@ mod tests {
             },
             paused: true,
         });
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
         assert_eq!(rig.task("borsuk/implement-i142").state, TaskState::Queued);
 
         rig.drive();
@@ -22878,7 +23017,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["add a regression test".to_string()][..])
+            Some(&[Outbound::text("add a regression test")][..])
         );
 
         rig.act(Action::Pause {
@@ -22925,11 +23064,12 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "continue with Postgres".to_string(),
+            images: Vec::new(),
         });
 
         assert_eq!(
             rig.session(0).sends.lock().unwrap().as_slice(),
-            &["continue with Postgres".to_string()]
+            &[Outbound::text("continue with Postgres")]
         );
         let log = rig.task("borsuk/refine-i142").log_path;
         let logged = fs::read_to_string(&log).unwrap();
@@ -22953,6 +23093,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "queued for the resumed turn".to_string(),
+            images: Vec::new(),
         });
 
         assert!(rig.session(0).sends.lock().unwrap().is_empty());
@@ -22961,7 +23102,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/refine-i142")
                 .map(Vec::as_slice),
-            Some(&["queued for the resumed turn".to_string()][..])
+            Some(&[Outbound::text("queued for the resumed turn")][..])
         );
         let log = rig.task("borsuk/refine-i142").log_path;
         assert_eq!(
@@ -22980,15 +23121,17 @@ mod tests {
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
 
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         assert_eq!(
             rig.daemon
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["add a regression test".to_string()][..])
+            Some(&[Outbound::text("add a regression test")][..])
         );
         let log = rig.task("borsuk/implement-i142").log_path;
         assert_eq!(
@@ -23012,6 +23155,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: typed.to_string(),
+            images: Vec::new(),
         });
 
         let lines = logged_lines(&rig.task("borsuk/refine-i142").log_path);
@@ -23032,7 +23176,8 @@ mod tests {
         rig.poll(vec![issue(142, &["refined"])], vec![]);
 
         assert!(
-            !rig.daemon.chat("borsuk/implement-i999", "no such task"),
+            !rig.daemon
+                .chat("borsuk/implement-i999", Outbound::text("no such task")),
             "an unknown task takes no message"
         );
 
@@ -23041,8 +23186,10 @@ mod tests {
         let task = rig.task("borsuk/implement-i142");
         assert_eq!(task.session_id, None);
         assert!(
-            !rig.daemon
-                .chat("borsuk/implement-i142", "there is no session"),
+            !rig.daemon.chat(
+                "borsuk/implement-i142",
+                Outbound::text("there is no session")
+            ),
             "a task without a session takes no message"
         );
         assert!(
@@ -23068,8 +23215,10 @@ mod tests {
         let task = rig.task("borsuk/implement-i142");
         assert!(rig.daemon.sibling_refusal(&task).is_some());
         assert!(
-            !rig.daemon
-                .chat("borsuk/implement-i142", "adjust the implementation"),
+            !rig.daemon.chat(
+                "borsuk/implement-i142",
+                Outbound::text("adjust the implementation")
+            ),
             "the worktree hold takes no message"
         );
 
@@ -23099,6 +23248,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/implement-i142".to_string(),
             text: "extend the change".to_string(),
+            images: Vec::new(),
         });
         let log = rig.task("borsuk/implement-i142").log_path;
         assert_eq!(
@@ -23115,8 +23265,10 @@ mod tests {
             InputMode::Closed { .. }
         ));
         assert!(
-            !rig.daemon
-                .chat("borsuk/implement-i142", "and one more thing"),
+            !rig.daemon.chat(
+                "borsuk/implement-i142",
+                Outbound::text("and one more thing")
+            ),
             "the closed input takes no message"
         );
 
@@ -23183,8 +23335,10 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         rig.act(Action::Abort {
             task: "borsuk/implement-i142".to_string(),
@@ -23197,7 +23351,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["add a regression test".to_string()][..])
+            Some(&[Outbound::text("add a regression test")][..])
         );
         let marker = rig
             .daemon
@@ -23214,8 +23368,10 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
         rig.act(Action::Abort {
             task: "borsuk/implement-i142".to_string(),
         });
@@ -23238,8 +23394,10 @@ mod tests {
         let mut rig = opencode_rig(&dir, 0);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
 
         rig.poll(vec![issue(142, &[])], vec![]);
 
@@ -23274,8 +23432,10 @@ mod tests {
         let mut rig = opencode_rig(&dir, 1);
         rig.poll(vec![issue(142, &["refined"])], vec![]);
         rig.event(started("borsuk/implement-i142", "ses-142"));
-        rig.daemon
-            .chat("borsuk/implement-i142", "add a regression test");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("add a regression test"),
+        );
         rig.act(Action::Pause {
             scope: PauseScope::Stage {
                 stage: Stage::Implement,
@@ -23295,7 +23455,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["add a regression test".to_string()][..])
+            Some(&[Outbound::text("add a regression test")][..])
         );
 
         rig.act(Action::Pause {
@@ -23326,7 +23486,7 @@ mod tests {
         // chat, so the abort requeues the review instead of closing it.
         rig.session(1).fail_send.store(true, Ordering::SeqCst);
         rig.daemon
-            .chat("borsuk/review-p7", "check the failing test");
+            .chat("borsuk/review-p7", Outbound::text("check the failing test"));
         assert!(rig.daemon.pending_chats.contains_key("borsuk/review-p7"));
         rig.act(Action::Abort {
             task: "borsuk/review-p7".to_string(),
@@ -23335,8 +23495,10 @@ mod tests {
 
         let task = rig.task("borsuk/implement-i142");
         assert!(rig.daemon.sibling_refusal(&task).is_some());
-        rig.daemon
-            .chat("borsuk/implement-i142", "adjust the implementation");
+        rig.daemon.chat(
+            "borsuk/implement-i142",
+            Outbound::text("adjust the implementation"),
+        );
 
         assert!(
             !rig.daemon
@@ -23415,8 +23577,10 @@ mod tests {
                 "the bar names the worktree guard for the refine state {refine_state:?}"
             );
             assert!(
-                !rig.daemon
-                    .chat("borsuk/implement-i142", "start from the specification"),
+                !rig.daemon.chat(
+                    "borsuk/implement-i142",
+                    Outbound::text("start from the specification")
+                ),
                 "the guard refuses the message for the refine state {refine_state:?}"
             );
             assert!(
@@ -23466,8 +23630,10 @@ mod tests {
             )
         );
         assert!(
-            !rig.daemon
-                .chat("borsuk/refine-i142", "clarify the second requirement"),
+            !rig.daemon.chat(
+                "borsuk/refine-i142",
+                Outbound::text("clarify the second requirement")
+            ),
             "the guard refuses the follow-up while the implement runs"
         );
         assert!(rig.daemon.pending_chats.is_empty());
@@ -23481,6 +23647,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/refine-i142".to_string(),
             text: "clarify the second requirement".to_string(),
+            images: Vec::new(),
         });
         assert_eq!(rig.job_count(), 3, "the refine follow-up started");
         let followup = rig.job(2);
@@ -23521,6 +23688,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/implement-i142".to_string(),
             text: "extend the change".to_string(),
+            images: Vec::new(),
         });
 
         assert_eq!(
@@ -23528,7 +23696,7 @@ mod tests {
                 .pending_chats
                 .get("borsuk/implement-i142")
                 .map(Vec::as_slice),
-            Some(&["extend the change".to_string()][..])
+            Some(&[Outbound::text("extend the change")][..])
         );
         // The worktree guard takes the message. The pipeline order still
         // holds the turn: the ticket chat carries the refine stage of the
@@ -23965,8 +24133,10 @@ mod tests {
             }
         );
 
-        rig.daemon
-            .chat("borsuk/refine-i142", "do not accept this message");
+        rig.daemon.chat(
+            "borsuk/refine-i142",
+            Outbound::text("do not accept this message"),
+        );
 
         assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Done);
         assert!(
@@ -24020,6 +24190,7 @@ mod tests {
         rig.act(Action::Chat {
             task: "borsuk/implement-i142".to_string(),
             text: "add a regression test".to_string(),
+            images: Vec::new(),
         });
         let view = last_view(&rx);
         let task = pushed_task(&view, "borsuk/implement-i142");

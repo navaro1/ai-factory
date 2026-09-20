@@ -199,6 +199,7 @@ mod tests {
             allowed_tools: None,
             allowed_permissions: Vec::new(),
             timeout_s: Some(timeout_s),
+            images: Vec::new(),
         }
     }
 

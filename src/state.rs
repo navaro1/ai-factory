@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{ReleasePolicy, ResolvedRoleSettings};
 use crate::decisions::{Decision, DecisionKind};
 use crate::model::Stage;
-use crate::runner::AllowedPermission;
+use crate::runner::{AllowedPermission, Outbound};
 use crate::sock::TicketProposal;
 use crate::tasks::{Task, MAX_ATTEMPTS};
 use crate::theory::cadence::Schedule;
@@ -171,9 +171,11 @@ pub struct RuntimeState {
     /// Every task, in insertion order.
     #[serde(default)]
     pub tasks: Vec<Task>,
-    /// The chat messages that wait for their turn, by task id.
+    /// The chat messages that wait for their turn, by task id. Each holds
+    /// its text and its images, and reads the plain-string form a file
+    /// written before images carried.
     #[serde(default)]
-    pub pending_chats: BTreeMap<String, Vec<String>>,
+    pub pending_chats: BTreeMap<String, Vec<Outbound>>,
     /// The ticket set of each review task, pinned at admit time.
     #[serde(default)]
     pub review_tickets: BTreeMap<String, BTreeSet<u64>>,
@@ -713,14 +715,41 @@ mod tests {
         let path = dir.join("state.json");
         let mut state = DaemonState::default();
         state.runtime.tasks = vec![task("borsuk/refine-i3", "borsuk", 3, 1)];
-        state
-            .runtime
-            .pending_chats
-            .insert("borsuk/refine-i4".to_string(), vec!["hello".to_string()]);
+        state.runtime.pending_chats.insert(
+            "borsuk/refine-i4".to_string(),
+            vec![Outbound::text("hello")],
+        );
 
         state.save(&path).unwrap();
 
         assert_eq!(DaemonState::load(&path), DaemonState::default());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_state_file_with_plain_string_pending_chats_loads_with_no_images() {
+        let dir = temp_dir("old-chat-form");
+        let path = dir.join("state.json");
+        // The task section comes from today's serializer; the chat queue is
+        // hand-written in the plain-string form a daemon before the image
+        // wire wrote.
+        let tasks = serde_json::to_string(&task("borsuk/implement-i42", "borsuk", 42, 1)).unwrap();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"runtime":{{"tasks":[{tasks}],
+                    "pending_chats":{{"borsuk/implement-i42":["add a regression test"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = DaemonState::load(&path);
+
+        assert_eq!(
+            loaded.runtime.pending_chats["borsuk/implement-i42"],
+            vec![Outbound::text("add a regression test")],
+            "an old queued text loads with no images"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -779,7 +808,10 @@ mod tests {
                 tasks: vec![task("borsuk/implement-i42", "borsuk", 42, 2)],
                 pending_chats: BTreeMap::from([(
                     "borsuk/implement-i42".to_string(),
-                    vec!["continue".to_string()],
+                    vec![Outbound {
+                        text: "continue".to_string(),
+                        images: vec![std::path::PathBuf::from("/state/aif/images/shot.png")],
+                    }],
                 )]),
                 review_tickets: BTreeMap::from([(
                     "borsuk/review-p5".to_string(),
