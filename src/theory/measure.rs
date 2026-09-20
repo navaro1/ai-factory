@@ -38,7 +38,7 @@ pub const TREE_CHARS: usize = 8;
 pub const MEASURE_DIR: &str = "measure";
 
 /// What one comparison renders for a value that does not exist.
-pub const NO_VALUE: &str = "none";
+const NO_VALUE: &str = "none";
 
 /// Which direction of one measurement is the better one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

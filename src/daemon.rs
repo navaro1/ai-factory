@@ -7503,7 +7503,7 @@ impl Daemon {
         };
         let measurers = self.touched_measurers(&repo.alias, &areas, Mode::Fast);
         if measurers.is_empty() {
-            self.push_measure_result(request, measure::NO_VALUE.to_string(), true);
+            self.push_measure_result(request, measure::agent_text(&[]), true);
             return;
         }
         let alias = repo.alias.clone();
