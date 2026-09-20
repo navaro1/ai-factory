@@ -103,6 +103,188 @@ fn aif_stop_help_does_not_offer_the_start_paused_flag() {
 }
 
 #[test]
+fn measure_lever_help_lists_the_area_option_and_the_root_row() {
+    let output = run(env!("CARGO_BIN_EXE_aif"), &["measure", "--help"]);
+
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("--area <AREA>"));
+
+    let output = run(env!("CARGO_BIN_EXE_aif"), &["--help"]);
+
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("\n  measure "));
+}
+
+/// A fake daemon that reads one measure action and answers one push.
+///
+/// The helper binds the socket of `dir` before it returns, and the
+/// thread reads the action line and answers `reply` with the request of
+/// the action. `None` closes the stream without a reply.
+fn measure_lever_fake_daemon(dir: &Path, reply: Option<String>) -> std::thread::JoinHandle<()> {
+    let socket_dir = dir.join("aif");
+    fs::create_dir_all(&socket_dir).expect("the socket directory must be creatable");
+    let listener = UnixListener::bind(socket_dir.join("daemon.sock"))
+        .expect("the fake daemon must bind the socket");
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        let (mut stream, _) = listener
+            .accept()
+            .expect("the fake daemon must accept one client");
+        let mut line = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("the fake daemon must read the action line");
+        let Some(template) = reply else {
+            return;
+        };
+        let action: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("the action line must parse");
+        let request = action["request"]
+            .as_str()
+            .expect("the action must carry one request")
+            .to_string();
+        let text = template.replace("__REQUEST__", &request);
+        stream
+            .write_all(text.as_bytes())
+            .and_then(|()| stream.write_all(b"\n"))
+            .expect("the fake daemon must write the reply");
+    })
+}
+
+#[test]
+fn measure_lever_prints_the_table_and_exits_0_on_a_pass() {
+    let dir = temp_dir("measure-pass");
+    let daemon = measure_lever_fake_daemon(
+        &dir,
+        Some(
+            concat!(
+                "{\"type\":\"measure_result\",\"request\":\"__REQUEST__\",",
+                "\"text\":\"AREA web-checkout\\npoll_p95  12 \\u2192 12  ms  unchanged\",",
+                "\"pass\":true}",
+            )
+            .to_string(),
+        ),
+    );
+
+    let output = run_with_env(
+        env!("CARGO_BIN_EXE_aif"),
+        &["measure"],
+        &[("XDG_RUNTIME_DIR", &dir)],
+    );
+    daemon.join().expect("the fake daemon must finish");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout(&output).contains("AREA web-checkout"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+}
+
+#[test]
+fn measure_lever_exits_1_on_a_failed_verdict() {
+    let dir = temp_dir("measure-fail");
+    let daemon = measure_lever_fake_daemon(
+        &dir,
+        Some(
+            concat!(
+                "{\"type\":\"measure_result\",\"request\":\"__REQUEST__\",",
+                "\"text\":\"AREA web-checkout\\npoll_p95  12 \\u2192 14  ms  worsened\",",
+                "\"pass\":false}",
+            )
+            .to_string(),
+        ),
+    );
+
+    let output = run_with_env(
+        env!("CARGO_BIN_EXE_aif"),
+        &["measure"],
+        &[("XDG_RUNTIME_DIR", &dir)],
+    );
+    daemon.join().expect("the fake daemon must finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stdout(&output).contains("worsened"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+}
+
+#[test]
+fn measure_lever_exits_3_on_an_error_reply() {
+    let dir = temp_dir("measure-error");
+    let daemon = measure_lever_fake_daemon(
+        &dir,
+        Some(
+            concat!(
+                "{\"type\":\"measure_result\",\"request\":\"__REQUEST__\",",
+                "\"text\":\"error: the governor of borsuk is off\",",
+                "\"pass\":false}",
+            )
+            .to_string(),
+        ),
+    );
+
+    let output = run_with_env(
+        env!("CARGO_BIN_EXE_aif"),
+        &["measure"],
+        &[("XDG_RUNTIME_DIR", &dir)],
+    );
+    daemon.join().expect("the fake daemon must finish");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stdout(&output).contains("error: the governor of borsuk is off"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+}
+
+#[test]
+fn measure_lever_exits_3_when_the_stream_closes_before_the_reply() {
+    let dir = temp_dir("measure-closed");
+    let daemon = measure_lever_fake_daemon(&dir, None);
+
+    let output = run_with_env(
+        env!("CARGO_BIN_EXE_aif"),
+        &["measure"],
+        &[("XDG_RUNTIME_DIR", &dir)],
+    );
+    daemon.join().expect("the fake daemon must finish");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr(&output).contains("closed the connection"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+}
+
+#[test]
+fn measure_lever_exits_3_when_no_daemon_listens() {
+    let dir = temp_dir("measure-no-daemon");
+
+    let output = run_with_env(
+        env!("CARGO_BIN_EXE_aif"),
+        &["measure"],
+        &[("XDG_RUNTIME_DIR", &dir)],
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr(&output).contains("no daemon is listening"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    fs::remove_dir_all(&dir).expect("the temp dir must be removable");
+}
+
+#[test]
 fn aif_stop_without_a_daemon_fails_with_a_clear_message() {
     let dir = temp_dir("no-daemon");
     let result = run_with_env(

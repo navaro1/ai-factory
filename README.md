@@ -341,6 +341,7 @@ Version 0.6.0 makes a clean configuration break. See `docs/v0.6/MIGRATION.md` fo
 | `aif` or `aif tui` | Starts the daemon when needed, then opens the terminal UI. |
 | `aif --paused` or `aif tui --paused` | Starts the daemon with the whole factory paused. |
 | `aif stop` | Stops the daemon. |
+| `aif measure` | Measures the touched areas of the current worktree against the merge base, and prints the comparison. Exit codes: 0 pass, 1 failed verdict, 3 error. |
 | `aif doctor` | Reports on the installation and the configuration. |
 | `aif doctor --clean` | Removes the worktrees of closed issues and merged pull requests. |
 
