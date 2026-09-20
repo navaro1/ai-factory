@@ -20,7 +20,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::sock::{
@@ -32,6 +32,7 @@ use crate::theory::model;
 use crate::theory::records::{empty_area, names_empty_area, MODEL_FILE};
 use crate::theory::verify::Tier;
 
+use super::crt::{frame, CRT};
 use super::editor::EditorOutcome;
 use super::session::SessionView;
 use super::theme::THEME;
@@ -455,28 +456,21 @@ fn plain_name(surface: &str) -> bool {
 /// interview and the panels do not compete with it for rows.
 pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theory) {
     if let Some((repo, id)) = view.chat_key.clone() {
-        let block = Block::bordered().title(format!(" bootstrap {repo}/{id} "));
+        let block = frame(&format!(" bootstrap {repo}/{id} "));
         let inner = block.inner(area);
         f.render_widget(block, area);
         if view.chat.task_id().is_some() {
             view.chat.draw(f, inner, &[], &state.usage);
         } else {
             f.render_widget(
-                Paragraph::new("… pending: the bootstrap chat starts.").style(THEME.dim()),
+                Paragraph::new("… pending: the bootstrap chat starts.")
+                    .style(Style::default().fg(CRT.dim)),
                 inner,
             );
         }
         return;
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(THEME.dim())
-        .title(Span::styled(
-            " theory ",
-            Style::default()
-                .fg(THEME.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = frame(" theory ");
     let at = view.at(state);
     let marked = at.as_ref().map(|stop| stop.repo().to_string());
     let mut lines: Vec<Line> = Vec::new();
@@ -487,15 +481,21 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
         let here = marked.as_deref() == Some(alias.as_str());
         lines.push(Line::from(Span::styled(
             format!("{} {alias}", if here { ">" } else { " " }),
-            Style::default().fg(THEME.repo).add_modifier(Modifier::BOLD),
+            Style::default().fg(CRT.amber).add_modifier(Modifier::BOLD),
         )));
         lines.push(strip(row));
         if !row.governor {
             continue;
         }
-        lines.push(Line::from(Span::styled("AREAS", THEME.dim())));
+        lines.push(Line::from(Span::styled(
+            "AREAS",
+            Style::default().fg(CRT.dim),
+        )));
         if row.areas.is_empty() {
-            lines.push(Line::from(Span::styled("no area", THEME.dim())));
+            lines.push(Line::from(Span::styled(
+                "no area",
+                Style::default().fg(CRT.dim),
+            )));
         }
         for one in &row.areas {
             let here = at
@@ -504,7 +504,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
             lines.push(area_row(one, here));
         }
         if !row.holds.is_empty() {
-            lines.push(Line::from(Span::styled("HOLDS", THEME.dim())));
+            lines.push(Line::from(Span::styled(
+                "HOLDS",
+                Style::default().fg(CRT.dim),
+            )));
             lines.extend(row.holds.iter().map(|hold| {
                 let here = at
                     .as_ref()
@@ -515,7 +518,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
         if row.deltas.is_empty() {
             continue;
         }
-        lines.push(Line::from(Span::styled("DELTAS", THEME.dim())));
+        lines.push(Line::from(Span::styled(
+            "DELTAS",
+            Style::default().fg(CRT.dim),
+        )));
         for one in &row.deltas {
             let here = at
                 .as_ref()
@@ -524,7 +530,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled("no repository", THEME.dim())));
+        lines.push(Line::from(Span::styled(
+            "no repository",
+            Style::default().fg(CRT.dim),
+        )));
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -533,15 +542,15 @@ pub(super) fn draw(f: &mut Frame, area: Rect, state: &StateView, view: &mut Theo
 /// or the theory read error.
 fn strip(view: &TheoryView) -> Line<'static> {
     let (word, color) = if view.governor {
-        ("GOVERNOR ON", THEME.ok)
+        ("GOVERNOR ON", CRT.bright)
     } else {
-        ("GOVERNOR OFF", THEME.dim)
+        ("GOVERNOR OFF", CRT.dim)
     };
     let mut spans = vec![Span::styled(word, Style::default().fg(color))];
     if !view.governor {
         return Line::from(spans);
     }
-    spans.push(Span::styled(DOT, THEME.dim()));
+    spans.push(Span::styled(DOT, Style::default().fg(CRT.dim)));
     if view.error.is_empty() {
         spans.push(Span::styled(
             format!(
@@ -549,16 +558,16 @@ fn strip(view: &TheoryView) -> Line<'static> {
                 view.model.entries.len(),
                 view.areas.len()
             ),
-            Style::default().fg(THEME.text),
+            Style::default().fg(CRT.amber),
         ));
         if view.window.1 > 0 {
-            spans.push(Span::styled(DOT, THEME.dim()));
+            spans.push(Span::styled(DOT, Style::default().fg(CRT.dim)));
             spans.push(Span::styled(
                 window_gauge(view.window),
-                Style::default().fg(THEME.text),
+                Style::default().fg(CRT.amber),
             ));
             if view.window.0 >= view.window.1 {
-                spans.push(Span::styled(DOT, THEME.dim()));
+                spans.push(Span::styled(DOT, Style::default().fg(CRT.dim)));
                 spans.push(Span::styled(
                     format!("IMPLEMENT {PAUSE_MARK} PAUSED"),
                     Style::default().fg(THEME.warn),
@@ -594,27 +603,25 @@ fn area_row(row: &AreaView, is_selected: bool) -> Line<'static> {
     let mark = mark(row);
     let color = match mark.as_str() {
         "!" => THEME.error,
-        "-" => THEME.dim,
-        _ => THEME.accent,
+        "-" => CRT.dim,
+        _ => CRT.bright,
     };
     let marker = if is_selected {
         Span::styled(
             "\u{25b8} ",
-            Style::default()
-                .fg(THEME.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(CRT.white).add_modifier(Modifier::BOLD),
         )
     } else {
         Span::raw("  ")
     };
     let line = Line::from(vec![
         marker,
-        Span::styled(row.id.clone(), Style::default().fg(THEME.text)),
-        Span::styled(DOT, THEME.dim()),
+        Span::styled(row.id.clone(), Style::default().fg(CRT.amber)),
+        Span::styled(DOT, Style::default().fg(CRT.dim)),
         Span::styled(mark, Style::default().fg(color)),
     ]);
     if is_selected {
-        line.style(THEME.selected())
+        line.style(Style::default().bg(CRT.dim))
     } else {
         line
     }
@@ -633,7 +640,7 @@ fn hold_row(hold: &HoldView, is_selected: bool) -> Line<'static> {
     }
     let line = Line::from(Span::styled(text, Style::default().fg(THEME.error)));
     if is_selected {
-        line.style(THEME.selected())
+        line.style(Style::default().bg(CRT.dim))
     } else {
         line
     }
@@ -650,7 +657,7 @@ fn delta_rows(row: &DeltaView, is_selected: bool) -> Vec<Line<'static>> {
     let texts: Vec<(String, Style)> = if row.state == DeltaState::Closed {
         vec![(
             format!("#{number} \u{2713} CLOSED"),
-            Style::default().fg(THEME.dim),
+            Style::default().fg(CRT.dim),
         )]
     } else if row.misses.is_empty() {
         vec![(
@@ -658,7 +665,7 @@ fn delta_rows(row: &DeltaView, is_selected: bool) -> Vec<Line<'static>> {
                 "#{number} \u{25cb} OPEN  {} hit {} unsure",
                 row.hits, row.unsure
             ),
-            Style::default().fg(THEME.accent),
+            Style::default().fg(CRT.bright),
         )]
     } else {
         row.misses
@@ -678,16 +685,14 @@ fn delta_rows(row: &DeltaView, is_selected: bool) -> Vec<Line<'static>> {
             let marker = if is_selected && at == 0 {
                 Span::styled(
                     "\u{25b8} ",
-                    Style::default()
-                        .fg(THEME.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(CRT.white).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::raw("  ")
             };
             let line = Line::from(vec![marker, Span::styled(text, style)]);
             if is_selected {
-                line.style(THEME.selected())
+                line.style(Style::default().bg(CRT.dim))
             } else {
                 line
             }
@@ -956,6 +961,26 @@ mod tests {
         );
     }
 
+    /// The strip draws inside the double-line frame of the Amber CRT
+    /// look, under the uppercase block title.
+    #[test]
+    fn the_strip_draws_inside_a_double_line_frame() {
+        let state = view(
+            vec![area("web-checkout", Tier::Browser, Tier::None, false)],
+            4,
+        );
+
+        let text = render(&state);
+
+        assert!(text.contains('╔'), "screen was:\n{text}");
+        assert!(text.contains('╚'), "screen was:\n{text}");
+        assert!(
+            text.contains("║GOVERNOR ON · ENTRIES 4 · AREAS 1"),
+            "screen was:\n{text}"
+        );
+        assert!(text.contains(" THEORY "), "screen was:\n{text}");
+    }
+
     /// The strip draws the window gauge after the counts, and the pause
     /// word when the open records reach the cap.
     #[test]
@@ -1079,7 +1104,7 @@ mod tests {
         assert_eq!(toast, "asked to bootstrap borsuk/gh");
         assert!(pane.typing(), "the session view takes the keyboard");
         assert!(
-            render_with(&state, &mut pane).contains("bootstrap borsuk/gh"),
+            render_with(&state, &mut pane).contains("BOOTSTRAP BORSUK/GH"),
             "the chat replaces the panels:\n{}",
             render_with(&state, &mut pane)
         );
