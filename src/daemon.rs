@@ -11903,8 +11903,19 @@ mod tests {
     /// The five git calls of a fresh issue worktree: the create path first
     /// prunes broken registrations, then cuts the branch from `HEAD`.
     fn fresh_issue_steps(repo: &Path, worktree: &Path, number: u64, gitdir: &Path) -> Vec<Step> {
-        let reference = format!("refs/heads/aif/borsuk/issue-{number}");
-        let branch = format!("aif/borsuk/issue-{number}");
+        fresh_alias_issue_steps(repo, "borsuk", worktree, number, gitdir)
+    }
+
+    /// The five git calls of a fresh issue worktree on `aif/<alias>/issue-n`.
+    fn fresh_alias_issue_steps(
+        repo: &Path,
+        alias: &str,
+        worktree: &Path,
+        number: u64,
+        gitdir: &Path,
+    ) -> Vec<Step> {
+        let reference = format!("refs/heads/aif/{alias}/issue-{number}");
+        let branch = format!("aif/{alias}/issue-{number}");
         let wt_text = worktree.to_string_lossy().into_owned();
         vec![
             git_step(repo, &["worktree", "prune"], CmdOut::ok("")),
@@ -12673,6 +12684,77 @@ mod tests {
         assert!(!rig.daemon.paused.global);
         assert_eq!(rig.job_count(), 1);
         assert_eq!(rig.job(0).task, "borsuk/refine-i142");
+    }
+
+    /// The limit of one stage caps the total over every repository.
+    ///
+    /// Two repositories hold three ready refine tickets each and the refine
+    /// limit is 2. The daemon starts 2 refine runs in total, and the other
+    /// 4 tasks stay queued. A lane reservation of one repository never
+    /// turns the global stage limit into a per-repository limit.
+    #[test]
+    fn daemon_keeps_stage_limit_across_repositories() {
+        let dir = temp_root();
+        let qubitsok = dir.join("qubitsok");
+        let mut steps = refine_worktree_steps(&dir, &[142, 143], 1);
+        for number in [242, 243, 244] {
+            steps.extend(fresh_alias_issue_steps(
+                &qubitsok,
+                "qubitsok",
+                &dir.join("state")
+                    .join("worktrees")
+                    .join("qubitsok")
+                    .join(format!("issue-{number}")),
+                number,
+                &qubitsok.join(".git"),
+            ));
+        }
+        let mut rig = Rig::make_in(dir.clone(), steps, |config| {
+            let mut second = config.repos["borsuk"].clone();
+            second.alias = "qubitsok".to_string();
+            second.owner_repo = "acme/qubitsok".to_string();
+            second.path = dir.join("qubitsok");
+            fs::create_dir_all(&second.path).unwrap();
+            config.repos.insert("qubitsok".to_string(), second);
+        });
+        rig.poll(
+            vec![
+                issue(142, &[TO_REFINE]),
+                issue(143, &[TO_REFINE]),
+                issue(144, &[TO_REFINE]),
+            ],
+            vec![],
+        );
+        rig.daemon.handle(Inbound::Poll(DaemonMsg::Polled {
+            started_ms: T0,
+            repo: "qubitsok".to_string(),
+            snapshot: RepoSnapshot {
+                issues: BTreeMap::from([
+                    (242, issue(242, &[TO_REFINE])),
+                    (243, issue(243, &[TO_REFINE])),
+                    (244, issue(244, &[TO_REFINE])),
+                ]),
+                prs: BTreeMap::new(),
+            },
+        }));
+
+        assert_eq!(
+            rig.job_count(),
+            2,
+            "the refine limit of 2 holds 2 runs in total"
+        );
+        assert_eq!(rig.job(0).task, "borsuk/refine-i142");
+        assert_eq!(rig.job(1).task, "borsuk/refine-i143");
+        assert_eq!(rig.task("borsuk/refine-i142").state, TaskState::Running);
+        assert_eq!(rig.task("borsuk/refine-i143").state, TaskState::Running);
+        for id in [
+            "borsuk/refine-i144",
+            "qubitsok/refine-i242",
+            "qubitsok/refine-i243",
+            "qubitsok/refine-i244",
+        ] {
+            assert_eq!(rig.task(id).state, TaskState::Queued, "{id} stays queued");
+        }
     }
 
     #[test]

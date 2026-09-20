@@ -202,7 +202,9 @@ effort = "max"
 - `model`, `agent`, `profile`, and `effort` accept nonempty harness values.
 - `effort` maps to the native effort or variant option of each harness.
 - `extra_args` adds arguments that do not replace managed protocol options.
-- `limit` caps concurrent tasks for one global pipeline stage.
+- `limit` caps concurrent tasks for one global pipeline stage. The cap counts
+  running tasks over every repository together, so `lanes` reserves slots
+  without raising the cap.
 - `path` sets the absolute path of one repository checkout.
 - `lanes` reserves stage slots for one repository.
 - `release.policy` is `manual`, `interval` with `minutes`, or `threshold`
