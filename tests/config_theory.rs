@@ -34,14 +34,16 @@ model = "claude-opus-5[1m]"
 harness = "claude"
 model = "claude-opus-5[1m]"
 
+[theory.audit]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
 [repo.borsuk]
 path = "/tmp/borsuk"
 "#;
 
 fn theory_tables() -> String {
-    "\n[theory.audit]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\n\n\
-     [theory.chat]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\n"
-        .to_string()
+    "\n[theory.chat]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\n".to_string()
 }
 
 #[test]
@@ -197,7 +199,17 @@ fn a_theory_repo_value_must_be_owner_slash_name() {
 }
 
 #[test]
-fn the_theory_roles_are_optional_global_tables() {
+fn the_audit_role_is_required_and_the_chat_role_stays_optional() {
+    let without_audit = BASE.replace(
+        "\n[theory.audit]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\n",
+        "",
+    );
+    let error = Config::parse(&without_audit).expect_err("the missing audit table must fail");
+    assert_eq!(
+        format!("{error:#}"),
+        "theory.audit is required; see docs/v0.7/MIGRATION.md"
+    );
+
     let config =
         Config::parse(&format!("{BASE}{}", theory_tables())).expect("the theory tables must parse");
     let view = SettingsView::from_config(&config, "revision", &[]).expect("the view must build");
@@ -216,9 +228,16 @@ fn the_theory_roles_are_optional_global_tables() {
 #[test]
 fn a_theory_role_rejects_a_stage_limit() {
     for role in ["theory.chat", "theory.audit"] {
-        let text = format!(
-            "{BASE}\n[{role}]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\nlimit = 2\n"
-        );
+        let text = if role == "theory.audit" {
+            BASE.replace(
+                "[theory.audit]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\n",
+                &format!(
+                    "[{role}]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\nlimit = 2\n"
+                ),
+            )
+        } else {
+            format!("{BASE}\n[{role}]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"\nlimit = 2\n")
+        };
         let error = Config::parse(&text).expect_err("the theory limit must fail");
         assert_eq!(
             format!("{error:#}"),

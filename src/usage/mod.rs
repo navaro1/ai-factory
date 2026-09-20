@@ -518,6 +518,10 @@ model = "claude-opus-5[1m]"
 permission_mode = "manual"
 permission_handler = "inbox"
 
+[theory.audit]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
 [repo.demo]
 path = "/tmp/demo"
 
@@ -584,19 +588,26 @@ model = "zai-coding-plan/glm-5.3"
     }
 
     #[test]
-    fn the_optional_theory_roles_add_their_identity_only_when_configured() {
-        // The two theory roles are optional global tables. A config without
-        // them must still derive its identity set.
+    fn the_theory_roles_add_their_identity_when_configured() {
+        // The audit table is required and the chat table stays optional.
+        // The audit role of this config rides the claude identity, so it
+        // adds no identity of its own.
         let without = config_with_overrides();
-        assert!(!without.roles.contains_key(&ExecutionRole::TheoryAudit));
+        assert!(without.roles.contains_key(&ExecutionRole::TheoryAudit));
+        assert!(!without.roles.contains_key(&ExecutionRole::TheoryChat));
         let ids: Vec<String> = identities(&without).into_iter().map(|one| one.id).collect();
         assert_eq!(ids, ["claude", "openai", "zai-coding-plan", "codex"]);
 
-        let with = Config::parse(&format!(
-            "{OVERRIDES_TEXT}\n[theory.audit]\nharness = \"opencode\"\n\
-             model = \"grok/grok-5\"\n[theory.chat]\nharness = \"opencode\"\n\
-             model = \"grok/grok-5\"\n"
-        ))
+        let with = Config::parse(
+            &format!(
+                "{OVERRIDES_TEXT}\n[theory.chat]\nharness = \"opencode\"\n\
+                 model = \"grok/grok-5\"\n"
+            )
+            .replace(
+                "[theory.audit]\nharness = \"claude\"\nmodel = \"claude-opus-5[1m]\"",
+                "[theory.audit]\nharness = \"opencode\"\nmodel = \"grok/grok-5\"",
+            ),
+        )
         .unwrap();
 
         let identities = identities(&with);
@@ -747,6 +758,10 @@ harness = "claude"
 model = "claude-opus-5[1m]"
 
 [ticket.chat]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[theory.audit]
 harness = "claude"
 model = "claude-opus-5[1m]"
 

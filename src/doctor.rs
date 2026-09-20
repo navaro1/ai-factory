@@ -1924,6 +1924,7 @@ mod tests {
         }
         text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
         text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
+        text.push_str("[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str(repos);
         text
     }
@@ -2213,7 +2214,8 @@ mod tests {
             [stage.review]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
             [stage.release]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
             [ticket.create]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
-            [ticket.chat]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n";
+            [ticket.chat]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n\
+            [theory.audit]\nharness = \"opencode\"\nprogram = \"shared\"\nmodel = \"m\"\n";
         let config = Config::parse(text).expect("the role configuration must parse");
         let exec = ScriptExec::new()
             .expect(|call| call.program == "gh", CmdOut::ok("gh 2.74.0\n"))
@@ -2994,7 +2996,8 @@ mod tests {
              [stage.review]\nharness = \"opencode\"\nmodel = \"m\"\n{review_extra}\
              [stage.release]\nharness = \"claude\"\nmodel = \"m\"\n\
              [ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
-             [ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n"
+             [ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n"
         )
     }
 
@@ -3058,7 +3061,8 @@ mod tests {
              [stage.review]\nharness = \"claude\"\nmodel = \"m\"\n\
              [stage.release]\nharness = \"claude\"\nmodel = \"m\"\n\
              [ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
-             [ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n";
+             [ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n\
+             [theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n";
         let claude_only = Config::parse(claude_only).expect("the claude roles must parse");
         let codex_review = permissions_review_text("")
             .replacen(

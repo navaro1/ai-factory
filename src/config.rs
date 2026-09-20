@@ -652,11 +652,19 @@ impl Config {
             let settings = raw_role.into_settings(&role.to_string())?;
             roles.insert(role, settings);
         }
-        for (role, raw_role) in [
-            (ExecutionRole::TheoryAudit, raw.theory.audit),
-            (ExecutionRole::TheoryChat, raw.theory.chat),
+        // The audit role carries production dispatches: the model pull
+        // request review, the sweeps, and the card grading. Its table is
+        // required, and `docs/v0.7/MIGRATION.md` holds the upgrade note.
+        // The chat role first dispatches in a later chunk, so its table
+        // stays optional until then.
+        for (role, raw_role, required) in [
+            (ExecutionRole::TheoryAudit, raw.theory.audit, true),
+            (ExecutionRole::TheoryChat, raw.theory.chat, false),
         ] {
             let Some(raw_role) = raw_role else {
+                if required {
+                    bail!("{role} is required; see docs/v0.7/MIGRATION.md");
+                }
                 continue;
             };
             if raw_role.limit.is_some() {
@@ -2596,6 +2604,7 @@ mod lifecycle_tests {
         }
         text.push_str("\n[ticket.create]\nharness = \"opencode\"\nmodel = \"create\"\n");
         text.push_str("\n[ticket.chat]\nharness = \"claude\"\nmodel = \"chat\"\n");
+        text.push_str("\n[theory.audit]\nharness = \"claude\"\nmodel = \"audit\"\n");
         text.push_str("\n[repo.demo]\npath = \"/tmp/demo\"\n");
         text.push_str("\n[repo.demo.stage.review]\nmodel = \"repo-review\"\n");
         text
@@ -2763,6 +2772,7 @@ mod repo_edit_tests {
         }
         text.push_str("\n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n");
         text.push_str("\n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n");
+        text.push_str("\n[theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n");
         text.push_str("\n[repo.demo]\npath = \"/tmp/demo\"\n");
         text.push_str("\n[repo.demo.stage.review]\nmodel = \"repo-review\"\n");
         text.push_str("\n[repo.demo.theory]\npath = \"docs/theory\"\n");
@@ -3097,6 +3107,10 @@ harness = "claude"
 model = "claude-opus-5[1m]"
 
 [ticket.chat]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
+[theory.audit]
 harness = "claude"
 model = "claude-opus-5[1m]"
 "#;

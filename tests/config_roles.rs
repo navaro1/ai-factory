@@ -37,6 +37,10 @@ permission_handler = "inbox"
 tools = ["Read", "Glob", "Grep"]
 extra_args = []
 
+[theory.audit]
+harness = "claude"
+model = "claude-opus-5[1m]"
+
 [repo.demo]
 path = "/tmp/demo"
 
@@ -45,12 +49,12 @@ model = "gpt-5.6-sol-custom"
 "#;
 
 #[test]
-fn the_installer_example_keeps_the_six_roles_and_read_only_ticket_chat() {
+fn the_installer_example_keeps_the_seven_roles_and_read_only_ticket_chat() {
     let config = Config::parse(include_str!("../docs/v0.5/factory.example.toml"))
         .expect("the installer example must parse");
 
     assert_eq!(config.schema_version, 1);
-    assert_eq!(config.roles.len(), 6);
+    assert_eq!(config.roles.len(), 7);
     assert_eq!(
         config.roles[&ExecutionRole::Review].harness,
         Harness::Opencode

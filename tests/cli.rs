@@ -298,6 +298,7 @@ fn a_sigterm_stops_the_daemon_cleanly_and_saves_the_paused_runtime() {
              \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n\
              permission_mode = \"manual\"\npermission_handler = \"inbox\"\n\
              tools = [\"Read\", \"Glob\", \"Grep\"]\n\
+             \n[theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[repo.borsuk]\npath = \"{}\"\n",
             repo.display()
         ),

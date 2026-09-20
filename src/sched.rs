@@ -830,6 +830,7 @@ mod tests {
             "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 1\n",
             "[ticket.create]\nmodel = \"m\"\nharness = \"opencode\"\n",
             "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[theory.audit]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { implement = 1 }\n",
             "[repo.qubitsok]\npath = \"/tmp/q\"\n",
         );
@@ -855,6 +856,7 @@ mod tests {
             "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[ticket.create]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[theory.audit]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[measure]\nlimit = 2\n",
             "[repo.borsuk]\npath = \"/tmp/b\"\n",
         );

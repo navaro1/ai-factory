@@ -2974,7 +2974,7 @@ mod tests {
         assert_eq!(view.prompts, prompts);
 
         assert_eq!(view.revision, "content-revision");
-        assert_eq!(view.global.len(), 6);
+        assert_eq!(view.global.len(), 7);
         assert_eq!(view.repositories.len(), 12);
         let role = view
             .repositories
@@ -3091,8 +3091,7 @@ mod tests {
     #[test]
     fn the_settings_view_round_trips_the_theory_roles_beside_the_prompts() {
         let text = format!(
-            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
-             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            "{}\n[theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
             config_text()
         );
         let config = Config::parse(&text).unwrap();
@@ -3387,8 +3386,7 @@ mod tests {
     #[test]
     fn a_revision_two_client_decodes_the_initial_state_before_rejecting_revision_three() {
         let text = format!(
-            "{}\n[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n\
-             [theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
+            "{}\n[theory.chat]\nmodel = \"model\"\nharness = \"claude\"\n",
             config_text()
         );
         let config = Config::parse(&text).unwrap();
@@ -4478,6 +4476,7 @@ mod tests {
         }
         text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
         text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
+        text.push_str("[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str("[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { implement = 1 }\n");
         text.push_str(
             "[repo.qubitsok]\npath = \"/tmp/q\"\nrelease = { policy = \"interval\", minutes = 30 }\n",

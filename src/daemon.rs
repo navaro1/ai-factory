@@ -12335,6 +12335,7 @@ mod tests {
              \n[stage.release]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
              \n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\npermission_mode = \"manual\"\npermission_handler = \"inbox\"\ntools = [\"Read\", \"Glob\", \"Grep\"]\n\
+             \n[theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[repo.borsuk]\npath = \"{}\"\ngovernor = \"off\"\n",
             repo.display()
         )

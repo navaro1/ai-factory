@@ -31,6 +31,10 @@ model = "create"
 harness = "claude"
 model = "chat"
 
+[theory.audit]
+harness = "claude"
+model = "audit"
+
 [repo.demo]
 path = "/tmp/demo"
 "#;
