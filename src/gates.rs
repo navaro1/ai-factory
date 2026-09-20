@@ -520,6 +520,7 @@ mod tests {
              \n[stage.release]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\n\
+             \n[theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[repo.borsuk]\npath = \"/tmp/borsuk\"\ngovernor = \"{governor}\"\n"
         );
         crate::config::Config::parse(&text).expect("the gate config must parse")

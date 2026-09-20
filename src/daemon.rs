@@ -56,7 +56,7 @@ use crate::runner::{
     capabilities, script, AllowedPermission, Answer, Capabilities, DefaultRunnerFactory, Job,
     RunEvent, RunnerFactory, Session,
 };
-use crate::sched::{self, Limits, Paused, Verdict};
+use crate::sched::{self, LimitKey, Limits, Paused, Verdict};
 use crate::sock::{
     Action, AreaView, AskView, ChatPurpose, DeltaState, DeltaView, HoldView, InputMode, ModelPath,
     PauseScope, PromptSource, PromptView, Push, RecordView, SettingsOperation, SettingsResult,
@@ -179,6 +179,8 @@ struct WorktreePush<'a> {
     /// The labels a created pull request carries, each as its name and
     /// the six hex digits GitHub renders it with.
     labels: &'a [(&'a str, &'a str)],
+    /// True when a created pull request opens as a draft.
+    draft: bool,
 }
 
 /// What one [`Daemon::push_worktree`] run left on GitHub.
@@ -202,6 +204,296 @@ enum PushOutcome {
 fn model_repo(repo: &RepoConfig) -> &str {
     repo.theory_repo().unwrap_or(&repo.owner_repo)
 }
+
+/// The body of one model pull request of `alias`.
+///
+/// The body carries the three sections of an unlinked change, so the
+/// deterministic body check passes it: a model pull request closes no
+/// ticket and its Before / After holds no line, because a model edit
+/// changes no behaviour of the code.
+fn model_pr_body(alias: &str) -> String {
+    format!(
+        concat!(
+            "## Why\n",
+            "The theory model of {}.\n",
+            "\n",
+            "## Before / After\n",
+            "\n",
+            "## Blast radius\n",
+            "The model file only.\n",
+        ),
+        alias
+    )
+}
+
+/// The routing table of one task purpose.
+///
+/// One const per [`TaskPurpose`] variant holds the answers every purpose
+/// owns, and each field matches a purpose payload inside when it must.
+/// `role` reads the whole task, because the pipeline purpose maps its
+/// role by stage. `limit` is a [`LimitKey`], because the measure purpose
+/// holds the measure limit while every purpose that rides a stage, a
+/// model audit included, holds the limit of its stage. A purpose with
+/// `prompt` `None` renders the template of its role from the prompts
+/// directory; every other purpose owns one template per purpose.
+struct PurposeSpec {
+    /// The execution role the purpose runs under.
+    role: fn(&Task) -> ExecutionRole,
+    /// The template render of the purpose, or `None` for the template of
+    /// the role.
+    prompt: Option<PromptRender>,
+    /// The working directory of the purpose's run.
+    cwd: fn(&Daemon, &Task, &RepoConfig) -> Option<PathBuf>,
+    /// The scheduler limit the purpose counts against.
+    limit: LimitKey,
+    /// The block tag one turn of the purpose must end with.
+    block: fn(&Daemon, &Task) -> Option<&'static str>,
+}
+
+/// The template render one purpose owns.
+type PromptRender = fn(&mut Daemon, &Task, &RepoConfig, &Path) -> Result<String>;
+
+impl TaskPurpose {
+    /// The routing table of this purpose.
+    fn spec(&self) -> PurposeSpec {
+        match self {
+            TaskPurpose::Pipeline => PIPELINE_SPEC,
+            TaskPurpose::TicketCreate => TICKET_CREATE_SPEC,
+            TaskPurpose::TicketChat => TICKET_CHAT_SPEC,
+            TaskPurpose::Measure => MEASURE_SPEC,
+            TaskPurpose::Teach(_) => TEACH_SPEC,
+            TaskPurpose::Audit(_) => AUDIT_SPEC,
+            TaskPurpose::Bootstrap { .. } => BOOTSTRAP_SPEC,
+        }
+    }
+}
+
+/// The role of one pipeline task: the role of its stage, with the
+/// restored shape of a ticket-creation session.
+fn pipeline_role(task: &Task) -> ExecutionRole {
+    if Daemon::is_ticket_creation(task) {
+        return ExecutionRole::TicketCreate;
+    }
+    match task.stage {
+        Stage::Refine => ExecutionRole::Refine,
+        Stage::Implement => ExecutionRole::Implement,
+        Stage::Review => ExecutionRole::Review,
+        Stage::Release => ExecutionRole::Release,
+    }
+}
+
+/// The role of one ticket-creation session.
+fn ticket_create_role(_task: &Task) -> ExecutionRole {
+    ExecutionRole::TicketCreate
+}
+
+/// The role of one ticket chat.
+fn ticket_chat_role(_task: &Task) -> ExecutionRole {
+    ExecutionRole::TicketChat
+}
+
+/// The role of one measure run.
+///
+/// The launcher builds a synthetic role for it, so the table names the
+/// role those settings carry. No dispatch path consults it, because the
+/// measure purpose owns its prompt and its cwd.
+fn measure_role_task(_task: &Task) -> ExecutionRole {
+    Daemon::measure_role().role
+}
+
+/// The role of one teach task and one bootstrap chat.
+fn theory_chat_role(_task: &Task) -> ExecutionRole {
+    ExecutionRole::TheoryChat
+}
+
+/// The role of one audit task, every job of it.
+fn theory_audit_role(_task: &Task) -> ExecutionRole {
+    ExecutionRole::TheoryAudit
+}
+
+/// The prompt of one measure run: the shell command of its queued job.
+fn measure_prompt(
+    daemon: &mut Daemon,
+    task: &Task,
+    _repo_cfg: &RepoConfig,
+    _worktree: &Path,
+) -> Result<String> {
+    daemon
+        .measure_jobs
+        .get(&task.id)
+        .map(|measure| measure.command.clone())
+        .ok_or_else(|| anyhow!("the measure task {} carries no command", task.id))
+}
+
+/// The prompt of one teach task.
+fn teach_prompt(
+    daemon: &mut Daemon,
+    task: &Task,
+    repo_cfg: &RepoConfig,
+    worktree: &Path,
+) -> Result<String> {
+    let TaskPurpose::Teach(key) = &task.purpose else {
+        bail!("the task {} carries no teach purpose", task.id);
+    };
+    let values = daemon.teach_values(task, key, repo_cfg, worktree)?;
+    prompts::fill_template(prompts::TEACH_PROMPT, &values)
+}
+
+/// The prompt of one audit task, per its job.
+fn audit_prompt(
+    daemon: &mut Daemon,
+    task: &Task,
+    repo_cfg: &RepoConfig,
+    worktree: &Path,
+) -> Result<String> {
+    let TaskPurpose::Audit(job) = &task.purpose else {
+        bail!("the task {} carries no audit purpose", task.id);
+    };
+    match job {
+        AuditJob::Card(key) => {
+            let values = daemon.card_values(task, key.clone(), repo_cfg, worktree)?;
+            prompts::fill_template(prompts::AUDIT_CARD_PROMPT, &values)
+        }
+        AuditJob::ModelPr => {
+            let values = daemon.model_pr_values(task, worktree)?;
+            prompts::fill_template(prompts::AUDIT_MODEL_PR_PROMPT, &values)
+        }
+        AuditJob::Sweep => {
+            let values = daemon.audit_values(task, worktree);
+            prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values)
+        }
+    }
+}
+
+/// The prompt of one bootstrap chat.
+fn bootstrap_prompt(
+    daemon: &mut Daemon,
+    task: &Task,
+    _repo_cfg: &RepoConfig,
+    worktree: &Path,
+) -> Result<String> {
+    let TaskPurpose::Bootstrap { area } = &task.purpose else {
+        bail!("the task {} carries no bootstrap purpose", task.id);
+    };
+    let values = vec![
+        ("repo", task.repo.clone()),
+        ("worktree", worktree.display().to_string()),
+        ("area", area.clone()),
+        ("model", daemon.model_entries(&task.repo)),
+    ];
+    prompts::fill_template(prompts::BOOTSTRAP_PROMPT, &values)
+}
+
+/// The working directory of one measure run: the directory its queued
+/// job named.
+fn measure_cwd(daemon: &Daemon, task: &Task, _repo: &RepoConfig) -> Option<PathBuf> {
+    daemon
+        .measure_jobs
+        .get(&task.id)
+        .map(|measure| measure.cwd.clone())
+}
+
+/// The working directory of one run that follows the worktree of its
+/// stage.
+fn workspace_cwd(daemon: &Daemon, task: &Task, repo: &RepoConfig) -> Option<PathBuf> {
+    Some(match daemon.workspace(task) {
+        Workspace::Shared => repo.path.clone(),
+        Workspace::Exclusive(WorktreeKey::Issue(number)) => {
+            daemon.worktrees.issue_path(repo, number)
+        }
+        Workspace::Exclusive(WorktreeKey::Pr(number)) => daemon.worktrees.pr_path(repo, number),
+        Workspace::Exclusive(WorktreeKey::Train) => daemon.worktrees.train_path(repo),
+    })
+}
+
+/// The working directory of one bootstrap chat: the theory checkout.
+fn bootstrap_cwd(daemon: &Daemon, task: &Task, repo: &RepoConfig) -> Option<PathBuf> {
+    match daemon.workspace(task) {
+        Workspace::Shared => Some(repo.theory.checkout(&repo.path)),
+        _ => workspace_cwd(daemon, task, repo),
+    }
+}
+
+/// The delta tag of one governed pipeline review.
+fn pipeline_block(daemon: &Daemon, task: &Task) -> Option<&'static str> {
+    daemon.wants_delta(task).then_some(DELTA_BLOCK)
+}
+
+/// The proposal tag of one ticket chat.
+fn ticket_proposal_final(_daemon: &Daemon, _task: &Task) -> Option<&'static str> {
+    Some(crate::ticket::TICKET_PROPOSAL_BLOCK)
+}
+
+/// The event tag of one teach task and one audit task.
+fn event_final(_daemon: &Daemon, _task: &Task) -> Option<&'static str> {
+    Some(EVENT_BLOCK)
+}
+
+/// The proposal tag of one bootstrap chat.
+fn model_proposal_final(_daemon: &Daemon, _task: &Task) -> Option<&'static str> {
+    Some(MODEL_PROPOSAL_BLOCK)
+}
+
+/// No final tag.
+fn no_block(_daemon: &Daemon, _task: &Task) -> Option<&'static str> {
+    None
+}
+
+const PIPELINE_SPEC: PurposeSpec = PurposeSpec {
+    role: pipeline_role,
+    prompt: None,
+    cwd: workspace_cwd,
+    limit: LimitKey::Stage,
+    block: pipeline_block,
+};
+
+const TICKET_CREATE_SPEC: PurposeSpec = PurposeSpec {
+    role: ticket_create_role,
+    prompt: None,
+    cwd: workspace_cwd,
+    limit: LimitKey::Stage,
+    block: no_block,
+};
+
+const TICKET_CHAT_SPEC: PurposeSpec = PurposeSpec {
+    role: ticket_chat_role,
+    prompt: None,
+    cwd: workspace_cwd,
+    limit: LimitKey::Stage,
+    block: ticket_proposal_final,
+};
+
+const MEASURE_SPEC: PurposeSpec = PurposeSpec {
+    role: measure_role_task,
+    prompt: Some(measure_prompt),
+    cwd: measure_cwd,
+    limit: LimitKey::Measure,
+    block: no_block,
+};
+
+const TEACH_SPEC: PurposeSpec = PurposeSpec {
+    role: theory_chat_role,
+    prompt: Some(teach_prompt),
+    cwd: workspace_cwd,
+    limit: LimitKey::Stage,
+    block: event_final,
+};
+
+const AUDIT_SPEC: PurposeSpec = PurposeSpec {
+    role: theory_audit_role,
+    prompt: Some(audit_prompt),
+    cwd: workspace_cwd,
+    limit: LimitKey::Stage,
+    block: event_final,
+};
+
+const BOOTSTRAP_SPEC: PurposeSpec = PurposeSpec {
+    role: theory_chat_role,
+    prompt: Some(bootstrap_prompt),
+    cwd: bootstrap_cwd,
+    limit: LimitKey::Stage,
+    block: model_proposal_final,
+};
 
 /// The body of one ladder ticket: the event text, then the note.
 fn ladder_body(question: &str, note: &str) -> String {
@@ -3199,6 +3491,9 @@ impl Daemon {
                     && task.number == work.number
                     && task.state.is_terminal()
             });
+            // A model pull request reviews under the audit role, so the
+            // admission reads its shape before the table borrow starts.
+            let model_pr = work.kind == ItemKind::Pr && self.is_model_pr(&work.repo, work.number);
             match self.table.upsert_queued(
                 &work.repo,
                 work.stage,
@@ -3215,6 +3510,9 @@ impl Daemon {
                         task.head_sha = work.head_sha.clone();
                         let id = task.id.clone();
                         self.review_tickets.insert(id.clone(), review_tickets);
+                        if model_pr {
+                            task.purpose = TaskPurpose::Audit(AuditJob::ModelPr);
+                        }
                         if work.kind == ItemKind::Pr {
                             fast_checks.push((work.repo.clone(), work.number, id));
                         }
@@ -3257,6 +3555,26 @@ impl Daemon {
                         .resolved_labels(Some(alias))
                         .has(LabelKey::NeedsHuman, &issue.labels)
                 })
+    }
+
+    /// True when one pull request of the last poll is a model pull
+    /// request.
+    ///
+    /// A model pull request carries the `model-pr` label or a model
+    /// branch head `aif/<alias>/model-<n>`. Its review runs under the
+    /// audit role with the model audit prompt, and the admission re-purposes
+    /// its review task in place: the task keeps its id, its stage, its
+    /// kind, and its number, so the supersede logic, the fast checks, the
+    /// role binding, and the train keep working.
+    fn is_model_pr(&self, repo: &str, number: u64) -> bool {
+        self.snapshot
+            .repos
+            .get(repo)
+            .and_then(|snapshot| snapshot.prs.get(&number))
+            .is_some_and(|pr| {
+                pr.labels.iter().any(|label| label == MODEL_PR_LABEL)
+                    || records::is_model_branch(&pr.head_ref)
+            })
     }
 
     /// Check the contract of one ticket that the implement gate admits.
@@ -4086,7 +4404,7 @@ impl Daemon {
                     task.stage,
                     &task.repo,
                     &task.id,
-                    &task.purpose,
+                    task.purpose.spec().limit,
                 ),
                 Verdict::Yes
             ) {
@@ -4223,7 +4541,7 @@ impl Daemon {
                     task.stage,
                     &task.repo,
                     &task.id,
-                    &task.purpose,
+                    task.purpose.spec().limit,
                 ),
                 Verdict::Yes
             ) {
@@ -4463,8 +4781,8 @@ impl Daemon {
         // chat holds a process between turns, and that process is the real
         // memory cost the stage limit exists to bound. A parked session
         // that no queued message waits for yields its slot to this task,
-        // and the check retries once.
-        if task.purpose != TaskPurpose::Measure
+        // and the check retries once. The measure key holds no session.
+        if task.purpose.spec().limit == LimitKey::Stage
             && self.live_sessions(task.stage) >= self.limits.limit(task.stage)
         {
             self.free_live_slot(task.stage, &task.id);
@@ -8810,6 +9128,7 @@ impl Daemon {
             title: &target.title,
             body: &body,
             labels: &[],
+            draft: false,
         })?;
         Ok(())
     }
@@ -8880,6 +9199,9 @@ impl Daemon {
             "--body",
             plan.body,
         ];
+        if plan.draft {
+            args.push("--draft");
+        }
         for (name, _) in plan.labels {
             args.push("--label");
             args.push(name);
@@ -9024,7 +9346,10 @@ impl Daemon {
     /// branch the operator just edited, whatever GitHub reports meanwhile.
     /// `file` is the one theory file the commit carries, and `message` is
     /// its commit message. One model pull request carries both the model
-    /// edits of the operator and the rules of the ladder.
+    /// edits of the operator and the rules of the ladder. The pull request
+    /// opens as a draft with the three-section body of an unlinked change,
+    /// so the body check passes it and the review gate admits it under
+    /// the audit role.
     fn push_model_worktree(
         &self,
         repo: &RepoConfig,
@@ -9034,7 +9359,7 @@ impl Daemon {
         let worktree = self.worktrees.model_path(repo);
         let branch = self.worktrees.current_branch(&*self.exec, &worktree)?;
         let title = format!("Update the model of {}", repo.alias);
-        let body = format!("The theory model of {}.", repo.alias);
+        let body = model_pr_body(&repo.alias);
         self.push_worktree(&WorktreePush {
             worktree: &worktree,
             branch: &branch,
@@ -9044,6 +9369,7 @@ impl Daemon {
             title: &title,
             body: &body,
             labels: &[(MODEL_PR_LABEL, MODEL_PR_COLOR)],
+            draft: true,
         })
     }
 
@@ -9729,7 +10055,31 @@ impl Daemon {
         match self.table.by_id.get(id).map(|task| task.purpose.clone()) {
             Some(TaskPurpose::Audit(AuditJob::Sweep)) => self.finish_audit_sweep(id),
             Some(TaskPurpose::Audit(AuditJob::Card(key))) => self.finish_audit_card(id, &key),
+            Some(TaskPurpose::Audit(AuditJob::ModelPr)) => self.finish_audit_model_pr(id),
             _ => {}
+        }
+    }
+
+    /// Open one theory event per block of one finished model pull request
+    /// audit.
+    ///
+    /// The events land on the record of the pull request the audit
+    /// reviewed, so the operator answers them where the model edit waits.
+    /// A turn with no block opens nothing, because the audit found no
+    /// contradiction and approved with `gh pr ready`. A failed post goes
+    /// to standard error only, because the audit itself succeeded.
+    fn finish_audit_model_pr(&mut self, id: &str) {
+        let Some(task) = self.table.by_id.get(id).cloned() else {
+            return;
+        };
+        let Some(turn) = self.ticket_turn_text.remove(id) else {
+            return;
+        };
+        let record = RecordKey::Pr(task.number);
+        for event in parse_event_blocks(&turn.all) {
+            if let Err(error) = self.open_event(&task.repo, &record, &event) {
+                eprintln!("task {id}: cannot open the theory event: {error:#}");
+            }
         }
     }
 
@@ -10081,21 +10431,14 @@ impl Daemon {
     /// The working directory of a task's run.
     fn task_cwd(&self, id: &str) -> Option<PathBuf> {
         // A measure run names its own directory, because the base run of
-        // one review reads a worktree the item does not own.
+        // one review reads a worktree the item does not own. The job
+        // outlives its task row, so the lookup runs before the table.
         if let Some(job) = self.measure_jobs.get(id) {
             return Some(job.cwd.clone());
         }
         let task = self.table.by_id.get(id)?;
         let repo = self.config.repos.get(&task.repo)?;
-        Some(match self.workspace(task) {
-            Workspace::Shared if Self::is_bootstrap(task) => repo.theory.checkout(&repo.path),
-            Workspace::Shared => repo.path.clone(),
-            Workspace::Exclusive(WorktreeKey::Issue(number)) => {
-                self.worktrees.issue_path(repo, number)
-            }
-            Workspace::Exclusive(WorktreeKey::Pr(number)) => self.worktrees.pr_path(repo, number),
-            Workspace::Exclusive(WorktreeKey::Train) => self.worktrees.train_path(repo),
-        })
+        (task.purpose.spec().cwd)(self, task, repo)
     }
 
     /// True when the task is an issue-creation session.
@@ -10147,18 +10490,13 @@ impl Daemon {
 
     /// The block tag one task must end its turn with, or `None`.
     ///
-    /// A task with a tag buffers its assistant text, so the daemon reads
-    /// the blocks of the turn back. Only the presence of a tag is read
-    /// today, because each purpose parses its own blocks; the tag itself
-    /// is here for the later chunks that select a parser by it.
+    /// The purpose routing table owns the tag. A task with a tag buffers
+    /// its assistant text, so the daemon reads the blocks of the turn
+    /// back. Only the presence of a tag is read today, because each
+    /// purpose parses its own blocks; the tag itself is here for the
+    /// later chunks that select a parser by it.
     fn wants_final_block(&self, task: &Task) -> Option<&'static str> {
-        match task.purpose {
-            TaskPurpose::TicketChat => Some(crate::ticket::TICKET_PROPOSAL_BLOCK),
-            TaskPurpose::Teach(_) | TaskPurpose::Audit(_) => Some(EVENT_BLOCK),
-            TaskPurpose::Bootstrap { .. } => Some(MODEL_PROPOSAL_BLOCK),
-            TaskPurpose::Pipeline => self.wants_delta(task).then_some(DELTA_BLOCK),
-            TaskPurpose::TicketCreate | TaskPurpose::Measure => None,
-        }
+        (task.purpose.spec().block)(self, task)
     }
 
     /// True when one review must end its report with a delta block.
@@ -10183,25 +10521,11 @@ impl Daemon {
     }
 
     /// Select the execution role for one task purpose.
+    ///
+    /// The purpose routing table owns the answer. The pipeline purpose
+    /// maps its role by stage, and every other purpose owns one role.
     fn execution_role(task: &Task) -> ExecutionRole {
-        if Self::is_ticket_creation(task) {
-            ExecutionRole::TicketCreate
-        } else if Self::is_ticket_chat(task) {
-            ExecutionRole::TicketChat
-        } else if Self::is_teach(task) {
-            ExecutionRole::TheoryChat
-        } else if Self::is_audit(task) {
-            ExecutionRole::TheoryAudit
-        } else if Self::is_bootstrap(task) {
-            ExecutionRole::TheoryChat
-        } else {
-            match task.stage {
-                Stage::Refine => ExecutionRole::Refine,
-                Stage::Implement => ExecutionRole::Implement,
-                Stage::Review => ExecutionRole::Review,
-                Stage::Release => ExecutionRole::Release,
-            }
-        }
+        (task.purpose.spec().role)(task)
     }
 
     /// Resolve the current typed settings for one task.
@@ -10406,43 +10730,19 @@ impl Daemon {
 
     /// Render the prompt of one task.
     ///
-    /// The template comes from the prompt file of the task's role in the
-    /// config directory, read at this moment, or from the built-in default.
-    /// Every placeholder must be known; an unknown one is an error that
-    /// names it, never a silent literal.
+    /// A purpose that owns one template renders it through the purpose
+    /// routing table. Every other purpose takes the template of its role:
+    /// the prompt file in the config directory, read at this moment, or
+    /// the built-in default. Every placeholder must be known; an unknown
+    /// one is an error that names it, never a silent literal.
     fn render_prompt(
         &mut self,
         task: &Task,
         repo_cfg: &RepoConfig,
         worktree: &Path,
     ) -> Result<String> {
-        if task.purpose == TaskPurpose::Measure {
-            return self
-                .measure_jobs
-                .get(&task.id)
-                .map(|measure| measure.command.clone())
-                .ok_or_else(|| anyhow!("the measure task {} carries no command", task.id));
-        }
-        if let TaskPurpose::Teach(key) = &task.purpose {
-            let values = self.teach_values(task, key, repo_cfg, worktree)?;
-            return prompts::fill_template(prompts::TEACH_PROMPT, &values);
-        }
-        if let TaskPurpose::Audit(job) = &task.purpose {
-            if let AuditJob::Card(key) = job {
-                let values = self.card_values(task, key.clone(), repo_cfg, worktree)?;
-                return prompts::fill_template(prompts::AUDIT_CARD_PROMPT, &values);
-            }
-            let values = self.audit_values(task, worktree);
-            return prompts::fill_template(prompts::AUDIT_SWEEP_PROMPT, &values);
-        }
-        if let TaskPurpose::Bootstrap { area } = &task.purpose {
-            let values = vec![
-                ("repo", task.repo.clone()),
-                ("worktree", worktree.display().to_string()),
-                ("area", area.clone()),
-                ("model", self.model_entries(&task.repo)),
-            ];
-            return prompts::fill_template(prompts::BOOTSTRAP_PROMPT, &values);
+        if let Some(render) = task.purpose.spec().prompt {
+            return render(self, task, repo_cfg, worktree);
         }
         let role = Self::execution_role(task);
         let (name, builtin) = prompts::file_name(role)
@@ -10905,6 +11205,58 @@ impl Daemon {
                 )
             })
             .unwrap_or_default()
+    }
+
+    /// The placeholder values of one model pull request audit.
+    ///
+    /// `{model}` carries only the entries whose ids differ between the
+    /// cached model and the head model of the pull request: an added or a
+    /// changed entry as the head holds it, a removed entry as the cache
+    /// held it under a `removed` marker. A head model that does not parse
+    /// fails the dispatch with the parse error, and a cache in error or
+    /// missing makes every head entry added.
+    fn model_pr_values(&self, task: &Task, worktree: &Path) -> Result<Vec<(&'static str, String)>> {
+        let head_sha = task
+            .head_sha
+            .as_deref()
+            .ok_or_else(|| anyhow!("the model audit task {} carries no head", task.id))?;
+        let head = match self.show_file(worktree, head_sha, MODEL_FILE) {
+            Some(text) => model::parse(&text).map_err(|error| {
+                anyhow!("the head model of pull request {}: {error}", task.number)
+            })?,
+            // A pull request that deleted the model file removes every
+            // cached entry, so the head side reads empty.
+            None => Model::default(),
+        };
+        let cached = self
+            .theory_models
+            .get(&task.repo)
+            .and_then(|cache| cache.model.as_ref().ok())
+            .cloned()
+            .unwrap_or_default();
+        let mut model_text = String::new();
+        for entry in &head.entries {
+            let unchanged = cached
+                .entries
+                .iter()
+                .any(|other| other.id() == entry.id() && other == entry);
+            if !unchanged {
+                model_text.push_str(&model::render(std::slice::from_ref(entry)));
+            }
+        }
+        for entry in &cached.entries {
+            if head.entries.iter().any(|other| other.id() == entry.id()) {
+                continue;
+            }
+            model_text.push_str("# removed\n");
+            model_text.push_str(&model::render(std::slice::from_ref(entry)));
+        }
+        Ok(vec![
+            ("repo", task.repo.clone()),
+            ("worktree", worktree.display().to_string()),
+            ("number", task.number.to_string()),
+            ("model", model_text),
+        ])
     }
 
     /// The `{skills}` value of one audit sweep: the implement-shaped slice
@@ -12346,6 +12698,7 @@ mod tests {
              \n[stage.release]\nharness = \"claude\"\nmodel = \"m\"\nlimit = 1\n\
              \n[ticket.create]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[ticket.chat]\nharness = \"claude\"\nmodel = \"m\"\npermission_mode = \"manual\"\npermission_handler = \"inbox\"\ntools = [\"Read\", \"Glob\", \"Grep\"]\n\
+             \n[theory.audit]\nharness = \"claude\"\nmodel = \"m\"\n\
              \n[repo.borsuk]\npath = \"{}\"\ngovernor = \"off\"\n",
             repo.display()
         )
@@ -17022,7 +17375,8 @@ mod tests {
                     "--title",
                     "Update the model of borsuk",
                     "--body",
-                    "The theory model of borsuk.",
+                    "## Why\nThe theory model of borsuk.\n\n## Before / After\n\n## Blast radius\nThe model file only.\n",
+                    "--draft",
                     "--label",
                     "model-pr",
                 ],
@@ -17089,7 +17443,8 @@ mod tests {
                 "--title",
                 "Update the model of borsuk",
                 "--body",
-                "The theory model of borsuk.",
+                "## Why\nThe theory model of borsuk.\n\n## Before / After\n\n## Blast radius\nThe model file only.\n",
+                "--draft",
                 "--label",
                 "model-pr",
             ]
@@ -17424,7 +17779,8 @@ mod tests {
                 "--title",
                 "Update the model of borsuk",
                 "--body",
-                "The theory model of borsuk.",
+                "## Why\nThe theory model of borsuk.\n\n## Before / After\n\n## Blast radius\nThe model file only.\n",
+                "--draft",
                 "--label",
                 "model-pr",
             ],
@@ -27721,24 +28077,50 @@ mod tests {
     }
 
     /// One pull request in the shape `push_model_worktree` opens: open,
-    /// not a draft, labelled `model-pr`, on a model branch, with a plain
-    /// body of one sentence.
+    /// a draft, labelled `model-pr`, on a model branch, with the
+    /// three-section body of an unlinked change.
     fn daemon_model_pr(number: u64) -> Pr {
-        let mut pull = pr(number, false, &[MODEL_PR_LABEL]);
+        let mut pull = pr(number, true, &[MODEL_PR_LABEL]);
         pull.head_ref = "aif/borsuk/model-a1b2c3d4".to_string();
-        pull.body = "The theory model of borsuk.".to_string();
+        pull.body = model_pr_body("borsuk");
         pull
     }
 
-    /// The daemon opens its own pull requests for the model worktree and
-    /// the skills worktree, and neither body carries the three sections.
-    /// Neither passes `--draft` to `gh pr create`, so the review gate
-    /// never admits one and the body check never reads one. This pins that
-    /// invariant, because the body check would refuse the body.
+    /// The model pull request of the daemon passes the deterministic body
+    /// check, and its draft dispatches the audit task under the audit
+    /// purpose. The merge train takes the pull request only after the
+    /// audit agent marks it ready with `gh pr ready`.
     #[test]
-    fn a_model_pull_request_of_the_daemon_never_reaches_the_body_check() {
+    fn a_model_pull_request_of_the_daemon_reviews_as_a_draft_and_merges_only_after_ready() {
         let dir = temp_root();
-        let steps = body_theory_steps(&rig_repo(&dir));
+        let repo = rig_repo(&dir);
+        let worktree = pr_wt(&dir, 7);
+        let mut steps = body_theory_steps(&repo);
+        steps.extend(body_admission_steps(
+            &repo,
+            &worktree,
+            7,
+            &rig_gitdir(&dir),
+            MODEL_FILE,
+        ));
+        steps.extend(reuse_pr_steps(&repo, &worktree, 7, &rig_gitdir(&dir)));
+        steps.push(git_step(
+            &worktree,
+            &["show", "sha7:theory/model.toml"],
+            CmdOut::ok(THEORY_MODEL),
+        ));
+        // The second poll hits the model cache, so the theory read stops
+        // after the commit.
+        steps.push(git_step(
+            &repo,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            CmdOut::ok("refs/remotes/origin/main\n"),
+        ));
+        steps.push(git_step(
+            &repo,
+            &["rev-parse", "refs/remotes/origin/main"],
+            CmdOut::ok("ccc333\n"),
+        ));
         let mut rig = Rig::make_in(dir, steps, governed);
         let pull = daemon_model_pr(7);
         let ctx = contract::ContractContext {
@@ -27752,23 +28134,295 @@ mod tests {
             ticket_names_dependency: false,
             has_ticket: false,
         };
-        let refused = records::check_pr(&pull.body, &pull.head_ref, &ctx)
-            .expect_err("the body carries no Why section");
-        assert_eq!(refused.reason, "section Why missing");
+        records::check_pr(&pull.body, &pull.head_ref, &ctx)
+            .expect("the three-section body passes the body check");
 
         rig.poll(Vec::new(), vec![pull]);
-
-        assert!(
-            !rig.daemon.table.by_id.contains_key("borsuk/review-p7"),
-            "a pull request that is no draft is release work, not review work"
+        let task = rig.task("borsuk/review-p7");
+        assert_eq!(
+            task.purpose,
+            TaskPurpose::Audit(AuditJob::ModelPr),
+            "the draft dispatches the audit task"
         );
         assert_eq!(
             rig.daemon.trains["borsuk"].queue,
-            vec![7],
-            "the pull request joined the merge train instead"
+            Vec::<u64>::new(),
+            "a draft joins no merge train"
         );
-        assert_eq!(findings(&rig, "PR: section Why missing"), 0);
-        assert_eq!(rig.job_count(), 0, "the held lane dispatches nothing");
+
+        let mut ready = daemon_model_pr(7);
+        ready.draft = false;
+        rig.poll(Vec::new(), vec![ready]);
+        assert_eq!(
+            rig.daemon.trains["borsuk"].queue,
+            vec![7],
+            "the ready pull request joins the merge train"
+        );
+    }
+
+    /// The cached model of the model audit tests: the checkout boundary,
+    /// one invariant the head changes, and one state the head removes.
+    const MODEL_AUDIT_CACHE: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"checkout\"\n",
+        "statement = \"the cart pays\"\nsides = [\"web\", \"api\"]\npaths = [\"web/**\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-token\"\ntitle = \"token\"\n",
+        "statement = \"the token stays\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"state\"\nid = \"S-gone\"\ntitle = \"gone\"\n",
+        "statement = \"the cart is empty\"\n",
+    );
+
+    /// The head model of the model audit tests: the boundary unchanged,
+    /// the invariant changed, one failure added, the state removed.
+    const MODEL_AUDIT_HEAD: &str = concat!(
+        "[[entry]]\nkind = \"boundary\"\nid = \"B-checkout\"\ntitle = \"checkout\"\n",
+        "statement = \"the cart pays\"\nsides = [\"web\", \"api\"]\npaths = [\"web/**\"]\n",
+        "[[entry]]\nkind = \"invariant\"\nid = \"INV-token\"\ntitle = \"token\"\n",
+        "statement = \"the token rotates\"\nconstrains = [\"B-checkout\"]\n",
+        "[[entry]]\nkind = \"failure\"\nid = \"F-void\"\ntitle = \"void\"\n",
+        "statement = \"the pay voids the token\"\ncrosses = \"B-checkout\"\n",
+    );
+
+    /// The governed theory read over the richer cached model of the
+    /// model audit tests.
+    fn model_audit_theory_steps(repo: &Path) -> Vec<Step> {
+        vec![
+            git_step(
+                repo,
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                CmdOut::ok("refs/remotes/origin/main\n"),
+            ),
+            git_step(
+                repo,
+                &["rev-parse", "refs/remotes/origin/main"],
+                CmdOut::ok("ccc333\n"),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:theory/model.toml"],
+                CmdOut::ok(MODEL_AUDIT_CACHE),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:theory/verify.toml"],
+                CmdOut::ok(FLOOR_VERIFY),
+            ),
+            rules_step(repo, "ccc333", refused()),
+            git_step(
+                repo,
+                &["ls-tree", "-r", "--name-only", "ccc333", SKILLS_DIR],
+                CmdOut::ok(BODY_SKILLS_TREE),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/SKILL.md"],
+                CmdOut::ok(run_skill("browser")),
+            ),
+            git_step(
+                repo,
+                &["show", "ccc333:.claude/skills/run-web/features/checkout.md"],
+                CmdOut::ok(feature_file_without_fast("web-checkout")),
+            ),
+        ]
+    }
+
+    /// The git steps one dispatched model audit runs: the admission of
+    /// the model diff, the reused head worktree, and the head model read
+    /// of the prompt.
+    fn model_audit_dispatch_steps(dir: &Path) -> Vec<Step> {
+        let repo = rig_repo(dir);
+        let worktree = pr_wt(dir, 7);
+        let mut steps = model_audit_theory_steps(&repo);
+        steps.extend(body_admission_steps(
+            &repo,
+            &worktree,
+            7,
+            &rig_gitdir(dir),
+            MODEL_FILE,
+        ));
+        steps.extend(reuse_pr_steps(&repo, &worktree, 7, &rig_gitdir(dir)));
+        steps.push(git_step(
+            &worktree,
+            &["show", "sha7:theory/model.toml"],
+            CmdOut::ok(MODEL_AUDIT_HEAD),
+        ));
+        steps
+    }
+
+    /// A model pull request enters review under the audit purpose through
+    /// either door: the `model-pr` label on any branch, or a model branch
+    /// without the label. The task keeps the id, the stage, the kind, and
+    /// the number of the review it re-purposes.
+    #[test]
+    fn a_model_pull_request_enters_review_as_one_model_pr_audit() {
+        let mut labelled = unlinked_pr(7);
+        labelled.labels = vec![MODEL_PR_LABEL.to_string()];
+        let mut branched = unlinked_pr(7);
+        branched.head_ref = "aif/borsuk/model-a1b2c3d4".to_string();
+        for pull in [labelled, branched] {
+            let diff = if records::is_model_branch(&pull.head_ref) {
+                MODEL_FILE
+            } else {
+                "docs/notes.md"
+            };
+            let dir = temp_root();
+            let repo = rig_repo(&dir);
+            let worktree = pr_wt(&dir, 7);
+            let mut steps = body_theory_steps(&repo);
+            steps.extend(body_admission_steps(
+                &repo,
+                &worktree,
+                7,
+                &rig_gitdir(&dir),
+                diff,
+            ));
+            steps.extend(reuse_pr_steps(&repo, &worktree, 7, &rig_gitdir(&dir)));
+            steps.push(git_step(
+                &worktree,
+                &["show", "sha7:theory/model.toml"],
+                CmdOut::ok(THEORY_MODEL),
+            ));
+            let mut rig = Rig::make_in(dir, steps, governed);
+
+            rig.poll(Vec::new(), vec![pull]);
+
+            let task = rig.task("borsuk/review-p7");
+            assert_eq!(
+                task.purpose,
+                TaskPurpose::Audit(AuditJob::ModelPr),
+                "the review task runs as one model audit"
+            );
+            assert_eq!(task.stage, Stage::Review);
+            assert_eq!(task.kind, ItemKind::Pr);
+            assert_eq!(task.number, 7);
+            assert_eq!(task.state, TaskState::Running, "the audit task dispatches");
+        }
+    }
+
+    /// The dispatched model audit runs under the audit role, and its
+    /// prompt carries only the entries whose ids differ between the
+    /// cached model and the head model.
+    #[test]
+    fn the_model_pr_audit_prompt_carries_only_the_changed_entries() {
+        let dir = temp_root();
+        let steps = model_audit_dispatch_steps(&dir);
+        let mut rig = Rig::make_in(dir, steps, governed);
+
+        rig.poll(Vec::new(), vec![daemon_model_pr(7)]);
+
+        assert_eq!(
+            rig.roles.lock().unwrap()[0].role,
+            ExecutionRole::TheoryAudit,
+            "the model audit runs under the audit role"
+        );
+        assert_eq!(
+            rig.purposes.lock().unwrap()[0],
+            TaskPurpose::Audit(AuditJob::ModelPr)
+        );
+        let prompt = rig.job(0).prompt;
+        assert!(
+            prompt.contains("INV-token") && prompt.contains("the token rotates"),
+            "the changed entry renders from the head text:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("F-void"),
+            "the added entry renders:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("# removed") && prompt.contains("S-gone"),
+            "the removed entry renders under its marker:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("the cart pays"),
+            "the unchanged boundary stays out:\n{prompt}"
+        );
+    }
+
+    /// One finished audit turn with exactly one event block opens exactly
+    /// one event on the record of the pull request: one comment and the
+    /// `event-open` label.
+    #[test]
+    fn a_finished_model_pr_audit_opens_one_event_on_the_pull_request() {
+        let dir = temp_root();
+        let event = Event {
+            kind: "model".to_string(),
+            text: "INV-token contradicts the pay flow, because the code clears the token."
+                .to_string(),
+            area: Some("web-checkout".to_string()),
+            number: None,
+            surface: None,
+        };
+        let mut steps = model_audit_dispatch_steps(&dir);
+        // The turn end settles the task first: it reads the live pull
+        // request, which still holds the draft and the `needs-human`
+        // label the audit left, so the review contract holds. The exit
+        // then opens the theory event.
+        steps.push(gh_pull_step(7, true, &["needs-human"]));
+        let body = format!("body={}", event_block(&event));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/comments",
+                "-f",
+                body.as_str(),
+            ],
+            CmdOut::ok(""),
+        ));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/labels",
+                "-f",
+                "name=event-open",
+                "-f",
+                "color=d4c5f9",
+            ],
+            CmdOut::ok("HTTP/2 201\r\n\r\n{\"name\":\"event-open\",\"color\":\"d4c5f9\"}"),
+        ));
+        steps.push(gh_step(
+            &[
+                "api",
+                "-i",
+                "-X",
+                "POST",
+                "repos/acme/borsuk/issues/7/labels",
+                "-f",
+                "labels[]=event-open",
+            ],
+            gh_ok(),
+        ));
+        let mut rig = Rig::make_in(dir, steps, governed);
+        rig.poll(Vec::new(), vec![daemon_model_pr(7)]);
+        let id = "borsuk/review-p7";
+
+        rig.event(RunEvent::Text {
+            task: id.to_string(),
+            text: event_block(&event),
+        });
+        rig.event(turn_ended(id));
+        rig.event(exited(id, true, ""));
+
+        assert_eq!(opened_events(&rig), vec![event], "one event per block");
+        assert_eq!(
+            rig.exec
+                .calls()
+                .iter()
+                .filter(|call| {
+                    call.program == "gh"
+                        && call
+                            .args
+                            .contains(&"repos/acme/borsuk/issues/7/comments".to_string())
+                })
+                .count(),
+            1,
+            "exactly one comment lands on the pull request record"
+        );
+        assert_eq!(label_calls(&rig, EVENT_OPEN_LABEL), 1);
+        assert_eq!(rig.task(id).state, TaskState::Done);
     }
 
     #[test]

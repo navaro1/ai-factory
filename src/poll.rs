@@ -836,6 +836,10 @@ model = "m"
 harness = "claude"
 model = "m"
 
+[theory.audit]
+harness = "claude"
+model = "m"
+
 [repo.a]
 path = "/repos/a"
 

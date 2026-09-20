@@ -341,6 +341,10 @@ model = "m"
 harness = "claude"
 model = "m"
 
+[theory.audit]
+harness = "claude"
+model = "m"
+
 [repo.borsuk]
 path = "/tmp/borsuk"
 "#,
@@ -375,6 +379,10 @@ harness = "claude"
 model = "m"
 
 [ticket.chat]
+harness = "claude"
+model = "m"
+
+[theory.audit]
 harness = "claude"
 model = "m"
 

@@ -809,6 +809,50 @@ Put valid JSON between the markers. Do not quote a block. Do not put a block
 in a code fence. Write no text after the last closing marker.
 "#;
 
+/// The built-in prompt of one model pull request audit.
+///
+/// The audit role reviews the model-only pull request of the operator. It
+/// reads only the entries whose ids differ between the cached model and
+/// the head model, checks each against the code, and ends the turn with
+/// one event block per contradiction. An audit with no contradiction
+/// approves with `gh pr ready`. The placeholders are `{repo}`,
+/// `{worktree}`, `{number}`, and `{model}`.
+pub const AUDIT_MODEL_PR_PROMPT: &str = r#"You audit the model changes of PR #{number}
+of the repository {repo}. You work in {worktree}, the checkout of the pull
+request head. Read the files you need. Change no file.
+
+The changed entries
+
+{model}
+
+Each block above is one entry of `theory/model.toml` whose id differs from
+the model of the default branch. An entry the operator added or changed
+appears as the head holds it. An entry the operator removed appears as the
+default branch held it, under a `removed` marker.
+
+Check every changed entry against the code you can read in this worktree.
+A statement the code contradicts is a contradiction. A statement no code
+supports is a contradiction. An entry that names a state, a boundary, or a
+path the repository no longer holds is a contradiction.
+
+End the turn with one event block per contradiction. Name the entry id and
+the contradiction in the text of the block.
+
+<aif-event-v1>
+{"kind":"model","text":"One sentence on the contradiction of the entry.","area":"area id"}
+</aif-event-v1>
+
+When every entry holds, approve the pull request with
+`gh pr ready {number}`.
+
+When a contradiction needs the operator, leave the pull request a draft and
+add the `needs-human` label to it with `gh`. Write the question into a
+comment on the pull request. Do not guess. Do not merge the pull request.
+
+Put valid JSON between the markers. Do not quote a block. Do not put a block
+in a code fence. Write no text after the last closing marker.
+"#;
+
 /// The built-in prompt of one bootstrap chat.
 ///
 /// The operator dictates a stream of memory about one area, and the agent
@@ -1360,6 +1404,42 @@ mod tests {
         assert!(
             filled.contains("An answer with no gap ends with no\nblock."),
             "the prompt says a pass opens no event:\n{filled}"
+        );
+    }
+
+    #[test]
+    fn the_audit_model_pr_prompt_names_exactly_its_four_placeholders() {
+        assert_eq!(
+            scan_placeholders(AUDIT_MODEL_PR_PROMPT),
+            vec!["number", "repo", "worktree", "model"]
+        );
+        let values: Vec<(&str, String)> = scan_placeholders(AUDIT_MODEL_PR_PROMPT)
+            .into_iter()
+            .map(|name| (name, format!("<{name}>")))
+            .collect();
+        let filled = fill_template(AUDIT_MODEL_PR_PROMPT, &values).expect("the model prompt fills");
+        assert!(filled.contains("<model>"));
+        assert!(
+            filled.contains("gh pr ready <number>"),
+            "the prompt names the approval command:\n{filled}"
+        );
+        assert!(
+            filled.contains("one event block per contradiction"),
+            "the prompt names one block per contradiction:\n{filled}"
+        );
+        assert!(
+            filled.contains("needs-human"),
+            "the prompt leaves the needs-human path:\n{filled}"
+        );
+        assert!(
+            filled.contains(
+                r#"{"kind":"model","text":"One sentence on the contradiction of the entry.","area":"area id"}"#
+            ),
+            "the contradiction block stays literal:\n{filled}"
+        );
+        assert!(
+            filled.contains(crate::theory::records::EVENT_BLOCK),
+            "the prompt names the block tag the daemon parses:\n{filled}"
         );
     }
 

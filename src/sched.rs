@@ -14,6 +14,33 @@ use crate::tasks::{TaskPurpose, TaskState, TaskTable};
 /// A task id, as [`TaskTable`] keys it.
 pub type TaskId = String;
 
+/// The limit one purpose counts against.
+///
+/// A purpose that rides a pipeline stage counts against the limit of its
+/// stage. The measure purpose alone counts against [`Limits::measure`],
+/// because a measure run holds no stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKey {
+    /// The limit of the task's stage.
+    Stage,
+    /// The measure limit, over every repository.
+    Measure,
+}
+
+impl LimitKey {
+    /// The key one task purpose counts against.
+    ///
+    /// Every purpose rides a stage, so it takes the stage limit. The
+    /// measure purpose alone holds the measure limit. The daemon routes
+    /// the same fact through its `PurposeSpec` table.
+    pub fn of(purpose: &TaskPurpose) -> Self {
+        match purpose {
+            TaskPurpose::Measure => Self::Measure,
+            _ => Self::Stage,
+        }
+    }
+}
+
 /// The stage limits and the strict lane reservations.
 ///
 /// Build it with [`Limits::from_config`]. The daemon owns the value and may
@@ -171,6 +198,10 @@ impl Paused {
 /// count is at or above its cap reports `Verdict::No(Reason::WindowFull)`
 /// before the capacity check. Refine and review tasks never refuse for
 /// the window, and a repository absent from the map never refuses.
+///
+/// `limit` names the limit the task counts against: the limit of its
+/// stage, or the measure limit. The measure key skips the window and the
+/// capacity checks and counts the running measure tasks alone.
 #[allow(clippy::too_many_arguments)]
 pub fn can_start(
     limits: &Limits,
@@ -180,12 +211,12 @@ pub fn can_start(
     stage: Stage,
     repo: &str,
     task: &str,
-    purpose: &TaskPurpose,
+    limit: LimitKey,
 ) -> Verdict {
     if paused.blocks_task(stage, repo, task) {
         return Verdict::No(Reason::Paused);
     }
-    if *purpose == TaskPurpose::Measure {
+    if limit == LimitKey::Measure {
         return if table.running_measure() >= limits.measure {
             Verdict::No(Reason::StageFull)
         } else {
@@ -262,7 +293,7 @@ pub fn next_dispatch(
                 task.stage,
                 &task.repo,
                 &task.id,
-                &task.purpose,
+                LimitKey::of(&task.purpose),
             ),
             Verdict::Yes
         ) {
@@ -345,7 +376,7 @@ mod tests {
             stage,
             repo,
             "test-task",
-            &TaskPurpose::Pipeline,
+            LimitKey::Stage,
         )
     }
 
@@ -717,7 +748,7 @@ mod tests {
                 Stage::Implement,
                 "borsuk",
                 "borsuk/implement-i142",
-                &TaskPurpose::Pipeline,
+                LimitKey::Stage,
             ),
             Verdict::No(Reason::WindowFull)
         );
@@ -730,7 +761,7 @@ mod tests {
                 Stage::Review,
                 "borsuk",
                 "borsuk/review-p5",
-                &TaskPurpose::Pipeline,
+                LimitKey::Stage,
             ),
             Verdict::Yes,
             "review never waits for the window"
@@ -746,7 +777,7 @@ mod tests {
                 Stage::Implement,
                 "borsuk",
                 "borsuk/implement-i142",
-                &TaskPurpose::Pipeline,
+                LimitKey::Stage,
             ),
             Verdict::Yes
         );
@@ -830,6 +861,7 @@ mod tests {
             "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\nlimit = 1\n",
             "[ticket.create]\nmodel = \"m\"\nharness = \"opencode\"\n",
             "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[theory.audit]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[repo.borsuk]\npath = \"/tmp/b\"\nlanes = { implement = 1 }\n",
             "[repo.qubitsok]\npath = \"/tmp/q\"\n",
         );
@@ -855,6 +887,7 @@ mod tests {
             "[stage.release]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[ticket.create]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[ticket.chat]\nmodel = \"m\"\nharness = \"claude\"\n",
+            "[theory.audit]\nmodel = \"m\"\nharness = \"claude\"\n",
             "[measure]\nlimit = 2\n",
             "[repo.borsuk]\npath = \"/tmp/b\"\n",
         );
@@ -890,7 +923,7 @@ mod tests {
                 Stage::Review,
                 "borsuk",
                 id,
-                &TaskPurpose::Measure,
+                LimitKey::of(&TaskPurpose::Measure),
             )
         };
 
@@ -903,6 +936,24 @@ mod tests {
             can_start(&limits, &Paused::default(), &table, Stage::Review, "borsuk"),
             Verdict::Yes,
             "two running measure tasks hold no review slot"
+        );
+    }
+
+    /// Every purpose but the measure one rides a stage limit. A model
+    /// pull request audit is review stage work, so it counts against the
+    /// review limit, while the measure purpose alone counts against
+    /// `[measure]`.
+    #[test]
+    fn every_purpose_but_measure_rides_its_stage_limit() {
+        assert_eq!(LimitKey::of(&TaskPurpose::Measure), LimitKey::Measure);
+        assert_eq!(
+            LimitKey::of(&TaskPurpose::Audit(crate::tasks::AuditJob::ModelPr)),
+            LimitKey::Stage
+        );
+        assert_eq!(LimitKey::of(&TaskPurpose::Pipeline), LimitKey::Stage);
+        assert_eq!(
+            LimitKey::of(&TaskPurpose::Audit(crate::tasks::AuditJob::Sweep)),
+            LimitKey::Stage
         );
     }
 

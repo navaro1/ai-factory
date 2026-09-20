@@ -922,6 +922,7 @@ mod tests {
         }
         text.push_str("[ticket.create]\nmodel = \"model\"\nharness = \"opencode\"\n");
         text.push_str("[ticket.chat]\nmodel = \"model\"\nharness = \"claude\"\n");
+        text.push_str("[theory.audit]\nmodel = \"model\"\nharness = \"claude\"\n");
         text.push_str("[repo.borsuk]\npath = \"/tmp/borsuk\"\n");
         let mut config = Config::parse(&text).unwrap();
         config.repos.get_mut("borsuk").unwrap().owner_repo = "acme/borsuk".to_string();
