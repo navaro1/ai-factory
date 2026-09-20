@@ -11,7 +11,7 @@ use anyhow::{bail, Context};
 
 use aif::config;
 use aif::exec::RealExec;
-use aif::sock::{Action, Client, TheoryAction};
+use aif::sock::{Action, Client, MeasureResult, Push, TheoryAction};
 
 #[path = "../doctor.rs"]
 mod doctor;
@@ -60,6 +60,15 @@ enum Command {
     },
     /// Stop the daemon.
     Stop,
+    /// Measure the touched areas of the current worktree against the
+    /// merge base, and print the comparison table.
+    Measure {
+        /// Measure only these areas of the verification map. Without the
+        /// flag the daemon measures the areas the working tree diff
+        /// touches.
+        #[arg(long, value_name = "AREA")]
+        area: Vec<String>,
+    },
     /// Report on the installation.
     Doctor {
         /// Path to the config file. Defaults to the config directory.
@@ -84,6 +93,7 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Some(Command::Stop) => stop(),
+        Some(Command::Measure { area }) => measure_main(&area),
         Some(Command::Doctor {
             config,
             clean,
@@ -178,6 +188,86 @@ fn stop() -> i32 {
             path.display(),
             STOP_TIMEOUT.as_secs()
         );
+        1
+    }
+}
+
+/// Send one measure request for the current directory to the daemon.
+///
+/// The daemon runs the touched areas at the working tree and answers one
+/// comparison table. The exit code is 0 on a pass, 1 on a failed
+/// verdict, and 3 on an error: no daemon, a broken transport, or an
+/// `error:` reply.
+fn measure_main(areas: &[String]) -> i32 {
+    let path = config::socket_path();
+    let mut client = match Client::connect(&path) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!(
+                "aif measure: no daemon is listening on {}: {error}",
+                path.display()
+            );
+            return MEASURE_EXIT_ERROR;
+        }
+    };
+    let request = measure_request();
+    if let Err(error) = client.send(&measure_action(&request, areas)) {
+        eprintln!("aif measure: cannot send the measure request: {error}");
+        return MEASURE_EXIT_ERROR;
+    }
+    let pushes = match client.pushes() {
+        Ok(pushes) => pushes,
+        Err(error) => {
+            eprintln!("aif measure: {error:#}");
+            return MEASURE_EXIT_ERROR;
+        }
+    };
+    for push in pushes {
+        match push {
+            // The daemon answers with the state push first, and the
+            // unrelated pushes of other clients pass by.
+            Ok(Push::MeasureResult(result)) if result.request == request => {
+                println!("{}", result.text);
+                return measure_exit(&result);
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                eprintln!("aif measure: {error:#}");
+                return MEASURE_EXIT_ERROR;
+            }
+        }
+    }
+    eprintln!("aif measure: the daemon closed the connection before the result");
+    MEASURE_EXIT_ERROR
+}
+
+/// The exit code `aif measure` returns on every error.
+const MEASURE_EXIT_ERROR: i32 = 3;
+
+/// The action behind one `aif measure` call.
+fn measure_action(request: &str, areas: &[String]) -> Action {
+    Action::Theory(TheoryAction::Measure {
+        path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        areas: areas.to_vec(),
+        request: request.to_string(),
+    })
+}
+
+/// The unique request identity of one `aif measure` call.
+fn measure_request() -> String {
+    format!("measure-{}", uuid::Uuid::new_v4())
+}
+
+/// The exit code of one measure reply.
+///
+/// An `error:` text is an error, a pass verdict is a pass, and every
+/// other verdict fails.
+fn measure_exit(result: &MeasureResult) -> i32 {
+    if result.text.starts_with("error:") {
+        MEASURE_EXIT_ERROR
+    } else if result.pass {
+        0
+    } else {
         1
     }
 }
@@ -298,6 +388,64 @@ mod tests {
 
         assert!(Cli::try_parse_from(["aif", "--paused", "stop"]).is_err());
         assert!(Cli::try_parse_from(["aif", "--paused", "doctor"]).is_err());
+    }
+
+    #[test]
+    fn measure_lever_builds_the_action_with_the_given_areas_and_request() {
+        let parsed = Cli::try_parse_from([
+            "aif",
+            "measure",
+            "--area",
+            "web-checkout",
+            "--area",
+            "api-orders",
+        ])
+        .expect("the arguments must parse");
+        let Some(Command::Measure { area }) = parsed.command else {
+            panic!("the measure command must parse");
+        };
+        assert_eq!(area, vec!["web-checkout", "api-orders"]);
+
+        let Action::Theory(TheoryAction::Measure {
+            areas,
+            request,
+            path: _,
+        }) = measure_action("measure-1", &area)
+        else {
+            panic!("the measure command must build one theory measure action");
+        };
+        assert_eq!(
+            areas,
+            vec!["web-checkout".to_string(), "api-orders".to_string()]
+        );
+        assert_eq!(request, "measure-1");
+
+        let parsed = Cli::try_parse_from(["aif", "measure"]).expect("the arguments must parse");
+        assert!(matches!(parsed.command, Some(Command::Measure { .. })));
+    }
+
+    #[test]
+    fn measure_lever_maps_the_reply_and_the_transport_to_exit_codes() {
+        let pass = MeasureResult {
+            request: "measure-1".to_string(),
+            text: "AREA web-checkout\npoll_p95  12 \u{2192} 12  ms  unchanged".to_string(),
+            pass: true,
+        };
+        assert_eq!(measure_exit(&pass), 0);
+
+        let failed = MeasureResult {
+            request: "measure-1".to_string(),
+            text: "AREA web-checkout\npoll_p95  12 \u{2192} 14  ms  worsened".to_string(),
+            pass: false,
+        };
+        assert_eq!(measure_exit(&failed), 1);
+
+        let error = MeasureResult {
+            request: "measure-1".to_string(),
+            text: "error: the governor of borsuk is off".to_string(),
+            pass: false,
+        };
+        assert_eq!(measure_exit(&error), 3);
     }
 
     #[test]

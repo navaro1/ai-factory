@@ -1557,6 +1557,20 @@ pub enum TheoryAction {
         /// area.
         key: String,
     },
+    /// Measure the touched areas of one worktree against the merge base.
+    ///
+    /// The daemon answers with one [`Push::MeasureResult`] that carries
+    /// the same `request`, so only the caller that asked reads the
+    /// comparison table.
+    Measure {
+        /// The worktree the caller works in.
+        path: PathBuf,
+        /// The areas to measure. An empty list measures the areas the
+        /// working tree diff touches.
+        areas: Vec<String>,
+        /// The unique request identity.
+        request: String,
+    },
 }
 
 /// What one theory conversation is for.
@@ -1576,6 +1590,19 @@ pub struct ModelPath {
     pub repo: String,
     /// The model worktree path. `theory/model.toml` lives under it.
     pub path: PathBuf,
+}
+
+/// The comparison table of one measure lever request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasureResult {
+    /// The request identity from the caller.
+    pub request: String,
+    /// The comparison table in agent text. An error carries an
+    /// `error: <reason>` text, and a run without measurers carries
+    /// `none`.
+    pub text: String,
+    /// Whether every measured area passes its policy.
+    pub pass: bool,
 }
 
 /// The request identity prefix of one model commit.
@@ -1896,6 +1923,8 @@ pub enum Push {
     SettingsResult(SettingsResult),
     /// The model worktree path of one edit-model request.
     ModelPath(ModelPath),
+    /// The comparison table of one measure lever request.
+    MeasureResult(MeasureResult),
 }
 
 /// One command from a UI or from `aif stop` to the daemon.
@@ -2881,6 +2910,11 @@ mod tests {
                 purpose: ChatPurpose::Bootstrap,
                 key: "gh".to_string(),
             }),
+            Action::Theory(TheoryAction::Measure {
+                path: PathBuf::from("/state/worktrees/borsuk/issue-142"),
+                areas: vec!["web-checkout".to_string()],
+                request: "measure-1".to_string(),
+            }),
             Action::Stop,
         ]
     }
@@ -3555,6 +3589,26 @@ mod tests {
             "{\"type\":\"model_path\",\"request\":\"edit-model-1\",\"repo\":\"borsuk\",\"path\":\"/state/worktrees/borsuk/model\"}"
         );
         assert_eq!(serde_json::from_str::<Push>(&text).unwrap(), push);
+    }
+
+    #[test]
+    fn measure_lever_result_push_round_trips_and_carries_the_request() {
+        let push = Push::MeasureResult(MeasureResult {
+            request: "measure-1".to_string(),
+            text: "AREA web-checkout\npoll_p95  12 \u{2192} 14  ms  worsened\n".to_string(),
+            pass: false,
+        });
+
+        let text = serde_json::to_string(&push).unwrap();
+
+        assert!(text.contains("\"type\":\"measure_result\""), "line: {text}");
+        assert!(!text.contains('\n'), "a wire line must not hold a newline");
+        let round = serde_json::from_str::<Push>(&text).unwrap();
+        assert_eq!(round, push);
+        let Push::MeasureResult(result) = round else {
+            panic!("the push must decode as one measure result");
+        };
+        assert_eq!(result.request, "measure-1");
     }
 
     #[test]
